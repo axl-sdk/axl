@@ -478,6 +478,51 @@ Cases that never started are `budget_skipped` and cases stopped mid-flight are
 `budget_interrupted` — neither is a workflow failure, and `summary.coverage` is the field
 to gate CI on (`summary.failures` keeps its older, broader "produced no output" meaning).
 
+### Seeing the request behind a score
+
+When a score is wrong, the question is what the model was actually asked. Traces
+tell you a call happened; [request capture](observability.md#captured-requests-opt-in)
+tells you what was in it — including the repaired message list on a retry turn
+and the prompt a judge built for itself.
+
+```ts
+const runtime = new AxlRuntime({
+  diagnostics: { artifacts: { root: '.axl/artifacts' } },
+});
+
+const result = await runEval(config, executeWorkflow, runtime, {
+  captureRequests: true,
+});
+
+// Which operations produced the worst-scoring item's answer?
+const worst = result.items.toSorted((a, b) => a.scores.quality! - b.scores.quality!)[0];
+worst.diagnostics?.operations;                  // generation calls
+worst.scoreDetails?.quality.diagnostics?.operations; // the judge's calls
+
+// Read them back (a saved run resolves through its history id).
+const opened = await runtime.openDiagnosticArtifact(result.diagnostics!.artifactId);
+for await (const line of opened!.lines) {
+  const record = JSON.parse(line);
+  if (record.phase === 'start') console.log(record.turn, record.request.messages);
+  if (record.correction) console.log('repair:', record.correction);
+}
+```
+
+From the CLI, `axl-eval --capture-requests --output result.json` writes the same
+records to `result.requests.jsonl`.
+
+Three things to know before asserting on capture in a test:
+
+- **It is off by default and requires storage.** Without `diagnostics.artifacts`
+  the run fails with `AxlError('DIAGNOSTICS_UNAVAILABLE')` *before* the dataset
+  is loaded — a deliberate early failure rather than a surprise at the end of a
+  paid run.
+- **Capture health is not run health.** A truncated, interrupted or unavailable
+  capture leaves `accounting` byte-identical; assert the two independently.
+- **Redaction applies.** With `trace.redact` on, message and response content in
+  the records is `'[redacted]'` and `captured.redacted` is `true`; structure,
+  counts and ids survive.
+
 ### Comparing model latency in an eval
 
 Eval callback metadata is additive: returning `{ output, metadata: { category: 'billing' } }`

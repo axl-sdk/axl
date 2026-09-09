@@ -320,7 +320,7 @@ This is what makes "what did the failed run cost?" answerable: a workflow that t
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `purpose` | `'generation' \| 'judging'` | inherited, else `'generation'` | Classifies this scope's operations in `accounting.breakdown` |
-| `admission` | `AdmissionController` | — | Stops admitting new paid operations once known spend reaches the limit |
+| `admission` | `AdmissionController` | — | Stops admitting new paid operations once known spend reaches the limit. Must be an `AdmissionController` instance (from any copy of `@axlsdk/axl`); an object without the internal settlement channel raises `AxlError('INCOMPATIBLE_ADMISSION_CONTROLLER')` rather than silently losing the charge. Use the exported `isAdmissionDeniedError(err)` to classify a refusal — it matches structurally, so it works across duplicate installs where `instanceof` does not |
 | `captureTraces` | `boolean` | `false` | As `trackExecution` |
 | `captureTimingSamples` | `boolean` | `false` | As `trackExecution` |
 
@@ -1861,6 +1861,31 @@ Eval results are automatically persisted when using `runRegisteredEval()`. Histo
 | `eval(config, options?)` | `Promise<unknown>` | Run an ad-hoc eval (not registered). Does **not** auto-persist to history. `options` accepts the same `{ onProgress?, signal?, captureTraces? }` as `runRegisteredEval` |
 | `evalCompare(baseline, candidate)` | `Promise<unknown>` | Compare two eval results for regressions/improvements |
 
+`runRegisteredEval` and `eval` also accept `captureRequests`, forwarded verbatim to `runEval`.
+
+### Diagnostic artifacts
+
+Storage for [captured requests](observability.md#captured-requests-opt-in), configured by `config.diagnostics.artifacts`:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `root` | `string?` | — | Directory for the built-in `FileDiagnosticArtifactStore`. One of `root` or `store` is required for capture |
+| `store` | `DiagnosticArtifactStore?` | — | A custom store. Takes precedence over `root` |
+| `sweepIntervalMs` | `number` | `60_000` | Reclamation cadence. The timer is `unref`'d and cleared by `runtime.shutdown()` |
+| `leaseMs` | `number` | `300_000` | How long a writer's lease survives without renewal before its staged artifact is treated as abandoned. Renewed automatically while a run writes |
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `getDiagnosticArtifactStore()` | `DiagnosticArtifactStore \| undefined` | The configured store, or `undefined` when capture is not configured |
+| `stageDiagnosticArtifact(owner)` | `Promise<{ artifactId, sink }>` | Take a lease and open a bounded sink. Throws `AxlError('DIAGNOSTICS_UNAVAILABLE')` when capture is not configured |
+| `finalizeDiagnosticArtifact(id, status, reason?)` | `Promise<ArtifactManifest>` | Declare what the writer managed to capture |
+| `rollbackDiagnosticArtifact(id)` | `Promise<void>` | Discard a staged artifact whose history row never landed |
+| `copyDiagnosticArtifact(sourceId, owner, options?)` | `Promise<{ artifactId, truncated } \| undefined>` | Copy records under a new owner, bounded by `maxBytes`, preserving original operation ids |
+| `openDiagnosticArtifact(id)` | `Promise<{ manifest, lines } \| undefined>` | Read an artifact. Returns `undefined` when it is pending deletion, logically expired, or its owning history row is gone |
+| `reconcileDiagnosticArtifacts()` | `Promise<{ removed: string[] }>` | Run a reclamation pass by hand (also runs at startup and on the sweep timer) |
+
+Lifecycle, retention and reclamation rules: [integration.md](integration.md#diagnostic-artifact-storage).
+
 `EvalHistoryEntry`:
 
 | Field | Type | Description |
@@ -2169,6 +2194,13 @@ class MyStore implements StateStore {
   // Required: implement all checkpoint, session, decision, and execution state methods
   // Optional: implement saveExecution/listExecutions for execution history,
   //           saveEvalResult/listEvalResults for eval history, etc.
+
+  // Optional, but REQUIRED to host captured-request artifacts: report whether
+  // an eval history row still exists and when it expires, so an artifact is
+  // never served — or retained — past its owner.
+  async getEvalRetention(id: string): Promise<{ exists: boolean; expiresAt?: number }> {
+    return { exists: await this.has(id) }; // omit expiresAt when rows never expire
+  }
 }
 
 const runtime = new AxlRuntime({ state: { store: new MyStore() } });
@@ -2572,6 +2604,7 @@ Per-scorer data stored on each `EvalItem`, providing richer detail than the `sco
 | `cost` | `number?` | Known cost for this scorer invocation. When the scorer's accounting observed operations this is `accounting.knownCost`; on an uninstrumented runtime it falls back to a `cost` the scorer itself returned. **Never summed into a run total** |
 | `outcome` | `ScorerOutcome?` | `'scored'`, `'failed'`, `'skipped'` (`applies` returned `false`), `'cancelled'`, `'budget_skipped'` (an LLM judge the budget refused to start) or `'budget_interrupted'` (denied mid-flight). Absent on pre-0.24 artifacts |
 | `accounting` | `Accounting?` | This scorer's measured spend, present when its scope observed at least one operation. `purpose` is `'judging'` |
+| `diagnostics` | `{ operations: OperationRef[] }?` | Pointers to this scorer's [captured requests](observability.md#captured-requests-opt-in), present only when the run used `captureRequests`. Each `OperationRef` is `{ operationId, kind, turn?, attempt?, status }` where `status` is `'recorded'`, `'start_only'` (the call never returned), `'truncated'` or `'omitted'` |
 | `skipped` | `boolean?` | `true` when the scorer's `applies` predicate returned `false` for this item, so it was deliberately **not run** (`score` is `null`, no `duration`). Distinct from a ran-and-failed scorer (`null` score WITH a `duration`) and from cancellation (no marker, no duration). A skipped scorer is excluded from the mean AND from the failure-rate denominator — see `EvalSummary.scorers[].skipped` and `failOnScorerErrorRate` |
 
 ### `EvalItem`
@@ -2595,6 +2628,7 @@ Per-item result from an eval run. `scores` provides quick numeric access; `score
 | `scoreDetails` | `Record<string, ScorerDetail>?` | Rich per-scorer data — includes `metadata` (e.g., LLM reasoning), per-scorer `duration`, and `cost` |
 | `metadata` | `Record<string, unknown>?` | Tracked execution metadata (e.g., `models`, `tokens`, `agentCalls`) merged with callback metadata, independently of `captureTraces`. User keys win; nested objects are replaced, not deep-merged. Explicit `models`/`workflows` lists without corresponding call counts remove the inherited count map so roll-ups use the list fallback. Invalid non-plain-object metadata is ignored with a warning. Without runtime tracking, only callback metadata is available. |
 | `timing` | `Record<string, ItemModelTiming>?` | Per-model provider-call latency for this item, keyed by the full model URI like `metadata.modelCallCounts`. `ItemModelTiming` is `{ calls, queuedMs, retryMs, wireMs, firstTokenMs?, firstTokenCalls? }` — ms sums across the item's **successful timed** calls; divide by `calls` (or `firstTokenCalls` for first token). **Absent** when the item made no such call. `duration` is unchanged workflow wall clock. Per-call percentiles live on [`summary.modelTiming`](#modeltimingstats), which is computed from the raw calls, not from these sums. Exported from `@axlsdk/eval` |
+| `diagnostics` | `{ operations: OperationRef[] }?` | Pointers to this item's captured **generation** requests, present only when the run used `captureRequests`. A rescored item keeps the original run's refs — a rescore performs no generation |
 | `traces` | `AxlEvent[]?` | Per-item events. Populated only when the eval was run with `{ captureTraces: true }`. Includes events on the failure path (recovered from the `axlCapturedTraces` side-channel on thrown errors) |
 
 ### `EvalResult`
@@ -2610,6 +2644,7 @@ Full result from an eval run.
 | `totalCost` | `number` | **Compatibility view** of `accounting.knownCost` — the spend the runtime measured, workflow plus LLM scorers. Independent of trace level, redaction and `captureTraces` |
 | `unpriced` | `boolean?` | Present exactly when `accounting.completeness !== 'complete'`, i.e. `totalCost` is a lower bound. `accounting.reasons` says why |
 | `accounting` | `EvalAccounting?` | The authoritative record for the run (see below). Absent on pre-0.24 artifacts — use [`readAccounting`](#readaccountingresult) rather than reading the field directly |
+| `diagnostics` | `DiagnosticManifest?` | Present only when the run used `captureRequests`. `{ version: 1, artifactId, fidelity: 'runtime_request', status, reason?, records, bytes, redaction, expiresAt? }`, where `status` is `'complete'`, `'truncated'` (a byte bound was reached), `'interrupted'` (the writer died) or `'unavailable'` (the sink failed). Capture health never affects `accounting` |
 | `duration` | `number` | Wall-clock time in ms |
 | `items` | `EvalItem[]` | Per-item results |
 | `summary` | `EvalSummary` | Aggregate statistics |
@@ -2855,6 +2890,8 @@ Options for `rescore()`.
 
 Re-run scorers on the saved outputs of an existing `EvalResult` without re-executing the workflow. Returns a new `EvalResult` with `rescored: true` and `originalId` set in metadata. Strips `runGroupId` and `runIndex` from inherited metadata (rescored results are independent evaluations).
 
+`RescoreOptions` accepts `budget`, `signal` and `captureRequests` (same shape as `RunEvalOptions`). With capture on, the new judging calls are recorded **and** the source run's captured generation requests are copied into the rescore's own artifact — bounded, with the original operation ids preserved so the copied refs still resolve. A source artifact that is gone or unreadable yields `diagnostics.status: 'unavailable'` rather than failing the rescore.
+
 Its `accounting.scope` is `'rescore'` and covers **only the new judging** — the original generation spend is not re-counted. `accounting.source` records `{ runId, generation }`, where `generation` is the original run's accounting (or `null` for a pre-0.24 artifact, which keeps the whole chain `unverified`). Items that carry a pass-through error keep their original `outcome`. Because the scopes differ, `evalCompare` refuses to certify a rescore total against a full run total.
 
 ### `MultiRunSummary`
@@ -2891,6 +2928,7 @@ Run an evaluation. LLM scorer providers are auto-resolved from the runtime's pro
 | `onProgress` | `(event: EvalProgressEvent) => void` | — | Called synchronously on two events: `item_done` (after each dataset item finishes — success, failure, cancellation, or budget-exceeded) and `run_done` (once after all items finish and stats are computed). Useful for progress bars, live log streams, or WS broadcasts |
 | `signal` | `AbortSignal` | — | Checked before each item AND between scorers within an item. Remaining items are marked as cancelled in the result |
 | `captureTraces` | `boolean` | `false` | Wrap `executeWorkflow` in `runtime.trackExecution(..., { captureTraces: true })`. Per-item `EvalItem.traces` is populated on both success and failure (failure path reads the `axlCapturedTraces` side-channel on the thrown error) |
+| `captureRequests` | `boolean \| { maxRecordBytes?, maxRunBytes?, maxQueueBytes? }` | `false` | Record the request Axl submitted for every model call in the run — case turns, tool continuations, nested asks and LLM judges. Requires [`diagnostics.artifacts`](#diagnostic-artifacts); without it the run fails with `AxlError('DIAGNOSTICS_UNAVAILABLE')` **before** the dataset is loaded. Populates `EvalResult.diagnostics` plus per-item and per-scorer `diagnostics`. Defaults: 256 KiB per record, 16 MiB per run, 1 MiB pending queue. See [observability.md](observability.md#captured-requests-opt-in) |
 
 `EvalProgressEvent`:
 

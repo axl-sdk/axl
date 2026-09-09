@@ -801,6 +801,96 @@ const runtime = new AxlRuntime({
 });
 ```
 
+## Captured requests (opt-in)
+
+Traces answer *what happened*. Captured requests answer the question traces
+cannot: **what exactly did Axl send the model on that turn?** A retry loop
+rewrites the message list between attempts, tool results are appended verbatim,
+and a judge builds its own prompt — so "the request" is a runtime artifact
+nobody can reconstruct after the fact.
+
+Capture is **off by default**, opt-in per run, and lives on a different rail
+from accounting: a capture that fails, hits a limit or is redacted leaves
+`accounting` byte-identical.
+
+```ts
+const runtime = new AxlRuntime({
+  diagnostics: { artifacts: { root: '.axl/artifacts' } },
+});
+
+const result = await runtime.eval({ ...config }, { captureRequests: true });
+
+result.diagnostics;
+// { version: 1, artifactId, fidelity: 'runtime_request',
+//   status: 'complete', records: 42, bytes: 91_233, redaction: 'none' }
+```
+
+`axl-eval --capture-requests` does the same from the CLI; with `--output
+result.json` it also writes `result.requests.jsonl` beside the result.
+
+### What a record contains
+
+One JSONL line per phase of a model call, `v: 1`:
+
+| Phase | Carries |
+|---|---|
+| `start` | The request as submitted — messages, tools, schema and the allowlisted call options |
+| `attempt` | An additional **transport** attempt for the same logical call (a 429 retry is not an output repair) |
+| `end` | The response, or the error |
+
+Every record carries the identity needed to place it: `operationId`, `kind`,
+`provider`, `model`, `transportAttempts`, plus `executionId` / `askId` /
+`parentAskId` / `turn`, the `caseIndex` and `scorer` of the eval scope it ran
+in, and — on a repair turn — `retryReason` and a `correction`
+(`{ stage, reason, feedbackMessage }`) saying which gate rejected the previous
+answer and what the model was told about it.
+
+`EvalItem.diagnostics.operations` and `ScorerDetail.diagnostics.operations`
+point at the operations each owns, so you can go from a suspicious score
+straight to the request behind it.
+
+### Fidelity: `runtime_request`, not wire bytes
+
+`fidelity` is always `'runtime_request'`. What is captured is the
+**provider-neutral request Axl submitted** — the messages, tools, schema and
+options as the runtime built them — *not* the adapter's serialized HTTP body.
+No field claims wire bytes, because the adapter is free to reshape them.
+
+Deliberate omissions are named rather than silently dropped, in
+`captured.omitted`:
+
+- `media` — image/audio/file parts become descriptors (type, size, hash-free)
+- `providerOptionValues` — `providerOptions` contributes **keys only**, so a
+  credential parked there can never reach the artifact
+- `record` — the whole record exceeded the per-record byte bound and was
+  replaced by a stub carrying its size
+
+Signals, functions, callbacks and credentials are never captured.
+
+### Bounds
+
+Capture must never slow a provider call or exhaust a disk, so three byte bounds
+apply (all UTF-8 bytes, all overridable via `captureRequests: { … }`):
+
+| Bound | Default | On exceeding |
+|---|---|---|
+| `maxRecordBytes` | 256 KiB | The record becomes a stub (`captured.truncated`, `omitted: ['record']`) |
+| `maxRunBytes` | 16 MiB | Capture stops for the run; status `truncated` with a reason |
+| `maxQueueBytes` | 1 MiB | Capture stops rather than buffering behind a slow sink |
+
+Writes are queued, never awaited by the provider path. A sink that throws stops
+capture with status `unavailable`. In every one of these cases the run
+completes normally and the numbers are unaffected — `EvalResult.diagnostics`
+reports the loss instead of hiding it.
+
+### Where the bytes live
+
+`diagnostics.artifacts` configures storage — see
+[integration.md](integration.md#diagnostic-artifact-storage) for the lifecycle,
+retention and reclamation rules, and
+[security.md](security.md#captured-requests) for what redaction does to a
+record.
+
 ## Execution Inspector
 
 Each execution is identified by a unique `execution_id`. The runtime provides an inspection API:

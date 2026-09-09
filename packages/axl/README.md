@@ -585,6 +585,18 @@ const relevant = await ctx.recall('knowledge-base', {
 
 Vector store implementations: `InMemoryVectorStore` (testing), `SqliteVectorStore` (production, requires `better-sqlite3`).
 
+**Captured requests (opt-in).** Configure `diagnostics.artifacts` with a `root`
+(or your own `DiagnosticArtifactStore`) and an eval run can record the
+provider-neutral request Axl submitted for every model call — including the
+repaired message list on a retry turn and the prompt a judge built for itself.
+It is off by default, bounded per record / run / queue, redacted when
+`trace.redact` is on, and strictly separate from accounting: a capture that
+fails or hits a limit changes no number. Artifacts are committed only after the
+eval history row that owns them is saved, deleted with it, and reclaimed by a
+startup pass plus a periodic sweep. See
+[observability.md](../../docs/observability.md#captured-requests-opt-in) and
+[integration.md](../../docs/integration.md#diagnostic-artifact-storage).
+
 **Embedder cost attribution.** `OpenAIEmbedder` reports `{ tokens, cost, model }` on every embed call — computed from the response's `prompt_tokens` and a pricing table (`text-embedding-3-small` $0.02/1M, `-large` $0.13/1M, `ada-002` $0.10/1M). The cost flows through `runtime.trackExecution()` the same way agent-call cost does, counts against `ctx.budget()`, and shows up in Studio's Cost Dashboard under "Memory (Embedder)". See [observability.md](../../docs/observability.md#event-types) for the trace-event shape.
 
 **Custom `Embedder` implementations** (breaking change in 0.15.0 — `embed()` previously returned `Promise<number[][]>`):

@@ -106,6 +106,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `completeness` and `budgetStopped`; each eval gains `costCompleteness` and
   `budgetStoppedRuns`; the payload gains `totalCostCompleteness`. See
   [docs/studio-api.md](docs/studio-api.md#eval-trend-spend-and-completeness).
+- **Opt-in request capture.** `runEval` / `runtime.eval()` / `runRegisteredEval`
+  / `rescore` accept `captureRequests`, and `axl-eval` accepts
+  `--capture-requests`, recording the provider-neutral request Axl submitted for
+  every model call in the run — the case's own turns, tool continuations, nested
+  asks, LLM-judge calls, and each transport attempt. `EvalResult.diagnostics`
+  reports what was captured (`fidelity: 'runtime_request'`, status, record and
+  byte counts, redaction), while `EvalItem.diagnostics` and
+  `ScorerDetail.diagnostics` point at the operations they own. Capture is
+  **off** by default and never changes what a run costs: a failing, bounded or
+  redacted capture leaves `accounting` byte-identical. Records are bounded per
+  record, per run and per pending queue, written through a queue that never
+  delays a provider call, and redacted before they are written whenever
+  `trace.redact` is on. A call that never returned leaves a `start` record with
+  no `end` — the one you most want to read.
+- **Diagnostic artifact store.** `diagnostics.artifacts` configures where
+  captured requests live: `root` for the built-in `FileDiagnosticArtifactStore`,
+  or a custom `store` implementing `DiagnosticArtifactStore`. Artifacts follow
+  the eval history row that owns them — staged while the run writes, committed
+  only after the row is saved (rolled back if that save fails), deleted with
+  `deleteEvalResult`, and reclaimed by a startup pass plus a periodic sweep for
+  anything orphaned, expired or abandoned by a dead writer. Expiry mirrors the
+  owning row: `StateStore.getEvalRetention` is implemented by the Memory, SQLite
+  and Redis stores (the last from `PTTL`), and a custom store without it is
+  refused **at configuration time** rather than mid-run. An interrupted writer's
+  artifact reads back as `interrupted` with its records intact.
+- **`axl-eval --capture-requests --output result.json`** writes a
+  `result.requests.jsonl` sidecar alongside the result — codec version 1, one
+  JSON record per line, validated on the way back in.
+- **Studio captured-request endpoints.** `GET /api/evals/:id/diagnostics`
+  returns the manifest and `GET /api/evals/:id/diagnostics/records` streams the
+  records as NDJSON, both resolved through the eval history id and both redacted
+  again at delivery. `POST /api/evals/:name/run` and `.../rescore` accept
+  `captureRequests: true`, and `POST /api/evals/import` accepts an optional
+  `requests` sidecar, re-staged under a **new** artifact id owned by the new
+  history row — an imported bundle can never name a path, a URL, or storage in
+  the deployment it came from.
 
 ### Changed
 
@@ -169,6 +205,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   callback output, so it is dropped like scorer metadata; item and scorer
   `outcome` / `accounting` are preserved as structural, non-content fields. Eval
   imports without accounting are stamped `unverified` on the way in.
+- **Studio: a declared `accounting` on an import must prove itself.** An
+  imported result carrying its own `accounting` is kept only if the record is
+  internally consistent — version 1, USD, a finite non-negative `knownCost`, a
+  known `completeness`, `operations.total === settled + unknown`, and (for
+  `complete` / `incomplete`) provenance and breakdown splits that sum back to
+  `knownCost`. Item-level and scorer-level records are held to the same rule,
+  all-or-nothing. A record that fails is replaced by the same `unverified`
+  synthesis an artifact with no accounting receives, so `compare` refuses to
+  certify a cost delta from a hand-edited "complete" file. Import never rejects
+  a result over its accounting; `metadata.importedAccounting` records
+  `'declared'` or `'invalid'` so the decision is visible rather than inferred.
+- **Studio: in redact mode `EvalItem.metadata` keeps only the measured keys**
+  (`models`, `modelCallCounts`, `workflows`, `workflowCallCounts`, `tokens`,
+  `agentCalls`); every other key is masked, matching the policy already applied
+  to `callerReport.metadata`.
+- **A settled charge reaches its `AdmissionController` across duplicate
+  installs.** The internal settlement channel is a registry symbol and
+  `AdmissionDeniedError` is now recognized structurally, so a budget attached
+  through a second copy of `@axlsdk/axl` (ESM alongside CJS) still records spend
+  and still reads as a stop rather than a model failure. An object that carries
+  no settlement channel at all raises
+  `AxlError('INCOMPATIBLE_ADMISSION_CONTROLLER')` naming the duplicate-install
+  cause, instead of a bare `TypeError`. The new `isAdmissionDeniedError(err)`
+  predicate is exported for callers that classify errors themselves.
 
 ## [0.23.3] - 2026-09-09
 

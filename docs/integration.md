@@ -175,6 +175,81 @@ runtime.on('decision_cleanup_failed', (e) => {
 
 `ExecutionInfo.metadata` strips internal session control-plane keys (`sessionHistory`, `sessionId`) before persistence so a multi-tenant tag bag stays clean. The snapshot is `structuredClone`'d for isolation from caller mutation.
 
+## Diagnostic artifact storage
+
+[Captured requests](observability.md#captured-requests-opt-in) are far too large
+to live inside an eval result, so they live beside it as an **artifact** and the
+result carries a manifest pointing at one. That makes them a two-store problem:
+the history row is in your `StateStore`, the bytes are in an artifact store, and
+every interesting failure is a partial one.
+
+```ts
+const runtime = new AxlRuntime({
+  state: { store: 'sqlite' },
+  diagnostics: {
+    artifacts: {
+      root: '.axl/artifacts', // built-in FileDiagnosticArtifactStore
+      sweepIntervalMs: 60_000, // reclamation cadence (default)
+      leaseMs: 300_000,        // how long a writer's lease survives (default)
+    },
+  },
+});
+```
+
+Supply `store` instead of `root` to plug in your own `DiagnosticArtifactStore`
+(S3, a blob column, anything). Supplying neither while a run asks for capture
+raises `AxlError('DIAGNOSTICS_UNAVAILABLE')` **before** the run starts, never
+halfway through.
+
+### Lifecycle
+
+An artifact is only ever published behind its history row:
+
+1. **stage** — a lease is taken and records stream in
+2. **finalize** — the writer declares `complete` / `truncated` / `unavailable`
+3. **save** — `runtime.saveEvalResult` writes the history row **first**
+4. **commit** — only then does the artifact become owned, carrying the row's
+   expiry
+
+If step 3 throws, the artifact is rolled back rather than left as an orphan
+pointing at a row that never existed. `runtime.deleteEvalResult(id)` runs the
+mirror image: the artifact is marked `delete_pending` **before** the row is
+removed, so a storage failure surfaces to the caller with an intent the next
+sweep finishes — never a silent half-delete reported as success.
+
+### Reclamation
+
+A pass runs at startup and then every `sweepIntervalMs` (unref'd, so it never
+holds the process open; stopped by `runtime.shutdown()`). It removes:
+
+- artifacts marked `delete_pending`
+- committed artifacts whose owning row is gone or whose expiry has passed
+- staged artifacts whose writer lease expired — a crashed run
+
+A staged artifact whose lease is **live** is never touched, so a sweep cannot
+race a running eval. A writer that died mid-run reads back as `interrupted`
+with its records intact up to the truncation point.
+
+### Retention and `getEvalRetention`
+
+An artifact must not outlive the row that owns it, and with Redis that row can
+expire server-side while this process is offline. Stores therefore expose:
+
+```ts
+getEvalRetention?(id: string): Promise<{ exists: boolean; expiresAt?: number }>;
+```
+
+`MemoryStore` and `SQLiteStore` report existence with no expiry; `RedisStore`
+derives both from `PTTL`, so a configured `ttls.evalHistory` is mirrored onto
+the artifact as an absolute `expiresAt`. Physical deletion is **eventual**: the
+row disappears the instant Redis expires it, and the bytes are reclaimed by the
+next sweep (or the next startup). Reads are gated on the logical expiry, so an
+expired artifact stops being served immediately regardless.
+
+A custom `StateStore` **without** `getEvalRetention` cannot host managed
+capture: it is rejected at runtime construction, with the method named, rather
+than being allowed to silently accumulate artifacts nothing will ever reclaim.
+
 ## Axl Studio
 
 Axl Studio provides a browser-based development UI for any Axl project.

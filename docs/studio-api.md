@@ -36,10 +36,12 @@ Studio exposes a REST API that the SPA consumes. You can also call these directl
 | `DELETE /api/memory/:scope/:key` | Delete memory entry |
 | `GET /api/evals` | List registered eval configs |
 | `GET /api/evals/history` | List eval run history |
-| `POST /api/evals/:name/run` | Run a registered eval by name. Body: `{ runs?: N, stream?: true, captureTraces?: true }` (`runs` capped at 25). When `stream: true`, returns `{ evalRunId }` immediately and broadcasts progress over the `eval:{evalRunId}` WS channel: `item_done` per item, `run_done` per successful run, `run_failed` on a provider error, `run_cancelled` on user-initiated abort, terminal `done` (carrying only `{ evalResultId, runGroupId? }` plus `partial: true / batchCompleted / batchAttempted` and either `cancelled: true` OR `batchFailure` — never both — when the batch is partial), or terminal `error` if no runs completed. Clients refetch the full result from history. `captureTraces: true` populates per-item `EvalItem.traces` on every item (success + failure); the Eval Runner panel renders these inline on item detail. Synchronous mode (default) returns the full `EvalResult` enriched with `_multiRun.partial` markers when applicable |
+| `POST /api/evals/:name/run` | Run a registered eval by name. Body: `{ runs?: N, stream?: true, captureTraces?: true, captureRequests?: true }` (`runs` capped at 25). When `stream: true`, returns `{ evalRunId }` immediately and broadcasts progress over the `eval:{evalRunId}` WS channel: `item_done` per item, `run_done` per successful run, `run_failed` on a provider error, `run_cancelled` on user-initiated abort, terminal `done` (carrying only `{ evalResultId, runGroupId? }` plus `partial: true / batchCompleted / batchAttempted` and either `cancelled: true` OR `batchFailure` — never both — when the batch is partial), or terminal `error` if no runs completed. Clients refetch the full result from history. `captureTraces: true` populates per-item `EvalItem.traces` on every item (success + failure); the Eval Runner panel renders these inline on item detail. Synchronous mode (default) returns the full `EvalResult` enriched with `_multiRun.partial` markers when applicable |
 | `POST /api/evals/runs/:evalRunId/cancel` | Abort an active streaming eval run. The cancelled run appears in history with remaining items marked as cancelled |
-| `POST /api/evals/:name/rescore` | Re-score a history entry with the eval's current scorers |
-| `POST /api/evals/import` | Import a CLI eval artifact (parsed `EvalResult` JSON) into runtime history. Body: `{ result: EvalResult \| EvalResult[], eval? }`. The CLI's `--output` writes a JSON array when `--runs N > 1` (including for partial batches), so array form is supported — each entry imports as its own history entry with shared `runGroupId`, rendering as a coherent group in the History tab. Single-object response is `{ id, eval, timestamp }`; array response is `{ imported: [{ id, eval, timestamp }, ...] }`. Per-entry validation; import is all-or-nothing |
+| `POST /api/evals/:name/rescore` | Re-score a history entry with the eval's current scorers. Body accepts `captureRequests?: true`, which captures the new judging calls and copies the source run's captured generation requests (bounded, original operation ids preserved) |
+| `GET /api/evals/:id/diagnostics` | Manifest for a history entry's [captured requests](observability.md#captured-requests-opt-in): `{ artifactId, status, reason?, records, bytes, fidelity, redaction, expiresAt?, copiedFrom? }`. 404 when the entry captured nothing or its artifact is gone. The artifact is resolved **through the history id** — a client can never name storage directly |
+| `GET /api/evals/:id/diagnostics/records` | The captured records, streamed as `application/x-ndjson` (one `v: 1` JSON record per line) rather than buffered into an array. Re-redacted line by line when `trace.redact` is on |
+| `POST /api/evals/import` | Import a CLI eval artifact (parsed `EvalResult` JSON) into runtime history. Body: `{ result: EvalResult \| EvalResult[], eval?, requests? }`. `requests` is an optional captured-request JSONL sidecar (`<name>.requests.jsonl` from `axl-eval --capture-requests --output`); it accompanies a **single** result only, is validated in full before anything is stored, and is re-staged under a new artifact id owned by the new history row. A result that claims captured requests but arrives without them is imported with `diagnostics.status: 'unavailable'` rather than rejected. The CLI's `--output` writes a JSON array when `--runs N > 1` (including for partial batches), so array form is supported — each entry imports as its own history entry with shared `runGroupId`, rendering as a coherent group in the History tab. Single-object response is `{ id, eval, timestamp }`; array response is `{ imported: [{ id, eval, timestamp }, ...] }`. Per-entry validation; import is all-or-nothing |
 | `DELETE /api/evals/history/:id` | Delete a single history entry. Blocked in readOnly |
 | `POST /api/evals/compare` | Compare two eval results by history ID. Body: `{ baselineId, candidateId, options? }` where each ID is `string` (single run) or `string[]` (pooled multi-run). Resolves IDs server-side from `runtime.getEvalHistory()` so the wire payload stays small |
 | `POST /api/playground/chat` | Chat with an agent directly (no workflow required). Accepts `{ message, agent?, sessionId?, image? }`, where `image` is `{ mediaType: 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif', data: string }`: standard base64 only (no data URL), one image, up to 5 MiB decoded. Streams results via WebSocket. |
@@ -501,6 +503,33 @@ If you currently use `npx @axlsdk/studio` with a config file:
 
 The `axl.config.ts` file is no longer needed. The standalone CLI continues to work for projects that don't need embedded middleware.
 
+### Imported accounting validation
+
+An imported result is the one eval in history Studio did not measure, and
+`compare` will certify a cost delta from an `accounting` block that says
+`completeness: 'complete'`. So a **declared** record has to earn that trust:
+
+| Check | Rule |
+|---|---|
+| Shape | `version === 1`, `currency === 'USD'`, finite non-negative `knownCost`, `completeness` in the enum, numeric `reasons` / `usage` |
+| Operations | `operations.total === settled + unknown`, with `denied` and `byKind` numeric |
+| Provenance | values sum to `knownCost` (float tolerance) |
+| Breakdown | `generation + judging + external` sums to `knownCost` |
+
+The two sum identities are checked only for `'complete'` and `'incomplete'`. An
+`'unverified'` record is by definition a synthesis with no operations,
+provenance or breakdown behind it, so it is accepted as-is.
+
+Item-level and scorer-level `accounting` are held to the same rules, and the
+verdict is **all-or-nothing** across the result: a run total that adds up while
+its items are forged is not half-trustworthy.
+
+A failing record is replaced with the `unverified` synthesis an artifact with no
+accounting receives — the numbers stay readable, the certification does not
+survive. Import **never rejects** a result over its accounting; the outcome is
+recorded on `metadata.importedAccounting` as `'declared'` or `'invalid'` so it
+is visible rather than inferred.
+
 ## Observability-boundary redaction
 
 When the runtime is constructed with `config.trace.redact: true`, Studio scrubs user/LLM content at three layers — trace events at emission, REST route responses at serialization, and WebSocket broadcasts at send time — while preserving structural metadata (IDs, keys, agent/tool/workflow names, roles, cost/token/duration metrics, timestamps).
@@ -510,7 +539,7 @@ const runtime = new AxlRuntime({ trace: { redact: true } });
 const studio = createStudioMiddleware({ runtime });
 ```
 
-Under `redact: true`, the following Studio endpoints scrub user content server-side before responding: `GET /api/executions{,/:id}` (also scrubs `ExecutionInfo.metadata` to `{ redacted: true }` — caller-supplied `userId`/`tenantId`/correlation ids are PII surfaces), `GET /api/memory/:scope{,/:key}` (keys preserved so Memory Browser stays navigable), `GET /api/sessions/:id`, `GET /api/evals/history`, `POST /api/evals/:name/run` (sync), `POST /api/evals/:name/rescore`, `GET /api/decisions`, `POST /api/tools/:name/test`, `POST /api/workflows/:name/execute` (sync); streaming WS broadcasts on `/workflows/:name/execute` with `stream: true`, `/api/playground/chat`, AND the trace channel firehose (`trace:{executionId}`) all scrub `AxlEvent` content before send.
+Under `redact: true`, the following Studio endpoints scrub user content server-side before responding: `GET /api/executions{,/:id}` (also scrubs `ExecutionInfo.metadata` to `{ redacted: true }` — caller-supplied `userId`/`tenantId`/correlation ids are PII surfaces), `GET /api/memory/:scope{,/:key}` (keys preserved so Memory Browser stays navigable), `GET /api/sessions/:id`, `GET /api/evals/history`, `POST /api/evals/:name/run` (sync), `POST /api/evals/:name/rescore`, `GET /api/evals/:id/diagnostics/records` (each record re-redacted on the way out), `GET /api/decisions`, `POST /api/tools/:name/test`, `POST /api/workflows/:name/execute` (sync); streaming WS broadcasts on `/workflows/:name/execute` with `stream: true`, `/api/playground/chat`, AND the trace channel firehose (`trace:{executionId}`) all scrub `AxlEvent` content before send.
 
 Session execution has the same boundary: `POST /api/sessions/:id/send` scrubs
 its result, and `POST /api/sessions/:id/stream` scrubs every `AxlEvent` before

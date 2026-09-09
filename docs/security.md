@@ -352,6 +352,47 @@ error *message* (`data.error`, already subject to `trace.redact`) plus the struc
 unchanged — operators who need the raw body must inspect the caught `ProviderError`
 programmatically. See [providers.md](./providers.md#typed-provider-errors).
 
+## Captured requests
+
+[Request capture](observability.md#captured-requests-opt-in) writes the prompts
+and responses of a run to disk. That is exactly the material redaction exists to
+contain, so the same policy applies, twice:
+
+- **Before the write.** When `trace.redact` is on, every record passes through
+  `redactCapturedRequest()` before it reaches the sink. Message content, tool-call
+  arguments, response content, error messages and gate `reason` /
+  `feedbackMessage` become `'[redacted]'`; structure (roles, counts, model,
+  provider, timings, ids) survives, and the record is stamped
+  `captured.redacted: true`.
+- **Again at delivery.** Studio re-applies redaction when streaming records out,
+  because an artifact may have been written before the flag was switched on.
+
+Rich media never lands in an artifact: image, audio and file parts are replaced
+by descriptors. `providerOptions` contributes **keys only** — a credential
+passed through it cannot reach the file even unredacted.
+
+Capture is off unless a run asks for it, and asking requires a configured
+artifact root or store; there is no implicit location and no ambient default.
+Artifacts are deleted with the eval result that owns them
+(see [Right-to-be-Forgotten](#right-to-be-forgotten--execution-deletion)) —
+`runtime.deleteEvalResult(id)` marks the artifact for deletion *before* the
+history row goes, so a failure leaves an intent the next sweep completes rather
+than an orphan nobody will ever look for.
+
+### Imported bundles
+
+`POST /api/evals/import` accepts an optional `requests` sidecar. Nothing in it
+is ever dereferenced: the server does not open a path, fetch a URL, or reuse the
+exporter's artifact id. The sidecar must be JSONL that parses, declares codec
+`v: 1`, and carries an `operationId` and a known `phase` on every line, under a
+size ceiling — and it is validated in full before a single result is stored.
+Accepted records are re-staged under a **new** artifact id owned by the **new**
+history row, so an imported reference can only ever resolve to bytes this
+runtime wrote itself.
+
+A declared `accounting` block on an imported result is likewise not taken on
+trust — see [studio-api.md](studio-api.md#imported-accounting-validation).
+
 ## Multi-Tenant Deployments (Studio Middleware)
 
 When `@axlsdk/studio/middleware` is mounted inside a multi-tenant application, two hooks scope what each connection can see:

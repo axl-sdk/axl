@@ -216,7 +216,25 @@ settles can carry the run past the limit, and `accounting.budget.knownOvershoot`
 by how much. An invalid limit throws `AxlError('INVALID_BUDGET')` before the dataset is
 even loaded.
 
-### 5. Reading older artifacts
+### 5. Captured requests are new, opt-in, and change nothing by default
+
+Nothing about an existing run changes: `captureRequests` is off unless you pass
+it, `EvalResult.diagnostics` is absent, and no artifact directory is created. If
+you turn it on, configure `diagnostics.artifacts` first — a run that asks for
+capture on a runtime with nowhere to put it fails immediately with
+`AxlError('DIAGNOSTICS_UNAVAILABLE')` rather than after spending.
+
+Two things to check before enabling it in production:
+
+- **Your `StateStore` must implement `getEvalRetention`.** The built-in Memory,
+  SQLite and Redis stores do. A custom store without it is rejected at runtime
+  construction, because an artifact whose owner's lifetime cannot be read is an
+  artifact nothing will ever reclaim.
+- **Captured requests contain prompts and responses.** They are redacted before
+  they are written when `trace.redact` is on, and again on the way out of
+  Studio — see [security.md](../security.md#captured-requests).
+
+### 6. Reading older artifacts
 
 `readAccounting(result)` returns a result's accounting, or synthesizes an `unverified`
 record from `totalCost` for a pre-0.24 artifact. `unverified` propagates: through

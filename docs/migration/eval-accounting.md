@@ -35,20 +35,51 @@ expect(runtime.resolveProvider('mock:m').provider).toBe(myProvider);
 expect(runtime.resolveProvider('mock:m').provider).toBeInstanceOf(MyProvider);
 ```
 
-What is not preserved: exotic reflection — a custom `Symbol.hasInstance`, or using the
-provider object as an identity key in a `Map`/`Set` that is also keyed by the raw
-instance elsewhere. Compare by `instanceof` or by a field, not by reference.
+What is not preserved:
+
+- **Exotic reflection** — a custom `Symbol.hasInstance`, or using the provider object as
+  an identity key in a `Map`/`Set` that is also keyed by the raw instance elsewhere.
+  Compare by `instanceof` or by a field, not by reference.
+- **Monkey-patching the raw adapter after the facade has already called the method.**
+  The facade binds each forwarded method once and caches it; writes *through the facade*
+  invalidate that cache, but a write directly onto the registered instance
+  (`rawProvider.someMethod = fn`) does not, so an already-bound method keeps serving the
+  old function. Patch through `resolveProvider(uri).provider`, or patch before first use.
+- **An accessor that returns `this`.** Property reads evaluate on the raw instance so
+  class private fields keep working, which means a getter like `get self() { return this }`
+  hands back the *unwrapped* adapter; calls made through that reference bypass accounting.
 
 ### 2. `trackExecution().cost` comes from the accounting scope
 
 `cost` is now `accounting.knownCost` and `unpriced` is
 `accounting.completeness !== 'complete'`; the return value also gains `accounting`.
 
-For instrumented paths the numbers are **identical** to the old trace sum. They differ
-only where the trace rail used to lose a charge — most visibly a leaf that never
-settled, which previously contributed nothing silently and now marks the result
-`unpriced` with a reason. A run that threw now reports its cost at all, via the new
-non-throwing [`runtime.trackOutcome`](../api-reference.md#runtimetrackoutcomefn-options).
+`cost` itself is unchanged wherever the old trace sum was already right, and higher
+wherever that rail lost a charge — a leaf that never settled contributed nothing
+silently and is now reported. A run that threw reports its cost at all for the first
+time, via the non-throwing
+[`runtime.trackOutcome`](../api-reference.md#runtimetrackoutcomefn-options).
+
+**`unpriced` is deliberately wider than before.** It now also flags a call that
+**dispatched and came back with neither usage nor a cost** — the trace rail treated that
+as "no measurable work" and left `unpriced` false. Expect the flag to flip from `false`
+to `true` for:
+
+- a **usage-omitting gateway** or any custom `Provider` returning just `{ content }`,
+- a **$0 local adapter** whose profile is not `pricing: { kind: 'zero' }`,
+- a **caught provider failure** with no usage on it.
+
+None of these is a new charge; the run's `cost` is the same number it always was. What
+changed is that Axl now says out loud that it could not confirm the number, rather than
+presenting a lower bound as exact. `accounting.reasons.usage_missing` names the calls
+involved.
+
+**`ctx.budget()` keeps the narrower rule, on purpose.** `ctx.getBudgetStatus().unpriced`
+and `BudgetResult.unpriced` still flag only a call that reported positive billable work
+without a price, so a synthesized empty response or a $0 local provider does not trip a
+budget's honesty signal. The two surfaces can therefore disagree about the same run:
+`trackExecution().unpriced === true` alongside `ctx.budget().unpriced === false` is
+expected, not a bug. Budget enforcement behavior is unchanged.
 
 `runtime.trackCost()` is unchanged.
 

@@ -66,10 +66,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [the migration guide](docs/migration/eval-accounting.md).
 - **Breaking: `trackExecution().cost` / `.unpriced` derive from the accounting
   scope**, not from a sum over trace events, and the result gains `accounting`.
-  Identical for instrumented paths; they differ only where the trace rail used
-  to lose a charge — notably a leaf that never settled, which previously
-  contributed nothing silently. `trackExecution` is now a throwing compatibility
-  wrapper over `trackOutcome`; `runtime.trackCost()` is unchanged.
+  `cost` is unchanged wherever the trace sum was already right and higher where
+  that rail lost a charge (a leaf that never settled). **`unpriced` is wider**:
+  it now also flags a call that dispatched and returned neither usage nor a
+  cost, so it flips `false` → `true` for usage-omitting gateways, custom
+  adapters returning bare content, $0 local adapters not declaring
+  `pricing: { kind: 'zero' }`, and caught provider failures. No new charge is
+  implied — Axl now says it could not confirm the figure instead of presenting a
+  lower bound as exact. `ctx.getBudgetStatus().unpriced` / `BudgetResult.unpriced`
+  deliberately keep the narrower positive-billable-work rule, so the two
+  surfaces can disagree about one run. `trackExecution` is now a throwing
+  compatibility wrapper over `trackOutcome`; `runtime.trackCost()` and every
+  `ctx.budget()` behavior are unchanged.
 - **Breaking: `AdmissionDeniedError` passes through every safe boundary
   unwrapped.** A budget refusal is a stop, not a failure: it is never normalized
   into a `ProviderError`, never wrapped in a `TranscriptionOperationError`,

@@ -713,6 +713,14 @@ stop rather than a failure:
 It is deliberately separate from the `timing` observer, whose callbacks must not throw. The hook
 is internal transport plumbing and is never sent to a vendor.
 
+**Only billable requests are gated.** An adapter's auxiliary traffic — a file upload, a
+readiness poll, a cleanup `DELETE` — is not a charge, and refusing it would turn a budget stop
+into a resource leak: a denied cleanup leaves the user's uploaded audio sitting on the vendor's
+storage for its full retention window. Gemini transcription therefore forwards the hook to its
+`interactions` request only, and its Files API upload, poll and delete run ungated. Apply the
+same rule in a custom adapter: gate the request that costs money, never the housekeeping around
+it.
+
 The embedder and transcription transports read the active operation's hook from the ambient
 async context rather than from `ChatOptions`, which they do not carry.
 

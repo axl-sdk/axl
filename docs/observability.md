@@ -32,9 +32,10 @@ the scope says so rather than rounding the unknown down to zero:
 - `completeness: 'incomplete'` — at least one operation did not. `knownCost` is a **lower
   bound**, and `reasons` counts why: `unpriced_model` (usage reported, no usable cost — a
   pricing-table miss, or a `NaN`/negative/`Infinity` from an adapter), `usage_missing`
-  (dispatched, but the terminal outcome carried no usage), `abandoned` (dispatched and never
-  settled before the scope finalized), `external_unreported` (a `withExternalOperation` that
-  never called `report.setCost`).
+  (dispatched, but the terminal outcome carried no usage at all — a failure, an abort, a
+  refused retry, or a successful response from a usage-omitting adapter), `abandoned`
+  (dispatched and never settled before the scope finalized), `external_unreported` (a
+  `withExternalOperation` that never called `report.setCost`).
 - `completeness: 'unverified'` — only ever produced by readers of legacy artifacts that carry no
   accounting at all. A live scope never emits it.
 

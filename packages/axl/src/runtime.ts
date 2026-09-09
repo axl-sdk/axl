@@ -1258,27 +1258,15 @@ export class AxlRuntime extends EventEmitter {
       }
       const originalExecuteFn = entry.executeWorkflow!;
 
-      // Wrap with trackExecution for transparent cost + metadata capture.
-      // When captureTraces is on, runEval wraps this again in a second
-      // trackExecution({ captureTraces: true }) — nested trackExecution walks
-      // the AsyncLocalStorage parent chain so both scopes observe events.
+      // Forward the callback VERBATIM. The runner owns measurement now: it opens
+      // the accounting scope for each item, so a `cost`/`metadata` fallback
+      // injected here would arrive as a caller report competing with the
+      // measurement — the exact replacement precedence the 0.24 cutover removed.
       const wrappedExecuteFn = async (
         input: unknown,
         runtime: unknown,
       ): Promise<{ output: unknown; cost?: number; metadata?: Record<string, unknown> }> => {
-        const {
-          result,
-          cost: trackedCost,
-          metadata,
-        } = await this.trackExecution(async () => {
-          return originalExecuteFn(input, runtime as AxlRuntime);
-        });
-        // Prefer user-supplied cost if present, fall back to tracked cost
-        return {
-          output: result.output,
-          cost: result.cost ?? trackedCost,
-          metadata: result.metadata ?? metadata,
-        };
+        return originalExecuteFn(input, runtime as AxlRuntime);
       };
 
       result = await runEvalFn(entry.config, wrappedExecuteFn, this, {
@@ -2485,13 +2473,14 @@ export class AxlRuntime extends EventEmitter {
       );
     }
 
+    // No `trackExecution` wrapper: the runner opens the per-item accounting
+    // scope, and `runtime.execute` inside it settles into that scope. Reporting
+    // a `cost` here would make the runtime a CALLER of its own eval, and the
+    // caller's number is never the measurement.
     const executeWorkflow = async (
       input: unknown,
     ): Promise<{ output: unknown; cost?: number; metadata?: Record<string, unknown> }> => {
-      const { result, cost, metadata } = await this.trackExecution(async () => {
-        return this.execute(config.workflow, input);
-      });
-      return { output: result, cost, metadata };
+      return { output: await this.execute(config.workflow, input) };
     };
 
     return runEvalFn(config, executeWorkflow, this, options);

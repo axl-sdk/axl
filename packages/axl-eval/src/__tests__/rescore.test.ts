@@ -1,8 +1,13 @@
 import { describe, it, expect } from 'vitest';
+import { z } from 'zod';
 import type { AxlRuntime } from '@axlsdk/axl';
 import type { EvalResult } from '../types.js';
 import type { Scorer } from '../scorer.js';
 import { rescore } from '../rescore.js';
+import { runEval } from '../runner.js';
+import { dataset } from '../dataset.js';
+import { llmScorer } from '../llm-scorer.js';
+import { askExecute, scriptedRuntime } from './accounting-helpers.js';
 
 const mockRuntime = {} as AxlRuntime;
 
@@ -443,6 +448,142 @@ describe('rescore()', () => {
         expect(item.scores.bad).toBeNull();
         expect(item.scorerErrors![0]).toContain('kaboom');
       }
+    });
+  });
+
+  describe('budget (A13.4)', () => {
+    /** A judge on its own provider so judging spend is exactly predictable. */
+    function judgeOn(runtime: AxlRuntime, cost: number, name: string): Scorer {
+      (
+        runtime as unknown as { registerProvider: (n: string, p: unknown) => void }
+      ).registerProvider('judgep', {
+        name: 'judgep',
+        chat: async () => ({
+          content: JSON.stringify({ score: 1, reasoning: 'x' }),
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          cost,
+        }),
+      });
+      return llmScorer({
+        name,
+        description: 'judge',
+        model: 'judgep:model',
+        system: 'Rate it',
+        schema: z.object({ score: z.number(), reasoning: z.string() }),
+      }) as unknown as Scorer;
+    }
+
+    it("does NOT seed the source run's spend into the rescore budget", async () => {
+      // This is the load-bearing claim of a rescore budget: the original run's
+      // cost is history. Seeding it would make a $2 rescore budget useless after
+      // a $2 run — the controller would open already closed and refuse every
+      // judge, which reads as "your judges are broken" rather than "you already
+      // spent this".
+      const { runtime } = scriptedRuntime([{ cost: 0.5 }]);
+      const original = await runEval(
+        {
+          workflow: 'w',
+          dataset: dataset({
+            name: 'd',
+            schema: z.object({ q: z.string() }),
+            items: [{ input: { q: 'a' } }, { input: { q: 'b' } }],
+          }),
+          scorers: [],
+        },
+        askExecute(),
+        runtime,
+      );
+      expect(original.accounting!.knownCost).toBeCloseTo(1, 10);
+
+      const judge = judgeOn(runtime, 0.1, 'judge');
+      const rescored = await rescore(original, [judge], runtime, { budget: '$1' });
+
+      // A $1 budget against $0.20 of new judging: nothing is refused, even
+      // though the source run alone already spent the whole $1.
+      expect(rescored.accounting!.budget).toMatchObject({ limit: 1, status: 'open' });
+      expect(rescored.accounting!.knownCost).toBeCloseTo(0.2, 10);
+      expect(rescored.items.every((i) => i.scores.judge === 1)).toBe(true);
+      expect(rescored.summary.coverage!.scorers.judge.budget_skipped).toBe(0);
+    });
+
+    it('closes on new judging spend and marks later judges budget_skipped', async () => {
+      const { runtime } = scriptedRuntime([{ cost: 0 }]);
+      const original = await runEval(
+        {
+          workflow: 'w',
+          dataset: dataset({
+            name: 'd',
+            schema: z.object({ q: z.string() }),
+            items: [{ input: { q: 'a' } }, { input: { q: 'b' } }, { input: { q: 'c' } }],
+          }),
+          scorers: [],
+        },
+        askExecute(),
+        runtime,
+      );
+
+      const judge = judgeOn(runtime, 0.6, 'judge');
+      const rescored = await rescore(original, [judge], runtime, {
+        budget: '$1',
+        concurrency: 1,
+      });
+
+      // Two judges reach $1.20; the third is refused.
+      expect(rescored.accounting!.budget).toMatchObject({ status: 'closed', limit: 1 });
+      const outcomes = rescored.items.map((i) => i.scoreDetails!.judge.outcome);
+      expect(outcomes).toEqual(['scored', 'scored', 'budget_skipped']);
+      expect(rescored.summary.coverage!.scorers.judge.budget_skipped).toBe(1);
+      // A skipped judge is not a scorer failure and not a scored 0.
+      expect(rescored.summary.scorers.judge.scored).toBe(2);
+      expect(rescored.summary.scorers.judge.failed).toBe(0);
+      expect(rescored.summary.scorers.judge.mean).toBe(1);
+    });
+
+    it('rejects an invalid rescore budget before scoring anything', async () => {
+      const { runtime, provider } = scriptedRuntime([{ cost: 0 }]);
+      const original = await runEval(
+        {
+          workflow: 'w',
+          dataset: dataset({
+            name: 'd',
+            schema: z.object({ q: z.string() }),
+            items: [{ input: { q: 'a' } }],
+          }),
+          scorers: [],
+        },
+        askExecute(),
+        runtime,
+      );
+      const callsBefore = provider.callCount;
+      const judge = judgeOn(runtime, 0.1, 'judge');
+
+      await expect(rescore(original, [judge], runtime, { budget: 'free' })).rejects.toThrow(
+        /INVALID_BUDGET|budget/i,
+      );
+      expect(provider.callCount).toBe(callsBefore);
+    });
+
+    it('leaves the source run untouched', async () => {
+      const { runtime } = scriptedRuntime([{ cost: 0.5 }]);
+      const original = await runEval(
+        {
+          workflow: 'w',
+          dataset: dataset({
+            name: 'd',
+            schema: z.object({ q: z.string() }),
+            items: [{ input: { q: 'a' } }],
+          }),
+          scorers: [],
+        },
+        askExecute(),
+        runtime,
+      );
+      const snapshot = JSON.stringify(original);
+
+      const judge = judgeOn(runtime, 2, 'judge');
+      await rescore(original, [judge], runtime, { budget: '$0.10' });
+
+      expect(JSON.stringify(original)).toBe(snapshot);
     });
   });
 });

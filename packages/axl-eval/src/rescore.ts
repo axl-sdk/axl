@@ -164,12 +164,25 @@ export async function rescore(
   );
   if (runOutcome.status === 'rejected') throw runOutcome.error;
 
+  // `source.generation` means the GENERATION spend this scoring rests on, so a
+  // rescore of a rescore must reach past its immediate source to the original
+  // run. The intermediate's own accounting is judging-only; storing it under a
+  // field named `generation` would tell a reader adding it to the new total
+  // that they had recovered total spend, when they would have judging twice and
+  // generation never. `runId` still points at the immediate source, which is
+  // the artifact this one was actually derived from.
+  const sourceAccounting = result.accounting;
+  const generation =
+    sourceAccounting?.scope === 'rescore'
+      ? (sourceAccounting.source?.generation ?? null)
+      : (sourceAccounting ?? null);
+
   const accounting: EvalAccounting = {
     ...runOutcome.accounting,
     scope: 'rescore',
     // `?? null` is load-bearing: a legacy source has no accounting and must read
     // as "unknown generation", never as a synthesized complete record.
-    source: { runId: result.id, generation: result.accounting ?? null },
+    source: { runId: result.id, generation },
     ...(admission
       ? { budget: { ...admission.snapshot(), ...(closedBy ? { closedBy } : {}) } }
       : {}),

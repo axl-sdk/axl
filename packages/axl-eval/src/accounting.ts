@@ -161,6 +161,29 @@ function usableCost(value: unknown): number {
 }
 
 /**
+ * Is this thrown value the budget refusing to admit a paid operation?
+ *
+ * Deliberately **not** `err instanceof AdmissionDeniedError`. Both packages ship
+ * dual ESM+CJS, and `AxlRuntime.eval()` reaches this runner through a dynamic
+ * `import('@axlsdk/eval')`. A CJS consumer therefore gets the CJS core for its
+ * runtime and the ESM core inside the eval package — two copies, two distinct
+ * error classes, and an `instanceof` that is `false` for a genuine denial. The
+ * consequence is not a crash but something worse: a budget stop silently
+ * reclassified as a workflow failure or a judge defect, which is the one
+ * distinction the whole outcome taxonomy exists to preserve.
+ *
+ * The `code`/`name` pair is stable public surface, so it survives the copy
+ * boundary. Both are checked: `code` is the contract, and `name` keeps an
+ * unrelated `AxlError` that happens to reuse the code from being read as a
+ * denial.
+ */
+export function isAdmissionDenied(err: unknown): boolean {
+  if (typeof err !== 'object' || err === null) return false;
+  const candidate = err as { code?: unknown; name?: unknown };
+  return candidate.code === 'ADMISSION_DENIED' && candidate.name === 'AdmissionDeniedError';
+}
+
+/**
  * Read the accounting of any `EvalResult`, including one written before this
  * field existed.
  *
@@ -169,6 +192,15 @@ function usableCost(value: unknown): number {
  * generation/judging split are invented, and it is never reported as
  * `'complete'`. Turning an absent completeness into `'complete'` is exactly the
  * bug that would let a legacy run certify a cost comparison.
+ *
+ * **The structural identities do not hold on a synthesized record.** For a live
+ * record (`'complete'` or `'incomplete'`) `provenance` sums to `knownCost` and
+ * `breakdown` splits it. A legacy artifact reports only a single total, so the
+ * synthesized record carries `knownCost` with an all-zero `breakdown` and
+ * `provenance` — inventing a generation/judging split from a number of unknown
+ * origin would be a fabrication. Consumers that render a breakdown must treat
+ * `'unverified'` as "no split available", not as "the split is zero"; the
+ * completeness field is what tells them which case they are in.
  */
 export function readAccounting(result: EvalResult): EvalAccounting {
   if (result?.accounting) return result.accounting;

@@ -1,11 +1,29 @@
 import type { AdmissionController, AxlRuntime } from '@axlsdk/axl';
-import { AdmissionDeniedError } from '@axlsdk/axl';
 
 import type { Scorer, ScorerContext } from './scorer.js';
 import { normalizeScorerResult, extractScorerErrorCost } from './scorer.js';
 import type { EvalItem, ScorerDetail, ScorerOutcome } from './types.js';
 import { round, mapWithConcurrency } from './utils.js';
-import { trackScope } from './accounting.js';
+import { isAdmissionDenied, trackScope } from './accounting.js';
+
+/**
+ * Render a dataset input for an error message without ever throwing.
+ *
+ * `JSON.stringify` throws on a circular reference and on a `BigInt`, and this
+ * runs on the path that reports a DIFFERENT failure — so a serialization throw
+ * here would replace a useful "scorer returned 7" message with an unrelated
+ * TypeError. Long inputs are truncated because this string lands in
+ * `item.scorerErrors`, which is persisted per item.
+ */
+function describeInput(input: unknown): string {
+  let rendered: string;
+  try {
+    rendered = JSON.stringify(input) ?? String(input);
+  } catch {
+    rendered = '[unserializable input]';
+  }
+  return rendered.length > 200 ? `${rendered.slice(0, 200)}…` : rendered;
+}
 
 /** The subset of an `EvalItem` that `scoreItem` reads and mutates. */
 type ScorableItem = Pick<
@@ -138,14 +156,16 @@ export async function scoreItem(
       // A cancelled call is not a scoring failure — leave the pre-seeded null
       // and record nothing against the scorer's reliability.
       if ((err as { name?: string })?.name === 'AbortError') {
-        record(withCost({ score: null }, undefined), 'cancelled');
+        record(withCost({ score: null, duration }, undefined), 'cancelled');
         return;
       }
       // A denial is the run budget stopping this judge, not a judge defect. Its
-      // spend up to the denial is kept.
-      if (err instanceof AdmissionDeniedError) {
+      // spend up to the denial is kept, and so is the time it spent before
+      // being refused: this judge DID run, so reporting no duration would make
+      // it indistinguishable from one that never started.
+      if (isAdmissionDenied(err)) {
         context.onClosure?.('operation');
-        record(withCost({ score: null }, undefined), 'budget_interrupted');
+        record(withCost({ score: null, duration }, undefined), 'budget_interrupted');
         return;
       }
       scorerErrorsByName[scorer.name] =
@@ -155,34 +175,50 @@ export async function scoreItem(
       return;
     }
 
-    const scorerResult = normalizeScorerResult(outcome.value);
-    const callerCost =
-      typeof scorerResult.cost === 'number' &&
-      Number.isFinite(scorerResult.cost) &&
-      scorerResult.cost >= 0
-        ? scorerResult.cost
-        : undefined;
+    // `trackScope` cannot throw, but everything AFTER it can: a scorer may
+    // return an exotic object that `normalizeScorerResult` chokes on, and the
+    // out-of-range message serializes `item.input`, which throws on a circular
+    // or BigInt-bearing input. Unguarded, such a throw escapes the concurrency
+    // pool, the item scope and the run scope, and `runEval` loses the ENTIRE
+    // run over one bad item. One scorer's failure is one scorer's failure.
+    try {
+      const scorerResult = normalizeScorerResult(outcome.value);
+      const callerCost =
+        typeof scorerResult.cost === 'number' &&
+        Number.isFinite(scorerResult.cost) &&
+        scorerResult.cost >= 0
+          ? scorerResult.cost
+          : undefined;
 
-    if (!Number.isFinite(scorerResult.score) || scorerResult.score < 0 || scorerResult.score > 1) {
+      if (
+        !Number.isFinite(scorerResult.score) ||
+        scorerResult.score < 0 ||
+        scorerResult.score > 1
+      ) {
+        scorerErrorsByName[scorer.name] =
+          `Scorer "${scorer.name}" returned out-of-range score ${scorerResult.score} for input ${describeInput(item.input)}`;
+        record(
+          withCost({ score: null, metadata: scorerResult.metadata, duration }, callerCost),
+          'failed',
+        );
+      } else {
+        item.scores[scorer.name] = round(scorerResult.score);
+        record(
+          withCost(
+            {
+              score: round(scorerResult.score),
+              metadata: scorerResult.metadata,
+              duration,
+            },
+            callerCost,
+          ),
+          'scored',
+        );
+      }
+    } catch (err) {
       scorerErrorsByName[scorer.name] =
-        `Scorer "${scorer.name}" returned out-of-range score ${scorerResult.score} for input ${JSON.stringify(item.input)}`;
-      record(
-        withCost({ score: null, metadata: scorerResult.metadata, duration }, callerCost),
-        'failed',
-      );
-    } else {
-      item.scores[scorer.name] = round(scorerResult.score);
-      record(
-        withCost(
-          {
-            score: round(scorerResult.score),
-            metadata: scorerResult.metadata,
-            duration,
-          },
-          callerCost,
-        ),
-        'scored',
-      );
+        `Scorer "${scorer.name}" threw: ${err instanceof Error ? err.message : String(err)}`;
+      record(withCost({ score: null, duration }, undefined), 'failed');
     }
     if (admission?.closed) context.onClosure?.('scorer');
   });

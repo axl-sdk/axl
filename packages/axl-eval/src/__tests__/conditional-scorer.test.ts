@@ -467,7 +467,7 @@ describe('mixed scorers on the same item', () => {
 });
 
 describe('abort vs skip remain distinguishable', () => {
-  it('a cancelled scorer has no skipped marker and no duration; an applies-skip has skipped:true', async () => {
+  it('a cancelled scorer has no skipped marker; an applies-skip has skipped:true and no duration', async () => {
     // One scorer is cancelled mid-flight (AbortError); a sibling is applies-skipped.
     // They must land in different states so scorerCounts can tell them apart.
     const aborts: Scorer = {
@@ -492,11 +492,15 @@ describe('abort vs skip remain distinguishable', () => {
       scoreOpts(mockContext({ chat: async () => ({ content: '{}' }) }), 5),
     );
 
-    // Cancelled: pre-seeded null, NO duration, NO skipped marker, NO error.
+    // Cancelled mid-flight: pre-seeded null score, NO skipped marker, NO error —
+    // and a duration, because this judge DID run before the abort reached it.
+    // (A scorer cancelled before it started reports no duration; that is what
+    // separates "never ran" from "ran and was stopped".)
     expect(it0.scores.aborts).toBeNull();
-    expect(it0.scoreDetails!.aborts).toEqual({ score: null, outcome: 'cancelled' });
+    expect(it0.scoreDetails!.aborts.outcome).toBe('cancelled');
+    expect(it0.scoreDetails!.aborts.score).toBeNull();
     expect(it0.scoreDetails!.aborts.skipped).toBeUndefined();
-    expect(it0.scoreDetails!.aborts.duration).toBeUndefined();
+    expect(typeof it0.scoreDetails!.aborts.duration).toBe('number');
     expect(it0.scorerErrors).toBeUndefined();
 
     // Skipped: positive marker, no duration.

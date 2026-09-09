@@ -1,5 +1,5 @@
 import type { AxlRuntime, CallTiming, ModelTimingRollup } from '@axlsdk/axl';
-import { AdmissionController, AdmissionDeniedError } from '@axlsdk/axl';
+import { AdmissionController } from '@axlsdk/axl';
 import type {
   EvalAccounting,
   EvalConfig,
@@ -21,7 +21,7 @@ import {
   evaluateScorerTolerance,
 } from './utils.js';
 import { scoreItem } from './score-item.js';
-import { emptyAccounting, parseBudget, trackScope } from './accounting.js';
+import { emptyAccounting, isAdmissionDenied, parseBudget, trackScope } from './accounting.js';
 import { randomUUID } from 'node:crypto';
 
 /**
@@ -303,7 +303,7 @@ export async function runEval(
 
         if (generation.status === 'rejected') {
           const err = generation.error;
-          if (err instanceof AdmissionDeniedError) {
+          if (isAdmissionDenied(err)) {
             // The run budget stopped this case mid-flight. Its spend so far is
             // kept — discarding it is exactly how a budget stops being honest.
             noteClosure('operation');

@@ -2,6 +2,54 @@
 
 > **Migrating from 0.15.x?** See the [unified event model migration guide](./migration/unified-event-model.md) for the full rename/move table (`TraceEvent`/`StreamEvent` → `AxlEvent`, `ExecutionInfo.steps` → `.events`, `AxlStream.steps` → `.lifecycle`, event tag renames, callback `meta` parameter, and the new ask-tree correlation model).
 
+## Two cost rails: accounting vs. traces
+
+Axl reports spend on two rails, and it matters which one you read.
+
+**The accounting rail is authoritative.** `runtime.trackOutcome(fn)` returns an
+[`Accounting`](./api-reference.md#accounting) record built from provider, tool, memory,
+transcription and declared-external settlement. It is independent of every observability knob:
+the same workload produces byte-identical accounting under `trace: false`, `trace.level: 'steps'`
+and `trace.level: 'full'`, with `captureTraces` on or off, with redaction on or off, and
+whether the workflow returned or threw. Turning tracing off changes what you can *see*, never
+what you are *charged*.
+
+**The trace rail is diagnostic.** `event.cost` on `agent_call_end` / `tool_call_end` /
+`memory_*` / `transcription_end` exists so a dashboard can attribute a charge to a specific
+step, and `ask_end` carries a per-ask rollup. It follows trace configuration, and a leaf that
+never settles simply never emits. Sum it for a chart; do not reconcile a bill with it.
+
+The two are fed by the same settlement producer, so they agree wherever both observe the same
+call. Do not add them together.
+
+### Completeness and reasons
+
+`knownCost` is the sum of charges Axl could actually establish. When it could not establish one,
+the scope says so rather than rounding the unknown down to zero:
+
+- `completeness: 'complete'` — every operation reached a terminal state with a usable charge,
+  **including a known $0**. A free call is complete, not unknown.
+- `completeness: 'incomplete'` — at least one operation did not. `knownCost` is a **lower
+  bound**, and `reasons` counts why: `unpriced_model` (usage reported, no usable cost — a
+  pricing-table miss, or a `NaN`/negative/`Infinity` from an adapter), `usage_missing`
+  (dispatched, but the terminal outcome carried no usage), `abandoned` (dispatched and never
+  settled before the scope finalized), `external_unreported` (a `withExternalOperation` that
+  never called `report.setCost`).
+- `completeness: 'unverified'` — only ever produced by readers of legacy artifacts that carry no
+  accounting at all. A live scope never emits it.
+
+This is coverage of Axl-observable operations, not invoice reconciliation. Arbitrary I/O inside
+your own tool handlers is invisible unless you declare it with
+[`ctx.withExternalOperation`](./api-reference.md#externaloperationdescriptor-fn--ctxwithexternaloperationdescriptor-fn).
+
+Operations refused admission by an [`AdmissionController`](./api-reference.md#admissioncontroller)
+are counted under `operations.denied` and contribute nothing — no charge, no reason, and no
+incompleteness. Refusing to spend is not the same as failing to measure.
+
+`accounting.provenance` splits `knownCost` by where each figure came from, so a vendor-reported
+total stays distinguishable from an Axl price-table estimate. See
+[cost provenance](./providers.md#cost-provenance).
+
 ## Trace Mode
 
 Every workflow execution produces a structured trace. In development, this is your primary debugging tool.

@@ -7,6 +7,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Authoritative cost accounting.** `runtime.trackOutcome(fn, options?)` runs
+  `fn` and **always** returns its outcome plus an `Accounting` record for every
+  paid operation inside it — provider chat/stream, tool invocations (including
+  each retry attempt), memory embeddings, transcription, and declared external
+  work. It never throws: a run that failed after a paid call now reports that
+  call's charge, and the rejected `error` is the **original thrown value**
+  (`===` what was thrown, primitives and frozen objects included). Accounting is
+  derived from settlement rather than from trace events, so it is byte-identical
+  under `trace: false`, `trace.level: 'steps'` / `'full'`, with `captureTraces`
+  on or off, and with redaction on or off. Scopes nest and are isolated: an
+  operation is counted exactly once in every enclosing scope, and concurrent
+  scopes on one runtime never see each other's operations or spend.
+- **Known $0 is distinguished from unknown.** `Accounting.completeness` is
+  `'complete'` only when every operation reached a terminal state with a usable
+  charge — a genuinely free call included. Otherwise it is `'incomplete'`,
+  `knownCost` is an explicit lower bound, and `reasons` counts why:
+  `unpriced_model`, `usage_missing`, `abandoned`, `external_unreported`, or
+  `uninstrumented`. At finalization `operations.total === settled + unknown`,
+  with denied operations tracked separately and excluded.
+- **`AdmissionController`** — a synchronous known-spend threshold for one
+  invocation, attached with `trackOutcome(fn, { admission })`. It closes at
+  `knownSpend >= limit` and refuses new paid operations with a typed
+  `AdmissionDeniedError` before the request leaves the process, so a refusal
+  never accompanies a charge. It is a threshold, not a reservation:
+  `knownOvershoot` reports how far a concurrently in-flight call pushed spend
+  past the limit. Built-in adapters check admission a second time immediately
+  before **every** `fetch` attempt — after the rate-governor grant and after
+  retry backoff — so a request that waited in a queue cannot spend against a
+  budget that closed while it waited; the governor permit is still released, so
+  a sibling request queued on the same governor proceeds.
+- **`externalOperation(descriptor, fn)` and `ctx.withExternalOperation(...)`** —
+  declare paid work Axl cannot observe (a vendor API called from a tool) so it
+  joins the scope's accounting and its budget. Admission is checked before `fn`
+  runs; a cost reported before a later throw is kept; not reporting one marks
+  the scope incomplete with `external_unreported` rather than being read as
+  free. A non-finite, negative, or duplicate `setCost` throws
+  `AxlError('INVALID_COST_REPORT')` so an invalid report can neither shrink nor
+  poison a total.
+- **`costProvenance`** on `ProviderResponse` and the terminal `StreamChunk`,
+  with `Accounting.provenance` reporting the split. A vendor-supplied USD figure
+  (`provider_reported`) stays distinguishable from an Axl price-table estimate
+  (`price_table_estimate`). Every built-in adapter stamps it; it is optional for
+  custom adapters, which are reported as `adapter_reported` rather than
+  mislabeled.
+
+### Changed
+
+- **Breaking: `runtime.resolveProvider(uri)` returns a scoped facade**, so
+  `resolveProvider(uri).provider === registeredInstance` is now `false`. The
+  facade routes `chat`/`stream` through accounting and admission and forwards
+  everything else verbatim — custom properties, accessors, class private-field
+  methods, property writes, capability methods, and `instanceof`. Its identity
+  is stable per runtime per adapter. Exotic reflection (a custom
+  `Symbol.hasInstance`, identity-keyed maps) is not preserved. See
+  [the migration guide](docs/migration/eval-accounting.md).
+- **Breaking: `trackExecution().cost` / `.unpriced` derive from the accounting
+  scope**, not from a sum over trace events, and the result gains `accounting`.
+  Identical for instrumented paths; they differ only where the trace rail used
+  to lose a charge — notably a leaf that never settled, which previously
+  contributed nothing silently. `trackExecution` is now a throwing compatibility
+  wrapper over `trackOutcome`; `runtime.trackCost()` is unchanged.
+- **Breaking: `AdmissionDeniedError` passes through every safe boundary
+  unwrapped.** A budget refusal is a stop, not a failure: it is never normalized
+  into a `ProviderError`, never wrapped in a `TranscriptionOperationError`,
+  never converted into a tool failure fed back to the model, and never retried.
+  Code that catches broadly around `ctx.ask` or a tool call and translates
+  errors into a model-visible message must rethrow it. `ctx.budget()`,
+  `BudgetExceededError`, and `hard_stop` semantics are unchanged.
+
 ## [0.23.3] - 2026-09-09
 
 ### Added

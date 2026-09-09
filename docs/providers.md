@@ -689,6 +689,43 @@ whole retry loop runs inside one held permit, so backoff naturally applies
 backpressure to other queued calls rather than letting them pile on a struggling
 provider.
 
+### Dispatch admission
+
+An [`AdmissionController`](./api-reference.md#admissioncontroller) is checked when an operation
+opens, but that alone is not enough: under a rate governor or a transport retry, a request can
+sit queued or sleeping in backoff for a long time, and the budget may close while it waits.
+Checking only at the start would let a request that was admitted minutes ago still spend.
+
+So built-in adapters carry a second checkpoint. `ChatOptions.dispatchAdmission` (internal, set
+by the scoped provider facade) is forwarded into `fetchWithRetry`, which calls it **after**
+acquiring the governor permit and immediately **before every** `fetch` attempt — including each
+retry, after its backoff sleep.
+
+The call sits **outside** the network-error `try`, which is what makes the refusal behave as a
+stop rather than a failure:
+
+- it is never normalized into a `ProviderError`,
+- it is never auto-retried,
+- it is never mistaken for an abort,
+- the governor permit is still released by the existing `finally`, so a sibling request queued
+  on the same governor proceeds normally.
+
+It is deliberately separate from the `timing` observer, whose callbacks must not throw. The hook
+is internal transport plumbing and is never sent to a vendor.
+
+The embedder and transcription transports read the active operation's hook from the ambient
+async context rather than from `ChatOptions`, which they do not carry.
+
+**Extension contract and reduced coverage.** A third-party adapter that ignores
+`dispatchAdmission` still gets the operation-open check, so its **next** operation is refused
+once the budget closes. What cannot be guaranteed is a request already inside that adapter's own
+queue or retry loop: Axl has no way to reach into it. If your adapter has its own governor or
+backoff, forward `options.dispatchAdmission` to `fetchWithRetry` (or call
+`beforeDispatch(attempt)` yourself immediately before each request) to get the same coverage the
+built-ins have. Declaring `reportsRequestLifecycle` and calling
+`ChatOptions.requestLifecycle.onDispatch` additionally lets the runtime tell a request that
+never left the process (no charge) from one that failed after dispatch (unknown charge).
+
 ### Typed provider errors
 
 Every adapter throws a `ProviderError` (extends `AxlError`, `code: 'PROVIDER_ERROR'`)
@@ -1217,9 +1254,25 @@ Both estimators expose the per-modality prompt split as
 reports it), including on the OpenRouter lane where it is observability only.
 The fields are **absent, never `0`**, when the provider reported no split.
 
+### Cost provenance
+
+A USD figure the vendor supplied and one an Axl price table produced are not equally
+trustworthy: the first is reconcilable against an invoice, the second goes stale the moment a
+vendor reprices. `ProviderResponse.costProvenance` and `StreamChunk(done).costProvenance` record
+which it was, and [`Accounting.provenance`](./api-reference.md#accounting) reports the split.
+
+| Value | Meaning |
+|---|---|
+| `'provider_reported'` | The vendor supplied the USD amount (the `from-response` pricing profiles — OpenRouter, xAI) |
+| `'price_table_estimate'` | An Axl/adapter price table was applied to reported usage (every other built-in) |
+
+Every built-in adapter stamps it whenever it returns a `cost`. It is optional: a cost with no
+stamp is recorded as `'adapter_reported'`, so a custom adapter that ignores the field keeps
+working and is simply reported as undeclared rather than being mislabeled.
+
 ### Custom providers
 
-Custom providers that implement the `Provider` interface return `cost` from `chat()` and `stream()`. Axl does not impose any pricing logic on custom providers — cost estimation is entirely up to the implementation.
+Custom providers that implement the `Provider` interface return `cost` from `chat()` and `stream()`. Axl does not impose any pricing logic on custom providers — cost estimation is entirely up to the implementation. Setting `costProvenance` is optional; omitting it maps to `'adapter_reported'`.
 
 ## Custom Providers
 

@@ -311,9 +311,130 @@ const ctx = runtime.createContext({
 });
 ```
 
+### `runtime.trackOutcome(fn, options?)`
+
+Run `fn` and **always** return its outcome plus the authoritative `Accounting` for every paid operation inside it. Unlike `trackExecution` it never throws: the result is `({ status: 'fulfilled'; value } | { status: 'rejected'; error }) & { accounting, metadata, modelTiming?, traces? }`. The `error` is the **original thrown value** — primitives, frozen objects, `AbortError`, `ProviderError` and `BudgetExceededError` all come back `===` what was thrown.
+
+This is what makes "what did the failed run cost?" answerable: a workflow that threw after a paid call still reports that call's charge.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `purpose` | `'generation' \| 'judging'` | inherited, else `'generation'` | Classifies this scope's operations in `accounting.breakdown` |
+| `admission` | `AdmissionController` | — | Stops admitting new paid operations once known spend reaches the limit |
+| `captureTraces` | `boolean` | `false` | As `trackExecution` |
+| `captureTimingSamples` | `boolean` | `false` | As `trackExecution` |
+
+```typescript
+const outcome = await runtime.trackOutcome(
+  () => runtime.execute('my-workflow', input),
+  { admission: new AdmissionController({ limit: 1.0 }) },
+);
+
+if (outcome.status === 'rejected') {
+  // The charge is still known, and the error is untouched.
+  console.log(`failed after $${outcome.accounting.knownCost}`, outcome.error);
+}
+```
+
+Scopes nest. An operation settled inside a child `trackOutcome` is counted **exactly once** in every enclosing scope, so a parent total is the sum of disjoint operations. Concurrent `trackOutcome` calls on one runtime are isolated — neither sees the other's operations, budget closure or spend.
+
+### `Accounting`
+
+The authoritative record of what a scope spent. It is derived from provider/tool settlement, **not** from trace events, so trace level, `captureTraces` and redaction change diagnostics and never the numbers.
+
+```typescript
+type Accounting = {
+  version: 1;
+  currency: 'USD';
+  knownCost: number;                 // settled, usable, disjoint charges
+  completeness: 'complete' | 'incomplete' | 'unverified';
+  reasons: Partial<Record<AccountingReason, number>>;
+  usage: AccountingUsage;
+  operations: {
+    total: number;                   // admitted and opened
+    settled: number;                 // terminal with a usable cost, including a known $0
+    unknown: number;                 // terminal without one — drives `completeness`
+    denied: number;                  // refused admission; never dispatched
+    byKind: Partial<Record<OperationKind, number>>;
+  };
+  breakdown: { generation: number; judging: number; external: number };
+  provenance: Partial<Record<CostProvenance, number>>;
+};
+```
+
+**Zero is never unknown.** A known $0 settles `complete`. Anything dispatched whose charge could not be established settles `unknown` with a reason, making `completeness: 'incomplete'` and `knownCost` an explicit **lower bound**.
+
+At finalization `operations.total === settled + unknown`. Denied operations are tracked separately and excluded from `total` (an operation refused at the transport check is retracted from it), because refused work contributes nothing anywhere.
+
+| `AccountingReason` | Meaning |
+|---|---|
+| `unpriced_model` | Usage was reported but no usable cost was (`undefined`, `NaN`, negative, `Infinity`) |
+| `usage_missing` | Dispatched, but the terminal outcome carried no usage — a failure, abort or stall |
+| `abandoned` | Dispatched and never settled before its scope finalized |
+| `external_unreported` | An external operation finished without calling `report.setCost()` |
+| `uninstrumented` | A consumer ran work with no accounting scope available. Core defines the name; no core producer emits it |
+
+| `CostProvenance` | Meaning |
+|---|---|
+| `provider_reported` | The vendor supplied the USD figure itself (e.g. OpenRouter `usage.cost`) |
+| `price_table_estimate` | An Axl/adapter price table was applied to reported usage |
+| `adapter_reported` | An adapter supplied a cost without declaring its basis |
+| `caller_reported` | `withExternalOperation` / tool / legacy caller value |
+
+`OperationKind` is `'chat' | 'stream' | 'embedding' | 'transcription' | 'tool' | 'external'`. `AccountingUsage` is `{ inputTokens, outputTokens, reasoningTokens, cachedTokens, cacheWriteTokens, audioSeconds }`; `reasoningTokens` / `cachedTokens` / `cacheWriteTokens` are counted once in their own bucket and `inputTokens` is the provider's already-folded prompt count, so cached tokens are **not** re-added to it.
+
+`completeness: 'unverified'` is reserved for readers of artifacts that carry no accounting at all (legacy eval results). A live scope never produces it.
+
+### `AdmissionController`
+
+A synchronous known-spend threshold for one invocation. Attach it to a scope with `trackOutcome(fn, { admission })`.
+
+```typescript
+class AdmissionController {
+  constructor(options: { limit: number });  // throws AxlError('INVALID_BUDGET') unless finite and >= 0
+  readonly limit: number;
+  get knownSpend(): number;
+  get status(): 'open' | 'closed';
+  get closed(): boolean;                    // knownSpend >= limit
+  get knownOvershoot(): number;             // max(0, knownSpend - limit)
+  admit(): { admitted: true } | { admitted: false; limit: number; knownSpend: number };
+  snapshot(): { limit; status; knownSpend; knownOvershoot };
+}
+```
+
+It closes at `knownSpend >= limit` on a raw float comparison, so a `limit` of `0` admits nothing. Unknown spend is **not** included in `knownSpend` — an unpriced model cannot be enforced against, which is why unknown work also marks the accounting incomplete.
+
+It is a **threshold, not a reservation**: a call admitted before a sibling settles may push known spend past the limit, and `knownOvershoot` reports how far. Never share one controller across unrelated invocations.
+
+Admission is checked at two points: when an operation opens (the provider facade, tool invocations, memory embeds, transcription, external operations), and again at transport dispatch for built-in adapters — see [dispatch admission](./providers.md#dispatch-admission). A refusal throws `AdmissionDeniedError`.
+
+### `AdmissionDeniedError`
+
+`extends AxlError`, `code: 'ADMISSION_DENIED'`, fields `{ limit, knownSpend, operation: { kind, model? } }`.
+
+Raised before the request leaves the process, so it never accompanies a charge. It is **never** wrapped in a `ProviderError` or a `TranscriptionOperationError`, never auto-retried by the transport, and never treated as an abort. It is distinct from `BudgetExceededError`, which is `ctx.budget()`'s own workflow-scoped policy and keeps its existing semantics.
+
+### `externalOperation(descriptor, fn)` / `ctx.withExternalOperation(descriptor, fn)`
+
+Declare paid work Axl cannot observe — a third-party API called from a tool, a vendor SDK, a custom scorer's own model call — so it joins the scope's accounting and its budget.
+
+```typescript
+const rows = await ctx.withExternalOperation({ name: 'vendor-search' }, async (report) => {
+  const res = await vendor.search(query);
+  report.setCost(res.billedUsd);       // finite, >= 0; explicit 0 means known-free
+  return res.rows;
+});
+```
+
+Admission is checked **before** `fn` runs. The operation finalizes on return, throw or abort, and a cost reported before a later throw is kept. Not calling `setCost` marks the scope incomplete with reason `external_unreported` — silence is never read as free. A non-finite/negative amount or a second `setCost` throws `AxlError('INVALID_COST_REPORT')`, so an invalid report can neither shrink nor poison a total.
+
+The amount must be **disjoint**: nested `ctx.ask` and other Axl operations account for themselves, and including them double-charges. `setCost(amount, usage?)` also accepts a partial `AccountingUsage`.
+
+`externalOperation` is the module-level equivalent for code without a `ctx`. Outside any accounting scope both still run `fn`, with a report that validates its argument but records nothing.
+
 ### `runtime.trackExecution(fn, options?)`
 
-Track cost and execution metadata across any runtime operations within `fn`. Returns `{ result, cost, unpriced, modelTiming?, metadata, traces? }` where `unpriced` is `true` when any tracked call was unpriced (making `cost` a **lower bound** — the aggregate counterpart of `ExecutionInfo.unpriced`), and `metadata` includes `models` (unique model URIs), `modelCallCounts`, `tokens` (input/output/reasoning sums — agent calls only, not embedder tokens), `agentCalls` count, `workflows` (insertion-ordered unique names), and `workflowCallCounts`. Uses `AsyncLocalStorage` for per-call scoping — correct with concurrent calls. Works with both `createContext()` and `execute()` inside `fn`.
+Throwing compatibility wrapper over [`trackOutcome`](#runtimetrackoutcomefn-options). Returns `{ result, cost, unpriced, accounting, modelTiming?, metadata, traces? }`. `cost` is `accounting.knownCost` and `unpriced` is `accounting.completeness !== 'complete'` (making `cost` a **lower bound**); both are compatibility views over the accounting rail rather than a sum over trace events, so they are identical for instrumented paths and differ only where the trace rail used to lose a charge — notably a leaf that never settled. `metadata` includes `models` (unique model URIs), `modelCallCounts`, `tokens` (input/output/reasoning sums — agent calls only, not embedder tokens), `agentCalls` count, `workflows` (insertion-ordered unique names), and `workflowCallCounts`. Uses `AsyncLocalStorage` for per-call scoping — correct with concurrent calls. Works with both `createContext()` and `execute()` inside `fn`.
 
 **`modelTiming`** rolls up [`CallTiming`](#calltiming) from `agent_call_end` per model, keyed exactly like `metadata.modelCallCounts`: `Record<model, { calls, queuedMs, retryMs, wireMs, firstTokenMs?, firstTokenCalls? }>`. It is **absent** unless at least one tracked call reported timing, so "no instrumentation" stays distinguishable from "zero milliseconds". `calls` counts only the **successful timed** calls, which can be fewer than that model's `modelCallCounts` entry (a custom provider that returns no `timing`, or a failed call), so divide the sums by `calls`, never by the call count. **Failed calls are excluded**, even though a non-2xx response does carry `timing` on its `agent_call_end` — a rollup that blended answers with failures would describe neither, and a fast 429 would improve a model's apparent latency. Read the events themselves for failure latency. `firstTokenMs` is streaming-only, is summed across just the calls that reported it, and carries its own denominator in `firstTokenCalls` (the two are present or absent together) — dividing it by `calls` would report a first-token latency no call achieved on a model that mixes streamed and non-streamed calls. Sums are per call, so `wireMs` across concurrent calls can exceed the wall clock of `fn`. Under `captureTimingSamples` each bucket also carries `samples: CallTiming[]` — the raw per-call blocks behind the sums, in `agent_call_end` order, with `samples.length === calls`. Sums can yield a mean but no percentile that describes calls rather than aggregates, so a consumer that needs a real distribution (this is how `axl-eval` builds `summary.modelTiming`) reads `samples` instead. It is a working form, not something to persist per item, and the key is **absent** without the option so "not collected" never reads as "no calls".
 
@@ -350,6 +471,14 @@ const { result, cost } = await runtime.trackCost(async () => {
 ```
 
 The eval runner and CLI use `trackExecution` internally to capture cost and model metadata for each eval item.
+
+### `runtime.resolveProvider(uri)`
+
+Resolves a `provider:model` URI to `{ provider, model }`.
+
+**Breaking in 0.24:** the returned provider is a **scoped facade**, not the registered instance, so `resolveProvider(uri).provider === registeredInstance` is now `false`. Facade identity is stable per runtime per adapter, so caching a resolution still works. See [the migration guide](./migration/eval-accounting.md).
+
+The facade routes `chat`/`stream` through accounting and budget admission whenever a `trackOutcome` scope is active, and forwards everything else to the adapter: custom properties, accessors, class private-field methods, property writes, capability methods (`inputCapabilities`, `validateInput`, `nativeStructuredOutputSupport`, `realizesPromptCache`, `effortResolution`, `reportsRequestLifecycle`) and ordinary `instanceof`. Exotic reflection — a custom `Symbol.hasInstance`, identity-keyed maps — is not guaranteed. Outside a scope it delegates verbatim, with no admission check and no accounting. A `stream` resolves its scope at the **first `next()`**, not when the generator is built.
 
 ---
 

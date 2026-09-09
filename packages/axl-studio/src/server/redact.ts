@@ -35,7 +35,8 @@ import type {
   HistoricalAxlEvent,
   EvalHistoryEntry,
 } from '@axlsdk/axl';
-import { redactHistoricalEvent } from '@axlsdk/axl';
+import { redactCapturedRequest, redactHistoricalEvent } from '@axlsdk/axl';
+import type { CapturedRequestRecord } from '@axlsdk/axl';
 import type { EvalResult, EvalItem, ScorerDetail } from '@axlsdk/eval';
 
 // Stream events on the wire are `AxlEvent` — the translation layer was
@@ -297,11 +298,45 @@ export function sanitizeRichInputFailure(event: HistoricalAxlEvent): HistoricalA
  *   metadata (execution metadata: models, tokens, agentCalls, workflows)
  *   traces (trace events — already redacted at emission time)
  */
+/**
+ * Metadata keys the RUNTIME measured. Everything else on `EvalItem.metadata` is
+ * the workflow callback's own free-form return value — the same category as
+ * `output` and `callerReport.metadata`, and just as capable of echoing user
+ * input — so it is masked rather than passed through.
+ *
+ * Kept as an allowlist, not a denylist: a new caller key must not become a new
+ * leak simply because nobody thought to add it to a blocklist.
+ */
+const MEASURED_METADATA_KEYS: ReadonlySet<string> = new Set([
+  'models',
+  'modelCallCounts',
+  'workflows',
+  'workflowCallCounts',
+  'tokens',
+  'agentCalls',
+]);
+
+function redactItemMetadata(
+  metadata: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (!metadata) return metadata;
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(metadata)) {
+    out[key] = MEASURED_METADATA_KEYS.has(key) ? value : REDACTED;
+  }
+  return out;
+}
+
 function redactEvalItem(item: EvalItem): EvalItem {
   const scrubbed: EvalItem = {
     ...item,
     input: REDACTED,
     output: REDACTED,
+    // `diagnostics` is spread through untouched on purpose: it holds operation
+    // IDs, kinds, turn/attempt indexes and a status — pointers into an artifact,
+    // never content. The records themselves are redacted by the core rule at
+    // both write time and delivery time (`redactRecordLine`).
+    ...(item.metadata !== undefined ? { metadata: redactItemMetadata(item.metadata) } : {}),
     ...(item.annotations !== undefined ? { annotations: REDACTED } : {}),
     ...(item.error !== undefined ? { error: REDACTED } : {}),
     ...(item.scorerErrors !== undefined
@@ -336,6 +371,9 @@ function redactEvalItem(item: EvalItem): EvalItem {
         // budget from one that scored 0.
         ...(detail.outcome !== undefined ? { outcome: detail.outcome } : {}),
         ...(detail.accounting !== undefined ? { accounting: detail.accounting } : {}),
+        // `diagnostics` survives for the same reason `accounting` does: it is a
+        // list of operation ids and statuses, not content.
+        ...(detail.diagnostics !== undefined ? { diagnostics: detail.diagnostics } : {}),
         // metadata deliberately omitted — may contain LLM scorer reasoning
       };
     }
@@ -370,6 +408,31 @@ export function redactEvalResult(result: EvalResult, redact: boolean): EvalResul
     metadata: scrubbedMetadata,
     items: result.items.map(redactEvalItem),
   };
+}
+
+/**
+ * Scrub one captured-request JSONL line on its way out of the server.
+ *
+ * Records are ALREADY redacted at write time when the runtime has redaction on,
+ * so under normal configuration this is a no-op that re-applies an idempotent
+ * rule. It earns its place for the configurations where it is not a no-op:
+ * an artifact captured before redaction was enabled, and an artifact imported
+ * from another deployment. Neither should be able to serve raw prompts out of
+ * a Studio that is running in compliance mode.
+ *
+ * A line that does not parse is replaced rather than forwarded — an unparseable
+ * line cannot be redacted, and forwarding it would be exactly the bypass this
+ * function exists to close.
+ */
+export function redactRecordLine(line: string, redact: boolean): string {
+  if (!redact) return line;
+  let parsed: CapturedRequestRecord;
+  try {
+    parsed = JSON.parse(line) as CapturedRequestRecord;
+  } catch {
+    return JSON.stringify({ v: 1, captured: { redacted: true, unparseable: true } });
+  }
+  return JSON.stringify(redactCapturedRequest(parsed));
 }
 
 /**

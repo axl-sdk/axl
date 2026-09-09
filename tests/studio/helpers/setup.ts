@@ -20,13 +20,25 @@ export const testAgent = agent({
 
 export function createTestServer(
   providerOverride?: MockProvider,
-  serverOptions?: { readOnly?: boolean; redact?: boolean },
+  serverOptions?: { readOnly?: boolean; redact?: boolean; artifactsRoot?: string },
 ) {
   // Only set `redact: true` — leave `trace.enabled` at the config default
   // so redact-on tests don't unexpectedly activate console trace output
   // and spam test logs. `runtime.isRedactEnabled()` reads the flag
   // directly and doesn't require `enabled: true`.
-  const runtime = new AxlRuntime(serverOptions?.redact ? { trace: { redact: true } } : undefined);
+  const runtime = new AxlRuntime({
+    ...(serverOptions?.redact ? { trace: { redact: true } } : {}),
+    // Diagnostic capture is opt-in, so a suite that exercises captured requests
+    // has to supply somewhere to put them. Left unset, the runtime behaves
+    // exactly as it does for every other suite: capture is simply unavailable.
+    ...(serverOptions?.artifactsRoot
+      ? {
+          diagnostics: {
+            artifacts: { root: serverOptions.artifactsRoot, sweepIntervalMs: 3_600_000 },
+          },
+        }
+      : {}),
+  });
   const provider = providerOverride ?? MockProvider.echo();
   runtime.registerProvider('mock', provider);
 

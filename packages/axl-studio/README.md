@@ -233,7 +233,9 @@ const runtime = new AxlRuntime({ trace: { redact: true } });
 const studio = createStudioMiddleware({ runtime });
 ```
 
-See the [redaction section in the API reference](../../docs/studio-api.md#observability-boundary-redaction) and the [scrubbed/preserved field table](../../docs/observability.md#pii-and-redaction).
+See the [redaction section in the API reference](../../docs/studio-api.md#observability-boundary-redaction) and the [scrubbed/preserved field table](../../docs/observability.md#pii-and-redaction). Captured-request records are re-redacted as they stream out of `GET /api/evals/:id/diagnostics/records`, and in redact mode `EvalItem.metadata` keeps only the measured keys (`models`, `modelCallCounts`, `workflows`, `workflowCallCounts`, `tokens`, `agentCalls`).
+
+An imported eval artifact's declared `accounting` is validated before it is trusted — a record that does not add up is replaced by an `unverified` synthesis and marked `metadata.importedAccounting: 'invalid'`, so `compare` will not certify a cost delta from a hand-edited file. See [studio-api.md](../../docs/studio-api.md#imported-accounting-validation).
 
 ## Development
 

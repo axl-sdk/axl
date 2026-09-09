@@ -16,10 +16,16 @@ import { scorer } from '../scorer.js';
 import { runEval } from '../runner.js';
 import { rescore } from '../rescore.js';
 import { scoreItem } from '../score-item.js';
-import { isAdmissionDenied, parseBudget, readAccounting } from '../accounting.js';
+import {
+  isAdmissionDenied,
+  isBudgetStopped,
+  parseBudget,
+  readAccounting,
+  refusedWork,
+} from '../accounting.js';
 import { budgetStopMessage, isTotalWipeout } from '../cli-format.js';
 import { scorerCounts } from '../utils.js';
-import type { EvalResult } from '../types.js';
+import type { EvalCoverage, EvalItemOutcome, EvalResult, ScorerOutcome } from '../types.js';
 import { askExecute, scriptedRuntime } from './accounting-helpers.js';
 
 const pass = scorer({ name: 'pass', description: 'always 1', score: () => 1 });
@@ -448,5 +454,93 @@ describe('scorerCounts() reads the authoritative outcome', () => {
       { scores: { s: null }, scoreDetails: { s: { score: null } } },
     ];
     expect(scorerCounts(legacy, 's')).toEqual({ scored: 1, failed: 1, skipped: 1 });
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// The "budget stopped" predicate the CLI and Studio both read
+// ═══════════════════════════════════════════════════════════════════════════
+
+function coverage(over: {
+  items?: Partial<Record<EvalItemOutcome, number>>;
+  scorers?: Record<string, Partial<Record<ScorerOutcome, number>>>;
+}): EvalCoverage {
+  const items: Record<EvalItemOutcome, number> = {
+    completed: 0,
+    failed: 0,
+    cancelled: 0,
+    budget_skipped: 0,
+    budget_interrupted: 0,
+    ...over.items,
+  };
+  const scorers: Record<string, Record<ScorerOutcome, number>> = {};
+  for (const [name, counts] of Object.entries(over.scorers ?? {})) {
+    scorers[name] = {
+      scored: 0,
+      failed: 0,
+      skipped: 0,
+      cancelled: 0,
+      budget_skipped: 0,
+      budget_interrupted: 0,
+      ...counts,
+    };
+  }
+  return { items, scorers };
+}
+
+describe('refusedWork() / isBudgetStopped()', () => {
+  it('counts nothing refused for a clean run', () => {
+    expect(refusedWork(coverage({ items: { completed: 3 }, scorers: { j: { scored: 3 } } }))).toBe(
+      0,
+    );
+  });
+
+  it('counts refused cases and refused judges together', () => {
+    const c = coverage({
+      items: { completed: 1, budget_skipped: 1, budget_interrupted: 1 },
+      scorers: { j: { scored: 1, budget_skipped: 2, budget_interrupted: 1 } },
+    });
+    expect(refusedWork(c)).toBe(5);
+  });
+
+  it('reads a pre-0.24 artifact with no coverage as refusing nothing', () => {
+    // An artifact that never recorded outcomes cannot be used to ASSERT that
+    // work was refused. Guessing "stopped" from an absent block would put a
+    // truncation badge on every legacy run.
+    expect(refusedWork(undefined)).toBe(0);
+    expect(isBudgetStopped({ budget: { status: 'closed' }, coverage: undefined })).toBe(false);
+  });
+
+  it('is false for a closed controller that refused nothing', () => {
+    // The `--budget $expected` CI threshold case: the last settlement lands
+    // exactly on the limit and closes the controller with the work done.
+    expect(
+      isBudgetStopped({
+        budget: { status: 'closed' },
+        coverage: coverage({ items: { completed: 2 }, scorers: { j: { scored: 2 } } }),
+      }),
+    ).toBe(false);
+  });
+
+  it('is true only once the closed controller actually refused something', () => {
+    expect(
+      isBudgetStopped({
+        budget: { status: 'closed' },
+        coverage: coverage({ items: { completed: 1, budget_skipped: 1 } }),
+      }),
+    ).toBe(true);
+    // A refused JUDGE with every case completed still counts.
+    expect(
+      isBudgetStopped({
+        budget: { status: 'closed' },
+        coverage: coverage({ items: { completed: 2 }, scorers: { j: { budget_skipped: 2 } } }),
+      }),
+    ).toBe(true);
+  });
+
+  it('is false while the budget is still open, and with no budget at all', () => {
+    const c = coverage({ items: { completed: 1, budget_skipped: 1 } });
+    expect(isBudgetStopped({ budget: { status: 'open' }, coverage: c })).toBe(false);
+    expect(isBudgetStopped({ budget: undefined, coverage: c })).toBe(false);
   });
 });

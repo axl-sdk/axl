@@ -26,7 +26,7 @@ export type { RescoreOptions } from './rescore.js';
 export { aggregateRuns } from './multi-run.js';
 export type { MultiRunSummary } from './multi-run.js';
 
-export { readAccounting, aggregateAccounting } from './accounting.js';
+export { readAccounting, aggregateAccounting, refusedWork, isBudgetStopped } from './accounting.js';
 
 export {
   DEFAULT_COPY_MAX_BYTES,

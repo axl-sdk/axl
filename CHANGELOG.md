@@ -190,6 +190,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runtime's own and are kept under `callerReport.metadata`. An uninstrumented
   runtime (`{} as AxlRuntime`) now yields `incomplete` accounting with
   `reasons.uninstrumented` and a `totalCost` of `0`.
+- **`refusedWork(coverage)` and `isBudgetStopped(summary)`** are exported from
+  `@axlsdk/eval`. They own the one rule that separates "the budget closed" from
+  "the budget truncated this run" — a stop requires refused cases or refused
+  judges, not just a closed controller — so the CLI, the Studio server and the
+  Studio browser mirror cannot drift apart on it.
+- **`EvalComparison.summary` states a cost change only when `cost.certified`.**
+  A one-line "40% cheaper" has no room for the refusal reason, so an
+  uncertified saving read as a measured one. The structured `cost` block still
+  carries both totals, the delta and the reason.
 - **Breaking: `axl-eval` exits non-zero when a budget refused work**, printing a
   distinct `[axl-eval] BUDGET STOPPED …` line first. The exit is driven by
   coverage, not by the controller's status: a run whose spend lands exactly on

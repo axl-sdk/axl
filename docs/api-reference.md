@@ -2717,6 +2717,16 @@ Returns `result.accounting`, or synthesizes an `unverified` record from `totalCo
 
 Folds several `Accounting` records into one, conservatively: costs, usage and operation counts sum, reasons union, and the **worst** completeness wins (`unverified` > `incomplete` > `complete`). One unmeasured run therefore makes the whole group unverified, while its known spend still contributes as a lower bound. Backs `MultiRunSummary.accounting`.
 
+#### `refusedWork(coverage)`
+
+Counts the work a run's budget actually refused: `items.budget_skipped + items.budget_interrupted`, plus the same two counts for every scorer in `coverage.scorers`. A pre-0.24 artifact with no `coverage` block reads `0` — an artifact that never recorded outcomes cannot be used to assert that work was refused.
+
+#### `isBudgetStopped(summary)`
+
+`true` when a run's budget both **closed** and **refused work** — `summary.budget?.status === 'closed' && refusedWork(summary.coverage) > 0`. Takes `{ budget?, coverage? }` structurally, so the CLI (which holds an `EvalResult`), the Studio server (which parses a persisted blob) and the Studio browser mirror can all call the same rule.
+
+> **A closed controller alone is not a stop.** Setting `--budget` to a run's expected spend is the obvious way to use it as a CI threshold, and the final settlement then lands exactly on the limit: the controller closes with every case completed and every judge scored, having refused nothing. Nothing derived from that artifact may describe the run as partial. `budgetStopMessage`, the CLI exit code, and Studio's budget badges are all gated on this predicate.
+
 #### `ModelTimingStats`
 
 Per-model provider latency on `EvalSummary.modelTiming`. Every field is a distribution over **per-call** values pooled across every successful provider call the run made — including calls made by items that later failed or were stopped on budget, since those calls really happened and dropping them would bias exactly the models whose slowness caused the timeouts. One provider call is one sample, so an item that makes ten calls weighs ten times an item that makes one.

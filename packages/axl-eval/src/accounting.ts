@@ -32,7 +32,7 @@ import type {
   TrackOutcomeOptions,
 } from '@axlsdk/axl';
 
-import type { EvalAccounting, EvalResult } from './types.js';
+import type { EvalAccounting, EvalCoverage, EvalResult } from './types.js';
 
 const USAGE_KEYS: (keyof AccountingUsage)[] = [
   'inputTokens',
@@ -210,6 +210,48 @@ export function readAccounting(result: EvalResult): EvalAccounting {
     completeness: 'unverified',
     scope: rescored ? 'rescore' : 'run',
   };
+}
+
+/**
+ * How much work the budget actually refused: cases never started or stopped
+ * mid-flight, plus judges that never ran for the same reason.
+ *
+ * This is the quantity that makes a run short. Spend alone does not: a run can
+ * settle exactly on its limit having refused nothing. Missing coverage (a
+ * pre-0.24 artifact) reads `0` — an artifact that never recorded outcomes
+ * cannot be used to assert that work was refused.
+ */
+export function refusedWork(coverage: EvalCoverage | undefined): number {
+  if (!coverage) return 0;
+  const items = coverage.items;
+  return (
+    items.budget_skipped +
+    items.budget_interrupted +
+    Object.values(coverage.scorers).reduce((n, s) => n + s.budget_skipped + s.budget_interrupted, 0)
+  );
+}
+
+/**
+ * `true` when a run's budget both closed AND refused work — the one reading
+ * that entitles a consumer to call the run truncated.
+ *
+ * A closed controller alone is the NORMAL end state of a run whose final
+ * settlement lands exactly on its limit, which is exactly how `--budget` is
+ * used as a CI threshold. Reporting that as a stop fails a perfect run and
+ * prints a self-contradicting message ("0 never started, 0 stopped mid-flight,
+ * 2 completed … incomplete by design").
+ *
+ * The argument is structural rather than an `EvalResult` because the three
+ * consumers hold different things: the CLI has the result, the Studio server
+ * has a persisted blob it parses itself, and the Studio browser mirror has a
+ * client-side type. All three can produce `{ budget, coverage }`.
+ */
+export function isBudgetStopped(summary: {
+  budget?: { status?: string } | undefined;
+  coverage?: EvalCoverage | undefined;
+}): boolean {
+  if (summary.budget?.status !== 'closed') return false;
+  return refusedWork(summary.coverage) > 0;
 }
 
 function addUsage(target: AccountingUsage, source: AccountingUsage | undefined): void {

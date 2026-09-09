@@ -261,3 +261,38 @@ describe('A14: a cost claim is certified only when both sides measured the same 
     expect(cost!.deltaPercent).toBeCloseTo(-50, 6);
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// The prose summary may not carry an uncertified saving
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('EvalComparison.summary states a cost change only when it is certified', () => {
+  it('appends the cost clause for a certified delta', async () => {
+    const baseline = await measuredRun(2, 1);
+    const candidate = await measuredRun(2, 0.5);
+
+    const { summary, cost } = evalCompare(baseline, candidate);
+
+    expect(cost!.certified).toBe(true);
+    expect(summary).toMatch(/50% cheaper/);
+  });
+
+  it('omits the cost clause when certification was refused', async () => {
+    // Both sides are fully measured, so the raw delta is a real number — but
+    // they did different amounts of work, which is exactly why the cheaper
+    // side is cheaper. A one-line "75% cheaper" has no room for that reason,
+    // and a reader ships a model change on it.
+    const baseline = await measuredRun(2, 1);
+    const measured = await measuredRun(2, 0.5);
+    // Same dataset, one case fewer — the candidate did less work.
+    const candidate: EvalResult = { ...measured, items: measured.items.slice(0, 1) };
+
+    const { summary, cost } = evalCompare(baseline, candidate);
+
+    expect(cost!.certified).toBe(false);
+    expect(cost!.reason).toMatch(/item counts differ/);
+    expect(cost!.deltaPercent).toBeCloseTo(-50, 6);
+    expect(summary).not.toMatch(/cheaper/);
+    expect(summary).not.toMatch(/more expensive/);
+  });
+});

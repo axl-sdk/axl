@@ -7,7 +7,7 @@
 import type { Accounting } from '@axlsdk/axl';
 
 import type { EvalAccounting, EvalResult, ModelTimingStats } from './types.js';
-import { readAccounting } from './accounting.js';
+import { isBudgetStopped, readAccounting } from './accounting.js';
 
 /**
  * Render known spend and say so when it is only a lower bound.
@@ -58,26 +58,6 @@ export function formatCoverageLine(result: EvalResult): string | undefined {
 }
 
 /**
- * How much work the budget actually refused: cases never started or stopped
- * mid-flight, plus judges skipped or interrupted.
- *
- * This — not the controller's `status` — is what makes a run incomplete. A
- * closed controller only means known spend reached the limit, which is the
- * NORMAL end state of a run whose last settlement lands exactly on the limit
- * with everything already done.
- */
-function refusedWork(result: EvalResult): number {
-  const coverage = result.summary.coverage;
-  if (!coverage) return 0;
-  const items = coverage.items;
-  return (
-    items.budget_skipped +
-    items.budget_interrupted +
-    Object.values(coverage.scorers).reduce((n, s) => n + s.budget_skipped + s.budget_interrupted, 0)
-  );
-}
-
-/**
  * The distinct, first-printed reason for a budget-stopped run, or `null`.
  *
  * "We stopped spending" is a different fact from "the model regressed" or "a
@@ -85,19 +65,14 @@ function refusedWork(result: EvalResult): number {
  * than the whole dataset. A caller exits non-zero on it WITHOUT counting it as
  * a model failure.
  *
- * A closed budget is NOT sufficient. Setting `--budget` to a run's expected
- * spend is the obvious way to use a threshold in CI, and it lands the final
- * settlement exactly on the limit: the controller closes with every case
- * completed and every judge scored, having refused nothing. Reporting that as a
- * stop fails a perfect run and prints a self-contradicting message ("0 never
- * started, 0 stopped mid-flight, 2 completed … incomplete by design"). The
- * informational `Budget:` row still shows the closure — it just does not gate
- * the exit code.
+ * A closed budget is NOT sufficient — see {@link isBudgetStopped}, which owns
+ * that rule for the CLI, the Studio server and the Studio browser mirror
+ * alike. The informational `Budget:` row still shows the closure; it just does
+ * not gate the exit code.
  */
 export function budgetStopMessage(result: EvalResult, label: string): string | null {
   const budget = readAccounting(result).budget;
-  if (!budget || budget.status !== 'closed') return null;
-  if (refusedWork(result) === 0) return null;
+  if (!budget || !isBudgetStopped({ budget, coverage: result.summary.coverage })) return null;
   const items = result.summary.coverage?.items;
   const stopped = items
     ? ` ${items.budget_skipped} case(s) never started, ${items.budget_interrupted} stopped mid-flight, ${items.completed} completed.`

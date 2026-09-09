@@ -411,7 +411,12 @@ export function evalCompare(
     const dir = timing.delta > 0 ? 'slower' : 'faster';
     parts.push(`${Math.abs(timing.deltaPercent).toFixed(0)}% ${dir}`);
   }
-  if (cost && cost.deltaPercent !== null && Math.abs(cost.deltaPercent) > 1) {
+  // Only a CERTIFIED delta earns a place in the prose summary. "40% cheaper"
+  // in a one-line verdict carries no room for the refusal reason, so an
+  // uncertified saving printed here reads as a measured one; the structured
+  // `cost` block still carries both totals and the reason for a reader who
+  // wants them.
+  if (cost?.certified && cost.deltaPercent !== null && Math.abs(cost.deltaPercent) > 1) {
     const dir = cost.delta > 0 ? 'more expensive' : 'cheaper';
     parts.push(`${Math.abs(cost.deltaPercent).toFixed(0)}% ${dir}`);
   }

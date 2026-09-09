@@ -201,6 +201,17 @@ export function completenessLabel(accounting: Accounting): string {
   return `incomplete: ${reasonSummary(accounting) || 'unknown spend'}`;
 }
 
+/**
+ * The `≥ ` that turns a lower bound into one, or `''`.
+ *
+ * One helper rather than an inline ternary per call site: the badge and the
+ * StatCards state the same fact, and two vocabularies for it is how a reader
+ * comes to believe they are two different figures.
+ */
+export function lowerBoundPrefix(accounting: Accounting): string {
+  return accounting.completeness === 'incomplete' ? '\u2265 ' : '';
+}
+
 /** The short chip text — `null` for a complete record, which needs no chip. */
 export function completenessChip(accounting: Accounting): string | null {
   if (accounting.completeness === 'complete') return null;
@@ -254,12 +265,28 @@ export function formatBudgetLine(accounting: EvalAccounting): string | null {
  */
 export function refusedWork(coverage: EvalCoverage | undefined): number {
   if (!coverage) return 0;
-  const items = coverage.items;
   return (
-    items.budget_skipped +
-    items.budget_interrupted +
-    Object.values(coverage.scorers).reduce((n, s) => n + s.budget_skipped + s.budget_interrupted, 0)
+    refusedIn(coverage.items) +
+    Object.values(coverage.scorers ?? {}).reduce((n, s) => n + refusedIn(s), 0)
   );
+}
+
+/**
+ * The two refusal counts on one outcome block, read defensively.
+ *
+ * A persisted artifact reaches the browser through an unchecked cast and can be
+ * hand-edited, truncated or written by a third party, so a missing block reads
+ * `0` rather than throwing inside a render, and a negative count reads `0`
+ * rather than cancelling out a real refusal. The Studio server reducer applies
+ * exactly this rule to the same blob; agreement is asserted by the drift
+ * tripwire in `packages/axl-studio/src/__tests__/eval-accounting-drift.test.ts`.
+ */
+function refusedIn(counts: Partial<Record<string, number>> | undefined): number {
+  return atLeastZero(counts?.budget_skipped) + atLeastZero(counts?.budget_interrupted);
+}
+
+function atLeastZero(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0;
 }
 
 /**

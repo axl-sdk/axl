@@ -132,7 +132,10 @@ artifact carries no `coverage` block (pre-0.24) is never reported as stopped
 either, because nothing recorded that work was refused. Spend folded into a
 window follows the same `usableCost` rule the eval package's
 `aggregateAccounting` uses: a negative or non-finite figure contributes `0`
-rather than dragging a window total.
+rather than dragging a window total. When an `accounting` block is present it
+is authoritative — an unusable `knownCost` reads `$0.00`, never the legacy
+`totalCost` beside it, so `cost` agrees with what `readAccounting` gives every
+other consumer.
 
 `completeness` mirrors core's `AccountingCompleteness`. A history entry with no
 `accounting` block predates measured spend: its `totalCost` is repeated as

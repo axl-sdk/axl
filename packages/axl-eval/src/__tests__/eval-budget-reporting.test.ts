@@ -538,6 +538,30 @@ describe('refusedWork() / isBudgetStopped()', () => {
     ).toBe(true);
   });
 
+  it('tolerates a malformed coverage block instead of throwing in a renderer', () => {
+    // Studio ingests imported CLI artifacts and hand-edited files, and the
+    // browser mirror of this function runs inside a render with no schema in
+    // front of it. A missing `scorers` key used to throw
+    // `Cannot convert undefined or null to object` and blank the panel.
+    expect(
+      refusedWork({ items: coverage({ items: { budget_skipped: 2 } }).items } as EvalCoverage),
+    ).toBe(2);
+    expect(
+      refusedWork({
+        scorers: coverage({ scorers: { j: { budget_skipped: 2 } } }).scorers,
+      } as EvalCoverage),
+    ).toBe(2);
+    expect(refusedWork({} as EvalCoverage)).toBe(0);
+  });
+
+  it('clamps a negative count at 0 rather than cancelling out a real refusal', () => {
+    // `-2 + 1 = -1` reads as "nothing refused" while the same artifact reads as
+    // stopped through the Studio server reducer, which has always clamped.
+    const c = coverage({ items: { budget_skipped: -2, budget_interrupted: 1 } });
+    expect(refusedWork(c)).toBe(1);
+    expect(isBudgetStopped({ budget: { status: 'closed' }, coverage: c })).toBe(true);
+  });
+
   it('is false while the budget is still open, and with no budget at all', () => {
     const c = coverage({ items: { completed: 1, budget_skipped: 1 } });
     expect(isBudgetStopped({ budget: { status: 'open' }, coverage: c })).toBe(false);

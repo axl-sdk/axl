@@ -5,7 +5,7 @@ import { EmptyState } from '../../components/shared/EmptyState';
 import { WindowSelector } from '../../components/shared/WindowSelector';
 import { CostSparkLine } from './CostSparkLine';
 import { SpendBadge } from './SpendBadge';
-import { emptyAccounting } from './accounting';
+import { emptyAccounting, lowerBoundPrefix } from './accounting';
 import type { Accounting } from './types';
 import { LineChart, type LineSeries } from '../../components/shared/charts/LineChart';
 import { fetchEvalTrends } from '../../lib/api';
@@ -90,6 +90,13 @@ export function EvalTrendsView({
   }
 
   const evalNames = Object.keys(trends.byEval).sort();
+  // The whole payload's spend, in the same completeness-carrying shape every
+  // other eval spend render uses.
+  const windowTotalAccounting: Accounting = {
+    ...emptyAccounting(),
+    knownCost: trends.totalCost,
+    completeness: trends.totalCostCompleteness ?? 'unverified',
+  };
 
   return (
     <div className="flex-1 overflow-auto p-6 space-y-6">
@@ -108,7 +115,7 @@ export function EvalTrendsView({
         />
         <StatCard
           label="Known Spend"
-          value={`${trends.totalCostCompleteness === 'incomplete' ? '\u2265 ' : ''}${formatCost(trends.totalCost)}`}
+          value={lowerBoundPrefix(windowTotalAccounting) + formatCost(trends.totalCost)}
           // A window that contains one legacy or unpriced run cannot present a
           // precise total, and a chart implying otherwise is the exact defect
           // the completeness flag exists to prevent.

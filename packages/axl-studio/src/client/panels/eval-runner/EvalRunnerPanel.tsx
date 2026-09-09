@@ -32,7 +32,12 @@ import {
   buildMultiRunResult,
   aggregateGroupAccounting,
 } from './types';
-import { completenessLabel, isRunBudgetStopped, readAccounting } from './accounting';
+import {
+  completenessLabel,
+  isRunBudgetStopped,
+  lowerBoundPrefix,
+  readAccounting,
+} from './accounting';
 import { BudgetStoppedBadge } from './RunAccountingPanel';
 import { ScorerCoverageCaveat } from './ScorerCoverageCaveat';
 import { DroppedAnnotationKeysBanner } from './DroppedAnnotationKeysBanner';
@@ -952,7 +957,12 @@ export function EvalRunnerPanel() {
                       />
                       <StatCard
                         label="Known Spend"
-                        value={formatCost(aggAccounting.knownCost)}
+                        // Same lower-bound vocabulary `SpendBadge` uses, so
+                        // the card and the badge cannot read as two different
+                        // claims about the same figure.
+                        value={
+                          lowerBoundPrefix(aggAccounting) + formatCost(aggAccounting.knownCost)
+                        }
                         subtitle={`all runs combined \u00b7 ${completenessLabel(aggAccounting)}`}
                         subtitleColor={
                           aggAccounting.completeness === 'complete'
@@ -1332,7 +1342,7 @@ export function EvalRunnerPanel() {
                         return (
                           <StatCard
                             label="Known Spend"
-                            value={formatCost(accounting.knownCost)}
+                            value={lowerBoundPrefix(accounting) + formatCost(accounting.knownCost)}
                             subtitle={completenessLabel(accounting)}
                             subtitleColor={
                               accounting.completeness === 'complete'

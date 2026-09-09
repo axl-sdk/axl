@@ -97,6 +97,11 @@ const openBudget = { limit: 5, status: 'open' as const, knownSpend: 1.5, knownOv
 /**
  * The artifacts every reader must agree about. Each is a plain JSON-shaped
  * object — exactly what a persisted run looks like coming back off disk.
+ *
+ * Several rows are deliberately MALFORMED. Studio ingests imported CLI
+ * artifacts and hand-edited files, and the renderer is the one reader with no
+ * schema in front of it, so "the runner never writes that" is not a reason for
+ * the three implementations to disagree about it.
  */
 const FIXTURES: { name: string; artifact: Record<string, unknown> }[] = [
   {
@@ -132,6 +137,53 @@ const FIXTURES: { name: string; artifact: Record<string, unknown> }[] = [
       totalCost: 0,
       accounting: { ...acc({ knownCost: -5 }), scope: 'run' },
       summary: { count: 1, failures: 0, scorers: {} },
+    },
+  },
+  {
+    name: 'R1: accounting block whose knownCost is null, beside a legacy total',
+    artifact: {
+      totalCost: 0.42,
+      accounting: { ...acc(), knownCost: null, scope: 'run' },
+      summary: { count: 1, failures: 0, scorers: {} },
+    },
+  },
+  {
+    name: 'R2: coverage with items but no scorers key',
+    artifact: {
+      totalCost: 1.5,
+      accounting: { ...acc({ knownCost: 1.5 }), scope: 'run', budget: closedBudget },
+      summary: {
+        count: 3,
+        failures: 1,
+        scorers: {},
+        coverage: { items: cov({ completed: 2, budget_skipped: 1 }).items },
+      },
+    },
+  },
+  {
+    name: 'R2: coverage with scorers but no items key',
+    artifact: {
+      totalCost: 1.5,
+      accounting: { ...acc({ knownCost: 1.5 }), scope: 'run', budget: closedBudget },
+      summary: {
+        count: 3,
+        failures: 0,
+        scorers: {},
+        coverage: { scorers: cov({}, { j: { scored: 1, budget_skipped: 2 } }).scorers },
+      },
+    },
+  },
+  {
+    name: 'R3: coverage carrying a negative refusal count',
+    artifact: {
+      totalCost: 1.5,
+      accounting: { ...acc({ knownCost: 1.5 }), scope: 'run', budget: closedBudget },
+      summary: {
+        count: 3,
+        failures: 0,
+        scorers: {},
+        coverage: cov({ completed: 3, budget_skipped: -2, budget_interrupted: 1 }),
+      },
     },
   },
   {

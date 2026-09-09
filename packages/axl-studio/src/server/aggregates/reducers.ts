@@ -292,9 +292,12 @@ function extractAccounting(data: unknown): {
     accounting.completeness === 'complete' || accounting.completeness === 'incomplete'
       ? accounting.completeness
       : 'unverified';
-  const knownCost = Number.isFinite(accounting.knownCost)
-    ? usable(accounting.knownCost)
-    : usable(extractCost(data));
+  // No fallback to the legacy `totalCost` here. When an `accounting` block
+  // exists it is authoritative: `@axlsdk/eval` and the browser mirror both read
+  // an unusable `knownCost` as `$0.00`, so substituting the unvouched compat
+  // field would report a figure no other surface agrees with — and stamp it
+  // with this block's `completeness`, which may say `complete`.
+  const knownCost = usable(accounting.knownCost);
   const summary = result.summary as { coverage?: unknown } | undefined;
   return {
     cost: knownCost,

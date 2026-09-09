@@ -1,5 +1,10 @@
 import { cn, formatCost } from '../../lib/utils';
-import { completenessChip, completenessLabel, spendDescription } from './accounting';
+import {
+  completenessChip,
+  completenessLabel,
+  lowerBoundPrefix,
+  spendDescription,
+} from './accounting';
 import type { Accounting } from './types';
 
 /**
@@ -37,7 +42,7 @@ export function SpendBadge({
       aria-label={`${label} ${formatCost(accounting.knownCost)}, ${completenessLabel(accounting)}`}
     >
       <span className="font-mono tabular-nums">
-        {accounting.completeness === 'incomplete' ? '≥ ' : ''}
+        {lowerBoundPrefix(accounting)}
         {formatCost(accounting.knownCost)}
       </span>
       {chip && !compact && <CompletenessChip accounting={accounting} />}

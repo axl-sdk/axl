@@ -452,10 +452,23 @@ describe('S1 tripwire — eval panels route cost through a completeness helper',
     // and the per-point cost, which is paired with that point's own
     // `completeness` before it reaches `CostSparkLine`.
     'EvalTrendsView.tsx': ['trends.totalCost', 'cost: r.cost,'],
-    // `compare.cost` is the server-certified comparison block. Every render of
-    // it sits inside the row that also prints `certified` / the refusal
-    // reason, so the figure never travels without its certification.
-    'EvalCompareView.tsx': ['compareResult.cost'],
+    // `compare.cost` is the server-certified comparison block. Each read below
+    // sits inside the Cost Delta card or the certified spend row, both of which
+    // print `certified` / the refusal reason beside the figure. Pinned to the
+    // specific reads rather than the identifier: a file-wide entry would let a
+    // new `formatCost(compareResult.cost.candidateTotal)` in an uncertified
+    // strip pass silently.
+    'EvalCompareView.tsx': [
+      'compareResult.cost?.certified',
+      'compareResult.cost && !certified',
+      'compareResult.cost.reason',
+      '{compareResult.cost && (',
+      '{compareResult.cost != null && (',
+      'compareResult.cost.delta',
+      'compareResult.cost.baselineTotal',
+      'compareResult.cost.candidateTotal',
+      'compareResult.cost.deltaPercent',
+    ],
     // Caller-reported spend, rendered explicitly as "caller-reported (not
     // counted)", and a presence check for the pre-0.24 scorer cost field.
     'EvalItemDetail.tsx': ['item.callerReport', 'detail?.cost != null'],

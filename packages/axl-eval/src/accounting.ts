@@ -219,16 +219,33 @@ export function readAccounting(result: EvalResult): EvalAccounting {
  * This is the quantity that makes a run short. Spend alone does not: a run can
  * settle exactly on its limit having refused nothing. Missing coverage (a
  * pre-0.24 artifact) reads `0` — an artifact that never recorded outcomes
- * cannot be used to assert that work was refused.
+ * cannot be used to assert that work was refused — and so do missing or
+ * negative counts inside a malformed block.
  */
 export function refusedWork(coverage: EvalCoverage | undefined): number {
   if (!coverage) return 0;
-  const items = coverage.items;
   return (
-    items.budget_skipped +
-    items.budget_interrupted +
-    Object.values(coverage.scorers).reduce((n, s) => n + s.budget_skipped + s.budget_interrupted, 0)
+    refusedIn(coverage.items) +
+    Object.values(coverage.scorers ?? {}).reduce((n, s) => n + refusedIn(s), 0)
   );
+}
+
+/**
+ * The two refusal counts on one outcome block, read defensively.
+ *
+ * A persisted artifact reaches the browser through an unchecked cast and can be
+ * hand-edited, truncated or written by a third party, so a missing block reads
+ * `0` rather than throwing inside a render, and a negative count reads `0`
+ * rather than cancelling out a real refusal. The Studio server reducer applies
+ * exactly this rule to the same blob; agreement is asserted by the drift
+ * tripwire in `packages/axl-studio/src/__tests__/eval-accounting-drift.test.ts`.
+ */
+function refusedIn(counts: Partial<Record<string, number>> | undefined): number {
+  return atLeastZero(counts?.budget_skipped) + atLeastZero(counts?.budget_interrupted);
+}
+
+function atLeastZero(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0;
 }
 
 /**

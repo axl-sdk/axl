@@ -2721,6 +2721,8 @@ Folds several `Accounting` records into one, conservatively: costs, usage and op
 
 Counts the work a run's budget actually refused: `items.budget_skipped + items.budget_interrupted`, plus the same two counts for every scorer in `coverage.scorers`. A pre-0.24 artifact with no `coverage` block reads `0` — an artifact that never recorded outcomes cannot be used to assert that work was refused.
 
+Reads defensively, because a persisted artifact can be imported, hand-edited, or written by a third party and the consumers include a browser renderer with no schema in front of it: a missing `items` or `scorers` key contributes `0` rather than throwing, and a negative count contributes `0` rather than cancelling out a real refusal.
+
 #### `isBudgetStopped(summary)`
 
 `true` when a run's budget both **closed** and **refused work** — `summary.budget?.status === 'closed' && refusedWork(summary.coverage) > 0`. Takes `{ budget?, coverage? }` structurally, so the CLI (which holds an `EvalResult`), the Studio server (which parses a persisted blob) and the Studio browser mirror can all call the same rule.

@@ -861,6 +861,73 @@ describe('redactEvalResult', () => {
     const out = redactEvalResult(result, true);
     expect(out.items).toEqual([]);
   });
+
+  it('drops callerReport.metadata, which is raw callback output', () => {
+    // `callerReport` carries whatever the workflow callback returned. Its
+    // `metadata` is user content of exactly the same kind as `output`, so it
+    // must not survive a compliance-mode read; the numeric `cost` beside it may.
+    const result = makeResult([
+      makeItem({
+        callerReport: {
+          cost: 0.002,
+          metadata: { prompt: 'patient john@acme.com asked about his results' },
+        },
+      }),
+    ]);
+
+    const out = redactEvalResult(result, true);
+    const report = out.items[0].callerReport!;
+    expect(report.metadata).toBeUndefined();
+    expect(report.cost).toBe(0.002);
+    expect(JSON.stringify(out)).not.toContain('john@acme.com');
+  });
+
+  it('preserves the structural accounting surface a compliance reader needs', () => {
+    // Counts and classifications describe the RUN, not the data. Scrubbing them
+    // would leave a redacted artifact unable to say why a run cost what it did
+    // or why a judge produced no score.
+    const accounting = {
+      version: 1,
+      currency: 'USD',
+      knownCost: 0.25,
+      completeness: 'incomplete',
+      reasons: { unpriced_model: 1 },
+      usage: {
+        inputTokens: 10,
+        outputTokens: 5,
+        reasoningTokens: 0,
+        cachedTokens: 0,
+        cacheWriteTokens: 0,
+        audioSeconds: 0,
+      },
+      operations: { total: 1, settled: 1, unknown: 0, denied: 0, byKind: { chat: 1 } },
+      breakdown: { generation: 0.25, judging: 0, external: 0 },
+      provenance: { adapter_reported: 0.25 },
+    };
+    const result = makeResult([
+      makeItem({
+        outcome: 'budget_interrupted',
+        accounting,
+        scoreDetails: {
+          accuracy: {
+            score: null,
+            outcome: 'budget_skipped',
+            accounting,
+            metadata: { reasoning: 'never ran' },
+          },
+        },
+      }),
+    ]);
+
+    const out = redactEvalResult(result, true);
+    expect(out.items[0].outcome).toBe('budget_interrupted');
+    expect(out.items[0].accounting).toEqual(accounting);
+    const detail = out.items[0].scoreDetails!.accuracy;
+    expect(detail.outcome).toBe('budget_skipped');
+    expect(detail.accounting).toEqual(accounting);
+    // ...while the judge's reasoning is still gone.
+    expect(detail.metadata).toBeUndefined();
+  });
 });
 
 describe('redactEvalHistoryList', () => {

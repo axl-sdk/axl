@@ -307,6 +307,18 @@ function redactEvalItem(item: EvalItem): EvalItem {
     ...(item.scorerErrors !== undefined
       ? { scorerErrors: item.scorerErrors.map(() => REDACTED) }
       : {}),
+    // `callerReport.metadata` is whatever the workflow callback returned — free-
+    // form user content, exactly like `output`, so it is dropped rather than
+    // masked (same treatment as scorer metadata below). Its sibling `cost` is a
+    // plain number and stays. (`outcome` and `accounting` are spread through
+    // untouched: both are structural counts and classifications, no content.)
+    ...(item.callerReport !== undefined
+      ? {
+          callerReport: {
+            ...(item.callerReport.cost !== undefined ? { cost: item.callerReport.cost } : {}),
+          },
+        }
+      : {}),
   };
   if (item.scoreDetails) {
     const detailsOut: Record<string, ScorerDetail> = {};
@@ -318,6 +330,12 @@ function redactEvalItem(item: EvalItem): EvalItem {
         // `skipped` is a structural boolean (the `applies` predicate verdict),
         // not user/LLM content — preserve it so the client's N/A chip renders.
         ...(detail.skipped !== undefined ? { skipped: detail.skipped } : {}),
+        // `outcome` and `accounting` are structural (a classification and a set
+        // of counts), so they survive redaction the way `skipped` does — without
+        // them a compliance-mode reader cannot tell a judge that was stopped on
+        // budget from one that scored 0.
+        ...(detail.outcome !== undefined ? { outcome: detail.outcome } : {}),
+        ...(detail.accounting !== undefined ? { accounting: detail.accounting } : {}),
         // metadata deliberately omitted — may contain LLM scorer reasoning
       };
     }

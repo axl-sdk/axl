@@ -650,6 +650,20 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
       trim((firstResult as { workflow?: unknown }).workflow) ??
       'imported';
 
+    // Stamp an accounting record on any artifact that lacks one, so a stored
+    // pre-0.24 import describes itself as `unverified` instead of looking like a
+    // measured run whose spend happened to be whatever `totalCost` said. Cost
+    // certification downstream then refuses it for a stated reason rather than
+    // silently trusting it. `@axlsdk/eval` stays an optional peer here (same as
+    // the aggregate/rescore routes): if it isn't installed we import the
+    // artifact unchanged, and readers synthesize the same `unverified` view.
+    let readAccounting: ((r: EvalResult) => unknown) | undefined;
+    try {
+      ({ readAccounting } = await import('@axlsdk/eval'));
+    } catch {
+      readAccounting = undefined;
+    }
+
     const timestamp = Date.now();
     const imported: Array<{ id: string; eval: string; timestamp: number }> = [];
     for (const r of validatedResults) {
@@ -665,6 +679,9 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
             ? (r.metadata as Record<string, unknown>)
             : {},
       };
+      if (entry.accounting === undefined && readAccounting) {
+        entry.accounting = readAccounting(entry) as EvalResult['accounting'];
+      }
       await runtime.saveEvalResult({ id, eval: evalName, timestamp, data: entry });
       imported.push({ id, eval: evalName, timestamp });
     }

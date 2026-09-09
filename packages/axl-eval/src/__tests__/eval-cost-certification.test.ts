@@ -189,4 +189,75 @@ describe('A14: a cost claim is certified only when both sides measured the same 
     expect(cost!.certified).toBe(false);
     expect(cost!.reason).toMatch(/scope differs/);
   });
+
+  // F3
+  it('still reports a cost row when both sides know nothing about their spend', async () => {
+    // Both sides ran entirely on unpriced models: `knownCost` is 0 on each, but
+    // "we could not price 2 calls" is the opposite of "these cost the same".
+    // Printing nothing here left the most uncertain comparison saying the least.
+    const baseline = await unpricedRun(2);
+    const candidate = await unpricedRun(2);
+
+    const { cost } = evalCompare(baseline, candidate);
+
+    expect(cost).toBeDefined();
+    expect(cost!.baselineTotal).toBe(0);
+    expect(cost!.candidateTotal).toBe(0);
+    expect(cost!.delta).toBe(0);
+    expect(cost!.deltaPercent).toBeNull();
+    expect(cost!.certified).toBe(false);
+    expect(cost!.reason).toMatch(/incomplete accounting/);
+  });
+
+  // F3(b)
+  it('reports a row when a genuinely-free baseline meets an unpriced candidate', async () => {
+    // The trap this closes: baseline is known-free (a local model, complete at
+    // $0), candidate is an unpriced gateway. Both totals read 0, so the old
+    // guard printed nothing and the reader concluded "no cost change" — when in
+    // fact the candidate's spend is entirely unknown.
+    const baseline = await measuredRun(2, 0);
+    const candidate = await unpricedRun(2);
+
+    const { cost } = evalCompare(baseline, candidate);
+
+    expect(cost).toBeDefined();
+    expect(cost!.certified).toBe(false);
+    expect(cost!.reason).toMatch(/candidate/);
+    expect(cost!.reason).toMatch(/unpriced_model/);
+  });
+
+  // F4
+  it('refuses when ONE side mixes a rescore into an otherwise full-run group', async () => {
+    // A multi-run side assembled from history can mix scopes. Checking only
+    // run[0] certifies a per-run average built from two different denominators
+    // — a judging-only total averaged with full-run totals.
+    const runA = await measuredRun(2, 0.5);
+    const runB = await measuredRun(2, 0.5);
+    const disguisedRescore: EvalResult = {
+      ...runB,
+      id: 'mixed-in',
+      accounting: { ...runB.accounting!, scope: 'rescore' },
+    };
+    const candidate = [await measuredRun(2, 0.4), await measuredRun(2, 0.4)];
+
+    const { cost } = evalCompare([runA, disguisedRescore], candidate);
+
+    expect(cost!.certified).toBe(false);
+    expect(cost!.reason).toMatch(/mixes accounting scopes/);
+    expect(cost!.reason).toMatch(/baseline/);
+    // Raw averages are still reported.
+    expect(cost!.baselineTotal).toBeCloseTo(1, 10);
+  });
+
+  // F4(b)
+  it('certifies a consistent multi-run group on both sides', async () => {
+    const baseline = [await measuredRun(2, 0.5), await measuredRun(2, 0.5)];
+    const candidate = [await measuredRun(2, 0.25), await measuredRun(2, 0.25)];
+
+    const { cost } = evalCompare(baseline, candidate);
+
+    expect(cost!.certified).toBe(true);
+    expect(cost!.reason).toBeUndefined();
+    expect(cost!.deltaPercent).toBeCloseTo(-50, 6);
+  });
 });

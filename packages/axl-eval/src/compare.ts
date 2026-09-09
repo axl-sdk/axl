@@ -53,8 +53,27 @@ function certifyCost(
     }
   }
 
-  const baselineScope = readAccounting(baselineRuns[0]).scope;
-  const candidateScope = readAccounting(candidateRuns[0]).scope;
+  // Scope is checked on EVERY run, not just the first. A multi-run side can be
+  // assembled from history by `runGroupId`, and a group that mixes a run-scope
+  // artifact with a judging-only rescore would otherwise pass this gate on
+  // run[0] alone and certify a per-run average built from two different
+  // denominators — exactly the failure this function exists to refuse.
+  const scopes = new Map<string, string>();
+  for (const [side, runs] of [
+    ['baseline', baselineRuns],
+    ['candidate', candidateRuns],
+  ] as const) {
+    for (const run of runs) {
+      const scope = readAccounting(run).scope;
+      const seen = scopes.get(side);
+      if (seen !== undefined && seen !== scope) {
+        return `${side} mixes accounting scopes ("${seen}" and "${scope}") — a rescore total covers judging only and cannot be averaged with a full run.`;
+      }
+      scopes.set(side, scope);
+    }
+  }
+  const baselineScope = scopes.get('baseline');
+  const candidateScope = scopes.get('candidate');
   if (baselineScope !== candidateScope) {
     return `accounting scope differs (baseline "${baselineScope}" vs candidate "${candidateScope}") — a rescore total covers judging only.`;
   }
@@ -349,7 +368,14 @@ export function evalCompare(
     baselineRuns.reduce((sum, r) => sum + readAccounting(r).knownCost, 0) / baselineRuns.length;
   const candidateAvgCost =
     candidateRuns.reduce((sum, r) => sum + readAccounting(r).knownCost, 0) / candidateRuns.length;
-  if (baselineAvgCost > 0 || candidateAvgCost > 0) {
+  // Emit the block whenever EITHER side carries an accounting record, not only
+  // when a positive number appeared. Two runs whose every model was unpriced
+  // both report `knownCost: 0` with `completeness: 'incomplete'` — the most
+  // uncertain comparison there is, and the one that previously printed nothing
+  // at all, leaving a reader to conclude the two cost the same. A `$0.00 /
+  // $0.00 (not certified: …)` row says what is actually known.
+  const hasAccounting = [...baselineRuns, ...candidateRuns].some((r) => r.accounting != null);
+  if (baselineAvgCost > 0 || candidateAvgCost > 0 || hasAccounting) {
     const deltaRaw = candidateAvgCost - baselineAvgCost;
     const delta = round(deltaRaw);
     // A percentage change from a zero baseline is not a number. Reporting `0`

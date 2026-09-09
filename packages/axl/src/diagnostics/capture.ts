@@ -183,6 +183,15 @@ export type RequestCaptureOptions = {
   redact?: boolean;
   /** Bounded wait for the queue to drain at close. Default 5s. */
   flushTimeoutMs?: number;
+  /**
+   * Bytes the artifact this channel writes into ALREADY holds.
+   *
+   * A rescore opens its channel over an artifact seeded with its source run's
+   * copied records. `maxRunBytes` is a promise about how large the artifact
+   * gets, not about this channel's share of it, so the carried bytes count
+   * against the same bound.
+   */
+  carriedBytes?: number;
 };
 
 /** Eval-side correlation stamped onto every record produced inside a scope. */
@@ -335,7 +344,7 @@ export class RequestCaptureChannel {
   private readonly flushTimeoutMs: number;
   readonly redact: boolean;
 
-  private runBytes = 0;
+  private runBytes: number;
   private queueBytes = 0;
   private records = 0;
   private stopped = false;
@@ -358,6 +367,10 @@ export class RequestCaptureChannel {
     this.maxQueueBytes = positive(options.maxQueueBytes, DEFAULT_MAX_QUEUE_BYTES);
     this.flushTimeoutMs = positive(options.flushTimeoutMs, DEFAULT_FLUSH_TIMEOUT_MS);
     this.redact = options.redact === true;
+    // Bytes already in the artifact count against the SAME run bound: the bound
+    // is a promise about how large the artifact gets, and a rescore that copied
+    // its source in must not then be allowed a second full budget of its own.
+    this.runBytes = Math.max(0, options.carriedBytes ?? 0);
     this.stoppedPromise = new Promise<void>((resolve) => {
       this.stoppedSignal = resolve;
     });

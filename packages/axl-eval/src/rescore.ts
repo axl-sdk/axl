@@ -1,10 +1,10 @@
-import type { AxlRuntime } from '@axlsdk/axl';
-import { AdmissionController } from '@axlsdk/axl';
+import type { AxlRuntime, RequestCaptureSink } from '@axlsdk/axl';
+import { AdmissionController, RequestCaptureChannel } from '@axlsdk/axl';
 import type { EvalAccounting, EvalItem, EvalResult, EvalSummary } from './types.js';
 import type { Scorer, ScorerContext } from './scorer.js';
 import { computeStats, mapWithConcurrency, scorerCounts } from './utils.js';
 import { scoreItem } from './score-item.js';
-import { buildCoverage } from './runner.js';
+import { attachOperationRefs, buildCoverage } from './runner.js';
 import { emptyAccounting, parseBudget, trackScope } from './accounting.js';
 import {
   DEFAULT_COPY_MAX_BYTES,
@@ -47,65 +47,134 @@ export type RescoreOptions = {
    * ids as provenance, so a reader can still line a record up against the run
    * that produced it — even after that run is gone.
    *
-   * A copy that would exceed the run byte bound is partial and the manifest
-   * says `truncated`; a source artifact that no longer exists yields
-   * `unavailable`. Neither prevents the numeric rescore results from being read.
+   * Both halves land in ONE artifact and share ONE `maxRunBytes` budget: the
+   * copied bytes count against it, so the artifact never grows to twice the
+   * bound the caller asked for. A copy that would exceed it is partial and the
+   * manifest says `truncated`; a source artifact that no longer exists, or a
+   * copy that fails, yields `unavailable` with `artifactId: ''` — never the
+   * source's id, which this result does not own. None of it prevents the
+   * numeric rescore results from being read.
    */
   captureRequests?: CaptureRequestsOption;
 };
 
+/** A rescore's live capture: the artifact, and the channel judge calls flow into. */
+type RescoreCapture = {
+  artifactId: string;
+  channel: RequestCaptureChannel;
+  /** Set when the copied source records did not all fit. */
+  copyTruncated?: string;
+};
+
+function describeFailure(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 /**
- * Copy the source run's captured requests into the rescore's own ownership.
+ * Open the rescore's capture: the source run's records copied in, and a channel
+ * for the judge calls this rescore is about to make.
  *
- * "Provenance must survive deletion of the source" is the whole requirement:
- * after this returns, deleting the original run leaves the rescore's evidence
- * intact, and the copied records still carry the ORIGINAL operation ids so a
- * reader can tell which run actually made each call. The manifest's
- * `copiedFrom` (recorded by the store) carries the other half of the link.
+ * Both halves live in ONE artifact deliberately. A rescore's evidence is the
+ * pair — the requests that produced the outputs, and the requests that scored
+ * them — and a result has exactly one `diagnostics.artifactId` to point at.
  *
- * Every failure degrades to an `unavailable` manifest instead of throwing: a
- * rescore's numbers must remain readable when its diagnostics are not.
+ * "Provenance must survive deletion of the source" is the other requirement, so
+ * the source is COPIED rather than referenced: deleting the original run leaves
+ * this evidence intact, and the copied records keep the ORIGINAL operation ids
+ * so a reader can still tell which run made each call. The manifest's
+ * `copiedFrom` carries the other half of the link.
+ *
+ * Every failure degrades instead of throwing — a rescore's numbers must stay
+ * readable when its diagnostics are not — and every degraded manifest publishes
+ * `artifactId: ''`, NEVER the source's. Naming the source would let this
+ * result's lifecycle (commit, expiry, delete) reach into another run's artifact.
  */
-async function copySourceDiagnostics(
+async function beginCapture(
   source: EvalResult,
   ownerId: string,
   runtime: AxlRuntime,
   options: RescoreOptions | undefined,
-): Promise<EvalResult['diagnostics']> {
+): Promise<{ capture?: RescoreCapture; degraded?: EvalResult['diagnostics'] }> {
   const limits = resolveCaptureLimits(options?.captureRequests);
-  if (!limits) return undefined;
+  if (!limits) return {};
+
+  const open = (
+    artifactId: string,
+    sink: RequestCaptureSink,
+    carriedBytes: number,
+  ): RescoreCapture => ({
+    artifactId,
+    channel: new RequestCaptureChannel({
+      sink,
+      ...limits,
+      carriedBytes,
+      // Redaction is the RUNTIME's policy, not the caller's: a rescore cannot
+      // opt out of compliance mode by asking for diagnostics.
+      redact: runtime.isRedactEnabled(),
+    }),
+  });
+
   const sourceId = source.diagnostics?.artifactId;
-  if (!sourceId) {
-    return unavailableManifest('', 'the source run carried no captured requests');
-  }
-  const maxBytes = limits.maxRunBytes ?? DEFAULT_COPY_MAX_BYTES;
-  let copied: { artifactId: string; truncated: boolean } | undefined;
   try {
-    copied = await runtime.copyDiagnosticArtifact(
+    if (!sourceId) {
+      // Nothing to carry forward, but the judging is still worth recording —
+      // it is the only work a rescore actually performs.
+      const staged = await runtime.stageDiagnosticArtifact({ kind: 'eval', id: ownerId });
+      return { capture: open(staged.artifactId, staged.sink, 0) };
+    }
+    const maxBytes = limits.maxRunBytes ?? DEFAULT_COPY_MAX_BYTES;
+    const copied = await runtime.copyDiagnosticArtifact(
       sourceId,
       { kind: 'eval', id: ownerId },
-      {
-        maxBytes,
-      },
+      { maxBytes },
     );
+    if (!copied) {
+      return {
+        degraded: unavailableManifest(
+          '',
+          "the source run's captured requests are no longer available",
+        ),
+      };
+    }
+    const capture = open(copied.artifactId, copied.sink, copied.bytes);
+    if (copied.truncated) {
+      capture.copyTruncated = `copy stopped at the ${maxBytes} byte limit`;
+    }
+    return { capture };
   } catch (error) {
-    return unavailableManifest(
-      sourceId,
-      `the source artifact could not be copied: ${error instanceof Error ? error.message : String(error)}`,
-    );
+    return {
+      degraded: unavailableManifest(
+        '',
+        `the captured requests could not be carried forward: ${describeFailure(error)}`,
+      ),
+    };
   }
-  if (!copied) {
-    return unavailableManifest(
-      sourceId,
-      "the source run's captured requests are no longer available",
+}
+
+/**
+ * Close the channel and seal the manifest.
+ *
+ * A finalize that fails degrades to `artifactId: ''` for the same reason the
+ * copy paths do: an artifact that was never sealed is never committed, so
+ * publishing its id points a reader at bytes the sweeper is about to reclaim.
+ */
+async function finishCapture(
+  runtime: AxlRuntime,
+  capture: RescoreCapture,
+): Promise<EvalResult['diagnostics']> {
+  const status = await capture.channel.close();
+  // A complete channel over a partial copy is still a partial artifact.
+  const truncatedByCopy = capture.copyTruncated !== undefined && status.status === 'complete';
+  try {
+    const manifest = await runtime.finalizeDiagnosticArtifact(
+      capture.artifactId,
+      truncatedByCopy ? 'truncated' : status.status,
+      truncatedByCopy ? capture.copyTruncated : status.reason,
     );
+    return toDiagnosticManifest(manifest);
+  } catch {
+    return unavailableManifest('', 'the diagnostic artifact could not be finalized');
   }
-  const manifest = await runtime.finalizeDiagnosticArtifact(
-    copied.artifactId,
-    copied.truncated ? 'truncated' : 'complete',
-    copied.truncated ? `copy stopped at the ${maxBytes} byte limit` : undefined,
-  );
-  return toDiagnosticManifest(manifest);
 }
 
 /**
@@ -158,6 +227,12 @@ export async function rescore(
 
   const rescored: EvalItem[] = new Array(result.items.length);
   const carryDiagnostics = resolveCaptureLimits(options?.captureRequests) !== undefined;
+
+  // Opened BEFORE any scoring: the judge calls a rescore makes are the work it
+  // actually performs, and capturing them afterwards would capture nothing.
+  // Staging can throw (capture asked for on a runtime that cannot host it), and
+  // that surfaces before a single provider call, exactly as in `runEval`.
+  const { capture, degraded } = await beginCapture(result, rescoredId, runtime, options);
 
   async function rescoreItem(original: EvalItem, itemIndex: number): Promise<void> {
     // Short-circuit if the rescore has been cancelled — matches runEval's
@@ -228,7 +303,12 @@ export async function rescore(
           onClosure: noteClosure,
         });
       },
-      { purpose: 'judging' },
+      {
+        purpose: 'judging',
+        // Every record produced under this item is stamped with the case index,
+        // which is how a `ScorerDetail` can point at its own judge calls.
+        ...(capture ? { captureCorrelation: { caseIndex: itemIndex } } : {}),
+      },
     );
     if (itemOutcome.status === 'rejected') throw itemOutcome.error;
 
@@ -245,7 +325,10 @@ export async function rescore(
       // source of truth) and returns void — the pool's returned array is ignored.
       await mapWithConcurrency(result.items, concurrency, (item, i) => rescoreItem(item, i));
     },
-    { purpose: 'judging', admission },
+    // The channel is declared ONCE, at the run scope: its byte budget and
+    // pending queue are per rescore, and every nested item/scorer scope inherits
+    // it rather than opening a competing budget of its own.
+    { purpose: 'judging', admission, ...(capture ? { capture: capture.channel } : {}) },
   );
   if (runOutcome.status === 'rejected') throw runOutcome.error;
 
@@ -262,7 +345,13 @@ export async function rescore(
       ? (sourceAccounting.source?.generation ?? null)
       : (sourceAccounting ?? null);
 
-  const diagnostics = await copySourceDiagnostics(result, rescoredId, runtime, options);
+  // Closed AFTER the tracked function settled, so a slow sink can never have
+  // delayed a provider call.
+  let diagnostics = degraded;
+  if (capture) {
+    attachOperationRefs(rescored, capture.channel);
+    diagnostics = await finishCapture(runtime, capture);
+  }
 
   const accounting: EvalAccounting = {
     ...runOutcome.accounting,

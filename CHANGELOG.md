@@ -142,7 +142,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a timer for as long as it holds the artifact — not by writing — so a run that
   exhausted its capture bound early, or that is waiting on a tool or a human,
   keeps its records. `runtime.openDiagnosticArtifact` serves only committed
-  artifacts. Expiry mirrors the
+  artifacts. A `rescore` with `captureRequests` records the judge calls it makes
+  — correlated to the case they scored — into the same artifact its source
+  records were copied into, with one `maxRunBytes` budget covering both halves,
+  and every degraded rescore reports `artifactId: ''` rather than naming the
+  source run's artifact. Expiry mirrors the
   owning row: `StateStore.getEvalRetention` is implemented by the Memory, SQLite
   and Redis stores (the last from `PTTL`), and a custom store without it is
   refused **at configuration time** rather than mid-run. An interrupted writer's

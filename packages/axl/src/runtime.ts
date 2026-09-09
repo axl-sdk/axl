@@ -60,6 +60,7 @@ import {
   type ArtifactStatus,
   type DiagnosticArtifactStore,
   type OpenedArtifact,
+  type StagedArtifact,
 } from './diagnostics/artifact-store.js';
 import {
   RequestCaptureChannel,
@@ -980,20 +981,33 @@ export class AxlRuntime extends EventEmitter {
     artifactId: string;
     sink: RequestCaptureSink;
   }> {
+    const staged = await this.requireArtifactStore().stage(owner, {
+      leaseMs: this.artifactLeaseMs,
+    });
+    return this.holdStagedArtifact(staged);
+  }
+
+  /**
+   * Hold a staged artifact's lease for as long as its writer lives, and hand
+   * back the sink that writer appends through.
+   *
+   * The lease belongs to the WRITER's lifetime, not to its write rate. Renewing
+   * from inside `append` looks equivalent and is not: a run that exhausts
+   * `maxRunBytes` at minute two stops appending forever, and a run waiting on a
+   * tool or a human approval may not call a provider for longer than a lease.
+   * Either way the sweeper would delete a live run's evidence, and the run
+   * would then fail to finalize the artifact it had been filling.
+   */
+  private holdStagedArtifact(staged: StagedArtifact): {
+    artifactId: string;
+    sink: RequestCaptureSink;
+  } {
     const store = this.requireArtifactStore();
-    const leaseMs = this.artifactLeaseMs;
-    const staged = await store.stage(owner, { leaseMs });
-    // The lease belongs to the WRITER's lifetime, not to its write rate.
-    // Renewing from inside `append` looks equivalent and is not: a run that
-    // exhausts `maxRunBytes` at minute two stops appending forever, and a run
-    // waiting on a tool or a human approval may not call a provider for longer
-    // than a lease. Either way the sweeper would delete a live run's evidence
-    // and the run would then fail to finalize the artifact it had been filling.
     const timer = setInterval(
       () => {
         void staged.renewLease().catch(() => undefined);
       },
-      Math.max(1, Math.floor(leaseMs / 2)),
+      Math.max(1, Math.floor(this.artifactLeaseMs / 2)),
     );
     timer.unref?.();
     this.artifactRenewals.set(staged.artifactId, timer);
@@ -1039,16 +1053,29 @@ export class AxlRuntime extends EventEmitter {
    * finalize the new manifest honestly. Returns `undefined` when the source is
    * gone — a rescore of a run whose artifact was deleted still produces numbers,
    * it just reports its diagnostics as `unavailable`.
+   *
+   * The copy comes back STAGED and lease-held, with a sink: the new owner
+   * carries the source records forward AND keeps writing its own calls into the
+   * same artifact, which is what makes one rescore result hold both halves of
+   * its evidence.
    */
   async copyDiagnosticArtifact(
     sourceId: string,
     owner: ArtifactOwner,
     opts: { maxBytes: number },
-  ): Promise<{ artifactId: string; truncated: boolean } | undefined> {
-    return this.requireArtifactStore().copy(sourceId, owner, {
+  ): Promise<
+    { artifactId: string; truncated: boolean; bytes: number; sink: RequestCaptureSink } | undefined
+  > {
+    const copied = await this.requireArtifactStore().copy(sourceId, owner, {
       maxBytes: opts.maxBytes,
       leaseMs: this.artifactLeaseMs,
     });
+    if (!copied) return undefined;
+    return {
+      ...this.holdStagedArtifact(copied),
+      truncated: copied.truncated,
+      bytes: copied.bytes,
+    };
   }
 
   /**

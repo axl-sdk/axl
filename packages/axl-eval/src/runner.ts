@@ -522,7 +522,9 @@ export async function runEval(
     const manifest = await finishCapture(runtime, capture);
     diagnostics = manifest
       ? toDiagnosticManifest(manifest)
-      : unavailableManifest(capture.artifactId, 'the diagnostic artifact could not be finalized');
+      : // An artifact that was never sealed is never committed, so publishing
+        // its id would point a reader at bytes the sweeper is about to reclaim.
+        unavailableManifest('', 'the diagnostic artifact could not be finalized');
   }
 
   const accounting: EvalAccounting = {

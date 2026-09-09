@@ -287,6 +287,117 @@ describe('rescore copies evidence without inventing it', () => {
   });
 });
 
+// ── Rescore capture (M1) and degrade ownership (H2) ──────────────────
+
+describe('a rescore records the judging it actually performs (M1)', () => {
+  it('captures its judge calls into its own artifact, correlated to the case', async () => {
+    const runtime = captureRuntime(4);
+    const judge = judgeOn(runtime);
+    const original = await runEval(
+      { workflow: 'w', dataset: ds(2), scorers: [pass] } satisfies EvalConfig,
+      askExecute(),
+      runtime,
+      { captureRequests: true },
+    );
+    const sourceIds = new Set(
+      (await readRecords(runtime, original.diagnostics!.artifactId)).map((r) => r.operationId),
+    );
+
+    const rescored = await rescore(original, [judge], runtime, { captureRequests: true });
+
+    const records = await readRecords(runtime, rescored.diagnostics!.artifactId);
+    // Everything the rescore itself did: the source records are copies, so the
+    // new work is whatever is NOT one of them.
+    const judged = records.filter((r) => !sourceIds.has(r.operationId));
+    // `captureRequests` on a rescore promises the judge calls are recorded; an
+    // artifact holding only the copy is a rescore that captured nothing it did.
+    expect(judged.length).toBeGreaterThan(0);
+    expect(judged.every((r) => r.scorer === 'judge')).toBe(true);
+    // Without the per-item correlation scope a reader cannot tell which case a
+    // judge call scored, which is the whole point of pointing at it.
+    expect(new Set(judged.map((r) => r.caseIndex))).toEqual(new Set([0, 1]));
+
+    // And the result points at them from the scorer that made them.
+    const ops = rescored.items[0].scoreDetails?.judge?.diagnostics?.operations ?? [];
+    expect(ops.length).toBeGreaterThan(0);
+    expect(judged.map((r) => r.operationId)).toEqual(
+      expect.arrayContaining(ops.map((o) => o.operationId)),
+    );
+    await runtime.shutdown();
+  });
+
+  it('carries the copied bytes against the same run bound', async () => {
+    const runtime = captureRuntime(4);
+    const judge = judgeOn(runtime);
+    const original = await runEval(
+      { workflow: 'w', dataset: ds(1), scorers: [pass] } satisfies EvalConfig,
+      askExecute(),
+      runtime,
+      { captureRequests: true },
+    );
+
+    // A bound the copy alone already exhausts. If the channel started its own
+    // budget from zero the artifact would quietly grow to twice the bound the
+    // caller asked for.
+    const rescored = await rescore(original, [judge], runtime, {
+      captureRequests: { maxRunBytes: original.diagnostics!.bytes + 32 },
+    });
+
+    expect(rescored.diagnostics!.status).toBe('truncated');
+    expect(rescored.diagnostics!.bytes).toBeLessThanOrEqual(original.diagnostics!.bytes + 32);
+    expect(rescored.items[0].scores.judge).toBe(0.5);
+    await runtime.shutdown();
+  });
+});
+
+describe('a degraded rescore never names the source artifact (H2)', () => {
+  it('publishes no artifact when the copy fails, and deleting it spares the source', async () => {
+    const runtime = captureRuntime(4);
+    const original = await runEval(
+      { workflow: 'w', dataset: ds(1), scorers: [pass] } satisfies EvalConfig,
+      askExecute(),
+      runtime,
+      { captureRequests: true },
+    );
+    const sourceId = original.diagnostics!.artifactId;
+    await runtime.saveEvalResult({
+      id: original.id,
+      eval: 'w',
+      timestamp: Date.now(),
+      data: original,
+    });
+
+    // A transient storage failure during the copy — the disk was full, the
+    // object store timed out. The rescore's numbers must survive it.
+    const store = runtime.getDiagnosticArtifactStore()!;
+    const realCopy = store.copy.bind(store);
+    store.copy = async () => {
+      throw new Error('object store unreachable');
+    };
+    const rescored = await rescore(original, [pass], runtime, { captureRequests: true });
+    store.copy = realCopy;
+
+    expect(rescored.items[0].scores.pass).toBe(1);
+    expect(rescored.diagnostics!.status).toBe('unavailable');
+    // Naming the source here is the bug: the rescore would then own a lifecycle
+    // over another run's evidence.
+    expect(rescored.diagnostics!.artifactId).toBe('');
+
+    await runtime.saveEvalResult({
+      id: rescored.id,
+      eval: 'w',
+      timestamp: Date.now(),
+      data: rescored,
+    });
+    expect(await runtime.deleteEvalResult(rescored.id)).toBe(true);
+
+    // The source run still has everything it captured.
+    expect(await store.open(sourceId)).toBeDefined();
+    expect(await runtime.openDiagnosticArtifact(sourceId)).toBeDefined();
+    await runtime.shutdown();
+  });
+});
+
 // ── Codec + sidecar validation ───────────────────────────────────────
 
 describe('the JSONL codec and its import guard', () => {

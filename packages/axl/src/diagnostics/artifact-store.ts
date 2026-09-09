@@ -104,15 +104,6 @@ export type OpenedArtifact = {
 };
 
 /**
- * The storage contract for diagnostic artifacts.
- *
- * Every method is idempotent where that is meaningful: deleting an unknown id
- * succeeds, marking delete-pending twice succeeds, and rolling back an
- * already-gone artifact succeeds. Keys are opaque ids the store mints — a
- * caller never supplies a path or a URL, which is what keeps an imported
- * artifact reference from naming an arbitrary file.
- */
-/**
  * The outcome of a manifest write that can legitimately find nothing to write.
  *
  * `commit`, `markDeletePending` and `refreshExpiry` all name an artifact that a
@@ -125,6 +116,15 @@ export type ArtifactWriteResult =
   | { ok: true; manifest: ArtifactManifest }
   | { ok: false; reason: 'missing' };
 
+/**
+ * The storage contract for diagnostic artifacts.
+ *
+ * Every method is idempotent where that is meaningful: deleting an unknown id
+ * succeeds, marking delete-pending twice succeeds, and rolling back an
+ * already-gone artifact succeeds. Keys are opaque ids the store mints — a
+ * caller never supplies a path or a URL, which is what keeps an imported
+ * artifact reference from naming an arbitrary file.
+ */
 export interface DiagnosticArtifactStore {
   /** Reserve a new artifact id for `owner`, held by a lease of `leaseMs`. */
   stage(owner: ArtifactOwner, opts: { leaseMs: number }): Promise<StagedArtifact>;
@@ -138,12 +138,20 @@ export interface DiagnosticArtifactStore {
   rollback(artifactId: string): Promise<void>;
   /** Read a committed (or interrupted) artifact, or `undefined` if absent. */
   open(artifactId: string): Promise<OpenedArtifact | undefined>;
-  /** Copy `sourceId`'s records under a new id owned by `owner`, bounded by bytes. */
+  /**
+   * Copy `sourceId`'s records under a new id owned by `owner`, bounded by bytes.
+   *
+   * The result is a STAGED artifact, exactly as `stage` returns one: a copy is
+   * the beginning of the new owner's capture, not the end of it — a rescore
+   * goes on writing its own judge calls into the same artifact. It therefore
+   * carries `renewLease` too, since a copy whose lease nobody holds is swept
+   * out from under the run still filling it.
+   */
   copy(
     sourceId: string,
     owner: ArtifactOwner,
     opts: { maxBytes: number; leaseMs: number },
-  ): Promise<{ artifactId: string; truncated: boolean } | undefined>;
+  ): Promise<(StagedArtifact & { truncated: boolean; bytes: number }) | undefined>;
   /** Record an idempotent deletion intent. Reports an artifact already gone. */
   markDeletePending(artifactId: string): Promise<ArtifactWriteResult>;
   /** Physically remove an artifact. Idempotent. */
@@ -381,7 +389,7 @@ export class FileDiagnosticArtifactStore implements DiagnosticArtifactStore {
     sourceId: string,
     owner: ArtifactOwner,
     opts: { maxBytes: number; leaseMs: number },
-  ): Promise<{ artifactId: string; truncated: boolean } | undefined> {
+  ): Promise<(StagedArtifact & { truncated: boolean; bytes: number }) | undefined> {
     const source = await this.open(sourceId);
     if (!source) return undefined;
     const staged = await this.stage(owner, { leaseMs: opts.leaseMs });
@@ -401,7 +409,7 @@ export class FileDiagnosticArtifactStore implements DiagnosticArtifactStore {
       redaction: source.manifest.redaction,
       copiedFrom: { artifactId: sourceId, ownerId: source.manifest.owner.id },
     }));
-    return { artifactId: staged.artifactId, truncated };
+    return { ...staged, truncated, bytes };
   }
 
   async markDeletePending(artifactId: string): Promise<ArtifactWriteResult> {

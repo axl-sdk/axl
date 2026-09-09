@@ -437,11 +437,9 @@ export async function executeAcceptedTool(options: {
         );
         break;
       case 'mcp': {
-        const mcpResult = await runToolOperation(invocation.toolName, () =>
-          invocation.source.kind === 'mcp'
-            ? invocation.source.call(effectiveArgs)
-            : Promise.reject(new Error('unreachable')),
-        );
+        // Bound before the closure so the narrowing survives it.
+        const callMcp = invocation.source.call;
+        const mcpResult = await runToolOperation(invocation.toolName, () => callMcp(effectiveArgs));
         if (signal?.aborted) return cancellation('after_handler', signal.reason, mcpResult);
         if (mcpResult.isError) {
           const content = mcpContent(mcpResult);

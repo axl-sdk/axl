@@ -316,6 +316,12 @@ export async function rescore(
     if (itemOutcome.status === 'rejected') throw itemOutcome.error;
 
     item.accounting = itemOutcome.accounting;
+    // Both compat views are written whenever `accounting` is (contracts §6, Q8):
+    // once an item carries accounting, `cost` is its MEASURED generation spend,
+    // which for a rescore is a real, measured $0. Leaving it absent would let a
+    // reader take the "no accounting → read the legacy caller value" branch and
+    // report the source run's generation as spend this rescore incurred.
+    item.cost = itemOutcome.accounting.breakdown.generation;
     item.scorerCost = itemOutcome.accounting.breakdown.judging;
     if (itemOutcome.accounting.completeness !== 'complete') item.unpriced = true;
     rescored[itemIndex] = item;

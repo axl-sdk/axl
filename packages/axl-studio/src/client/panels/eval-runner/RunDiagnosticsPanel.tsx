@@ -22,10 +22,18 @@
  *    option *values*, or credentials from anything.
  * 3. **The inline viewer is capped.** See `MAX_INLINE_RECORDS`. The cap is
  *    stated in the UI, not hidden.
+ *
+ * Both server reads are `useQuery`s keyed on the result id rather than
+ * hand-rolled `useState` + `useEffect`. That is the client's convention, and
+ * here it is also the correctness argument: the detail view swaps `result`
+ * without remounting this subtree, so any state not keyed to the run can render
+ * one run's captured evidence under another run's heading. Per-key caching makes
+ * that impossible by construction; the local view state that remains (the
+ * expand toggle and the download's error) is reset in render when the id moves.
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import { fetchEvalDiagnostics, fetchEvalDiagnosticsRecords } from '../../lib/api';
-import type { EvalDiagnosticsManifest } from '../../lib/types';
 import { cn, formatDuration } from '../../lib/utils';
 import {
   MAX_INLINE_RECORDS,
@@ -38,15 +46,8 @@ import {
   recordsFilename,
   parseRecordStream,
 } from './diagnostics';
+import type { ParsedRecords } from './diagnostics';
 import type { DiagnosticManifest, EvalResultData, RequestRecord } from './types';
-
-/** The live-availability check against the diagnostics route. */
-type LiveState =
-  | { kind: 'idle' }
-  | { kind: 'loading' }
-  | { kind: 'ok'; manifest: EvalDiagnosticsManifest }
-  | { kind: 'gone'; message: string }
-  | { kind: 'error'; message: string };
 
 const STATUS_TONE: Record<DiagnosticManifest['status'], string> = {
   complete: 'text-[hsl(var(--muted-foreground))]',
@@ -87,6 +88,20 @@ function download(text: string, filename: string): void {
   // Deferred so the browser has a chance to start the download first — same
   // reason as `exportEntry` in EvalHistoryTable.
   setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+/** What the reader must be told about the parse, or `null` when nothing. */
+function describeViewerNote(parsed: ParsedRecords): string | null {
+  const notes: string[] = [];
+  if (parsed.cappedEarly) {
+    notes.push(
+      `Showing the first ${MAX_INLINE_RECORDS} records. Download the .jsonl for the rest.`,
+    );
+  }
+  if (parsed.malformed > 0) {
+    notes.push(`${parsed.malformed} line(s) could not be parsed and are not shown.`);
+  }
+  return notes.length > 0 ? notes.join(' ') : null;
 }
 
 /** One line of the record list, expandable into the normalized request/response. */
@@ -256,16 +271,28 @@ export function RunDiagnosticsPanel({
   evalName?: string;
 }) {
   const embedded = readDiagnostics(result);
-  const [live, setLive] = useState<LiveState>({ kind: 'idle' });
-  const [records, setRecords] = useState<RequestRecord[] | null>(null);
-  const [viewerNote, setViewerNote] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const mounted = useRef(true);
-
   const resultId = result.id;
-  const embeddedReadable = hasReadableRecords(embedded);
+  // A multi-run aggregate is `buildMultiRunResult`'s output, which spreads run
+  // 1 — `diagnostics` included. One run's artifact is not the group's evidence,
+  // and its download would serve run 1's records under a group heading.
+  const isAggregate = result._multiRun !== undefined;
+  const embeddedReadable = !isAggregate && hasReadableRecords(embedded);
 
+  // View state that is not server data. Reset in render (not in an effect) when
+  // the panel is handed a different run, so no frame ever shows run A's
+  // expansion state or download error under run B.
+  const [shownFor, setShownFor] = useState(resultId);
+  const [showRecords, setShowRecords] = useState(false);
+  const [downloading, setDownloading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  if (shownFor !== resultId) {
+    setShownFor(resultId);
+    setShowRecords(false);
+    setDownloading(false);
+    setError(null);
+  }
+
+  const mounted = useRef(true);
   useEffect(() => {
     mounted.current = true;
     return () => {
@@ -274,28 +301,24 @@ export function RunDiagnosticsPanel({
   }, []);
 
   // Confirm the bytes are still there — and pick up `copiedFrom`, which the
-  // embedded manifest does not carry.
-  useEffect(() => {
-    if (!embeddedReadable) return;
-    let cancelled = false;
-    setLive({ kind: 'loading' });
-    void fetchEvalDiagnostics(resultId).then((res) => {
-      if (cancelled) return;
-      if (res.ok) setLive({ kind: 'ok', manifest: res.manifest });
-      else
-        setLive(
-          res.gone
-            ? { kind: 'gone', message: res.message }
-            : { kind: 'error', message: res.message },
-        );
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [resultId, embeddedReadable]);
+  // embedded manifest does not carry. Keyed on the run: a cached answer can
+  // only ever be answered about the run it was fetched for.
+  const availability = useQuery({
+    queryKey: ['eval-diagnostics', resultId],
+    queryFn: () => fetchEvalDiagnostics(resultId),
+    enabled: embeddedReadable,
+    retry: false,
+  });
+
+  const recordsQuery = useQuery({
+    queryKey: ['eval-diagnostics-records', resultId],
+    queryFn: async () => parseRecordStream(await fetchEvalDiagnosticsRecords(resultId)),
+    enabled: showRecords && embeddedReadable,
+    retry: false,
+  });
 
   const onDownload = useCallback(async () => {
-    setBusy(true);
+    setDownloading(true);
     setError(null);
     try {
       const res = await fetchEvalDiagnosticsRecords(resultId);
@@ -304,51 +327,39 @@ export function RunDiagnosticsPanel({
     } catch (err) {
       if (mounted.current) setError(err instanceof Error ? err.message : String(err));
     } finally {
-      if (mounted.current) setBusy(false);
+      if (mounted.current) setDownloading(false);
     }
   }, [resultId, evalName]);
 
-  const onToggleRecords = useCallback(async () => {
-    if (records !== null) {
-      setRecords(null);
-      setViewerNote(null);
-      return;
-    }
-    setBusy(true);
+  const onToggleRecords = useCallback(() => {
     setError(null);
-    try {
-      const res = await fetchEvalDiagnosticsRecords(resultId);
-      const parsed = await parseRecordStream(res, MAX_INLINE_RECORDS);
-      if (!mounted.current) return;
-      setRecords(parsed.records);
-      const notes: string[] = [];
-      if (parsed.cappedEarly) {
-        notes.push(
-          `Showing the first ${MAX_INLINE_RECORDS} records. Download the .jsonl for the rest.`,
-        );
-      }
-      if (parsed.malformed > 0) {
-        notes.push(`${parsed.malformed} line(s) could not be parsed and are not shown.`);
-      }
-      setViewerNote(notes.length > 0 ? notes.join(' ') : null);
-    } catch (err) {
-      if (mounted.current) setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      if (mounted.current) setBusy(false);
-    }
-  }, [records, resultId]);
+    setShowRecords((v) => !v);
+  }, []);
 
   // A run that captured nothing — and every artifact written before capture
   // existed — says nothing at all. An empty block would imply the feature was
   // on and produced nothing.
-  if (!embedded) return null;
+  if (!embedded || isAggregate) return null;
 
-  const liveManifest = live.kind === 'ok' ? live.manifest : undefined;
-  const gone = live.kind === 'gone';
+  const probe = availability.data;
+  const liveManifest = probe?.ok ? probe.manifest : undefined;
+  const gone = probe?.ok === false && probe.gone;
+  const probeFailure = probe?.ok === false && !probe.gone ? probe.message : undefined;
+  const parsed = showRecords ? recordsQuery.data : undefined;
+  const records = parsed?.records;
+  const viewerNote = parsed ? describeViewerNote(parsed) : null;
+  const recordsError =
+    showRecords && recordsQuery.error instanceof Error ? recordsQuery.error.message : null;
+  const busy = downloading || (showRecords && recordsQuery.isFetching);
+  const shownError = error ?? recordsError;
   const status: DiagnosticManifest['status'] = gone
     ? 'unavailable'
     : (liveManifest?.status ?? embedded.status);
-  const reason = gone ? live.message : (liveManifest?.reason ?? embedded.reason);
+  const reason = gone
+    ? probe?.ok === false
+      ? probe.message
+      : undefined
+    : (liveManifest?.reason ?? embedded.reason);
   const readable =
     !gone && hasReadableRecords({ ...embedded, status, artifactId: embedded.artifactId });
   const counters = readable
@@ -383,7 +394,7 @@ export function RunDiagnosticsPanel({
             disabled={!readable || busy}
             className="text-[11px] px-2 py-1 rounded-md border border-[hsl(var(--border))] text-[hsl(var(--foreground))] hover:bg-[hsl(var(--muted))] disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            {records !== null ? 'Hide captured records' : 'Show captured records'}
+            {showRecords ? 'Hide captured records' : 'Show captured records'}
           </button>
           <button
             type="button"
@@ -450,21 +461,21 @@ export function RunDiagnosticsPanel({
             </span>
           </Row>
         )}
-        {live.kind === 'error' && (
+        {probeFailure !== undefined && (
           <Row label="Note">
             <span className="text-amber-700 dark:text-amber-300">
-              could not confirm the artifact is still stored: {live.message}
+              could not confirm the artifact is still stored: {probeFailure}
             </span>
           </Row>
         )}
-        {error && (
+        {shownError && (
           <Row label="Error">
-            <span className="text-red-700 dark:text-red-300">{error}</span>
+            <span className="text-red-700 dark:text-red-300">{shownError}</span>
           </Row>
         )}
       </div>
 
-      {records !== null && (
+      {records !== undefined && (
         <div className="border-t border-[hsl(var(--border))]">
           {viewerNote && (
             <p className="px-4 py-2 text-[11px] text-amber-700 dark:text-amber-300">{viewerNote}</p>

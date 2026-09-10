@@ -1401,15 +1401,22 @@ export function EvalRunnerPanel() {
 
                             {/* Its own block, deliberately not inside the
                                 accounting footer: capture is diagnostics and
-                                must never move a spend or coverage figure. */}
-                            <RunDiagnosticsPanel
-                              result={displayResult}
-                              evalName={
-                                history.find((h) => h.id === displayResult.id)?.eval ||
-                                selectedEval ||
-                                undefined
-                              }
-                            />
+                                must never move a spend or coverage figure.
+                                Per run only: the aggregate view's result is
+                                `buildMultiRunResult`'s output, whose
+                                `diagnostics` is run 1's. Keyed on the run so
+                                no view state outlives the run it describes. */}
+                            {!isAggregateView && (
+                              <RunDiagnosticsPanel
+                                key={displayResult.id}
+                                result={displayResult}
+                                evalName={
+                                  history.find((h) => h.id === displayResult.id)?.eval ||
+                                  selectedEval ||
+                                  undefined
+                                }
+                              />
+                            )}
 
                             <ScoreDistribution
                               items={displayResult.items}

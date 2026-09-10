@@ -13,6 +13,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import type { ReactElement, ReactNode } from 'react';
 
 import {
   RunDiagnosticsPanel,
@@ -44,9 +46,9 @@ function manifest(overrides: Partial<DiagnosticManifest> = {}): DiagnosticManife
   };
 }
 
-function result(diagnostics?: DiagnosticManifest): EvalResultData {
+function result(diagnostics?: DiagnosticManifest, id: string = RESULT_ID): EvalResultData {
   return {
-    id: RESULT_ID,
+    id,
     dataset: 'qa-dataset',
     timestamp: new Date(0).toISOString(),
     totalCost: 0,
@@ -87,14 +89,31 @@ function record(overrides: Partial<RequestRecord> = {}): RequestRecord {
 type Routes = {
   manifest?: { status: number; body: unknown };
   records?: string;
+  /** Throw from `fetch` itself — a network failure on the availability probe. */
+  networkError?: string;
 };
 
 let calls: string[] = [];
 
-function stubFetch(routes: Routes) {
+/** The history id in `/api/evals/<id>/diagnostics[/records]`. */
+function idFromUrl(url: string): string {
+  return /\/evals\/([^/]+)\/diagnostics/.exec(url)?.[1] ?? '';
+}
+
+/**
+ * Route `fetch` by URL, optionally per result id.
+ *
+ * Per-id routing is what makes the "switch runs on a mounted panel" cases
+ * meaningful: run B must be able to answer differently from run A.
+ */
+function stubFetch(fallback: Routes, byId: Record<string, Routes> = {}) {
   const fetchMock = vi.fn((input: RequestInfo | URL) => {
     const url = String(input);
     calls.push(url);
+    const routes = byId[decodeURIComponent(idFromUrl(url))] ?? fallback;
+    if (routes.networkError !== undefined) {
+      return Promise.reject(new Error(routes.networkError));
+    }
     if (url.endsWith('/diagnostics/records')) {
       if (routes.records === undefined) {
         return Promise.resolve(
@@ -133,6 +152,25 @@ function ndjson(records: RequestRecord[]): string {
   return records.map((r) => JSON.stringify(r)).join('\n') + '\n';
 }
 
+/**
+ * Render inside a fresh `QueryClient`, as the app does.
+ *
+ * A per-test client is what keeps one case's cached manifest out of the next
+ * one; `retry: false` keeps a 404 from being retried for the length of the test.
+ */
+function renderPanel(node: ReactElement) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false, gcTime: 0 } },
+  });
+  const wrapper = ({ children }: { children: ReactNode }) => (
+    <QueryClientProvider client={client}>{children}</QueryClientProvider>
+  );
+  // `wrapper` is remembered by `rerender`, so switching the panel's `result`
+  // keeps the same client — which is the point: a per-run cache must isolate
+  // the runs, not a fresh provider.
+  return render(node, { wrapper });
+}
+
 let clicked: Array<{ download: string; href: string }> = [];
 
 beforeEach(() => {
@@ -166,7 +204,7 @@ describe('RunDiagnosticsPanel', () => {
       },
     });
 
-    render(<RunDiagnosticsPanel result={result(manifest())} evalName="qa-eval" />);
+    renderPanel(<RunDiagnosticsPanel result={result(manifest())} evalName="qa-eval" />);
 
     expect(screen.getByRole('heading', { name: 'Captured requests' })).toBeInTheDocument();
     expect(
@@ -187,7 +225,7 @@ describe('RunDiagnosticsPanel', () => {
     });
     stubFetch({ manifest: { status: 200, body: { ok: true, data: truncated } } });
 
-    render(<RunDiagnosticsPanel result={result(truncated)} evalName="qa-eval" />);
+    renderPanel(<RunDiagnosticsPanel result={result(truncated)} evalName="qa-eval" />);
 
     expect(
       screen.getByText(/truncated — capture stopped at a size limit — some operations are missing/),
@@ -211,7 +249,7 @@ describe('RunDiagnosticsPanel', () => {
     });
     const fetchMock = stubFetch({});
 
-    render(<RunDiagnosticsPanel result={result(gone)} evalName="qa-eval" />);
+    renderPanel(<RunDiagnosticsPanel result={result(gone)} evalName="qa-eval" />);
 
     expect(screen.getByText(/unavailable — the captured bytes are not stored/)).toBeInTheDocument();
     expect(
@@ -228,7 +266,7 @@ describe('RunDiagnosticsPanel', () => {
 
   it('A16.22 renders nothing for a legacy result with no diagnostics', () => {
     stubFetch({});
-    const { container } = render(<RunDiagnosticsPanel result={result()} evalName="qa-eval" />);
+    const { container } = renderPanel(<RunDiagnosticsPanel result={result()} evalName="qa-eval" />);
     expect(container).toBeEmptyDOMElement();
   });
 
@@ -243,7 +281,7 @@ describe('RunDiagnosticsPanel', () => {
       },
     });
 
-    render(<RunDiagnosticsPanel result={result(manifest())} evalName="qa-eval" />);
+    renderPanel(<RunDiagnosticsPanel result={result(manifest())} evalName="qa-eval" />);
 
     await screen.findByText(/unavailable — the captured bytes are not stored/);
     expect(screen.getByText('Captured requests are no longer available')).toBeInTheDocument();
@@ -255,7 +293,7 @@ describe('RunDiagnosticsPanel', () => {
     const body = ndjson([record()]);
     const fetchMock = stubFetch({ records: body });
 
-    render(<RunDiagnosticsPanel result={result(manifest())} evalName="qa eval" />);
+    renderPanel(<RunDiagnosticsPanel result={result(manifest())} evalName="qa eval" />);
     await waitFor(() => expect(calls.some((u) => u.endsWith('/diagnostics'))).toBe(true));
 
     await user.click(screen.getByRole('button', { name: 'Download records (.jsonl)' }));
@@ -285,7 +323,7 @@ describe('RunDiagnosticsPanel', () => {
       ]),
     });
 
-    render(<RunDiagnosticsPanel result={result(manifest())} evalName="qa-eval" />);
+    renderPanel(<RunDiagnosticsPanel result={result(manifest())} evalName="qa-eval" />);
     await user.click(screen.getByRole('button', { name: 'Show captured records' }));
 
     const list = await screen.findByRole('list', { name: 'Captured request records' });
@@ -308,7 +346,7 @@ describe('RunDiagnosticsPanel', () => {
     );
     stubFetch({ records: ndjson(many) });
 
-    render(
+    renderPanel(
       <RunDiagnosticsPanel
         result={result(manifest({ records: many.length }))}
         evalName="qa-eval"
@@ -336,9 +374,94 @@ describe('RunDiagnosticsPanel', () => {
       },
     });
 
-    render(<RunDiagnosticsPanel result={result(manifest())} evalName="qa-eval" />);
+    renderPanel(<RunDiagnosticsPanel result={result(manifest())} evalName="qa-eval" />);
 
     expect(await screen.findByText('artifact artifact-src (run run-src)')).toBeInTheDocument();
+  });
+
+  it('A16.30 drops one run’s captured records when the panel switches to another run', async () => {
+    const user = userEvent.setup();
+    const OTHER_ID = 'run-def-456';
+    stubFetch(
+      {},
+      {
+        [RESULT_ID]: { records: ndjson([record({ operationId: 'op-run-a' })]) },
+        [OTHER_ID]: { records: ndjson([record({ operationId: 'op-run-b' })]) },
+      },
+    );
+
+    const { rerender } = renderPanel(
+      <RunDiagnosticsPanel result={result(manifest())} evalName="qa-eval" />,
+    );
+    await user.click(screen.getByRole('button', { name: 'Show captured records' }));
+    expect(await screen.findByText('op-run-a')).toBeInTheDocument();
+
+    rerender(<RunDiagnosticsPanel result={result(manifest(), OTHER_ID)} evalName="qa-eval" />);
+
+    // Run A's evidence may never be rendered under run B's heading, not even
+    // for a frame while B loads.
+    await waitFor(() =>
+      expect(screen.getByRole('heading', { name: 'Captured requests' })).toBeInTheDocument(),
+    );
+    expect(screen.queryByText('op-run-a')).not.toBeInTheDocument();
+  });
+
+  it('A16.31 disables both actions and drops the previous run’s counters when the next run has no artifact', async () => {
+    const OTHER_ID = 'run-gone-789';
+    stubFetch(
+      {},
+      {
+        [RESULT_ID]: {
+          manifest: {
+            status: 200,
+            body: { ok: true, data: { ...manifest(), records: 12, bytes: 2048 } },
+          },
+        },
+      },
+    );
+
+    const { rerender } = renderPanel(
+      <RunDiagnosticsPanel result={result(manifest())} evalName="qa-eval" />,
+    );
+    await screen.findByText('12');
+
+    const gone = manifest({
+      artifactId: '',
+      status: 'unavailable',
+      records: 137,
+      bytes: 2_100_000,
+    });
+    rerender(<RunDiagnosticsPanel result={result(gone, OTHER_ID)} evalName="qa-eval" />);
+
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Download records (.jsonl)' })).toBeDisabled(),
+    );
+    expect(screen.getByRole('button', { name: 'Show captured records' })).toBeDisabled();
+    expect(screen.getByText(/unavailable — the captured bytes are not stored/)).toBeInTheDocument();
+    // Neither run A's live counters nor run B's stale pre-downgrade ones.
+    expect(screen.queryByText('12')).not.toBeInTheDocument();
+    expect(screen.queryByText('2.0 KB')).not.toBeInTheDocument();
+    expect(screen.queryByText('137')).not.toBeInTheDocument();
+  });
+
+  it('A16.32 renders nothing for a multi-run aggregate result', () => {
+    stubFetch({});
+    // `buildMultiRunResult` spreads run 1 — including its `diagnostics` — into
+    // the aggregate. Rendering the block there would present one run's captured
+    // requests as the whole group's.
+    const runOne = result(manifest({ records: 6 }), 'run-1');
+    const aggregate: EvalResultData = {
+      ...runOne,
+      _multiRun: {
+        aggregate: { runGroupId: 'group-1', runCount: 2, scorers: {} },
+        allRuns: [runOne, result(undefined, 'run-2')],
+      },
+    };
+
+    const { container } = renderPanel(
+      <RunDiagnosticsPanel result={aggregate} evalName="qa-eval" />,
+    );
+    expect(container).toBeEmptyDOMElement();
   });
 });
 

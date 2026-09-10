@@ -8,7 +8,7 @@
  * that quietly drops records past its cap, and a redaction label that leaves
  * the reader guessing whether the bytes on disk are scrubbed.
  *
- * Test-matrix rows: A16.19–A16.26 (P5b).
+ * Test-matrix rows: A16.19–A16.29 (P5b).
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, waitFor, within } from '@testing-library/react';

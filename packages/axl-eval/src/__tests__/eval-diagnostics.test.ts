@@ -228,8 +228,8 @@ describe('A12.7 — capture is off unless asked for', () => {
 
 // ── Rescore provenance ───────────────────────────────────────────────
 
-describe('rescore copies evidence without inventing it', () => {
-  it('copies the source artifact, preserving the original operation ids', async () => {
+describe('A13.3 — rescore copies evidence without inventing it', () => {
+  it('A13.3 copies the source artifact, preserving the original operation ids', async () => {
     const runtime = captureRuntime(4);
     const original = await runEval(
       { workflow: 'w', dataset: ds(1), scorers: [pass] } satisfies EvalConfig,
@@ -249,7 +249,7 @@ describe('rescore copies evidence without inventing it', () => {
     await runtime.shutdown();
   });
 
-  it('preserves the original item diagnostics on the rescored items', async () => {
+  it('A13.3 preserves the original item diagnostics on the rescored items', async () => {
     const runtime = captureRuntime(4);
     const original = await runEval(
       { workflow: 'w', dataset: ds(1), scorers: [pass] } satisfies EvalConfig,

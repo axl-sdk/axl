@@ -207,7 +207,10 @@ describe('A6: crossing the limit stops scheduling, and says by how much', () => 
     expect(result.items.every((i) => i.outcome === 'completed')).toBe(true);
   });
 
-  // A6.8
+  // A7.6 — closure inside an ACTIVE case stops that case's next call. (This
+  // block previously carried an `A6.8` comment; A6.8 is the different scenario
+  // where a run of *failed but charged* cases trips the threshold, and it lives
+  // in `eval-budget-attribution.test.ts`.)
   it('stops a case mid-flight when its NEXT call is denied, keeping the earlier charge', async () => {
     // The single case asks twice. The first ask alone exhausts the budget, so
     // the second is refused — the case cannot finish, but the money already
@@ -251,7 +254,7 @@ describe('A6: crossing the limit stops scheduling, and says by how much', () => 
 // ═══════════════════════════════════════════════════════════════════════════
 
 describe('A7: a judge can exhaust the budget, and the run says so', () => {
-  // A7.1 / A7.2
+  // A7.1 / A7.4
   it('stops later cases AND later LLM scorers, while deterministic scorers finish', async () => {
     const { runtime } = scriptedRuntime([{ cost: 0 }]);
     const judge = judgeOn(runtime, 2, 'llmJudge');
@@ -292,7 +295,9 @@ describe('A7: a judge can exhaust the budget, and the run says so', () => {
     });
   });
 
-  // A7.3
+  // A7.2 — subsequent scorers on the SAME item after a judge crossing. (This
+  // block previously carried an `A7.3` comment; A7.3 is the concurrent
+  // already-launched-judges case, in `eval-budget-attribution.test.ts`.)
   it('skips a further LLM scorer on an item whose earlier judge closed the budget', async () => {
     const { runtime } = scriptedRuntime([{ cost: 0 }]);
     const expensive = judgeOn(runtime, 2, 'first');
@@ -322,6 +327,16 @@ describe('A7: a judge can exhaust the budget, and the run says so', () => {
     expect(details.second.outcome).toBe('budget_skipped');
     expect(details.second.score).toBeNull();
     expect(details.exact.outcome).toBe('scored');
+
+    // The skipped judge reached no decision, so it must not enter the stats as
+    // a 0 — that would silently tank the reported quality of the run.
+    const secondStats = result.summary.scorers.second;
+    expect(secondStats.scored).toBe(0);
+    expect(secondStats.failed).toBe(0);
+    expect(result.summary.coverage!.scorers.second.budget_skipped).toBe(1);
+    // (The "a skipped judge never enters the mean as a 0" half of A7.2 needs a
+    // run where the same judge DID score something to drag down — see
+    // `eval-budget-attribution.test.ts`.)
   });
 
   // A7.4

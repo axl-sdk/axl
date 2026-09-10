@@ -916,6 +916,13 @@ retention and reclamation rules, and
 [security.md](security.md#captured-requests) for what redaction does to a
 record.
 
+When the sweep reclaims a committed artifact — its expiry passed, or its owning
+row is gone — it rewrites that row's `diagnostics` to `unavailable` with zeroed
+counters and no `expiresAt`. So a stored result is self-describing: nothing has
+to make a second call to discover the evidence is no longer there, and a reader
+that cannot make one — an export, a CLI listing, a client rendering a cached
+result — never publishes a promise of bytes nothing can serve.
+
 ## Execution Inspector
 
 Each execution is identified by a unique `execution_id`. The runtime provides an inspection API:

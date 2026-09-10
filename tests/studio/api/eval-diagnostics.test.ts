@@ -195,6 +195,36 @@ describe('A13.19 — import/export roundtrip', () => {
     expect(res.status).toBe(400);
   });
 
+  it('the history row stops claiming evidence the sweep has reclaimed', async () => {
+    const { app, runtime } = createTestServer(undefined, { artifactsRoot: root });
+
+    const res = await importResult(app, {
+      result: resultWithAccounting(),
+      requests: sidecar(RECORDS),
+    });
+    const { data } = await readJson(res);
+    const before = await readJson(await app.request('/api/evals/history'));
+    const imported = before.data.find((e: { id: string }) => e.id === data.id);
+    expect(imported.data.diagnostics.status).toBe('complete');
+    const artifactId = imported.data.diagnostics.artifactId as string;
+
+    // The retention this deployment mirrored onto the manifest has elapsed —
+    // a Redis TTL that ran out while the process was up, say.
+    await runtime.getDiagnosticArtifactStore()!.refreshExpiry(artifactId, Date.now() - 1);
+    const { removed } = await runtime.reconcileDiagnosticArtifacts();
+    expect(removed).toContain(artifactId);
+
+    // What a client renders comes from this payload. A row still reading
+    // `complete` with a live artifact id makes correctness depend on the client
+    // making a second call to find out the bytes are gone.
+    const after = await readJson(await app.request('/api/evals/history'));
+    const entry = after.data.find((e: { id: string }) => e.id === data.id);
+    expect(entry.data.diagnostics.status).toBe('unavailable');
+    expect(entry.data.diagnostics.artifactId).toBe('');
+    expect(entry.data.diagnostics.records).toBe(0);
+    expect(entry.data.diagnostics.bytes).toBe(0);
+  });
+
   it('rejects a malformed sidecar before storing any result', async () => {
     const { app } = createTestServer(undefined, { artifactsRoot: root });
 

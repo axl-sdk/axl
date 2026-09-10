@@ -1166,9 +1166,45 @@ export class AxlRuntime extends EventEmitter {
       } catch {
         // Leave it for the next sweep rather than aborting the whole pass —
         // one undeletable artifact must not strand every other orphan.
+        continue;
       }
+      // The bytes are gone; the row that points at them must say so, or every
+      // reader is left depending on a liveness check to discover it — and the
+      // ones that cannot make one (an export, a CLI listing, a client cache
+      // rendered from a stored result) publish a result promising evidence
+      // nothing can serve. A staged or delete_pending artifact usually has no
+      // committed owner row, but if one exists it gets the same treatment: the
+      // lookup is by owner id and does not care which state it was reclaimed
+      // from.
+      await this.downgradeReclaimedOwner(manifest);
     }
     return { removed };
+  }
+
+  /**
+   * Rewrite the history row that owned an artifact the sweep has just removed.
+   *
+   * Best effort by design: reclaiming the bytes is the operation that had to
+   * succeed, and a state store that cannot take the correction must not turn a
+   * routine sweep into a throwing one. The next `saveEvalResult` or artifact
+   * read corrects the row anyway, because both already downgrade a dangling id.
+   */
+  private async downgradeReclaimedOwner(manifest: ArtifactManifest): Promise<void> {
+    if (manifest.owner.kind !== 'eval') return;
+    try {
+      const entry = await this.getEvalResult(manifest.owner.id);
+      // Only the row that actually names THIS artifact: a degraded rescore
+      // carries its source's id in provenance, and rewriting a row over an
+      // artifact it does not own is the cross-result corruption §12.1 forbids.
+      if (!entry || this.artifactIdOf(entry.data) !== manifest.artifactId) return;
+      this.downgradeDiagnostics(
+        entry,
+        'the captured-request artifact for this result was reclaimed after it expired',
+      );
+      await this.stateStore.saveEvalResult?.(entry);
+    } catch {
+      // See the docstring: the bytes are already gone either way.
+    }
   }
 
   /** The artifact id an eval result carries, when it carries one. */
@@ -1188,7 +1224,7 @@ export class AxlRuntime extends EventEmitter {
    * The dangling id is cleared too — `''` is the sentinel every lifecycle path
    * already skips.
    */
-  private downgradeDiagnostics(entry: EvalHistoryEntry): void {
+  private downgradeDiagnostics(entry: EvalHistoryEntry, reason?: string): void {
     const data = entry.data as { diagnostics?: Record<string, unknown> } | undefined;
     if (!data?.diagnostics) return;
     if (data.diagnostics.artifactId === '' && data.diagnostics.status === 'unavailable') return;
@@ -1203,7 +1239,7 @@ export class AxlRuntime extends EventEmitter {
       ...rest,
       artifactId: '',
       status: 'unavailable',
-      reason: 'the captured-request artifact for this result is no longer available',
+      reason: reason ?? 'the captured-request artifact for this result is no longer available',
       records: 0,
       bytes: 0,
     };

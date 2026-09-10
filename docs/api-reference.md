@@ -1889,7 +1889,7 @@ Storage for [captured requests](observability.md#captured-requests-opt-in), conf
 | `rollbackDiagnosticArtifact(id)` | `Promise<void>` | Discard a staged artifact whose history row never landed |
 | `copyDiagnosticArtifact(sourceId, owner, options?)` | `Promise<{ artifactId, truncated, bytes, redaction, sink } \| undefined>` | Copy records under a new owner, bounded by `maxBytes`, preserving original operation ids. The copy comes back **staged** and lease-held with a `sink`, so the new owner keeps writing its own calls into the same artifact. `redaction` is what the SOURCE said about the copied bytes |
 | `openDiagnosticArtifact(id)` | `Promise<{ manifest, lines } \| undefined>` | Read a **committed** artifact. Returns `undefined` when it is still staged, pending deletion, logically expired, or its owning history row is gone. Read a not-yet-committed artifact through `getDiagnosticArtifactStore()` instead |
-| `reconcileDiagnosticArtifacts()` | `Promise<{ removed: string[] }>` | Run a reclamation pass by hand (also runs at startup and on the sweep timer) |
+| `reconcileDiagnosticArtifacts()` | `Promise<{ removed: string[] }>` | Run a reclamation pass by hand (also runs at startup and on the sweep timer). Reclaiming a committed artifact also rewrites its owning history row's `diagnostics` to `unavailable`, so a stored result never points at bytes that are gone |
 
 Lifecycle, retention and reclamation rules: [integration.md](integration.md#diagnostic-artifact-storage).
 

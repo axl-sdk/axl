@@ -151,7 +151,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gone (`{ ok: false, reason: 'missing' }` — the `ArtifactWriteResult` type is
   exported alongside the interface) instead of succeeding silently, and
   a result whose artifact vanished is stored as `unavailable` rather than
-  published claiming evidence it cannot serve. The writer's lease is renewed on
+  published claiming evidence it cannot serve — including when the SWEEP is
+  what removed it, so a stored result is self-describing and no reader has to
+  make a liveness call to discover its evidence is gone. The writer's lease is renewed on
   a timer for as long as it holds the artifact — not by writing — so a run that
   exhausted its capture bound early, or that is waiting on a tool or a human,
   keeps its records; the hold is bounded by `artifacts.maxHoldMs` (24 h) and a

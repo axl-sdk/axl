@@ -376,6 +376,34 @@ describe('A13 — save, delete and reconciliation', () => {
     await runtime.shutdown();
   });
 
+  it('downgrades the owning row when the sweep reclaims its committed artifact', async () => {
+    const runtime = artifactRuntime();
+    const { artifactId, data } = await stagedResult(runtime, 'run-swept');
+    (data.diagnostics as Record<string, unknown>).status = 'complete';
+    (data.diagnostics as Record<string, unknown>).records = 4;
+    (data.diagnostics as Record<string, unknown>).bytes = 900;
+    await runtime.saveEvalResult({ id: 'run-swept', eval: 'e', timestamp: 1, data });
+    await runtime.getDiagnosticArtifactStore()!.refreshExpiry(artifactId, Date.now() - 1);
+
+    const { removed } = await runtime.reconcileDiagnosticArtifacts();
+    expect(removed).toContain(artifactId);
+
+    // The bytes are gone, so the PERSISTED row must say so. Leaving it reading
+    // `status: 'complete', records: 4` makes every reader depend on a live
+    // liveness check to discover the evidence is not there — and any reader
+    // that skips it (an export, a CLI listing, a stale client cache) publishes
+    // a result promising evidence nothing can serve.
+    const stored = (await runtime.getEvalHistory()).find((e) => e.id === 'run-swept')!;
+    const diagnostics = (stored.data as { diagnostics: Record<string, unknown> }).diagnostics;
+    expect(diagnostics.status).toBe('unavailable');
+    expect(diagnostics.artifactId).toBe('');
+    expect(diagnostics.records).toBe(0);
+    expect(diagnostics.bytes).toBe(0);
+    expect(diagnostics.expiresAt).toBeUndefined();
+    expect(diagnostics.reason).toMatch(/reclaim|sweep|expir/i);
+    await runtime.shutdown();
+  });
+
   it('returns undefined for an artifact whose owner row is gone', async () => {
     const runtime = artifactRuntime();
     const { artifactId, data } = await stagedResult(runtime, 'run-ownerless');

@@ -78,6 +78,12 @@ export function isValidImportedBudget(value: unknown): boolean {
   ) {
     return false;
   }
+  // `AdmissionController.status` IS `knownSpend >= limit`, and `snapshot()`
+  // serializes both from the same doubles — so the two agree in every genuine
+  // export, overshooting runs included. Without this check the cheapest possible
+  // forgery of the budget-stopped badge (`status: 'closed'` beside a $0 spend
+  // against a $10 limit) passes every other identity.
+  if (b.knownSpend >= b.limit !== (b.status === 'closed')) return false;
   const expected = Math.max(0, b.knownSpend - b.limit);
   return Math.abs(b.knownOvershoot - expected) <= EPSILON;
 }

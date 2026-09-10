@@ -889,6 +889,9 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
           !isValidImportedCoverage(entry.summary.coverage)
         ) {
           delete entry.summary.coverage;
+          // Marked, not just dropped: a reader has to be able to tell "this
+          // artifact never had coverage" from "its coverage was refused".
+          entry.metadata.importedAccounting = 'invalid';
         }
         if (readAccounting) {
           entry.accounting = readAccounting(entry) as EvalResult['accounting'];

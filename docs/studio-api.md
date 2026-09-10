@@ -529,7 +529,7 @@ An imported result is the one eval in history Studio did not measure, and
 | Operations | `operations.total === settled + unknown`, with `denied` and `byKind` numeric |
 | Provenance | values sum to `knownCost` (float tolerance) |
 | Breakdown | `generation + judging + external` sums to `knownCost` |
-| Budget | when `accounting.budget` is present: finite non-negative `limit` / `knownSpend` / `knownOvershoot`, `status` in `open`/`closed`, `closedBy` in the enum, and `knownOvershoot === max(0, knownSpend - limit)` |
+| Budget | when `accounting.budget` is present: finite non-negative `limit` / `knownSpend` / `knownOvershoot`, `status` in `open`/`closed`, `closedBy` in the enum, `knownOvershoot === max(0, knownSpend - limit)`, and `status === 'closed'` exactly when `knownSpend >= limit` (an `AdmissionController` closes on nothing else) |
 | Coverage | when `summary.coverage` is present: every item-outcome key and every scorer-outcome key per scorer, each a non-negative integer |
 
 The two sum identities are checked only for `'complete'` and `'incomplete'`. An
@@ -547,9 +547,10 @@ panel's badge) and which a reader treats as "the numbers are short for a known
 reason" rather than "the numbers are wrong". A failing record loses both along
 with its accounting, so nothing downstream can badge it budget-stopped. A
 coverage block that arrives without any accounting at all is validated on its
-own and dropped if malformed — `EvalCoverage` promises every key including
-zeros, and a partial block reads downstream as zeros, turning refused work into
-a clean run.
+own; a malformed one is dropped AND recorded as `importedAccounting: 'invalid'`
+— `EvalCoverage` promises every key including zeros, a partial block reads
+downstream as zeros (turning refused work into a clean run), and a reader has to
+be able to tell "never had coverage" from "its coverage was refused".
 
 A failing record is replaced with the `unverified` synthesis an artifact with no
 accounting receives — the numbers stay readable, the certification does not

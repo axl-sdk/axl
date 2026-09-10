@@ -429,6 +429,51 @@ describe('budget and coverage are validated with the accounting (I2)', () => {
     expect(entry.data.summary?.coverage).toBeUndefined();
   });
 
+  it('refuses a closed budget that no controller could have closed (N3)', async () => {
+    // `AdmissionController.status` IS `knownSpend >= limit`. A $0 spend against
+    // a $10 limit cannot be `closed` — and this is the cheapest possible
+    // forgery of the badge, because every other identity holds trivially at
+    // zero.
+    const entry = await importAndRead(
+      budgetStopped({
+        budget: { limit: 10, status: 'closed', knownSpend: 0, knownOvershoot: 0 },
+      }),
+    );
+
+    expect(entry.data.metadata.importedAccounting).toBe('invalid');
+    expect(entry.data.accounting?.budget).toBeUndefined();
+    expect(entry.data.summary?.coverage).toBeUndefined();
+  });
+
+  it('keeps an open budget below its limit', async () => {
+    const entry = await importAndRead(
+      budgetStopped({
+        budget: { limit: 10, status: 'open', knownSpend: 4, knownOvershoot: 0 },
+      }),
+    );
+
+    // The identity cuts both ways; a normal run must not be refused by it.
+    expect(entry.data.metadata.importedAccounting).toBe('declared');
+    expect(entry.data.accounting.budget.status).toBe('open');
+  });
+
+  it('marks a refused coverage block invalid even with no accounting (N10)', async () => {
+    const base = resultWithAccounting();
+    const noAccounting = {
+      ...base,
+      accounting: undefined,
+      summary: { ...base.summary, coverage: { items: { completed: 1 }, scorers: {} } },
+    };
+    delete (noAccounting as { accounting?: unknown }).accounting;
+
+    const entry = await importAndRead(noAccounting as Record<string, unknown>);
+
+    // Dropping it silently leaves a reader unable to tell "never had coverage"
+    // from "its coverage was refused".
+    expect(entry.data.summary?.coverage).toBeUndefined();
+    expect(entry.data.metadata.importedAccounting).toBe('invalid');
+  });
+
   it('refuses a coverage block that is missing outcome keys', async () => {
     // `EvalCoverage` promises every key, including zeros. A partial block reads
     // as zeros downstream, turning refused work into a clean run.

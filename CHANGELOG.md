@@ -122,7 +122,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bounded per record, per run and per pending queue, written through a queue
   that never delays a provider call, and redacted before they are written
   whenever `trace.redact` is on. A call that never returned leaves a `start`
-  record with no `end` — the one you most want to read; a stream that was closed
+  record with no `end` — the one you most want to read. A request or response
+  that cannot be projected at all costs that ONE record — the same stub the byte
+  bound produces, carrying a `captured.reason` — never the rest of the run;
+  `status: 'unavailable'` is reserved for a failure that really is run-wide. A
+  stream that was closed
   early, aborted, ended without a `done` chunk, or threw mid-iteration is
   instead sealed with an `end` record carrying an explicit `termination`, so the
   two cases stay distinguishable.
@@ -136,19 +140,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   commit or delete an artifact whose manifest names **it** as the owner, so one
   result can never rewrite or destroy another's evidence; `commit`,
   `markDeletePending` and `refreshExpiry` report an artifact that has already
-  gone (`{ ok: false, reason: 'missing' }`) instead of succeeding silently, and
+  gone (`{ ok: false, reason: 'missing' }` — the `ArtifactWriteResult` type is
+  exported alongside the interface) instead of succeeding silently, and
   a result whose artifact vanished is stored as `unavailable` rather than
   published claiming evidence it cannot serve. The writer's lease is renewed on
   a timer for as long as it holds the artifact — not by writing — so a run that
   exhausted its capture bound early, or that is waiting on a tool or a human,
-  keeps its records. `runtime.openDiagnosticArtifact` serves only committed
+  keeps its records; the hold is bounded by `artifacts.maxHoldMs` (24 h) and a
+  run that throws between staging and finalizing rolls its artifact back, so
+  neither a caller bug nor a failed run can pin an artifact the sweeper would
+  never reclaim. `runtime.openDiagnosticArtifact` serves only committed
   artifacts. A `rescore` with `captureRequests` records the judge calls it makes
   — correlated to the case they scored — into the same artifact its source
   records were copied into, with one `maxRunBytes` budget covering both halves,
   and every degraded rescore reports `artifactId: ''` rather than naming the
-  source run's artifact. A manifest's `redaction` now reports what the writer
+  source run's artifact — dropping the per-item refs into it with it. The copy
+  may take at most three quarters of the run bound, so the judging it exists to
+  record always has room. A rescore asked to capture on a runtime that cannot
+  host capture throws before any judging, exactly as `runEval` does. A manifest's `redaction` now reports what the writer
   actually applied — a run captured under `trace.redact` reads back as
-  `applied`, and an imported bundle is described by its own records rather than
+  `applied`, an artifact holding copied records only claims `applied` when both
+  halves were scrubbed, and an imported bundle is described by its own records rather than
   by the importing deployment's setting. Expiry mirrors the
   owning row: `StateStore.getEvalRetention` is implemented by the Memory, SQLite
   and Redis stores (the last from `PTTL`), and a custom store without it is
@@ -265,8 +277,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `knownCost`. Item-level and scorer-level records are held to the same rule,
   all-or-nothing — and so are the two accounting-derived facts a reader turns
   into a budget-stopped badge: `accounting.budget` (finite non-negative figures,
-  a known `status`, and `knownOvershoot === max(0, knownSpend - limit)`) and
-  `summary.coverage` (every outcome key present as a non-negative integer).
+  a known `status`, `knownOvershoot === max(0, knownSpend - limit)`, and
+  `status === 'closed'` exactly when `knownSpend >= limit`, the only rule an
+  `AdmissionController` closes on) and
+  `summary.coverage` (every outcome key present as a non-negative integer),
+  including a coverage block that arrives with no accounting beside it.
   A failing result loses all three, so nothing downstream can excuse its missing
   cases as a budget stop. A record that fails is replaced by the same `unverified`
   synthesis an artifact with no accounting receives, so `compare` refuses to

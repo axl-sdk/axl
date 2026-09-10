@@ -20,8 +20,10 @@
  *    stored bytes (and re-redacts on delivery under `trace.redact`); this view
  *    renders what the record contains and never re-assembles headers, provider
  *    option *values*, or credentials from anything.
- * 3. **The inline viewer is capped.** See `MAX_INLINE_RECORDS`. The cap is
- *    stated in the UI, not hidden.
+ * 3. **The inline viewer is capped, in operations.** See
+ *    `MAX_INLINE_OPERATIONS`. The cap is stated in the UI, not hidden, and it
+ *    admits whole operations so a page never ends on a request whose response
+ *    was cut off.
  *
  * Both server reads are `useQuery`s keyed on the result id rather than
  * hand-rolled `useState` + `useEffect`. That is the client's convention, and
@@ -36,9 +38,10 @@ import { useQuery } from '@tanstack/react-query';
 import { fetchEvalDiagnostics, fetchEvalDiagnosticsRecords } from '../../lib/api';
 import { cn, formatDuration } from '../../lib/utils';
 import {
-  MAX_INLINE_RECORDS,
+  MAX_INLINE_OPERATIONS,
   STATUS_EXPLANATIONS,
   formatBytes,
+  groupOperations,
   hasCapturedRequests,
   hasReadableRecords,
   readDiagnostics,
@@ -46,7 +49,7 @@ import {
   recordsFilename,
   parseRecordStream,
 } from './diagnostics';
-import type { ParsedRecords } from './diagnostics';
+import type { CapturedOperation, ParsedRecords } from './diagnostics';
 import type { DiagnosticManifest, EvalResultData, RequestRecord } from './types';
 
 const STATUS_TONE: Record<DiagnosticManifest['status'], string> = {
@@ -95,7 +98,7 @@ function describeViewerNote(parsed: ParsedRecords): string | null {
   const notes: string[] = [];
   if (parsed.cappedEarly) {
     notes.push(
-      `Showing the first ${MAX_INLINE_RECORDS} records. Download the .jsonl for the rest.`,
+      `Showing the first ${MAX_INLINE_OPERATIONS} operations. Download the .jsonl for the rest.`,
     );
   }
   if (parsed.malformed > 0) {
@@ -104,17 +107,47 @@ function describeViewerNote(parsed: ParsedRecords): string | null {
   return notes.length > 0 ? notes.join(' ') : null;
 }
 
-/** One line of the record list, expandable into the normalized request/response. */
-function RecordRow({ record, index }: { record: RequestRecord; index: number }) {
+/** Whether any line of this operation was written as a stub. */
+function stubCause(records: readonly RequestRecord[]): string | undefined {
+  const stub = records.find((r) => r.captured?.truncated);
+  return stub ? 'record exceeded the size limit' : undefined;
+}
+
+/** Everything the artifact could not represent, across the operation's lines. */
+function omittedAcross(records: readonly RequestRecord[]): string[] {
+  const seen = new Set<string>();
+  for (const record of records) {
+    for (const item of record.captured?.omitted ?? []) seen.add(item);
+  }
+  return [...seen];
+}
+
+/**
+ * One operation of the record list, expandable into request and response.
+ *
+ * Rendered from the operation rather than from a line, because a line is half
+ * a turn. The `start` is the only line that carries a request and the `end` is
+ * the only line that carries a response, so an absent half is only ever
+ * reported when the LINE that would have carried it is absent — never because
+ * the line on screen structurally cannot carry it.
+ */
+function OperationRow({ operation, index }: { operation: CapturedOperation; index: number }) {
   const [open, setOpen] = useState(false);
+  const head = operation.start ?? operation.records[0];
+  const end = operation.end;
   const correlation =
-    record.caseIndex !== undefined
-      ? `case ${record.caseIndex}${record.scorer ? ` · ${record.scorer}` : ''}`
-      : record.scorer
-        ? record.scorer
+    head?.caseIndex !== undefined
+      ? `case ${head.caseIndex}${head.scorer ? ` · ${head.scorer}` : ''}`
+      : head?.scorer
+        ? head.scorer
         : undefined;
-  const attempts = Number.isFinite(record.transportAttempts) ? record.transportAttempts : undefined;
-  const totalMs = record.response?.timing?.totalMs;
+  const reported = end?.transportAttempts ?? head?.transportAttempts;
+  const attempts = Number.isFinite(reported) ? reported : undefined;
+  const totalMs = end?.response?.timing?.totalMs;
+  const stub = stubCause(operation.records);
+  // A response is missing either because the operation has no `end` line at
+  // all, or because its `end` carries neither response nor error.
+  const noResponse = !end || (end.response === undefined && end.error === undefined);
 
   return (
     <li className="border-b border-[hsl(var(--border))] last:border-b-0">
@@ -125,16 +158,13 @@ function RecordRow({ record, index }: { record: RequestRecord; index: number }) 
         className="w-full text-left px-3 py-2 hover:bg-[hsl(var(--muted))]/60 focus:outline-none focus-visible:ring-1 focus-visible:ring-[hsl(var(--ring))]"
       >
         <span className="flex items-baseline gap-2 flex-wrap text-[11px]">
-          <span className="font-mono text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-[hsl(var(--muted))] text-[hsl(var(--muted-foreground))]">
-            {record.phase}
-          </span>
-          <span className="font-mono text-[hsl(var(--foreground))]">{record.model}</span>
-          <span className="font-mono text-[hsl(var(--muted-foreground))]">{record.kind}</span>
+          <span className="font-mono text-[hsl(var(--foreground))]">{head?.model}</span>
+          <span className="font-mono text-[hsl(var(--muted-foreground))]">{head?.kind}</span>
           {correlation && (
             <span className="text-[hsl(var(--muted-foreground))]">{correlation}</span>
           )}
-          {record.turn !== undefined && (
-            <span className="text-[hsl(var(--muted-foreground))]">turn {record.turn}</span>
+          {head?.turn !== undefined && (
+            <span className="text-[hsl(var(--muted-foreground))]">turn {head.turn}</span>
           )}
           <span className="text-[hsl(var(--muted-foreground))]">
             {attempts !== undefined ? (
@@ -145,33 +175,43 @@ function RecordRow({ record, index }: { record: RequestRecord; index: number }) 
               </>
             )}
           </span>
-          {record.termination !== undefined && (
+          {end?.termination !== undefined && (
             <span
               className="text-amber-700 dark:text-amber-300"
               title="The operation ended deliberately without a response — not a call that never came back."
             >
-              terminated: {record.termination}
+              terminated: {end.termination}
             </span>
           )}
-          {record.error && (
-            <span className="text-red-700 dark:text-red-300">error: {record.error.message}</span>
+          {end?.error && (
+            <span className="text-red-700 dark:text-red-300">error: {end.error.message}</span>
           )}
-          {record.captured?.truncated && (
-            <span className="text-amber-700 dark:text-amber-300">
-              stub — record exceeded the size limit
+          {noResponse && (
+            <span
+              className="text-amber-700 dark:text-amber-300"
+              title={
+                end
+                  ? 'The operation was sealed without a response.'
+                  : 'The artifact holds no end record for this operation.'
+              }
+            >
+              no response recorded
             </span>
+          )}
+          {stub !== undefined && (
+            <span className="text-amber-700 dark:text-amber-300">stub — {stub}</span>
           )}
           <span className="ml-auto font-mono text-[10px] text-[hsl(var(--muted-foreground))]">
             {totalMs !== undefined ? formatDuration(totalMs) : null}
           </span>
         </span>
         <span className="block font-mono text-[10px] text-[hsl(var(--muted-foreground))] mt-0.5">
-          {record.operationId}
+          {operation.operationId}
         </span>
       </button>
       {open && (
         <div className="px-3 pb-3 space-y-2 text-[11px]">
-          <RecordDetail record={record} index={index} />
+          <OperationDetail operation={operation} index={index} />
         </div>
       )}
     </li>
@@ -191,17 +231,22 @@ function Pre({ label, value }: { label: string; value: unknown }) {
   );
 }
 
-function RecordDetail({ record, index }: { record: RequestRecord; index: number }) {
-  const request = record.request;
-  const response = record.response;
+function OperationDetail({ operation, index }: { operation: CapturedOperation; index: number }) {
+  const start = operation.start;
+  const end = operation.end;
+  const request = start?.request;
+  const response = end?.response;
+  const correction = operation.records.find((r) => r.correction)?.correction;
+  const omitted = omittedAcross(operation.records);
+
   return (
-    <div className="space-y-2" data-testid={`record-detail-${index}`}>
-      {record.correction && (
+    <div className="space-y-2" data-testid={`operation-detail-${index}`}>
+      {correction && (
         <Pre
-          label={`Correction (${record.correction.stage}${
-            record.correction.reason ? `: ${record.correction.reason}` : ''
+          label={`Correction (${correction.stage}${
+            correction.reason ? `: ${correction.reason}` : ''
           })`}
-          value={record.correction.feedbackMessage}
+          value={correction.feedbackMessage}
         />
       )}
       {request ? (
@@ -228,7 +273,13 @@ function RecordDetail({ record, index }: { record: RequestRecord; index: number 
         </>
       ) : (
         <Row label="Request">
-          <Unknown what="The request" />
+          {start ? (
+            <Unknown what="The request" />
+          ) : (
+            <span className="text-[hsl(var(--muted-foreground))]">
+              no start record — the artifact does not hold this operation’s request
+            </span>
+          )}
         </Row>
       )}
       {response ? (
@@ -244,18 +295,30 @@ function RecordDetail({ record, index }: { record: RequestRecord; index: number 
             )}
           </Row>
         </>
-      ) : record.error ? (
-        <Pre label="Error" value={record.error} />
+      ) : end?.error ? (
+        <Pre label="Error" value={end.error} />
       ) : (
         <Row label="Response">
-          <Unknown what="The response" />
+          <span className="text-[hsl(var(--muted-foreground))]">
+            no response recorded
+            {end?.termination !== undefined
+              ? ` — the operation was terminated: ${end.termination}`
+              : end
+                ? ' — the operation was sealed without one'
+                : ' — the artifact holds no end record for this operation'}
+          </span>
         </Row>
       )}
-      {record.captured?.omitted?.length > 0 && (
-        <Row label="Omitted">
-          <span className="text-[hsl(var(--muted-foreground))]">
-            {record.captured.omitted.join(', ')}
+      {operation.retries > 0 && (
+        <Row label="Transport retries">
+          <span className="font-mono text-[10px] text-[hsl(var(--muted-foreground))]">
+            {operation.retries}
           </span>
+        </Row>
+      )}
+      {omitted.length > 0 && (
+        <Row label="Omitted">
+          <span className="text-[hsl(var(--muted-foreground))]">{omitted.join(', ')}</span>
         </Row>
       )}
     </div>
@@ -346,7 +409,8 @@ export function RunDiagnosticsPanel({
   const gone = probe?.ok === false && probe.gone;
   const probeFailure = probe?.ok === false && !probe.gone ? probe.message : undefined;
   const parsed = showRecords ? recordsQuery.data : undefined;
-  const records = parsed?.records;
+  // One row per OPERATION, reassembled from its phase lines.
+  const operations = parsed ? groupOperations(parsed.records) : undefined;
   const viewerNote = parsed ? describeViewerNote(parsed) : null;
   const recordsError =
     showRecords && recordsQuery.error instanceof Error ? recordsQuery.error.message : null;
@@ -475,21 +539,21 @@ export function RunDiagnosticsPanel({
         )}
       </div>
 
-      {records !== undefined && (
+      {operations !== undefined && (
         <div className="border-t border-[hsl(var(--border))]">
           {viewerNote && (
             <p className="px-4 py-2 text-[11px] text-amber-700 dark:text-amber-300">{viewerNote}</p>
           )}
-          {records.length === 0 ? (
+          {operations.length === 0 ? (
             <p className="px-4 py-3 text-[11px] text-[hsl(var(--muted-foreground))]">
               The artifact holds no records.
             </p>
           ) : (
             <ul aria-label="Captured request records" className="divide-y-0">
-              {records.map((record, i) => (
-                <RecordRow
-                  key={`${record.operationId}-${record.phase}-${i}`}
-                  record={record}
+              {operations.map((operation, i) => (
+                <OperationRow
+                  key={`${operation.operationId}-${i}`}
+                  operation={operation}
                   index={i}
                 />
               ))}

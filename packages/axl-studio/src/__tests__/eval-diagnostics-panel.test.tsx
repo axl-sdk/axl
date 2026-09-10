@@ -21,7 +21,7 @@ import {
   CapturedRequestsBadge,
 } from '../client/panels/eval-runner/RunDiagnosticsPanel';
 import { EvalHistoryTable } from '../client/panels/eval-runner/EvalHistoryTable';
-import { MAX_INLINE_RECORDS, recordsFilename } from '../client/panels/eval-runner/diagnostics';
+import { MAX_INLINE_OPERATIONS, recordsFilename } from '../client/panels/eval-runner/diagnostics';
 import type { EvalHistoryEntry } from '../client/lib/types';
 import type {
   DiagnosticManifest,
@@ -59,29 +59,60 @@ function result(diagnostics?: DiagnosticManifest, id: string = RESULT_ID): EvalR
   };
 }
 
-function record(overrides: Partial<RequestRecord> = {}): RequestRecord {
+/**
+ * The record fixtures are codec-faithful on purpose.
+ *
+ * The artifact is one JSONL line per PHASE, and the phases carry disjoint
+ * halves of a call: `scoped-provider.ts` emits `start` with the request only,
+ * `attempt` with neither, and `end` with the response / error / termination
+ * only. A fixture that puts a request and a response on one line is a shape
+ * the writer cannot emit, and a viewer tested only against it never has to
+ * reassemble anything.
+ */
+function baseRecord(overrides: Partial<RequestRecord> = {}): RequestRecord {
   return {
     v: 1,
-    phase: 'end',
+    phase: 'start',
     operationId: 'op-1',
     kind: 'chat',
     caseIndex: 0,
     transportAttempts: 1,
     provider: 'openai',
     model: 'gpt-5-mini',
+    captured: { fidelity: 'runtime_request', redacted: false, truncated: false, omitted: [] },
+    ...overrides,
+  };
+}
+
+/** A `start` line: the request, and nothing about how the call ended. */
+function startRecord(overrides: Partial<RequestRecord> = {}): RequestRecord {
+  return baseRecord({
+    phase: 'start',
     request: {
       messages: [{ role: 'user', content: 'what is 2+2?' }],
       options: { model: 'gpt-5-mini', temperature: 0 },
       providerOptionKeys: ['organization'],
     },
+    ...overrides,
+  });
+}
+
+/** An `end` line: the response (or error / termination), and no request. */
+function endRecord(overrides: Partial<RequestRecord> = {}): RequestRecord {
+  return baseRecord({
+    phase: 'end',
     response: {
       content: '4',
       usage: { inputTokens: 8, outputTokens: 1 },
       timing: { totalMs: 120 },
     },
-    captured: { fidelity: 'runtime_request', redacted: false, truncated: false, omitted: [] },
     ...overrides,
-  };
+  });
+}
+
+/** The two lines one ordinary completed operation writes. */
+function operationLines(overrides: Partial<RequestRecord> = {}): RequestRecord[] {
+  return [startRecord(overrides), endRecord(overrides)];
 }
 
 // ── Fetch routing ────────────────────────────────────────────────
@@ -172,13 +203,19 @@ function renderPanel(node: ReactElement) {
 }
 
 let clicked: Array<{ download: string; href: string }> = [];
+/** Every blob handed to `URL.createObjectURL` — i.e. what the user would save. */
+let blobs: Blob[] = [];
 
 beforeEach(() => {
   calls = [];
   clicked = [];
+  blobs = [];
   vi.stubGlobal('URL', {
     ...URL,
-    createObjectURL: vi.fn(() => 'blob:mock'),
+    createObjectURL: vi.fn((blob: Blob) => {
+      blobs.push(blob);
+      return 'blob:mock';
+    }),
     revokeObjectURL: vi.fn(),
   });
   vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (
@@ -288,9 +325,9 @@ describe('RunDiagnosticsPanel', () => {
     expect(screen.getByRole('button', { name: 'Download records (.jsonl)' })).toBeDisabled();
   });
 
-  it('A16.24 downloads the records route once and names the file <eval>-<id>.requests.jsonl', async () => {
+  it('A16.24 downloads the records route once, names the file, and saves the artifact bytes', async () => {
     const user = userEvent.setup();
-    const body = ndjson([record()]);
+    const body = ndjson(operationLines());
     const fetchMock = stubFetch({ records: body });
 
     renderPanel(<RunDiagnosticsPanel result={result(manifest())} evalName="qa eval" />);
@@ -305,20 +342,23 @@ describe('RunDiagnosticsPanel', () => {
       String(u).endsWith('/diagnostics/records'),
     );
     expect(recordCalls).toHaveLength(1);
+    // The saved file is the artifact, not a name and an empty blob: assert the
+    // bytes handed to `createObjectURL` round-trip to the records on the wire.
+    expect(blobs).toHaveLength(1);
+    expect(blobs[0].type).toBe('application/x-ndjson');
+    await expect(blobs[0].text()).resolves.toBe(body);
   });
 
-  it('A16.25 shows a record with its correlation and termination, and expands into the request', async () => {
+  it('A16.25 renders one operation as one row carrying both its request and its response', async () => {
     const user = userEvent.setup();
     stubFetch({
       records: ndjson([
-        record({
-          phase: 'start',
-          operationId: 'op-hung',
+        startRecord({ operationId: 'op-answered', caseIndex: 4, scorer: 'llm-judge' }),
+        endRecord({
+          operationId: 'op-answered',
           caseIndex: 4,
           scorer: 'llm-judge',
-          termination: 'stream_stall_timeout',
           transportAttempts: 2,
-          response: undefined,
         }),
       ]),
     });
@@ -327,23 +367,64 @@ describe('RunDiagnosticsPanel', () => {
     await user.click(screen.getByRole('button', { name: 'Show captured records' }));
 
     const list = await screen.findByRole('list', { name: 'Captured request records' });
-    expect(within(list).getByText(/terminated: stream_stall_timeout/)).toBeInTheDocument();
+    // One turn is one row, not a request row and an orphan response row.
+    expect(within(list).getAllByRole('listitem')).toHaveLength(1);
     expect(within(list).getByText(/case 4 · llm-judge/)).toBeInTheDocument();
     expect(within(list).getByText(/attempt 2/)).toBeInTheDocument();
-    expect(within(list).getByText('op-hung')).toBeInTheDocument();
+    expect(within(list).getByText('op-answered')).toBeInTheDocument();
+    // A completed call is never described as one whose response is missing.
+    expect(within(list).queryByText(/no response recorded/)).not.toBeInTheDocument();
 
     await user.click(within(list).getByRole('button', { expanded: false }));
-    expect(await screen.findByTestId('record-detail-0')).toBeInTheDocument();
-    expect(screen.getByText(/what is 2\+2\?/)).toBeInTheDocument();
-    // A record with no response says so rather than implying an empty answer.
-    expect(screen.getByText('unknown')).toBeInTheDocument();
+    const detail = await screen.findByTestId('operation-detail-0');
+    expect(within(detail).getByText(/what is 2\+2\?/)).toBeInTheDocument();
+    expect(within(detail).getByText(/"inputTokens": 8|inputTokens/)).toBeInTheDocument();
+    // Neither half of the turn claims the other is unrecorded.
+    expect(within(detail).queryByText('unknown')).not.toBeInTheDocument();
   });
 
-  it('A16.26 caps the inline viewer and says so', async () => {
+  it('A16.25b reports a start with no end as no response recorded, and names a termination', async () => {
     const user = userEvent.setup();
-    const many = Array.from({ length: MAX_INLINE_RECORDS + 25 }, (_, i) =>
-      record({ operationId: `op-${i}`, caseIndex: i }),
-    );
+    stubFetch({
+      records: ndjson([
+        // A genuinely hung call: the artifact holds its request and nothing else.
+        startRecord({ operationId: 'op-hung', caseIndex: 1 }),
+        // A deliberately ended one: sealed by an `end` that carries a reason.
+        startRecord({ operationId: 'op-stalled', caseIndex: 2 }),
+        endRecord({
+          operationId: 'op-stalled',
+          caseIndex: 2,
+          response: undefined,
+          termination: 'stream_stall_timeout',
+        }),
+      ]),
+    });
+
+    renderPanel(<RunDiagnosticsPanel result={result(manifest())} evalName="qa-eval" />);
+    await user.click(screen.getByRole('button', { name: 'Show captured records' }));
+
+    const list = await screen.findByRole('list', { name: 'Captured request records' });
+    const rows = within(list).getAllByRole('listitem');
+    expect(rows).toHaveLength(2);
+    expect(within(rows[0]).getByText(/no response recorded/)).toBeInTheDocument();
+    expect(within(rows[0]).queryByText(/terminated:/)).not.toBeInTheDocument();
+    // The stalled one is NOT a call that never came back — the reason says so.
+    expect(within(rows[1]).getByText(/terminated: stream_stall_timeout/)).toBeInTheDocument();
+
+    await user.click(within(rows[0]).getByRole('button', { expanded: false }));
+    const detail = await screen.findByTestId('operation-detail-0');
+    expect(within(detail).getByText(/what is 2\+2\?/)).toBeInTheDocument();
+    expect(
+      within(detail).getByText(/no response recorded — the artifact holds no end record/),
+    ).toBeInTheDocument();
+  });
+
+  it('A16.26 caps the inline viewer at whole operations and says so', async () => {
+    const user = userEvent.setup();
+    // Two lines per operation: a cap counted in lines would show half of these.
+    const many = Array.from({ length: MAX_INLINE_OPERATIONS + 25 }, (_, i) =>
+      operationLines({ operationId: `op-${i}`, caseIndex: i }),
+    ).flat();
     stubFetch({ records: ndjson(many) });
 
     renderPanel(
@@ -355,12 +436,36 @@ describe('RunDiagnosticsPanel', () => {
     await user.click(screen.getByRole('button', { name: 'Show captured records' }));
 
     const list = await screen.findByRole('list', { name: 'Captured request records' });
-    expect(within(list).getAllByRole('listitem')).toHaveLength(MAX_INLINE_RECORDS);
+    expect(within(list).getAllByRole('listitem')).toHaveLength(MAX_INLINE_OPERATIONS);
+    // Every admitted operation is whole — none of them lost its `end` to the cap.
+    expect(within(list).queryByText(/no response recorded/)).not.toBeInTheDocument();
     expect(
       screen.getByText(
-        `Showing the first ${MAX_INLINE_RECORDS} records. Download the .jsonl for the rest.`,
+        `Showing the first ${MAX_INLINE_OPERATIONS} operations. Download the .jsonl for the rest.`,
       ),
     ).toBeInTheDocument();
+  });
+
+  it('A16.26b does not claim there is more when the artifact holds exactly the cap', async () => {
+    const user = userEvent.setup();
+    const exact = Array.from({ length: MAX_INLINE_OPERATIONS }, (_, i) =>
+      operationLines({ operationId: `op-${i}`, caseIndex: i }),
+    ).flat();
+    stubFetch({ records: ndjson(exact) });
+
+    renderPanel(
+      <RunDiagnosticsPanel
+        result={result(manifest({ records: exact.length }))}
+        evalName="qa-eval"
+      />,
+    );
+    await user.click(screen.getByRole('button', { name: 'Show captured records' }));
+
+    const list = await screen.findByRole('list', { name: 'Captured request records' });
+    expect(within(list).getAllByRole('listitem')).toHaveLength(MAX_INLINE_OPERATIONS);
+    // There is no rest. Saying there is tells the reader evidence is missing
+    // that is in fact on screen.
+    expect(screen.queryByText(/Download the .jsonl for the rest/)).not.toBeInTheDocument();
   });
 
   it('A16.27 shows a rescore copy provenance from the live manifest', async () => {
@@ -385,8 +490,8 @@ describe('RunDiagnosticsPanel', () => {
     stubFetch(
       {},
       {
-        [RESULT_ID]: { records: ndjson([record({ operationId: 'op-run-a' })]) },
-        [OTHER_ID]: { records: ndjson([record({ operationId: 'op-run-b' })]) },
+        [RESULT_ID]: { records: ndjson(operationLines({ operationId: 'op-run-a' })) },
+        [OTHER_ID]: { records: ndjson(operationLines({ operationId: 'op-run-b' })) },
       },
     );
 

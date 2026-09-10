@@ -622,6 +622,9 @@ describe('RunDiagnosticsPanel', () => {
     ).toBeInTheDocument();
     // The projection failure must not be reported as an over-size record.
     expect(within(rows[0]).queryByText(/exceeded the size limit/)).not.toBeInTheDocument();
+    // Nor as a call that never came back: a stub says why its content is
+    // missing, and that answer is not "the response was never recorded".
+    expect(within(rows[0]).queryByText(/no response recorded/)).not.toBeInTheDocument();
     expect(within(rows[1]).getByText(/stub — record exceeded the size limit/)).toBeInTheDocument();
   });
 

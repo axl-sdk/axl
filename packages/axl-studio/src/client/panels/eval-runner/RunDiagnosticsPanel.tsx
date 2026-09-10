@@ -199,7 +199,10 @@ function OperationRow({ operation, index }: { operation: CapturedOperation; inde
           {end?.error && (
             <span className="text-red-700 dark:text-red-300">error: {end.error.message}</span>
           )}
-          {noResponse && (
+          {/* A stub already says why this operation's content is missing;
+              adding "no response recorded" would read as a call that never
+              came back, which is the discrimination this row exists to keep. */}
+          {noResponse && stub === undefined && (
             <span
               className="text-amber-700 dark:text-amber-300"
               title={
@@ -259,6 +262,7 @@ function OperationDetail({ operation, index }: { operation: CapturedOperation; i
   const response = end?.response;
   const correction = operation.records.find((r) => r.correction)?.correction;
   const omitted = omittedAcross(operation.records);
+  const stub = stubCause(operation.records);
 
   return (
     <div className="space-y-2" data-testid={`operation-detail-${index}`}>
@@ -321,12 +325,18 @@ function OperationDetail({ operation, index }: { operation: CapturedOperation; i
       ) : (
         <Row label="Response">
           <span className="text-[hsl(var(--muted-foreground))]">
-            no response recorded
-            {end?.termination !== undefined
-              ? ` — the operation was terminated: ${end.termination}`
-              : end
-                ? ' — the operation was sealed without one'
-                : ' — the artifact holds no end record for this operation'}
+            {stub !== undefined ? (
+              <>the record was replaced by a stub — {stub}</>
+            ) : (
+              <>
+                no response recorded
+                {end?.termination !== undefined
+                  ? ` — the operation was terminated: ${end.termination}`
+                  : end
+                    ? ' — the operation was sealed without one'
+                    : ' — the artifact holds no end record for this operation'}
+              </>
+            )}
           </span>
         </Row>
       )}

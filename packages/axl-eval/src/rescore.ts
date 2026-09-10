@@ -338,13 +338,22 @@ export async function rescore(
     // run's budget is a fact about that run, and a rescore does not re-litigate
     // it. Its accounting stays with the original run too.
     if (original.error) {
+      const accounting = emptyAccounting();
       rescored[itemIndex] = {
         input: original.input,
         annotations: original.annotations,
         output: original.output,
         error: original.error,
         ...(original.outcome ? { outcome: original.outcome } : {}),
-        accounting: emptyAccounting(),
+        accounting,
+        // Same rule as a scored item: an item carrying `accounting` always
+        // carries both compat views, so no reader falls through to the legacy
+        // "no accounting → trust the caller's number" branch and reports the
+        // SOURCE run's spend as this rescore's. A passthrough did no work, so
+        // both are a measured $0; the source's spend lives in the run-level
+        // `accounting.source` provenance and nowhere else.
+        cost: accounting.breakdown.generation,
+        scorerCost: accounting.breakdown.judging,
         scores: {},
       };
       return;

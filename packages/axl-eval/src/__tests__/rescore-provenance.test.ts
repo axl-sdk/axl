@@ -85,4 +85,34 @@ describe('A13.1: rescore spend excludes the original generation', () => {
     expect(rescored.items[0].scorerCost).toBeCloseTo(0.2, 10);
     expect(rescored.items[0].scoreDetails!.judge.accounting!.knownCost).toBeCloseTo(0.2, 10);
   });
+
+  it('claims no spend for a passed-through error item, whatever the source spent', async () => {
+    const { runtime } = scriptedRuntime([{ cost: 0.75 }]);
+    registerJudge(runtime, 0.2);
+
+    const original = await runEval(
+      { workflow: 'w', dataset: ds(1), scorers: [] },
+      askExecute(),
+      runtime,
+    );
+
+    // A source case that failed. A rescore does not re-litigate it: no scoring
+    // runs and no provider is called, so the rescore spent nothing on it.
+    const withFailure = JSON.parse(JSON.stringify(original)) as typeof original;
+    withFailure.items[0].error = 'boom';
+    withFailure.items[0].outcome = 'failed';
+
+    const rescored = await rescore(withFailure, [paidJudge], runtime);
+    const item = rescored.items[0];
+
+    expect(item.error).toBe('boom');
+    expect(item.outcome).toBe('failed');
+    // Both compat views must be present and zero. Leaving them absent sends a
+    // reader down the legacy "no accounting → trust the caller's number" branch,
+    // where the source run's $0.75 generation would be read as spend this
+    // rescore incurred.
+    expect(item.accounting!.knownCost).toBe(0);
+    expect(item.cost).toBe(0);
+    expect(item.scorerCost).toBe(0);
+  });
 });

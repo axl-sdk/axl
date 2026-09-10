@@ -438,6 +438,197 @@ describe('a degraded rescore never names the source artifact (H2)', () => {
   });
 });
 
+// ── Re-check findings N1, N2, N4, N5 and the capture-or-throw contract ──
+
+describe('a run that throws does not pin its artifact forever (N1)', () => {
+  it('reclaims the staged artifact when the dataset fails to load', async () => {
+    const provider = new ScriptedProvider([{ cost: 0.01, content: 'answer' }], { name: 'mock' });
+    const leaseMs = 150;
+    const runtime = new AxlRuntime({
+      defaultProvider: 'mock',
+      trace: { enabled: false },
+      diagnostics: { artifacts: { root, sweepIntervalMs: 3_600_000, leaseMs } },
+    });
+    runtime.registerProvider('mock', provider);
+
+    const broken = {
+      name: 'broken',
+      getItems: () => Promise.reject(new Error('dataset file is missing')),
+    } as unknown as EvalConfig['dataset'];
+
+    await expect(
+      runEval(
+        { workflow: 'w', dataset: broken, scorers: [pass] } satisfies EvalConfig,
+        askExecute(),
+        runtime,
+        { captureRequests: true },
+      ),
+    ).rejects.toThrow('dataset file is missing');
+
+    // The lease renewal is a timer the runtime holds until finalize or
+    // rollback. A run that throws in between used to leave it renewing forever,
+    // so the sweeper could NEVER reclaim the directory — one permanent leak per
+    // failed run on a long-lived server.
+    await new Promise((resolve) => setTimeout(resolve, leaseMs * 3));
+    const { removed } = await runtime.reconcileDiagnosticArtifacts();
+    const left = await runtime.getDiagnosticArtifactStore()!.list();
+    expect(left).toEqual([]);
+    expect(removed.length + left.length).toBeGreaterThanOrEqual(0);
+    await runtime.shutdown();
+  });
+
+  it('reclaims the rescore artifact when scoring throws', async () => {
+    const leaseMs = 150;
+    const runtime = captureRuntime(4);
+    const original = await runEval(
+      { workflow: 'w', dataset: ds(1), scorers: [pass] } satisfies EvalConfig,
+      askExecute(),
+      runtime,
+      { captureRequests: true },
+    );
+
+    const rescoreRuntime = new AxlRuntime({
+      defaultProvider: 'mock',
+      trace: { enabled: false },
+      diagnostics: { artifacts: { root, sweepIntervalMs: 3_600_000, leaseMs } },
+    });
+    rescoreRuntime.registerProvider('mock', new ScriptedProvider([], { name: 'mock' }));
+    const before = (await rescoreRuntime.getDiagnosticArtifactStore()!.list()).length;
+
+    const exploding = scorer({
+      name: 'boom',
+      description: 'aborts the run',
+      score: () => {
+        throw Object.assign(new Error('scorer exploded'), { name: 'FatalScorerError' });
+      },
+    });
+    await rescore(original, [exploding], rescoreRuntime, { captureRequests: true }).catch(
+      () => undefined,
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, leaseMs * 3));
+    await rescoreRuntime.reconcileDiagnosticArtifacts();
+    // Whatever happened to the numbers, no artifact may be left pinned.
+    expect((await rescoreRuntime.getDiagnosticArtifactStore()!.list()).length).toBeLessThanOrEqual(
+      before,
+    );
+    await rescoreRuntime.shutdown();
+    await runtime.shutdown();
+  });
+});
+
+describe('a rescore never relabels the bytes it copied (N2)', () => {
+  it('does not claim `applied` over an unredacted copy', async () => {
+    const runtime = captureRuntime(4);
+    const original = await runEval(
+      { workflow: 'w', dataset: ds(1), scorers: [pass] } satisfies EvalConfig,
+      askExecute(),
+      runtime,
+      { captureRequests: true },
+    );
+    expect(original.diagnostics!.redaction).toBe('none');
+
+    // The operator turned compliance mode on afterwards — or the bundle was
+    // imported into a deployment that has it on — and now rescores.
+    const compliant = new AxlRuntime({
+      defaultProvider: 'mock',
+      trace: { enabled: false, redact: true },
+      diagnostics: { artifacts: { root, sweepIntervalMs: 3_600_000 } },
+    });
+    compliant.registerProvider('mock', new ScriptedProvider([], { name: 'mock' }));
+
+    const rescored = await rescore(original, [pass], compliant, { captureRequests: true });
+
+    // Half these bytes are the source's RAW prompts. Labelling the artifact
+    // `applied` tells a compliance reader — one exporting it through the CLI,
+    // which reads the store directly and never re-redacts — that raw prompts
+    // are scrubbed.
+    expect(rescored.diagnostics!.redaction).toBe('none');
+    await compliant.shutdown();
+    await runtime.shutdown();
+  });
+});
+
+describe('a copy leaves room for the judging it exists to record (N4)', () => {
+  it('still captures judge calls when the source fills the run bound', async () => {
+    const runtime = captureRuntime(12);
+    const judge = judgeOn(runtime);
+    const original = await runEval(
+      { workflow: 'w', dataset: ds(6), scorers: [pass] } satisfies EvalConfig,
+      askExecute(),
+      runtime,
+      { captureRequests: true },
+    );
+    const sourceIds = new Set(
+      (await readRecords(runtime, original.diagnostics!.artifactId)).map((r) => r.operationId),
+    );
+
+    // A run bound the source alone would consume entirely. Without reserved
+    // headroom the first judge record trips the limit and the user who turned
+    // capture on to debug a flaky judge gets zero judge records — and a reason
+    // blaming the run limit rather than the copy.
+    const rescored = await rescore(original, [judge], runtime, {
+      captureRequests: { maxRunBytes: original.diagnostics!.bytes },
+    });
+
+    const records = await readRecords(runtime, rescored.diagnostics!.artifactId);
+    const judged = records.filter((r) => !sourceIds.has(r.operationId));
+    expect(judged.length).toBeGreaterThan(0);
+    expect(judged.some((r) => r.phase === 'start' && r.scorer === 'judge')).toBe(true);
+    // And the reason names the half that was cut.
+    expect(rescored.diagnostics!.status).toBe('truncated');
+    expect(rescored.diagnostics!.reason).toContain('copied source records');
+    await runtime.shutdown();
+  });
+});
+
+describe('a rescore points only at evidence it holds (N5)', () => {
+  it('drops the carried item refs when the source artifact is gone', async () => {
+    const runtime = captureRuntime(4);
+    const original = await runEval(
+      { workflow: 'w', dataset: ds(1), scorers: [pass] } satisfies EvalConfig,
+      askExecute(),
+      runtime,
+      { captureRequests: true },
+    );
+    expect(original.items[0].diagnostics?.operations.length).toBeGreaterThan(0);
+    await runtime.getDiagnosticArtifactStore()!.delete(original.diagnostics!.artifactId);
+
+    const rescored = await rescore(original, [pass], runtime, { captureRequests: true });
+
+    // The result itself says `artifactId: ''`. Item-level refs into the artifact
+    // that just vanished are pointers Studio renders and nobody can follow.
+    expect(rescored.diagnostics!.artifactId).toBe('');
+    expect(rescored.items[0].diagnostics).toBeUndefined();
+    await runtime.shutdown();
+  });
+});
+
+describe('capture asked for is capture delivered, or an error', () => {
+  it('refuses to rescore with capture on a runtime that cannot host it', async () => {
+    const bare = new AxlRuntime({ defaultProvider: 'mock', trace: { enabled: false } });
+    bare.registerProvider('mock', new ScriptedProvider([], { name: 'mock' }));
+    const result = {
+      id: 'r',
+      dataset: 'd',
+      metadata: {},
+      timestamp: new Date().toISOString(),
+      totalCost: 0,
+      duration: 0,
+      items: [{ input: 'in', output: 'out', scores: {} }],
+      summary: { count: 1, failures: 0, scorers: {} },
+    } as unknown as Parameters<typeof rescore>[0];
+
+    // Silently returning numbers with no evidence is the failure: the caller
+    // asked for the requests. `runEval` has always thrown here; a rescore that
+    // degraded instead left the asymmetry to be discovered in production.
+    await expect(rescore(result, [pass], bare, { captureRequests: true })).rejects.toThrow(
+      /DIAGNOSTICS_UNAVAILABLE|diagnostics/i,
+    );
+    await bare.shutdown();
+  });
+});
+
 // ── Codec + sidecar validation ───────────────────────────────────────
 
 describe('the JSONL codec and its import guard', () => {

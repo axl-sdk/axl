@@ -199,6 +199,30 @@ async function finishCapture(
 }
 
 /**
+ * Discard a staged artifact whose run is about to throw.
+ *
+ * The lease renewal is a timer the RUNTIME holds, cleared only by finalize,
+ * rollback, delete or shutdown. A run that throws between staging and
+ * finalizing therefore leaves that timer renewing the lease forever, and an
+ * artifact whose lease never expires can never be reclaimed by the sweeper —
+ * a permanent directory per failed run, with no self-healing path. Rolling back
+ * is what closes it: the bytes go, and so does the timer.
+ *
+ * Rollback rather than `finalize('interrupted')` because nothing will ever be
+ * able to read these bytes: the run threw, so no history row will name them,
+ * and only a committed artifact is readable.
+ */
+async function abandonCapture(
+  runtime: AxlRuntime,
+  capture: StagedCapture | undefined,
+): Promise<void> {
+  if (!capture) return;
+  // Close first so nothing is still writing into an artifact being removed.
+  await capture.channel.close().catch(() => undefined);
+  await runtime.rollbackDiagnosticArtifact(capture.artifactId).catch(() => undefined);
+}
+
+/**
  * Attach operation references to the items and judges that produced them.
  *
  * References only. Putting the records themselves on the result is exactly the
@@ -241,7 +265,12 @@ export function attachOperationRefs(
   }
   for (const [caseIndex, operations] of byItem) {
     const item = items[caseIndex];
-    if (item) item.diagnostics = { operations };
+    if (!item) continue;
+    // Merge, never replace: a rescored item already carries the ORIGINAL run's
+    // generation refs, and overwriting them would silently erase the evidence
+    // this rescore deliberately copied forward the moment any provider call is
+    // made inside an item scope but outside a per-scorer one.
+    item.diagnostics = { operations: [...(item.diagnostics?.operations ?? []), ...operations] };
   }
   for (const [caseIndex, forItem] of byScorer) {
     for (const [scorer, operations] of forItem) {
@@ -278,7 +307,16 @@ export async function runEval(
   // will save it under.
   const capture = await stageCapture(runtime, id, options?.captureRequests);
 
-  const items = await config.dataset.getItems();
+  let items: Awaited<ReturnType<EvalConfig['dataset']['getItems']>>;
+  try {
+    items = await config.dataset.getItems();
+  } catch (error) {
+    // A dataset that reads a missing file, fails a schema parse, or fetches over
+    // the network throws here routinely — and the artifact was staged one line
+    // ago.
+    await abandonCapture(runtime, capture);
+    throw error;
+  }
   // Snapshot dataset-load diagnostics (e.g. annotation keys the schema dropped)
   // so we can surface them on EvalResult.metadata for any consumer — mirrors the
   // console.warn the dataset already emits. Read synchronously after getItems()
@@ -515,14 +553,22 @@ export async function runEval(
     // inherits it rather than opening a competing budget of its own.
     { admission, ...(capture ? { capture: capture.channel } : {}) },
   );
-  if (runOutcome.status === 'rejected') throw runOutcome.error;
+  if (runOutcome.status === 'rejected') {
+    await abandonCapture(runtime, capture);
+    throw runOutcome.error;
+  }
 
   // Capture is closed AFTER the tracked function has already settled, so a slow
   // or hung sink can never have delayed a provider call — and the channel's own
   // bounds mean `close()` cannot wait indefinitely either.
   let diagnostics: EvalResult['diagnostics'];
   if (capture) {
-    attachOperationRefs(evalItems, capture.channel);
+    try {
+      attachOperationRefs(evalItems, capture.channel);
+    } catch (error) {
+      await abandonCapture(runtime, capture);
+      throw error;
+    }
     const manifest = await finishCapture(runtime, capture);
     diagnostics = manifest
       ? toDiagnosticManifest(manifest)

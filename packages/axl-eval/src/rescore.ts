@@ -62,12 +62,43 @@ export type RescoreOptions = {
 type RescoreCapture = {
   artifactId: string;
   channel: RequestCaptureChannel;
+  /** Whether the source run's records were actually carried into this artifact. */
+  copied: boolean;
   /** Set when the copied source records did not all fit. */
   copyTruncated?: string;
+  /**
+   * What the SOURCE manifest said about the bytes copied in, when there was a
+   * copy. Never the current runtime's policy — see {@link finishCapture}.
+   */
+  carriedRedaction?: 'applied' | 'none';
 };
+
+/**
+ * Share of the run byte bound the copied half may consume.
+ *
+ * The copy and the judging land in ONE artifact under ONE `maxRunBytes`, so an
+ * unbounded copy starves the half a rescore actually produces: a source at the
+ * bound would leave the first judge record to trip the limit, and the user who
+ * turned capture on specifically to debug a flaky judge would get zero judge
+ * records and a reason blaming the run limit. Three quarters is a margin, not a
+ * measurement — large enough that the provenance is rarely cut, small enough
+ * that judging always has room.
+ */
+const COPY_SHARE_OF_RUN_BOUND = 0.75;
 
 function describeFailure(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Is this the runtime saying it cannot host capture at all?
+ *
+ * Duck-typed on the code, not on `instanceof`: `@axlsdk/axl` legitimately loads
+ * twice in one process, and an error thrown by copy A is not an instance of
+ * copy B's `AxlError`.
+ */
+function isDiagnosticsUnavailable(error: unknown): boolean {
+  return (error as { code?: unknown } | undefined)?.code === 'DIAGNOSTICS_UNAVAILABLE';
 }
 
 /**
@@ -84,10 +115,15 @@ function describeFailure(error: unknown): string {
  * so a reader can still tell which run made each call. The manifest's
  * `copiedFrom` carries the other half of the link.
  *
- * Every failure degrades instead of throwing — a rescore's numbers must stay
- * readable when its diagnostics are not — and every degraded manifest publishes
- * `artifactId: ''`, NEVER the source's. Naming the source would let this
- * result's lifecycle (commit, expiry, delete) reach into another run's artifact.
+ * A runtime that cannot host capture at all is the ONE failure that throws,
+ * and it throws here — before a single judge call — exactly as `runEval` does.
+ * Asking for evidence and silently receiving none is worse than being told, and
+ * the caller can still rescore without `captureRequests`.
+ *
+ * Every other failure degrades — a rescore's numbers must stay readable when its
+ * diagnostics are not — and every degraded manifest publishes `artifactId: ''`,
+ * NEVER the source's. Naming the source would let this result's lifecycle
+ * (commit, expiry, delete) reach into another run's artifact.
  */
 async function beginCapture(
   source: EvalResult,
@@ -102,7 +138,7 @@ async function beginCapture(
     artifactId: string,
     sink: RequestCaptureSink,
     carriedBytes: number,
-  ): RescoreCapture => ({
+  ): Omit<RescoreCapture, 'copied'> => ({
     artifactId,
     channel: new RequestCaptureChannel({
       sink,
@@ -120,9 +156,11 @@ async function beginCapture(
       // Nothing to carry forward, but the judging is still worth recording —
       // it is the only work a rescore actually performs.
       const staged = await runtime.stageDiagnosticArtifact({ kind: 'eval', id: ownerId });
-      return { capture: open(staged.artifactId, staged.sink, 0) };
+      return { capture: { ...open(staged.artifactId, staged.sink, 0), copied: false } };
     }
-    const maxBytes = limits.maxRunBytes ?? DEFAULT_COPY_MAX_BYTES;
+    // Headroom for the judging half — see COPY_SHARE_OF_RUN_BOUND.
+    const runBound = limits.maxRunBytes ?? DEFAULT_COPY_MAX_BYTES;
+    const maxBytes = Math.max(1, Math.floor(runBound * COPY_SHARE_OF_RUN_BOUND));
     const copied = await runtime.copyDiagnosticArtifact(
       sourceId,
       { kind: 'eval', id: ownerId },
@@ -136,12 +174,19 @@ async function beginCapture(
         ),
       };
     }
-    const capture = open(copied.artifactId, copied.sink, copied.bytes);
+    const capture: RescoreCapture = {
+      ...open(copied.artifactId, copied.sink, copied.bytes),
+      copied: true,
+      carriedRedaction: copied.redaction,
+    };
     if (copied.truncated) {
-      capture.copyTruncated = `copy stopped at the ${maxBytes} byte limit`;
+      capture.copyTruncated =
+        `the copied source records stopped at ${maxBytes} bytes, ` +
+        `the share of the ${runBound} byte run limit reserved for them`;
     }
     return { capture };
   } catch (error) {
+    if (isDiagnosticsUnavailable(error)) throw error;
     return {
       degraded: unavailableManifest(
         '',
@@ -149,6 +194,22 @@ async function beginCapture(
       ),
     };
   }
+}
+
+/**
+ * Discard a staged artifact whose rescore is about to throw.
+ *
+ * Rollback stops the runtime's lease-renewal timer as well as removing the
+ * bytes. Without it a rescore that throws mid-scoring pins its artifact
+ * permanently: the sweeper only reclaims a lease that expired.
+ */
+async function abandonCapture(
+  runtime: AxlRuntime,
+  capture: RescoreCapture | undefined,
+): Promise<void> {
+  if (!capture) return;
+  await capture.channel.close().catch(() => undefined);
+  await runtime.rollbackDiagnosticArtifact(capture.artifactId).catch(() => undefined);
 }
 
 /**
@@ -163,14 +224,28 @@ async function finishCapture(
   capture: RescoreCapture,
 ): Promise<EvalResult['diagnostics']> {
   const status = await capture.channel.close();
-  // A complete channel over a partial copy is still a partial artifact.
-  const truncatedByCopy = capture.copyTruncated !== undefined && status.status === 'complete';
+  // A complete channel over a partial copy is still a partial artifact — and a
+  // truncated one over a partial copy was cut TWICE. Both reasons are kept:
+  // "the copy filled it" and "the judging filled it" are different findings and
+  // a reader given only the second cannot tell which half is missing.
+  const reason = [capture.copyTruncated, status.reason].filter(Boolean).join('; ') || undefined;
+  const truncated = capture.copyTruncated !== undefined || status.status === 'truncated';
+  // Redaction describes the BYTES, and this artifact may hold two kinds: the
+  // channel's own records, scrubbed or not by this runtime's policy, and the
+  // copied ones, scrubbed or not by whatever policy was in force when the
+  // source was written. `applied` may only be claimed when BOTH halves are
+  // scrubbed; anything else and a compliance reader exporting this artifact
+  // gets raw prompts labelled as clean.
+  const redaction =
+    status.redaction === 'applied' && (capture.carriedRedaction ?? 'applied') === 'applied'
+      ? 'applied'
+      : 'none';
   try {
     const manifest = await runtime.finalizeDiagnosticArtifact(
       capture.artifactId,
-      truncatedByCopy ? 'truncated' : status.status,
-      truncatedByCopy ? capture.copyTruncated : status.reason,
-      status.redaction,
+      truncated ? 'truncated' : status.status,
+      reason,
+      redaction,
     );
     return toDiagnosticManifest(manifest);
   } catch {
@@ -227,15 +302,18 @@ export async function rescore(
   };
 
   const rescored: EvalItem[] = new Array(result.items.length);
-  const carryDiagnostics = resolveCaptureLimits(options?.captureRequests) !== undefined;
 
   // Opened BEFORE any scoring: the judge calls a rescore makes are the work it
   // actually performs, and capturing them afterwards would capture nothing.
-  // Unlike `runEval`, a rescore whose runtime cannot host capture DEGRADES
-  // rather than throwing — that has been the behaviour since this option
-  // existed, and a rescore's value is the numbers it produces from outputs that
-  // already exist.
+  // A runtime that cannot host capture at all throws from here, before a single
+  // judge call — the same contract as `runEval`, because asking for evidence
+  // and silently receiving none is worse than being told.
   const { capture, degraded } = await beginCapture(result, rescoredId, runtime, options);
+  // Whether the source's evidence is actually IN this rescore's artifact — not
+  // whether the caller asked for it. An item ref into an artifact that was
+  // swept, or into one holding only this rescore's judge calls, is a pointer a
+  // reader cannot follow: Studio renders operations that cannot be fetched.
+  const carryDiagnostics = capture?.copied === true;
 
   async function rescoreItem(original: EvalItem, itemIndex: number): Promise<void> {
     // Short-circuit if the rescore has been cancelled — matches runEval's
@@ -285,8 +363,9 @@ export async function rescore(
       // Carried forward VERBATIM, original operation ids included. The rescore
       // did not re-run the workflow, so these still describe the calls that
       // produced this output; reminting the ids would break the only link back
-      // to the run that made them. Only carried when the artifact behind them is
-      // being copied — a dangling reference is worse than none.
+      // to the run that made them. Only carried when the source records were
+      // actually copied into this rescore's artifact — a dangling reference is
+      // worse than none.
       ...(carryDiagnostics && original.diagnostics ? { diagnostics: original.diagnostics } : {}),
       scores: {},
       scoreDetails: {},
@@ -339,7 +418,13 @@ export async function rescore(
     // it rather than opening a competing budget of its own.
     { purpose: 'judging', admission, ...(capture ? { capture: capture.channel } : {}) },
   );
-  if (runOutcome.status === 'rejected') throw runOutcome.error;
+  if (runOutcome.status === 'rejected') {
+    // The lease renewal is a timer the runtime holds until finalize or
+    // rollback. Throwing without rolling back leaves it renewing forever, and
+    // an artifact whose lease never expires can never be reclaimed.
+    await abandonCapture(runtime, capture);
+    throw runOutcome.error;
+  }
 
   // `source.generation` means the GENERATION spend this scoring rests on, so a
   // rescore of a rescore must reach past its immediate source to the original

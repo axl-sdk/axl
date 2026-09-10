@@ -283,25 +283,38 @@ describe.skipIf(!REDIS_URL)('RedisStore integration (real Redis)', () => {
 
         // The absolute expiry may only move EARLIER or stay put. `SET ... EX`
         // pushes it forward by the full window; `SET ... XX KEEPTTL` cannot
-        // move it at all.
+        // move it at all. The tolerance absorbs the client/RTT jitter between
+        // two derived reads — a blind `EX` moves it by 120 s, three orders of
+        // magnitude past the slack.
         const after = (await expiring.getEvalRetention(id)).expiresAt!;
-        expect(after).toBeLessThanOrEqual(before);
+        expect(after).toBeLessThanOrEqual(before + 250);
 
         // And a row that is gone stays gone. A SECOND artifact, so this sweep
         // actually reaches the write-back rather than finding nothing to
         // reclaim — the row is deleted while that manifest is still live.
+        //
+        // It has to be saved through the RUNTIME: that is what commits the
+        // artifact (a store-level save leaves it `staged`, and the staged
+        // branch reclaims only on lease expiry, which is an hour away here) and
+        // what repoints the cached row at the new artifact id. Saved through
+        // the store, the sweep reclaims nothing and the write-back is never
+        // reached, so the final assertion holds trivially.
         const second = await stage(id);
-        await expiring.saveEvalResult({
+        await runtime.saveEvalResult({
           id,
           eval: 'suite',
           timestamp: Date.now(),
           data: { id, diagnostics: { artifactId: second, status: 'complete' } },
         });
-        await runtime.getEvalHistory();
+        // Deleted behind the runtime's back: no in-process tombstone, so the
+        // store's own `XX` condition is the only thing that can refuse the
+        // correction.
         await expiring.deleteEvalResult(id);
         await runtime.getDiagnosticArtifactStore()!.refreshExpiry(second, Date.now() - 1);
-        await runtime.reconcileDiagnosticArtifacts();
 
+        const { removed } = await runtime.reconcileDiagnosticArtifacts();
+        // Proof the write-back was actually reached this time.
+        expect(removed).toContain(second);
         expect(await expiring.getEvalRetention(id)).toEqual({ exists: false });
         await runtime.shutdown();
       } finally {

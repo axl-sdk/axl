@@ -286,10 +286,17 @@ the store:
 
 | Store | How | Note |
 |---|---|---|
-| `RedisStore` | `SET key value XX KEEPTTL` | **Requires Redis ≥ 6.0** for `KEEPTTL`. Nothing else in `RedisStore` does. On an older server corrections fail loudly rather than silently resetting a window |
+| `RedisStore` | `SET key value XX KEEPTTL` | **Requires Redis ≥ 6.0** for `KEEPTTL`. Nothing else in `RedisStore` does |
 | `SQLiteStore` | `UPDATE … WHERE id = ?` | no expiry, so a resurrection here would be permanent |
 | `MemoryStore` | presence check, then set | as above |
 | a custom store | omit it | corrections are then **not persisted at all**; the in-process cache is still corrected |
+
+On a Redis older than 6.0 the server rejects `KEEPTTL`, and the store raises an
+`AxlError` with code `REDIS_VERSION_UNSUPPORTED` naming the floor. The runtime
+warns once per process and then keeps correcting its own cache only: this
+process stops serving a promise of bytes that are gone, and the stored row is
+left exactly as it is — never rewritten with a fresh retention window. Upgrade
+the server to persist corrections.
 
 A same-process delete also beats a correction already in flight: the runtime
 records the id before it asks the store, and a correction for a recorded id is

@@ -6,6 +6,7 @@ import type {
   HumanDecision,
 } from '../types.js';
 import type { StateStore, PendingDecision, ExecutionState, EvalHistoryEntry } from './types.js';
+import { AxlError } from '../errors.js';
 import { normalizePersistedSessionHistory } from '../input.js';
 import { getExecutionEventSchemaVersion, normalizeStoredExecution } from '../event-schema.js';
 
@@ -965,19 +966,37 @@ export class RedisStore implements StateStore {
    * remaining lifetime untouched, so the correction carries no retention
    * decision of its own.
    *
-   * **Requires Redis 6.0 or newer** (`KEEPTTL`). On an older server the option
-   * is rejected and corrections fail loudly rather than silently resetting a
-   * retention window. Nothing else in `RedisStore` needs 6.0.
+   * **Requires Redis 6.0 or newer** (`KEEPTTL`). An older server rejects the
+   * option with a syntax error, which is translated into a
+   * `REDIS_VERSION_UNSUPPORTED` {@link AxlError} naming the floor — a
+   * misconfiguration, not a failed write, and the one thing in `RedisStore`
+   * that needs 6.0. Silently resetting the retention window instead is the one
+   * outcome this write exists to rule out.
    *
    * The index members are deliberately not re-added: the row already exists, so
    * they are already there, and writing them for a key that vanished is exactly
    * the resurrection this avoids.
    */
   async updateEvalResult(entry: EvalHistoryEntry): Promise<boolean> {
-    const result = await this.client.set(this.evalHistoryKey(entry.id), JSON.stringify(entry), {
-      XX: true,
-      KEEPTTL: true,
-    });
+    let result: string | null;
+    try {
+      result = await this.client.set(this.evalHistoryKey(entry.id), JSON.stringify(entry), {
+        XX: true,
+        KEEPTTL: true,
+      });
+    } catch (err) {
+      // Redis reports an unknown SET option as a plain syntax error, so the
+      // version floor is what a syntax error on THIS command means. Raising a
+      // distinct code keeps the runtime from reading a misconfigured server as
+      // an ordinary failed write and retrying it forever.
+      if (!/syntax error/i.test((err as Error | undefined)?.message ?? '')) throw err;
+      throw new AxlError(
+        'REDIS_VERSION_UNSUPPORTED',
+        'RedisStore.updateEvalResult requires Redis 6.0 or newer: this server rejected ' +
+          '`SET key value XX KEEPTTL`. Eval history corrections cannot be persisted ' +
+          'retention-neutrally against it.',
+      );
+    }
     return result !== null;
   }
 

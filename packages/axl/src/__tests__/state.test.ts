@@ -2515,6 +2515,30 @@ describe('RedisStore', () => {
         }
       });
 
+      it('updateEvalResult names the Redis version floor when KEEPTTL is rejected', async () => {
+        // Redis < 6.0 has no KEEPTTL and answers an unknown SET option with a
+        // plain syntax error. Left as-is it reaches the runtime as an ordinary
+        // failed write, is swallowed by a best-effort catch, and no correction
+        // is ever persisted without anyone being told why.
+        const { store, mockClient } = createRedisStoreWithMockClient(undefined, {
+          evalHistory: 120,
+        });
+        const set = mockClient.set as unknown as {
+          mockRejectedValueOnce: (v: unknown) => void;
+        };
+
+        set.mockRejectedValueOnce(new Error('ERR syntax error'));
+        await expect(
+          store.updateEvalResult({ id: 'ev-old', eval: 't', timestamp: 0, data: {} }),
+        ).rejects.toMatchObject({ code: 'REDIS_VERSION_UNSUPPORTED' });
+
+        // Everything else is still an ordinary write failure.
+        set.mockRejectedValueOnce(new Error('READONLY replica'));
+        await expect(
+          store.updateEvalResult({ id: 'ev-old', eval: 't', timestamp: 0, data: {} }),
+        ).rejects.toThrow('READONLY replica');
+      });
+
       it('re-saving a deliberately untimed eval row leaves it untimed', async () => {
         const { store, ttls, mockClient } = createRedisStoreWithMockClient(undefined, {
           evalHistory: 120,

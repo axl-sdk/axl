@@ -557,8 +557,10 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
       );
     }
 
-    const history = await runtime.getEvalHistory();
-    const historyEntry = history.find((h) => h.id === body.resultId);
+    // By id, not a scan of the cached list: a rescore copies this row's items
+    // into a brand-new result with a brand-new retention window, so the source
+    // has to still exist in the store. `getEvalResult` confirms that.
+    const historyEntry = await runtime.getEvalResult(body.resultId);
     if (!historyEntry) {
       return c.json(
         { ok: false, error: { code: 'NOT_FOUND', message: `Result "${body.resultId}" not found` } },
@@ -651,8 +653,17 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
       );
     }
 
-    const history = await runtime.getEvalHistory();
-    const byId = new Map(history.map((h) => [h.id, h.data as EvalResult]));
+    // Resolve every requested id through the by-id read, which confirms the row
+    // against the store's retention view. The cached history list outlives a
+    // Redis TTL or a delete made elsewhere, and compare serves whole results
+    // back in its response.
+    const idsOf = (v: string | string[]): string[] => (Array.isArray(v) ? v : [v]);
+    const requested = new Set([...idsOf(body.baselineId), ...idsOf(body.candidateId)]);
+    const byId = new Map<string, EvalResult>();
+    for (const id of requested) {
+      const entry = await runtime.getEvalResult(id);
+      if (entry) byId.set(id, entry.data as EvalResult);
+    }
 
     const missing: string[] = [];
     const resolveOne = (id: string): EvalResult | undefined => {

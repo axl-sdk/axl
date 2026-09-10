@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { z } from 'zod';
 import { MockProvider } from '@axlsdk/testing';
 import { dataset, scorer } from '@axlsdk/eval';
+import { MemoryStore } from '@axlsdk/axl';
 import { createTestServer } from '../helpers/setup.js';
 import { readJson } from '../helpers/json.js';
 
@@ -224,6 +225,34 @@ describe('Studio API: Evals', () => {
     expect(body.ok).toBe(false);
     expect(body.error.code).toBe('NOT_FOUND');
     expect(body.error.message).toContain('nonexistent-result-id');
+  });
+
+  it('POST /api/evals/:name/rescore returns 404 once the store has dropped the row', async () => {
+    // A rescore copies its SOURCE row's items into a brand-new result with a
+    // brand-new retention window. Resolving that source out of the runtime's
+    // history cache — which outlives a Redis TTL or a delete made elsewhere —
+    // would republish an expired run's inputs and outputs indefinitely, one
+    // rescore at a time.
+    const provider = MockProvider.sequence([{ content: 'eval output' }]);
+    const stateStore = new MemoryStore();
+    const { app } = createTestServer(provider, { stateStore });
+
+    const resultId = (
+      await readJson(await app.request('/api/evals/test-eval/run', { method: 'POST' }))
+    ).data.id;
+
+    // Gone from the store, still in this process's cache.
+    await stateStore.deleteEvalResult(resultId);
+
+    const res = await app.request('/api/evals/test-eval/rescore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ resultId }),
+    });
+    expect(res.status).toBe(404);
+    const body = await readJson(res);
+    expect(body.error.code).toBe('NOT_FOUND');
+    expect(body.error.message).toContain(resultId);
   });
 
   // --- Multi-run endpoint ---
@@ -564,6 +593,33 @@ describe('Studio API: Evals', () => {
     expect(body.ok).toBe(false);
     expect(body.error.code).toBe('NOT_FOUND');
     expect(body.error.message).toContain('does-not-exist');
+  });
+
+  it('POST /api/evals/compare returns 404 once the store has dropped a row', async () => {
+    // Compare serves whole results back in its response, so it must resolve
+    // each id against the store's retention view rather than the cache.
+    const provider = MockProvider.sequence([{ content: 'a' }, { content: 'b' }]);
+    const stateStore = new MemoryStore();
+    const { app } = createTestServer(provider, { stateStore });
+
+    const baselineId = (
+      await readJson(await app.request('/api/evals/test-eval/run', { method: 'POST' }))
+    ).data.id;
+    const candidateId = (
+      await readJson(await app.request('/api/evals/test-eval/run', { method: 'POST' }))
+    ).data.id;
+
+    await stateStore.deleteEvalResult(baselineId);
+
+    const res = await app.request('/api/evals/compare', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ baselineId, candidateId }),
+    });
+    expect(res.status).toBe(404);
+    const body = await readJson(res);
+    expect(body.error.code).toBe('NOT_FOUND');
+    expect(body.error.message).toContain(baselineId);
   });
 
   it('POST /api/evals/compare returns 400 when IDs are missing', async () => {

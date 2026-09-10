@@ -161,10 +161,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`SET ... XX KEEPTTL` on Redis, which needs Redis >= 6.0; `UPDATE ... WHERE
   id` on SQLite) — because checking first and then saving leaves a window a
   delete slips through, and a store that cannot promise it simply gets no
-  correction written. A delete started in-process beats a correction already in
-  flight, `runtime.getEvalResult(id)` confirms the row still exists before
-  serving it so a rescore can never republish an expired run's items under a
-  fresh id, and a plain re-save keeps the time the row had left rather than
+  correction written. A Redis older than 6.0 rejects `KEEPTTL`, which now
+  surfaces as a `REDIS_VERSION_UNSUPPORTED` error named once in a warning
+  rather than vanishing into a best-effort catch; corrections then apply to
+  that process's cache only, and the stored row is left untouched. A delete
+  started in-process beats a correction already in flight,
+  `runtime.getEvalResult(id)` confirms the row still exists before serving it —
+  and Studio's rescore and compare routes resolve every id through it, so a
+  rescore can never republish an expired run's items under a fresh id — and a
+  plain re-save keeps the time the row had left rather than
   starting its `ttls.evalHistory` window over — including leaving a
   deliberately untimed row untimed. The writer's lease is renewed on
   a timer for as long as it holds the artifact — not by writing — so a run that

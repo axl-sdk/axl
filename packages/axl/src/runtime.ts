@@ -115,6 +115,14 @@ const DEFAULT_ARTIFACT_SWEEP_MS = 60_000;
 const DEFAULT_ARTIFACT_LEASE_MS = 300_000;
 /** How long one artifact's lease is renewed before the runtime gives up on it. */
 const DEFAULT_ARTIFACT_MAX_HOLD_MS = 24 * 60 * 60 * 1000;
+/** How many dropped eval history ids the runtime remembers. See `deletedEvalIds`. */
+const DELETED_EVAL_MEMORY = 1024;
+/**
+ * One warning per process for a store that cannot do a retention-neutral
+ * update. It is a static misconfiguration — a Redis older than 6.0 — so every
+ * later correction would repeat the same line, and corrections fire on a timer.
+ */
+let warnedUpdateUnsupported = false;
 
 /** Sentinel workflow name on synthesized ExecutionInfos when the streaming
  *  buffer doesn't include a `workflow_start` event. The `__axl/` prefix
@@ -850,6 +858,13 @@ export class AxlRuntime extends EventEmitter {
    * landed yet. And it keeps the lazy first load from merging a row back in
    * from a snapshot taken before the eviction. Ids are minted per result and
    * never reused, so an entry can only ever be right.
+   *
+   * Bounded like the artifact store's deleted-id window, and for the same
+   * reason: a long-lived server with TTL churn would otherwise grow it for the
+   * life of the process. Both jobs are windows measured in the length of one
+   * in-flight write or one lazy first load, so the oldest ids are the ones with
+   * nothing left to protect. Past the window the row is simply re-read from the
+   * store, which by then is the authority anyway.
    */
   private readonly deletedEvalIds = new Set<string>();
   /** Lease-renewal timers for artifacts currently being written, by id. */
@@ -1256,7 +1271,22 @@ export class AxlRuntime extends EventEmitter {
     // is corrected either way, so this process stops publishing a promise of
     // bytes that are gone.
     if (!this.stateStore.updateEvalResult) return false;
-    const updated = await this.stateStore.updateEvalResult(entry);
+    let updated: boolean;
+    try {
+      updated = await this.stateStore.updateEvalResult(entry);
+    } catch (err) {
+      // A store that cannot express the write at all is a misconfiguration, and
+      // every caller here is best-effort: the raw rejection would vanish into
+      // their catches and the operator would never learn that no correction has
+      // ever been persisted. Only this one class is absorbed; anything else
+      // keeps the existing behaviour and propagates to the caller.
+      if (!(err instanceof AxlError) || err.code !== 'REDIS_VERSION_UNSUPPORTED') throw err;
+      if (!warnedUpdateUnsupported) {
+        warnedUpdateUnsupported = true;
+        console.warn(`[axl] ${err.message} Corrections apply to this process's cache only.`);
+      }
+      return false;
+    }
     if (!updated) this.forgetEvalRow(entry.id);
     return updated;
   }
@@ -1271,7 +1301,15 @@ export class AxlRuntime extends EventEmitter {
    */
   private forgetEvalRow(id: string): void {
     this.evalHistory = this.evalHistory.filter((e) => e.id !== id);
+    // Re-adding does not move an existing id to the back of a Set's insertion
+    // order, but an id re-enters the cache only through a save, which clears
+    // its tombstone, so there is nothing to refresh.
     this.deletedEvalIds.add(id);
+    while (this.deletedEvalIds.size > DELETED_EVAL_MEMORY) {
+      const oldest = this.deletedEvalIds.values().next();
+      if (oldest.done) break;
+      this.deletedEvalIds.delete(oldest.value);
+    }
   }
 
   /** The artifact id an eval result carries, when it carries one. */

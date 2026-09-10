@@ -12,7 +12,7 @@
  * failure than to report a partial delete as success.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtemp, readdir, rm, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -463,21 +463,17 @@ describe('A13 — save, delete and reconciliation', () => {
     // can, with an update-only write — and on a store with no expiry the
     // resurrected row never ages back out.
     const store = new MemoryStore();
-    // Armed only once the sweep is running, so the delete lands inside the
-    // correction rather than during the initial save.
-    let armed = false;
+    // The delete fires inside the write itself — after the correction decided
+    // to persist, before the store applies it — which is precisely the window
+    // a check-then-save cannot close. It is the store's own update-only
+    // condition that has to refuse.
     const racing = store as MemoryStore & {
-      getEvalRetention(id: string): Promise<{ exists: boolean; expiresAt?: number }>;
+      updateEvalResult(entry: EvalHistoryEntry): Promise<boolean>;
     };
-    const realRetention = store.getEvalRetention.bind(store);
-    racing.getEvalRetention = async (id: string) => {
-      const answer = await realRetention(id);
-      if (id === 'run-raced' && armed) {
-        armed = false;
-        // The delete happens AFTER the correction was told the row is alive.
-        await store.deleteEvalResult('run-raced');
-      }
-      return answer;
+    const realUpdate = store.updateEvalResult.bind(store);
+    racing.updateEvalResult = async (entry: EvalHistoryEntry) => {
+      if (entry.id === 'run-raced') await store.deleteEvalResult('run-raced');
+      return realUpdate(entry);
     };
 
     const runtime = artifactRuntime({ store });
@@ -485,7 +481,6 @@ describe('A13 — save, delete and reconciliation', () => {
     await runtime.saveEvalResult({ id: 'run-raced', eval: 'e', timestamp: 1, data });
     await runtime.getDiagnosticArtifactStore()!.refreshExpiry(artifactId, Date.now() - 1);
 
-    armed = true;
     await runtime.reconcileDiagnosticArtifacts();
 
     expect((await store.listEvalResults()).map((e) => e.id)).not.toContain('run-raced');
@@ -500,7 +495,10 @@ describe('A13 — save, delete and reconciliation', () => {
     const store = new MemoryStore() as MemoryStore & { updateEvalResult?: unknown };
     const saves: string[] = [];
     const realSave = store.saveEvalResult.bind(store);
-    delete store.updateEvalResult;
+    // `delete` would not remove a class method — it lives on the prototype.
+    // Shadowing it with `undefined` on the instance is what makes the store
+    // read as one that never implemented the capability.
+    store.updateEvalResult = undefined;
     store.saveEvalResult = async (entry) => {
       saves.push(entry.id);
       await realSave(entry);
@@ -523,11 +521,44 @@ describe('A13 — save, delete and reconciliation', () => {
     await runtime.shutdown();
   });
 
+  it('a store too old to update conditionally warns instead of failing silently', async () => {
+    // A Redis older than 6.0 rejects `KEEPTTL`. Every correction path is
+    // best-effort, so the rejection would disappear into a catch and no
+    // correction would ever be persisted, silently, for the life of the server.
+    const store = new MemoryStore();
+    const attempts: string[] = [];
+    store.updateEvalResult = async (entry: EvalHistoryEntry) => {
+      attempts.push(entry.id);
+      throw new AxlError('REDIS_VERSION_UNSUPPORTED', 'requires Redis 6.0 or newer');
+    };
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const runtime = artifactRuntime({ store });
+    const { artifactId, data } = await stagedResult(runtime, 'run-oldredis');
+    await runtime.saveEvalResult({ id: 'run-oldredis', eval: 'e', timestamp: 1, data });
+    await runtime.getDiagnosticArtifactStore()!.refreshExpiry(artifactId, Date.now() - 1);
+
+    // The sweep does not throw, and the row is still there — never rewritten
+    // with a fresh window, never removed.
+    await runtime.reconcileDiagnosticArtifacts();
+    expect(attempts).toContain('run-oldredis');
+    expect((await store.listEvalResults()).map((e) => e.id)).toContain('run-oldredis');
+
+    // The cache is still corrected, so this process stops promising the bytes.
+    const cached = (await runtime.getEvalHistory()).find((e) => e.id === 'run-oldredis')!;
+    expect((cached.data as { diagnostics: { status: string } }).diagnostics.status).toBe(
+      'unavailable',
+    );
+    expect(warn.mock.calls.flat().join(' ')).toContain('Redis 6.0');
+    warn.mockRestore();
+    await runtime.shutdown();
+  });
+
   it('a by-id read never serves a row the store has dropped (R4)', async () => {
-    // Studio's rescore route resolves its SOURCE through this read, and copies
-    // that row's items into a brand-new result. A cache that outlived the
-    // store's own retention would republish expired inputs and outputs under a
-    // fresh id, with a fresh full window, once per rescore.
+    // Studio's rescore and compare routes resolve every id through this read.
+    // A rescore copies the row's items into a brand-new result, so a cache that
+    // outlived the store's own retention would republish expired inputs and
+    // outputs under a fresh id, with a fresh full window, once per rescore.
     const store = new MemoryStore();
     const runtime = artifactRuntime({ store });
     const { data } = await stagedResult(runtime, 'run-stale-read');

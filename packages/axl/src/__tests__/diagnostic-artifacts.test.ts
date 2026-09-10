@@ -377,7 +377,8 @@ describe('A13 — save, delete and reconciliation', () => {
   });
 
   it('downgrades the owning row when the sweep reclaims its committed artifact', async () => {
-    const runtime = artifactRuntime();
+    const store = new MemoryStore();
+    const runtime = artifactRuntime({ store });
     const { artifactId, data } = await stagedResult(runtime, 'run-swept');
     (data.diagnostics as Record<string, unknown>).status = 'complete';
     (data.diagnostics as Record<string, unknown>).records = 4;
@@ -393,14 +394,65 @@ describe('A13 — save, delete and reconciliation', () => {
     // liveness check to discover the evidence is not there — and any reader
     // that skips it (an export, a CLI listing, a stale client cache) publishes
     // a result promising evidence nothing can serve.
-    const stored = (await runtime.getEvalHistory()).find((e) => e.id === 'run-swept')!;
+    // Read from the STORE, not `getEvalHistory()`: the downgrade mutates the
+    // cached object in place, so a cache read passes even when nothing was
+    // persisted — and the persisted row is the one an export, a CLI listing or
+    // a restart sees, which is the whole point of the fix.
+    const rows = await store.listEvalResults!();
+    const stored = rows.find((e) => e.id === 'run-swept')!;
     const diagnostics = (stored.data as { diagnostics: Record<string, unknown> }).diagnostics;
     expect(diagnostics.status).toBe('unavailable');
     expect(diagnostics.artifactId).toBe('');
     expect(diagnostics.records).toBe(0);
     expect(diagnostics.bytes).toBe(0);
     expect(diagnostics.expiresAt).toBeUndefined();
-    expect(diagnostics.reason).toMatch(/reclaim|sweep|expir/i);
+    expect(diagnostics.reason).toMatch(/expir/i);
+    await runtime.shutdown();
+  });
+
+  it('names the reason the sweep actually reclaimed on (N5)', async () => {
+    const store = new MemoryStore();
+    const runtime = artifactRuntime({ store });
+    const { data } = await stagedResult(runtime, 'run-orphan');
+    await runtime.saveEvalResult({ id: 'run-orphan', eval: 'e', timestamp: 1, data });
+
+    // Reclaimed because the owner row is GONE, not because anything expired.
+    // A downgrade that blames expiry sends a reader looking at retention
+    // settings for a row somebody deleted.
+    await store.deleteEvalResult!('run-orphan');
+    await runtime.reconcileDiagnosticArtifacts();
+
+    const cached = (await runtime.getEvalHistory()).find((e) => e.id === 'run-orphan');
+    // The row is gone from the store, so it must not be served from the cache
+    // either — and above all it must not have been written back.
+    expect(cached).toBeUndefined();
+    expect((await store.listEvalResults!()).map((e) => e.id)).not.toContain('run-orphan');
+    await runtime.shutdown();
+  });
+
+  it('never writes a reclaimed row back into a store that no longer holds it (N1)', async () => {
+    const store = new MemoryStore();
+    const runtime = artifactRuntime({ store });
+    const { artifactId, data } = await stagedResult(runtime, 'run-forgotten');
+    await runtime.saveEvalResult({ id: 'run-forgotten', eval: 'e', timestamp: 1, data });
+    // The row is in this process's history cache, which never evicts on a
+    // store-side expiry or an out-of-band delete.
+    expect((await runtime.getEvalHistory()).some((e) => e.id === 'run-forgotten')).toBe(true);
+
+    // Deleted behind the runtime's back — another process, a
+    // right-to-be-forgotten request, or a Redis TTL that simply elapsed.
+    await store.deleteEvalResult!('run-forgotten');
+    await runtime.getDiagnosticArtifactStore()!.refreshExpiry(artifactId, Date.now() - 1);
+
+    await runtime.reconcileDiagnosticArtifacts();
+
+    // Writing the cached row back RESURRECTS it: the item inputs, outputs and
+    // scores of a run the store was told to forget come back, and on Redis with
+    // a fresh full TTL window.
+    expect((await store.listEvalResults!()).map((e) => e.id)).not.toContain('run-forgotten');
+    expect(await store.getEvalRetention!('run-forgotten')).toEqual({ exists: false });
+    // And the cache stops serving what the store no longer has.
+    expect((await runtime.getEvalHistory()).some((e) => e.id === 'run-forgotten')).toBe(false);
     await runtime.shutdown();
   });
 

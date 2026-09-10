@@ -1147,19 +1147,24 @@ export class AxlRuntime extends EventEmitter {
     const now = Date.now();
     const removed: string[] = [];
     for (const manifest of await store.list()) {
-      let reclaim = false;
+      let cause: string | undefined;
       if (manifest.state === 'delete_pending') {
-        reclaim = true;
+        cause = 'a delete that did not finish was completed by the sweep';
       } else if (manifest.state === 'staged') {
-        reclaim = manifest.leaseUntil === undefined || manifest.leaseUntil <= now;
+        if (manifest.leaseUntil === undefined || manifest.leaseUntil <= now) {
+          cause = "its writer's lease expired, so the sweep reclaimed it";
+        }
       } else {
-        if (manifest.expiresAt !== undefined && manifest.expiresAt <= now) reclaim = true;
-        else {
+        if (manifest.expiresAt !== undefined && manifest.expiresAt <= now) {
+          cause = 'it reached its retention expiry and was reclaimed';
+        } else {
           const retention = await this.stateStore.getEvalRetention?.(manifest.owner.id);
-          if (retention && !retention.exists) reclaim = true;
+          if (retention && !retention.exists) {
+            cause = 'the history row that owned it is gone, so it was reclaimed';
+          }
         }
       }
-      if (!reclaim) continue;
+      if (cause === undefined) continue;
       try {
         await store.delete(manifest.artifactId);
         removed.push(manifest.artifactId);
@@ -1176,7 +1181,7 @@ export class AxlRuntime extends EventEmitter {
       // committed owner row, but if one exists it gets the same treatment: the
       // lookup is by owner id and does not care which state it was reclaimed
       // from.
-      await this.downgradeReclaimedOwner(manifest);
+      await this.downgradeReclaimedOwner(manifest, cause);
     }
     return { removed };
   }
@@ -1189,7 +1194,7 @@ export class AxlRuntime extends EventEmitter {
    * routine sweep into a throwing one. The next `saveEvalResult` or artifact
    * read corrects the row anyway, because both already downgrade a dangling id.
    */
-  private async downgradeReclaimedOwner(manifest: ArtifactManifest): Promise<void> {
+  private async downgradeReclaimedOwner(manifest: ArtifactManifest, cause: string): Promise<void> {
     if (manifest.owner.kind !== 'eval') return;
     try {
       const entry = await this.getEvalResult(manifest.owner.id);
@@ -1199,12 +1204,46 @@ export class AxlRuntime extends EventEmitter {
       if (!entry || this.artifactIdOf(entry.data) !== manifest.artifactId) return;
       this.downgradeDiagnostics(
         entry,
-        'the captured-request artifact for this result was reclaimed after it expired',
+        `the captured-request artifact for this result is gone: ${cause}`,
       );
-      await this.stateStore.saveEvalResult?.(entry);
+      await this.persistCorrectedRow(entry);
     } catch {
       // See the docstring: the bytes are already gone either way.
     }
+  }
+
+  /**
+   * Write back a history row this process corrected in memory — but ONLY while
+   * the store still holds it.
+   *
+   * The history cache is process-global, loaded once and evicted only by
+   * `deleteEvalResult`. It therefore outlives whatever the STORE decided: a
+   * Redis TTL that elapsed, a delete by another process, a
+   * right-to-be-forgotten request. A blind `saveEvalResult` of a cached row
+   * resurrects all of it — item inputs, outputs and scores — and on Redis
+   * re-SETs it with a fresh full TTL window, silently extending the retention
+   * the operator configured. Correcting a row must never be able to un-delete
+   * one, so the store is asked first and the stale cache entry is dropped when
+   * the answer is no.
+   *
+   * A store with no retention view cannot answer, and a blind write is exactly
+   * what this exists to prevent, so nothing is written: the cache is corrected
+   * and the store keeps what it decided. In practice the question does not
+   * arise, because configuring artifacts at all requires `getEvalRetention`.
+   */
+  private async persistCorrectedRow(entry: EvalHistoryEntry): Promise<boolean> {
+    const retention = await this.stateStore.getEvalRetention?.(entry.id);
+    if (!retention) return false;
+    // `expiresAt <= now` is the same window read the other way: a store that
+    // has not reaped the key yet still reports it, and writing then would hand
+    // an already-expired row a brand-new lifetime.
+    const expired = retention.expiresAt !== undefined && retention.expiresAt <= Date.now();
+    if (!retention.exists || expired) {
+      this.evalHistory = this.evalHistory.filter((e) => e.id !== entry.id);
+      return false;
+    }
+    await this.stateStore.saveEvalResult?.(entry);
+    return true;
   }
 
   /** The artifact id an eval result carries, when it carries one. */
@@ -2608,7 +2647,10 @@ export class AxlRuntime extends EventEmitter {
         // The row is already stored, so correct it in place rather than leaving
         // a published result promising evidence it cannot serve.
         this.downgradeDiagnostics(entry);
-        await this.stateStore.saveEvalResult?.(entry).catch(() => undefined);
+        // Same rule as the sweep's write-back: the row was saved a moment ago,
+        // but "a moment ago" is not proof it is still there, and a blind
+        // re-save would resurrect one deleted or expired in between.
+        await this.persistCorrectedRow(entry).catch(() => undefined);
       }
     }
 

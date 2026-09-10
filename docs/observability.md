@@ -918,10 +918,18 @@ record.
 
 When the sweep reclaims a committed artifact — its expiry passed, or its owning
 row is gone — it rewrites that row's `diagnostics` to `unavailable` with zeroed
-counters and no `expiresAt`. So a stored result is self-describing: nothing has
-to make a second call to discover the evidence is no longer there, and a reader
-that cannot make one — an export, a CLI listing, a client rendering a cached
-result — never publishes a promise of bytes nothing can serve.
+counters and no `expiresAt`, and the `reason` names which of those it was. So a
+stored result is self-describing: nothing has to make a second call to discover
+the evidence is no longer there, and a reader that cannot make one — an export,
+a CLI listing, a client rendering a cached result — never publishes a promise of
+bytes nothing can serve.
+
+That correction is only written back **while the store still holds the row**.
+The history cache is process-global and outlives whatever the store decided — a
+Redis TTL that elapsed, a delete by another process, a right-to-be-forgotten
+request — so a blind write would resurrect a row's item inputs, outputs and
+scores and, on Redis, hand it a fresh full TTL. The store is asked first; when
+the answer is no, the cache entry is dropped instead.
 
 ## Execution Inspector
 

@@ -1,6 +1,10 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { randomUUID } from 'node:crypto';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { RedisStore } from '../state/redis.js';
+import { AxlRuntime } from '../runtime.js';
 import type { ExecutionInfo, AxlEvent } from '../types.js';
 
 /**
@@ -227,6 +231,65 @@ describe.skipIf(!REDIS_URL)('RedisStore integration (real Redis)', () => {
         expect(retention.expiresAt!).toBeGreaterThan(before);
         expect(retention.expiresAt!).toBeLessThanOrEqual(Date.now() + 120_000);
       } finally {
+        await expiring.close?.();
+      }
+    });
+
+    it('a diagnostics sweep does not hand an eval row a fresh TTL window', async () => {
+      // The sweep corrects a row whose artifact it just reclaimed. That
+      // correction goes through the process-global history cache, which never
+      // evicts on a store-side expiry — so a blind write-back re-SETs the row
+      // with a whole new `EX`, silently extending the retention the operator
+      // configured, and un-deletes one Redis has already reaped.
+      const expiring = await RedisStore.create({
+        url: REDIS_URL!,
+        keyPrefix: `${TEST_PREFIX}sweepttl-`,
+        skipMigration: true,
+        ttls: { evalHistory: 120 },
+      });
+      const root = await mkdtemp(path.join(tmpdir(), 'axl-sweep-ttl-'));
+      try {
+        const runtime = new AxlRuntime({
+          state: { store: expiring },
+          diagnostics: { artifacts: { root, sweepIntervalMs: 3_600_000, leaseMs: 3_600_000 } },
+        });
+        const id = `ev-sweep-${randomUUID()}`;
+        const staged = await runtime.stageDiagnosticArtifact({ kind: 'eval', id });
+        await staged.sink.append(JSON.stringify({ v: 1, phase: 'start', operationId: 'op_1' }));
+        await runtime.finalizeDiagnosticArtifact(staged.artifactId, 'complete');
+        await runtime.saveEvalResult({
+          id,
+          eval: 'suite',
+          timestamp: Date.now(),
+          data: { id, diagnostics: { artifactId: staged.artifactId, status: 'complete' } },
+        });
+
+        const client = (expiring as unknown as { client: { ttl: (k: string) => Promise<number> } })
+          .client;
+        const key = `${TEST_PREFIX}sweepttl-eval:${id}`;
+        const before = await client.ttl(key);
+        expect(before).toBeGreaterThan(0);
+
+        // Age the window, then make the artifact look expired so the sweep
+        // reclaims it and reaches the write-back.
+        await new Promise((r) => setTimeout(r, 1_100));
+        await runtime
+          .getDiagnosticArtifactStore()!
+          .refreshExpiry(staged.artifactId, Date.now() - 1);
+        await runtime.reconcileDiagnosticArtifacts();
+
+        // The row's remaining lifetime may only go DOWN. Jumping back to 120
+        // is the retention extension.
+        const after = await client.ttl(key);
+        expect(after).toBeLessThan(before);
+
+        // And a row Redis has already dropped must stay dropped.
+        await expiring.deleteEvalResult(id);
+        await runtime.reconcileDiagnosticArtifacts();
+        expect(await expiring.getEvalRetention(id)).toEqual({ exists: false });
+        await runtime.shutdown();
+      } finally {
+        await rm(root, { recursive: true, force: true });
         await expiring.close?.();
       }
     });

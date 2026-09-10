@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { AxlRuntime, tool, agent, workflow } from '@axlsdk/axl';
+import type { StateStore } from '@axlsdk/axl';
 import { MockProvider } from '@axlsdk/testing';
 import { dataset, scorer } from '@axlsdk/eval';
 import { createServer } from '@axlsdk/studio';
@@ -20,13 +21,24 @@ export const testAgent = agent({
 
 export function createTestServer(
   providerOverride?: MockProvider,
-  serverOptions?: { readOnly?: boolean; redact?: boolean; artifactsRoot?: string },
+  serverOptions?: {
+    readOnly?: boolean;
+    redact?: boolean;
+    artifactsRoot?: string;
+    /**
+     * Supply the state store so a test can read what was actually PERSISTED.
+     * The runtime's history cache is corrected in place, so reading back
+     * through the API cannot tell a stored correction from a cached one.
+     */
+    stateStore?: StateStore;
+  },
 ) {
   // Only set `redact: true` — leave `trace.enabled` at the config default
   // so redact-on tests don't unexpectedly activate console trace output
   // and spam test logs. `runtime.isRedactEnabled()` reads the flag
   // directly and doesn't require `enabled: true`.
   const runtime = new AxlRuntime({
+    ...(serverOptions?.stateStore ? { state: { store: serverOptions.stateStore } } : {}),
     ...(serverOptions?.redact ? { trace: { redact: true } } : {}),
     // Diagnostic capture is opt-in, so a suite that exercises captured requests
     // has to supply somewhere to put them. Left unset, the runtime behaves

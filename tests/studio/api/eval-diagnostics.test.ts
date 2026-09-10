@@ -12,6 +12,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { MemoryStore } from '@axlsdk/axl';
 import { createTestServer } from '../helpers/setup.js';
 import { readJson } from '../helpers/json.js';
 
@@ -196,7 +197,8 @@ describe('A13.19 — import/export roundtrip', () => {
   });
 
   it('the history row stops claiming evidence the sweep has reclaimed', async () => {
-    const { app, runtime } = createTestServer(undefined, { artifactsRoot: root });
+    const stateStore = new MemoryStore();
+    const { app, runtime } = createTestServer(undefined, { artifactsRoot: root, stateStore });
 
     const res = await importResult(app, {
       result: resultWithAccounting(),
@@ -223,6 +225,14 @@ describe('A13.19 — import/export roundtrip', () => {
     expect(entry.data.diagnostics.artifactId).toBe('');
     expect(entry.data.diagnostics.records).toBe(0);
     expect(entry.data.diagnostics.bytes).toBe(0);
+
+    // And it is PERSISTED, not merely corrected in the cache the API reads
+    // through — the stored row is what a restart, an export or a CLI listing
+    // sees, and it is the one the fix is about.
+    const stored = (await stateStore.listEvalResults()).find((e) => e.id === data.id)!;
+    const persisted = (stored.data as { diagnostics: Record<string, unknown> }).diagnostics;
+    expect(persisted.status).toBe('unavailable');
+    expect(persisted.artifactId).toBe('');
   });
 
   it('rejects a malformed sidecar before storing any result', async () => {

@@ -184,6 +184,12 @@ export interface DiagnosticArtifactStore {
 const MANIFEST_FILE = 'manifest.json';
 const RECORDS_FILE = 'records.jsonl';
 
+/**
+ * How many deleted ids the store remembers, to drop writes that were already in
+ * flight when the delete landed. See `FileDiagnosticArtifactStore.deleted`.
+ */
+const DELETED_MEMORY = 1024;
+
 function isMissing(error: unknown): boolean {
   return (error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT';
 }
@@ -198,12 +204,6 @@ function isMissing(error: unknown): boolean {
  * Record appends are serialized per artifact through a promise chain so
  * concurrent writers cannot interleave partial lines.
  */
-/**
- * How many deleted ids the store remembers, to drop writes that were already in
- * flight when the delete landed. See `FileDiagnosticArtifactStore.deleted`.
- */
-const DELETED_MEMORY = 1024;
-
 export class FileDiagnosticArtifactStore implements DiagnosticArtifactStore {
   private readonly root: string;
   /** Per-artifact serialization chain for appends. */

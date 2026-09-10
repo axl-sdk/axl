@@ -14,6 +14,7 @@ import type {
   HealthData,
   RegisteredEval,
   EvalHistoryEntry,
+  EvalDiagnosticsManifest,
   WindowId,
   EvalTrendData,
   WorkflowStatsResponse,
@@ -248,6 +249,57 @@ export const deleteEvalHistoryEntry = (id: string) =>
   request<{ id: string; deleted: boolean }>(`/evals/history/${encodeURIComponent(id)}`, {
     method: 'DELETE',
   });
+
+// ── Captured-request diagnostics ───────────────────────────────────
+
+/**
+ * `GET /api/evals/:id/diagnostics`.
+ *
+ * Returns a result instead of throwing, because 404 is not an error here — it
+ * is the answer. The bytes behind a manifest can be swept between the moment a
+ * result was loaded into the client and the moment the reader opens it, and
+ * "the evidence is gone" has to be renderable as a state, not as a toast.
+ */
+export async function fetchEvalDiagnostics(
+  id: string,
+): Promise<
+  { ok: true; manifest: EvalDiagnosticsManifest } | { ok: false; gone: boolean; message: string }
+> {
+  let res: Response;
+  try {
+    res = await fetch(`${BASE}/evals/${encodeURIComponent(id)}/diagnostics`);
+  } catch (err) {
+    return { ok: false, gone: false, message: err instanceof Error ? err.message : String(err) };
+  }
+  const body = (await res.json().catch(() => undefined)) as
+    | ApiResponse<EvalDiagnosticsManifest>
+    | undefined;
+  if (res.ok && body?.ok) return { ok: true, manifest: body.data };
+  const message =
+    body && !body.ok ? body.error.message : `Server returned HTTP ${res.status} for diagnostics`;
+  return { ok: false, gone: res.status === 404, message };
+}
+
+/**
+ * `GET /api/evals/:id/diagnostics/records`.
+ *
+ * Hands back the raw `Response` rather than a parsed body: the route streams
+ * NDJSON and an artifact is allowed to be 16 MiB, so the caller decides whether
+ * to stream it line by line (the inline viewer, which stops at its cap) or to
+ * take the whole body (the download, which needs every byte).
+ */
+export async function fetchEvalDiagnosticsRecords(id: string): Promise<Response> {
+  const res = await fetch(`${BASE}/evals/${encodeURIComponent(id)}/diagnostics/records`);
+  if (!res.ok) {
+    const body = (await res.json().catch(() => undefined)) as ApiResponse<unknown> | undefined;
+    throw new Error(
+      body && !body.ok
+        ? body.error.message
+        : `Server returned HTTP ${res.status} for captured requests`,
+    );
+  }
+  return res;
+}
 
 // ── Playground ─────────────────────────────────────────────────────
 export const playgroundChat = (

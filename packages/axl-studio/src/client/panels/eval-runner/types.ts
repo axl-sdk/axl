@@ -244,6 +244,106 @@ export type MultiRunAggregate = {
   budgetStoppedRuns?: number;
 };
 
+/**
+ * What an `EvalResult` says about its captured requests.
+ *
+ * Client mirror of `@axlsdk/eval`'s `DiagnosticManifest` (which is itself built
+ * from the core `ArtifactManifest`). Mirrored rather than imported because the
+ * client bundle must not pull in the core packages — see
+ * `client-no-core-import-tripwire.test.ts`. Keep the two in sync.
+ *
+ * NOTE the difference from the `GET /api/evals/:id/diagnostics` response
+ * (`EvalDiagnosticsManifest` in `lib/types.ts`): the manifest embedded in the
+ * result carries no `copiedFrom`, so a rescore's provenance is only readable
+ * from the route.
+ */
+export type DiagnosticManifest = {
+  version: 1;
+  artifactId: string;
+  fidelity: 'runtime_request';
+  status: 'complete' | 'truncated' | 'interrupted' | 'unavailable';
+  reason?: string;
+  records: number;
+  bytes: number;
+  /** Whether the STORED bytes were redacted when they were written. */
+  redaction: 'applied' | 'none';
+  expiresAt?: number;
+};
+
+/** One captured message, as the record stores it. Rich media is a descriptor. */
+export type CapturedMessage = {
+  role: string;
+  content: string | null;
+  input?: { kind?: string; [key: string]: unknown };
+  name?: string;
+  tool_calls?: Array<{ id?: string; name?: string; arguments?: unknown; [k: string]: unknown }>;
+  tool_call_id?: string;
+};
+
+/**
+ * One JSONL line of a captured-request artifact (codec `v: 1`).
+ *
+ * Client mirror of the core `CapturedRequestRecord`, re-exported by
+ * `@axlsdk/eval` as `RequestRecord`. Every field is rendered defensively: an
+ * artifact on disk may predate a field this build knows about, and a field this
+ * build knows about may be absent from an older record.
+ */
+export type RequestRecord = {
+  v: 1;
+  phase: 'start' | 'attempt' | 'end';
+  operationId: string;
+  kind: 'chat' | 'stream';
+  caseIndex?: number;
+  scorer?: string;
+  executionId?: string;
+  askId?: string;
+  parentAskId?: string;
+  turn?: number;
+  retryReason?: 'schema' | 'validate' | 'guardrail';
+  /** 1-indexed transport attempt this record describes. */
+  transportAttempts: number;
+  provider: string;
+  model: string;
+  request?: {
+    messages: CapturedMessage[];
+    tools?: Array<{ name: string; description?: string; parameters: unknown }>;
+    responseFormat?: unknown;
+    options: {
+      model: string;
+      temperature?: number;
+      maxTokens?: number;
+      effort?: string;
+      thinkingBudget?: number;
+      includeThoughts?: boolean;
+      toolChoice?: unknown;
+      stop?: string[];
+      promptCache?: boolean;
+    };
+    /** KEYS only — the writer never stores `providerOptions` values. */
+    providerOptionKeys?: string[];
+  };
+  response?: {
+    content: string;
+    tool_calls?: unknown[];
+    usage?: { inputTokens?: number; outputTokens?: number; [k: string]: unknown };
+    cost?: number;
+    costProvenance?: string;
+    timing?: { totalMs?: number; ttftMs?: number; [k: string]: unknown };
+  };
+  error?: { name?: string; message: string; code?: string; status?: number };
+  /** Why an operation ended without a response, when it ended deliberately. */
+  termination?: string;
+  correction?: { stage: string; reason?: string; feedbackMessage: string };
+  captured: {
+    fidelity: 'runtime_request';
+    redacted: boolean;
+    truncated: boolean;
+    omitted: string[];
+  };
+  /** Encoded size of the record this stub replaced. Present only on stubs. */
+  bytes?: number;
+};
+
 export type EvalResultData = {
   id: string;
   dataset: string;
@@ -275,6 +375,13 @@ export type EvalResultData = {
   /** The authoritative record `totalCost` is derived from. Absent on pre-0.24
    *  artifacts, which `readAccounting()` reports as `'unverified'`. */
   accounting?: EvalAccounting;
+  /**
+   * What this run captured, when `captureRequests` was on. Absent on every run
+   * that did not opt in AND on every pre-0.24 artifact — the two are
+   * indistinguishable here and the UI renders nothing for both, because
+   * "captured nothing" and "could not have captured" are equally silent.
+   */
+  diagnostics?: DiagnosticManifest;
   duration: number;
   items: EvalItem[];
   summary: {

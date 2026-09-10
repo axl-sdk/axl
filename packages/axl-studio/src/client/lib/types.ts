@@ -322,6 +322,28 @@ export type EvalHistoryEntry = {
   data: unknown;
 };
 
+/**
+ * `GET /api/evals/:id/diagnostics` — the live manifest for a run's captured
+ * requests.
+ *
+ * Deliberately NOT the same shape as the `diagnostics` block embedded in the
+ * result: the route reads the artifact's own manifest, so it carries
+ * `copiedFrom` (a rescore's provenance) and it 404s once the bytes are gone.
+ * `redaction` describes the stored bytes, not this deployment's delivery
+ * policy — see `docs/studio-api.md`.
+ */
+export type EvalDiagnosticsManifest = {
+  artifactId: string;
+  status: 'complete' | 'truncated' | 'interrupted' | 'unavailable';
+  reason?: string;
+  records: number;
+  bytes: number;
+  fidelity: 'runtime_request';
+  redaction: 'applied' | 'none';
+  expiresAt?: number;
+  copiedFrom?: { artifactId: string; ownerId: string };
+};
+
 /** Time window for aggregate views */
 export type WindowId = '24h' | '7d' | '30d' | 'all';
 

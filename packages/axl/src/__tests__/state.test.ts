@@ -436,6 +436,24 @@ describe('MemoryStore', () => {
       expect(list[0].id).toBe('ev2');
     });
 
+    it('updateEvalResult refuses to create a row that is not there', async () => {
+      const store = new MemoryStore();
+      // The whole point of the update-only write: a correction must never be
+      // able to bring back a row somebody deleted between the read and the
+      // write. `saveEvalResult` would recreate it, permanently, on a store with
+      // no expiry to age it back out.
+      expect(await store.updateEvalResult({ id: 'gone', eval: 't', timestamp: 1, data: {} })).toBe(
+        false,
+      );
+      expect(await store.listEvalResults()).toEqual([]);
+
+      await store.saveEvalResult({ id: 'ev1', eval: 't', timestamp: 1, data: { v: 1 } });
+      expect(
+        await store.updateEvalResult({ id: 'ev1', eval: 't', timestamp: 1, data: { v: 2 } }),
+      ).toBe(true);
+      expect((await store.listEvalResults())[0].data).toEqual({ v: 2 });
+    });
+
     it('re-saving an eval result does not give it an expiry', async () => {
       const store = new MemoryStore();
       await store.saveEvalResult({ id: 'ev1', eval: 'test', timestamp: 1000, data: { v: 1 } });
@@ -907,6 +925,21 @@ describe('SQLiteStore', () => {
       store.close();
     });
 
+    it('updateEvalResult refuses to create a row that is not there', async () => {
+      const store = createStore();
+      expect(await store.updateEvalResult({ id: 'gone', eval: 't', timestamp: 1, data: {} })).toBe(
+        false,
+      );
+      expect(await store.listEvalResults()).toEqual([]);
+
+      await store.saveEvalResult({ id: 'ev1', eval: 't', timestamp: 1, data: { v: 1 } });
+      expect(
+        await store.updateEvalResult({ id: 'ev1', eval: 't', timestamp: 1, data: { v: 2 } }),
+      ).toBe(true);
+      expect((await store.listEvalResults())[0].data).toEqual({ v: 2 });
+      store.close();
+    });
+
     it('re-saving an eval result does not give it an expiry', async () => {
       const store = createStore();
       await store.saveEvalResult({ id: 'ev1', eval: 'test', timestamp: 1000, data: { v: 1 } });
@@ -1164,12 +1197,24 @@ describe('RedisStore', () => {
       // on a side-map so tests can assert "TTL was set with the right value"
       // without simulating real wall-clock expiration (which would make tests
       // flaky and slow).
-      set: vi.fn(async (key: string, value: string, options?: { EX?: number }) => {
-        data.set(key, value);
-        if (options?.EX !== undefined) ttls.set(key, options.EX);
-        else ttls.delete(key); // SET without EX clears any existing TTL
-        return 'OK';
-      }),
+      set: vi.fn(
+        async (
+          key: string,
+          value: string,
+          options?: { EX?: number; PX?: number; XX?: boolean; KEEPTTL?: boolean },
+        ) => {
+          // XX: only overwrite an existing key. Redis returns null and writes
+          // nothing when the key is absent.
+          if (options?.XX === true && !data.has(key)) return null;
+          data.set(key, value);
+          // KEEPTTL leaves whatever TTL the key already had.
+          if (options?.KEEPTTL === true) return 'OK';
+          if (options?.EX !== undefined) ttls.set(key, options.EX);
+          else if (options?.PX !== undefined) ttls.set(key, options.PX / 1000);
+          else ttls.delete(key); // SET without EX clears any existing TTL
+          return 'OK';
+        },
+      ),
       // EXPIRE applies a TTL to an existing key. With `mode: 'NX'`, only
       // sets if no TTL exists (used for fixed-window hash-backed data).
       // Without mode, always (re)sets — used for sliding-window memory.
@@ -2438,6 +2483,54 @@ describe('RedisStore', () => {
         });
         await store.saveEvalResult({ id: 'ev1', eval: 't', timestamp: 0, data: {} });
         expect(ttls.get('axl:eval-history:ev1')).toBe(60 * 60 * 24 * 7);
+      });
+
+      it('updateEvalResult writes SET XX KEEPTTL and never creates a row', async () => {
+        const { store, data, ttls, mockClient } = createRedisStoreWithMockClient(undefined, {
+          evalHistory: 120,
+        });
+        const key = 'axl:eval-history:ev-upd';
+
+        // A row that is not there stays not there. `XX` is what makes this
+        // atomic: no check-then-write window a delete can slip through.
+        expect(
+          await store.updateEvalResult({ id: 'ev-upd', eval: 't', timestamp: 0, data: { v: 1 } }),
+        ).toBe(false);
+        expect(data.has(key)).toBe(false);
+
+        await store.saveEvalResult({ id: 'ev-upd', eval: 't', timestamp: 0, data: { v: 1 } });
+        ttls.set(key, 30);
+        expect(
+          await store.updateEvalResult({ id: 'ev-upd', eval: 't', timestamp: 0, data: { v: 2 } }),
+        ).toBe(true);
+        // KEEPTTL: the correction carries no retention decision of its own.
+        expect(ttls.get(key)).toBe(30);
+        expect(JSON.parse(data.get(key)!).data).toEqual({ v: 2 });
+
+        const setCalls = (mockClient.set as unknown as { mock: { calls: unknown[][] } }).mock.calls;
+        const conditional = setCalls.filter((c) => c[0] === key);
+        expect(conditional.length).toBeGreaterThan(0);
+        for (const call of conditional) {
+          expect(call[2]).toMatchObject({ XX: true, KEEPTTL: true });
+        }
+      });
+
+      it('re-saving a deliberately untimed eval row leaves it untimed', async () => {
+        const { store, ttls, mockClient } = createRedisStoreWithMockClient(undefined, {
+          evalHistory: 120,
+        });
+        const key = 'axl:eval-history:ev-persist';
+        await store.saveEvalResult({ id: 'ev-persist', eval: 't', timestamp: 0, data: {} });
+
+        // An operator ran PERSIST, or the row predates the TTL setting. PTTL
+        // reports -1: the key is there and deliberately has no expiry. Stamping
+        // the configured window on it SHORTENS its retention to finite.
+        ttls.delete(key);
+        (
+          mockClient.pTTL as unknown as { mockResolvedValue: (v: number) => void }
+        ).mockResolvedValue(-1);
+        await store.saveEvalResult({ id: 'ev-persist', eval: 't', timestamp: 0, data: {} });
+        expect(ttls.get(key)).toBeUndefined();
       });
 
       it('re-saving an existing eval result never extends its retention', async () => {

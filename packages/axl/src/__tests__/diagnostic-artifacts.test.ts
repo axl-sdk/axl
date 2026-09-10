@@ -456,6 +456,104 @@ describe('A13 — save, delete and reconciliation', () => {
     await runtime.shutdown();
   });
 
+  it('a delete that lands inside the correction still wins (R2)', async () => {
+    // The exact race: the sweep is between reading the row's retention and
+    // writing the correction back when a right-to-be-forgotten delete lands.
+    // Checking first and then saving cannot close that window — only the store
+    // can, with an update-only write — and on a store with no expiry the
+    // resurrected row never ages back out.
+    const store = new MemoryStore();
+    // Armed only once the sweep is running, so the delete lands inside the
+    // correction rather than during the initial save.
+    let armed = false;
+    const racing = store as MemoryStore & {
+      getEvalRetention(id: string): Promise<{ exists: boolean; expiresAt?: number }>;
+    };
+    const realRetention = store.getEvalRetention.bind(store);
+    racing.getEvalRetention = async (id: string) => {
+      const answer = await realRetention(id);
+      if (id === 'run-raced' && armed) {
+        armed = false;
+        // The delete happens AFTER the correction was told the row is alive.
+        await store.deleteEvalResult('run-raced');
+      }
+      return answer;
+    };
+
+    const runtime = artifactRuntime({ store });
+    const { artifactId, data } = await stagedResult(runtime, 'run-raced');
+    await runtime.saveEvalResult({ id: 'run-raced', eval: 'e', timestamp: 1, data });
+    await runtime.getDiagnosticArtifactStore()!.refreshExpiry(artifactId, Date.now() - 1);
+
+    armed = true;
+    await runtime.reconcileDiagnosticArtifacts();
+
+    expect((await store.listEvalResults()).map((e) => e.id)).not.toContain('run-raced');
+    expect((await runtime.getEvalHistory()).some((e) => e.id === 'run-raced')).toBe(false);
+    await runtime.shutdown();
+  });
+
+  it('a correction is not written at all by a store that cannot do it conditionally', async () => {
+    // No `updateEvalResult`: the store cannot promise the write will not create
+    // the row, so nothing is written. The cache is still corrected, so this
+    // process stops publishing a promise of bytes that are gone.
+    const store = new MemoryStore() as MemoryStore & { updateEvalResult?: unknown };
+    const saves: string[] = [];
+    const realSave = store.saveEvalResult.bind(store);
+    delete store.updateEvalResult;
+    store.saveEvalResult = async (entry) => {
+      saves.push(entry.id);
+      await realSave(entry);
+    };
+
+    const runtime = artifactRuntime({ store: store as unknown as StateStore });
+    const { artifactId, data } = await stagedResult(runtime, 'run-nocond');
+    await runtime.saveEvalResult({ id: 'run-nocond', eval: 'e', timestamp: 1, data });
+    expect(saves).toEqual(['run-nocond']);
+    await runtime.getDiagnosticArtifactStore()!.refreshExpiry(artifactId, Date.now() - 1);
+
+    await runtime.reconcileDiagnosticArtifacts();
+
+    // The first write is the only write.
+    expect(saves).toEqual(['run-nocond']);
+    const cached = (await runtime.getEvalHistory()).find((e) => e.id === 'run-nocond')!;
+    expect((cached.data as { diagnostics: { status: string } }).diagnostics.status).toBe(
+      'unavailable',
+    );
+    await runtime.shutdown();
+  });
+
+  it('a by-id read never serves a row the store has dropped (R4)', async () => {
+    // Studio's rescore route resolves its SOURCE through this read, and copies
+    // that row's items into a brand-new result. A cache that outlived the
+    // store's own retention would republish expired inputs and outputs under a
+    // fresh id, with a fresh full window, once per rescore.
+    const store = new MemoryStore();
+    const runtime = artifactRuntime({ store });
+    const { data } = await stagedResult(runtime, 'run-stale-read');
+    await runtime.saveEvalResult({ id: 'run-stale-read', eval: 'e', timestamp: 1, data });
+    expect(await runtime.getEvalResult('run-stale-read')).toBeDefined();
+
+    await store.deleteEvalResult('run-stale-read');
+
+    expect(await runtime.getEvalResult('run-stale-read')).toBeUndefined();
+    // And the stale entry is dropped, not merely hidden from this one read.
+    expect((await runtime.getEvalHistory()).some((e) => e.id === 'run-stale-read')).toBe(false);
+    await runtime.shutdown();
+  });
+
+  it('saving the same id twice leaves one cached entry (L2)', async () => {
+    const store = new MemoryStore();
+    const runtime = artifactRuntime({ store });
+    const { data } = await stagedResult(runtime, 'run-dup');
+    await runtime.saveEvalResult({ id: 'run-dup', eval: 'e', timestamp: 1, data });
+    await runtime.saveEvalResult({ id: 'run-dup', eval: 'e', timestamp: 2, data });
+
+    const history = await runtime.getEvalHistory();
+    expect(history.filter((e) => e.id === 'run-dup')).toHaveLength(1);
+    await runtime.shutdown();
+  });
+
   it('returns undefined for an artifact whose owner row is gone', async () => {
     const runtime = artifactRuntime();
     const { artifactId, data } = await stagedResult(runtime, 'run-ownerless');

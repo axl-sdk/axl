@@ -842,6 +842,16 @@ export class AxlRuntime extends EventEmitter {
   private artifactLeaseMs = DEFAULT_ARTIFACT_LEASE_MS;
   private artifactMaxHoldMs = DEFAULT_ARTIFACT_MAX_HOLD_MS;
   private artifactSweepTimer?: ReturnType<typeof setInterval>;
+  /**
+   * Eval history ids this process has established are gone.
+   *
+   * Two jobs. It makes a delete started here beat a correction already in
+   * flight, which no store-side condition can do while the delete has not
+   * landed yet. And it keeps the lazy first load from merging a row back in
+   * from a snapshot taken before the eviction. Ids are minted per result and
+   * never reused, so an entry can only ever be right.
+   */
+  private readonly deletedEvalIds = new Set<string>();
   /** Lease-renewal timers for artifacts currently being written, by id. */
   private readonly artifactRenewals = new Map<string, ReturnType<typeof setInterval>>();
 
@@ -1232,18 +1242,36 @@ export class AxlRuntime extends EventEmitter {
    * arise, because configuring artifacts at all requires `getEvalRetention`.
    */
   private async persistCorrectedRow(entry: EvalHistoryEntry): Promise<boolean> {
-    const retention = await this.stateStore.getEvalRetention?.(entry.id);
-    if (!retention) return false;
-    // `expiresAt <= now` is the same window read the other way: a store that
-    // has not reaped the key yet still reports it, and writing then would hand
-    // an already-expired row a brand-new lifetime.
-    const expired = retention.expiresAt !== undefined && retention.expiresAt <= Date.now();
-    if (!retention.exists || expired) {
-      this.evalHistory = this.evalHistory.filter((e) => e.id !== entry.id);
+    // A delete this process already started always wins. It may still be in
+    // flight — `deleteEvalResult` awaits the store — and the store cannot
+    // refuse a write for a row it has not removed yet.
+    if (this.deletedEvalIds.has(entry.id)) {
+      this.forgetEvalRow(entry.id);
       return false;
     }
-    await this.stateStore.saveEvalResult?.(entry);
-    return true;
+    // Update-only or nothing. A store that cannot promise the write will not
+    // CREATE the row cannot be handed a correction at all: checking first and
+    // then saving leaves a window a delete or an expiry slips through, and on a
+    // store with no expiry the row it recreates never ages back out. The cache
+    // is corrected either way, so this process stops publishing a promise of
+    // bytes that are gone.
+    if (!this.stateStore.updateEvalResult) return false;
+    const updated = await this.stateStore.updateEvalResult(entry);
+    if (!updated) this.forgetEvalRow(entry.id);
+    return updated;
+  }
+
+  /**
+   * Drop a row from the history cache and refuse to re-add it.
+   *
+   * The cache is process-global and loaded once, so a row the STORE has
+   * dropped — expired, deleted here or elsewhere — would otherwise be served
+   * for the life of the process, and an in-flight first load whose snapshot
+   * predates the eviction would merge it straight back in.
+   */
+  private forgetEvalRow(id: string): void {
+    this.evalHistory = this.evalHistory.filter((e) => e.id !== id);
+    this.deletedEvalIds.add(id);
   }
 
   /** The artifact id an eval result carries, when it carries one. */
@@ -2615,8 +2643,14 @@ export class AxlRuntime extends EventEmitter {
     // band) must not be persisted as if it were readable.
     if (!artifactId) this.downgradeDiagnostics(entry);
 
-    // Add to in-memory cache (newest first)
+    // Add to in-memory cache (newest first). Replacing rather than prepending:
+    // a re-save of an existing id would otherwise leave two entries, and every
+    // by-id read would serve whichever landed first.
+    this.evalHistory = this.evalHistory.filter((e) => e.id !== entry.id);
     this.evalHistory.unshift(entry);
+    // An explicit save is a deliberate write, so it clears any tombstone: the
+    // caller is asserting this id exists again.
+    this.deletedEvalIds.delete(entry.id);
 
     // Persist to store
     if (this.stateStore.saveEvalResult) {
@@ -2792,7 +2826,12 @@ export class AxlRuntime extends EventEmitter {
     const ownedArtifactId = await this.ownedArtifactId(artifactId, id);
 
     const beforeLength = this.evalHistory.length;
-    this.evalHistory = this.evalHistory.filter((e) => e.id !== id);
+    // Tombstoned BEFORE the store delete, not after: a correction already in
+    // flight (the sweep's downgrade, a commit failure's) reaches its write
+    // while this method is still awaiting the store, and the store cannot
+    // refuse a write for a row it has not removed yet. The intent is what
+    // makes the delete win.
+    this.forgetEvalRow(id);
     const removedFromMemory = this.evalHistory.length < beforeLength;
 
     // The row goes FIRST, then the deletion intent. Writing the intent first
@@ -2841,7 +2880,10 @@ export class AxlRuntime extends EventEmitter {
           // Merge: stored entries not already in memory
           const ids = new Set(this.evalHistory.map((e) => e.id));
           for (const entry of stored) {
-            if (!ids.has(entry.id)) {
+            // The snapshot may predate an eviction that happened while it was
+            // in flight, and re-adding a row the store has dropped is the same
+            // staleness eviction exists to end.
+            if (!ids.has(entry.id) && !this.deletedEvalIds.has(entry.id)) {
               this.evalHistory.push(entry);
             }
           }
@@ -2870,13 +2912,34 @@ export class AxlRuntime extends EventEmitter {
    *
    * The lazy first load is still whole-history (that is how the cache is
    * populated); what this avoids is paying for a copy of it per request.
+   *
+   * The row is confirmed against the store's retention view before it is
+   * served, and dropped when the store says it is gone. The cache outlives
+   * whatever the store decided — a Redis TTL that elapsed, a delete elsewhere —
+   * and this is the read a rescore resolves its SOURCE through, copying that
+   * row's items into a brand-new result with a brand-new retention window. An
+   * expired run could otherwise be republished indefinitely, one rescore at a
+   * time. `getEvalHistory()` is still served from the cache unconfirmed; the
+   * per-row check is affordable here because it is one row.
    */
   async getEvalResult(id: string): Promise<EvalHistoryEntry | undefined> {
-    const cached = this.evalHistory.find((entry) => entry.id === id);
-    if (cached) return cached;
-    // Not in memory yet: make sure the store has been read at least once.
-    await this.getEvalHistory();
-    return this.evalHistory.find((entry) => entry.id === id);
+    if (this.deletedEvalIds.has(id)) return undefined;
+    let entry = this.evalHistory.find((e) => e.id === id);
+    if (!entry) {
+      // Not in memory yet: make sure the store has been read at least once.
+      await this.getEvalHistory();
+      entry = this.evalHistory.find((e) => e.id === id);
+    }
+    if (!entry) return undefined;
+    const retention = await this.stateStore.getEvalRetention?.(id);
+    // A store with no retention view has nothing to contradict the cache with.
+    if (!retention) return entry;
+    const expired = retention.expiresAt !== undefined && retention.expiresAt <= Date.now();
+    if (!retention.exists || expired) {
+      this.forgetEvalRow(id);
+      return undefined;
+    }
+    return entry;
   }
 
   /** List pending human decisions. */

@@ -238,9 +238,10 @@ describe.skipIf(!REDIS_URL)('RedisStore integration (real Redis)', () => {
     it('a diagnostics sweep does not hand an eval row a fresh TTL window', async () => {
       // The sweep corrects a row whose artifact it just reclaimed. That
       // correction goes through the process-global history cache, which never
-      // evicts on a store-side expiry — so a blind write-back re-SETs the row
-      // with a whole new `EX`, silently extending the retention the operator
-      // configured, and un-deletes one Redis has already reaped.
+      // evicts on a store-side expiry — so a write-back that is not both
+      // update-only and retention-neutral re-SETs the row with a whole new
+      // window, silently extending the retention the operator configured, or
+      // un-deletes one that is already gone.
       const expiring = await RedisStore.create({
         url: REDIS_URL!,
         keyPrefix: `${TEST_PREFIX}sweepttl-`,
@@ -253,39 +254,54 @@ describe.skipIf(!REDIS_URL)('RedisStore integration (real Redis)', () => {
           state: { store: expiring },
           diagnostics: { artifacts: { root, sweepIntervalMs: 3_600_000, leaseMs: 3_600_000 } },
         });
+        // One artifact per sweep: the first reclaim removes the manifest, so a
+        // second sweep over the same one never reaches the write-back at all.
+        const stage = async (id: string): Promise<string> => {
+          const staged = await runtime.stageDiagnosticArtifact({ kind: 'eval', id });
+          await staged.sink.append(JSON.stringify({ v: 1, phase: 'start', operationId: 'op_1' }));
+          await runtime.finalizeDiagnosticArtifact(staged.artifactId, 'complete');
+          return staged.artifactId;
+        };
+
         const id = `ev-sweep-${randomUUID()}`;
-        const staged = await runtime.stageDiagnosticArtifact({ kind: 'eval', id });
-        await staged.sink.append(JSON.stringify({ v: 1, phase: 'start', operationId: 'op_1' }));
-        await runtime.finalizeDiagnosticArtifact(staged.artifactId, 'complete');
+        const first = await stage(id);
         await runtime.saveEvalResult({
           id,
           eval: 'suite',
           timestamp: Date.now(),
-          data: { id, diagnostics: { artifactId: staged.artifactId, status: 'complete' } },
+          data: { id, diagnostics: { artifactId: first, status: 'complete' } },
         });
 
-        const client = (expiring as unknown as { client: { ttl: (k: string) => Promise<number> } })
-          .client;
-        const key = `${TEST_PREFIX}sweepttl-eval:${id}`;
-        const before = await client.ttl(key);
-        expect(before).toBeGreaterThan(0);
+        // Read the remaining window through the store's own retention view, so
+        // this cannot drift from however RedisStore names its keys.
+        const before = (await expiring.getEvalRetention(id)).expiresAt!;
+        expect(before).toBeGreaterThan(Date.now());
 
-        // Age the window, then make the artifact look expired so the sweep
-        // reclaims it and reaches the write-back.
         await new Promise((r) => setTimeout(r, 1_100));
-        await runtime
-          .getDiagnosticArtifactStore()!
-          .refreshExpiry(staged.artifactId, Date.now() - 1);
+        await runtime.getDiagnosticArtifactStore()!.refreshExpiry(first, Date.now() - 1);
         await runtime.reconcileDiagnosticArtifacts();
 
-        // The row's remaining lifetime may only go DOWN. Jumping back to 120
-        // is the retention extension.
-        const after = await client.ttl(key);
-        expect(after).toBeLessThan(before);
+        // The absolute expiry may only move EARLIER or stay put. `SET ... EX`
+        // pushes it forward by the full window; `SET ... XX KEEPTTL` cannot
+        // move it at all.
+        const after = (await expiring.getEvalRetention(id)).expiresAt!;
+        expect(after).toBeLessThanOrEqual(before);
 
-        // And a row Redis has already dropped must stay dropped.
+        // And a row that is gone stays gone. A SECOND artifact, so this sweep
+        // actually reaches the write-back rather than finding nothing to
+        // reclaim — the row is deleted while that manifest is still live.
+        const second = await stage(id);
+        await expiring.saveEvalResult({
+          id,
+          eval: 'suite',
+          timestamp: Date.now(),
+          data: { id, diagnostics: { artifactId: second, status: 'complete' } },
+        });
+        await runtime.getEvalHistory();
         await expiring.deleteEvalResult(id);
+        await runtime.getDiagnosticArtifactStore()!.refreshExpiry(second, Date.now() - 1);
         await runtime.reconcileDiagnosticArtifacts();
+
         expect(await expiring.getEvalRetention(id)).toEqual({ exists: false });
         await runtime.shutdown();
       } finally {

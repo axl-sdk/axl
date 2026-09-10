@@ -156,8 +156,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   make a liveness call to discover its evidence is gone. That correction is
   written back only while the state store still holds the row, so it can never
   resurrect a result that expired or was deleted, nor extend the retention an
-  operator configured — re-saving an existing eval result now keeps the time it
-  had left rather than starting its `ttls.evalHistory` window over. The writer's lease is renewed on
+  operator configured. Corrections go through a new optional
+  `StateStore.updateEvalResult` — an update-only, retention-neutral write
+  (`SET ... XX KEEPTTL` on Redis, which needs Redis >= 6.0; `UPDATE ... WHERE
+  id` on SQLite) — because checking first and then saving leaves a window a
+  delete slips through, and a store that cannot promise it simply gets no
+  correction written. A delete started in-process beats a correction already in
+  flight, `runtime.getEvalResult(id)` confirms the row still exists before
+  serving it so a rescore can never republish an expired run's items under a
+  fresh id, and a plain re-save keeps the time the row had left rather than
+  starting its `ttls.evalHistory` window over — including leaving a
+  deliberately untimed row untimed. The writer's lease is renewed on
   a timer for as long as it holds the artifact — not by writing — so a run that
   exhausted its capture bound early, or that is waiting on a tool or a human,
   keeps its records; the hold is bounded by `artifacts.maxHoldMs` (24 h) and a

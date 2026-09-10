@@ -1856,7 +1856,7 @@ Eval results are automatically persisted when using `runRegisteredEval()`. Histo
 |--------|---------|-------------|
 | `runRegisteredEval(name, options?)` | `Promise<unknown>` | Run a registered eval by name. Automatically persists the result to eval history. `options` accepts `{ metadata?, onProgress?, signal?, captureTraces? }` — `metadata: Record<string, unknown>` injects custom metadata, `onProgress: (event: EvalProgressEventShape) => void` fires on `item_done` and `run_done` progress events, `signal: AbortSignal` cancels remaining items, `captureTraces: boolean` populates per-item `EvalItem.traces` on success and failure paths (forwarded to `runEval`) |
 | `getEvalHistory()` | `Promise<EvalHistoryEntry[]>` | All eval results, most recent first. Merges in-memory results with historical data from the state store |
-| `saveEvalResult(entry)` | `Promise<void>` | Manually save an eval result to history. Persists to the in-memory cache + `StateStore` and emits an `eval_result` event on the runtime's `EventEmitter` (load-bearing for Studio's live eval-trends aggregation — any custom consumer wanting live eval updates can subscribe via `runtime.on('eval_result', ...)`) |
+| `saveEvalResult(entry)` | `Promise<void>` | Manually save an eval result to history. Replaces any cached entry with the same id rather than shadowing it. Persists to the in-memory cache + `StateStore` and emits an `eval_result` event on the runtime's `EventEmitter` (load-bearing for Studio's live eval-trends aggregation — any custom consumer wanting live eval updates can subscribe via `runtime.on('eval_result', ...)`) |
 | `deleteEvalResult(id)` | `Promise<boolean>` | Remove a single eval history entry. Mutates the in-memory cache and delegates to `StateStore.deleteEvalResult?`. Returns `true` if the id existed |
 | `eval(config, options?)` | `Promise<unknown>` | Run an ad-hoc eval (not registered). Does **not** auto-persist to history. `options` accepts the same `{ onProgress?, signal?, captureTraces? }` as `runRegisteredEval` |
 | `evalCompare(baseline, candidate)` | `Promise<unknown>` | Compare two eval results for regressions/improvements |
@@ -1882,7 +1882,7 @@ Storage for [captured requests](observability.md#captured-requests-opt-in), conf
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `getEvalResult(id)` | `Promise<EvalHistoryEntry \| undefined>` | One history entry by id, without copying the whole history to find it. Returns the cached entry itself, where `getEvalHistory()` returns a copied array — treat it as read-only |
+| `getEvalResult(id)` | `Promise<EvalHistoryEntry \| undefined>` | One history entry by id, without copying the whole history to find it. Confirmed against `StateStore.getEvalRetention` before it is served, so a row the store has expired or deleted comes back `undefined` and is dropped from the cache rather than republished by a rescore. Returns the cached entry itself, where `getEvalHistory()` returns a copied array — treat it as read-only. `getEvalHistory()` is still served unconfirmed from the cache |
 | `getDiagnosticArtifactStore()` | `DiagnosticArtifactStore \| undefined` | The configured store, or `undefined` when capture is not configured |
 | `stageDiagnosticArtifact(owner)` | `Promise<{ artifactId, sink }>` | Take a lease and open a bounded sink. Throws `AxlError('DIAGNOSTICS_UNAVAILABLE')` when capture is not configured |
 | `finalizeDiagnosticArtifact(id, status, reason?, redaction?)` | `Promise<ArtifactManifest>` | Declare what the writer managed to capture. `redaction` is what the WRITER applied — the store only ever sees already-scrubbed bytes and cannot infer it. It describes ALL the artifact's bytes: an artifact holding copied records may only claim `'applied'` when both halves are scrubbed |
@@ -2207,6 +2207,19 @@ class MyStore implements StateStore {
   // never served — or retained — past its owner.
   async getEvalRetention(id: string): Promise<{ exists: boolean; expiresAt?: number }> {
     return { exists: await this.has(id) }; // omit expiresAt when rows never expire
+  }
+
+  // Optional. An UPDATE-ONLY, retention-neutral write: replace a row that is
+  // already there, return false rather than create one, and leave its expiry
+  // exactly as it was. The runtime writes every CORRECTION through this — a
+  // diagnostics sweep rewriting a row whose artifact it just reclaimed, a
+  // commit failure downgrading one — because such a write must never be able
+  // to resurrect a row deleted or expired since the correction was computed.
+  // Checking first and then saving does not close that window; only the store
+  // can, so implement it atomically (`SET ... XX KEEPTTL`, `UPDATE ... WHERE
+  // id = ?`). Omit it and corrections are simply not persisted.
+  async updateEvalResult(entry: EvalHistoryEntry): Promise<boolean> {
+    return (await this.replaceIfPresent(entry.id, entry)) ?? false;
   }
 }
 

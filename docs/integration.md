@@ -269,13 +269,31 @@ the artifact as an absolute `expiresAt`.
 
 **Re-saving an existing eval result never extends its retention.** Only a
 genuinely new row gets the configured `ttls.evalHistory` window; an existing one
-keeps the time it had left (`RedisStore` reads `PTTL` and re-applies it as
-`PX`). A result is re-saved by corrections that have nothing to do with your
-retention policy — the diagnostics sweep rewriting a row whose artifact it just
-reclaimed, a commit failure downgrading one — and renewing the window on each of
-those would keep item inputs, outputs and scores alive indefinitely on a busy
-server. `MemoryStore` and `SQLiteStore` have no automatic expiry at all, so the
-rule is vacuous for them. Physical deletion is **eventual**: the
+keeps the time it had left, and a row deliberately left untimed (`PERSIST`, or
+one predating the setting) stays untimed. A result is re-saved by corrections
+that have nothing to do with your retention policy — the diagnostics sweep
+rewriting a row whose artifact it just reclaimed, a commit failure downgrading
+one — and renewing the window on each of those would keep item inputs, outputs
+and scores alive indefinitely on a busy server.
+
+Those corrections go through `StateStore.updateEvalResult`, an **update-only,
+retention-neutral** write: it replaces a row that is already there and returns
+`false` rather than creating one. That is not the same as checking first and
+then saving — between the check and the write a row can be deleted (a
+right-to-be-forgotten request) or expire, and the save would bring it back,
+permanently on a store with no expiry. The condition therefore has to be inside
+the store:
+
+| Store | How | Note |
+|---|---|---|
+| `RedisStore` | `SET key value XX KEEPTTL` | **Requires Redis ≥ 6.0** for `KEEPTTL`. Nothing else in `RedisStore` does. On an older server corrections fail loudly rather than silently resetting a window |
+| `SQLiteStore` | `UPDATE … WHERE id = ?` | no expiry, so a resurrection here would be permanent |
+| `MemoryStore` | presence check, then set | as above |
+| a custom store | omit it | corrections are then **not persisted at all**; the in-process cache is still corrected |
+
+A same-process delete also beats a correction already in flight: the runtime
+records the id before it asks the store, and a correction for a recorded id is
+refused outright. Physical deletion is **eventual**: the
 row disappears the instant Redis expires it, and the bytes are reclaimed by the
 next sweep (or the next startup). Reads are gated on the logical expiry, so an
 expired artifact stops being served immediately regardless.

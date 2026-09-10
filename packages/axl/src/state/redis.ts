@@ -23,7 +23,11 @@ interface RedisClient {
   hDel(key: string, field: string | string[]): Promise<number>;
   // SET with optional `EX` (expiration in seconds). When `EX` is undefined,
   // the key has no TTL — same behavior as the pre-#3 single-arg form.
-  set(key: string, value: string, options?: { EX?: number; PX?: number }): Promise<string | null>;
+  set(
+    key: string,
+    value: string,
+    options?: { EX?: number; PX?: number; XX?: boolean; KEEPTTL?: boolean },
+  ): Promise<string | null>;
   // EXPIRE applies a TTL to an existing key (e.g. after `hSet`, since
   // node-redis has no `HSET ... EX` primitive). `mode: 'NX'` only sets the
   // TTL when none already exists — used for fixed-window semantics so a
@@ -937,7 +941,12 @@ export class RedisStore implements StateStore {
     if (ttl !== undefined) {
       // -2 no such key, -1 the key exists with no TTL, otherwise ms remaining.
       const remaining = await this.client.pTTL(key);
-      setOptions = remaining > 0 ? { PX: remaining } : { EX: ttl };
+      // -1 is a DELIBERATELY untimed row: an operator ran PERSIST, or the row
+      // predates `ttls.evalHistory`. Stamping the configured window on it would
+      // shorten its retention from forever to finite, which is the same
+      // violation as extending one, pointed the other way.
+      if (remaining === -2) setOptions = { EX: ttl };
+      else if (remaining > 0) setOptions = { PX: remaining };
     }
     await this.client
       .multi()
@@ -945,6 +954,31 @@ export class RedisStore implements StateStore {
       .set(key, JSON.stringify(entry), setOptions)
       .zAdd(this.evalHistoryZsetKey(), { score: entry.timestamp, value: entry.id })
       .exec();
+  }
+
+  /**
+   * Update-only write: see `StateStore.updateEvalResult`.
+   *
+   * One `SET key value XX KEEPTTL`, which is atomic and therefore has no
+   * check-then-write window at all: `XX` refuses a key that is not there, so a
+   * delete or an expiry racing the correction wins, and `KEEPTTL` leaves the
+   * remaining lifetime untouched, so the correction carries no retention
+   * decision of its own.
+   *
+   * **Requires Redis 6.0 or newer** (`KEEPTTL`). On an older server the option
+   * is rejected and corrections fail loudly rather than silently resetting a
+   * retention window. Nothing else in `RedisStore` needs 6.0.
+   *
+   * The index members are deliberately not re-added: the row already exists, so
+   * they are already there, and writing them for a key that vanished is exactly
+   * the resurrection this avoids.
+   */
+  async updateEvalResult(entry: EvalHistoryEntry): Promise<boolean> {
+    const result = await this.client.set(this.evalHistoryKey(entry.id), JSON.stringify(entry), {
+      XX: true,
+      KEEPTTL: true,
+    });
+    return result !== null;
   }
 
   async listEvalResults(limit?: number): Promise<EvalHistoryEntry[]> {

@@ -885,6 +885,11 @@ describe('capture failures never reach the run', () => {
     const end = phase(sink.records(), 'end');
     expect(end).toHaveLength(1);
     expect(end[0].response).toBeDefined();
+    // But the operation does NOT read back as fully recorded. A loss verdict is
+    // sticky in both directions: a reader following this ref to look at the
+    // retry would find nothing there, with the ref itself the only thing that
+    // could have warned them.
+    expect(channel.operations()[0].status).toBe('omitted');
   });
 
   it('keeps capturing the rest of the run after one un-projectable call', async () => {

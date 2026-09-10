@@ -224,8 +224,11 @@ export class FileDiagnosticArtifactStore implements DiagnosticArtifactStore {
    * of the process. The window that matters is short: a dropped write is one
    * already in flight when the delete landed, i.e. queued behind it on the same
    * serializer. Keeping the last {@link DELETED_MEMORY} ids covers that window
-   * by orders of magnitude, and an id evicted from it can at worst recreate a
-   * directory the sweeper will reclaim on its next pass.
+   * by orders of magnitude. Past it the append does not recreate anything —
+   * `appendFile` does not create parent directories, so it fails `ENOENT` — it
+   * degrades that run's capture, which the guard exists to avoid: the channel
+   * reads a rejected write as a dead sink and stops capturing the rest of the
+   * run.
    */
   private readonly deleted = new Set<string>();
 
@@ -473,8 +476,9 @@ export class FileDiagnosticArtifactStore implements DiagnosticArtifactStore {
     // Inside the serializer, not before it: draining the chain and THEN
     // removing the directory leaves a window in which a late `append`
     // recreates it as a `records.jsonl` with no manifest — which `list()`
-    // skips and reconciliation therefore never reclaims. `deleted` closes the
-    // window for good, since an id is never reused.
+    // skips and reconciliation therefore never reclaims. Once the directory is
+    // gone `deleted` takes over, dropping a queued write instead of letting it
+    // fail `ENOENT` into the channel and kill the rest of the run's capture.
     await this.serialize(artifactId, async () => {
       this.rememberDeleted(artifactId);
       this.counters.delete(artifactId);

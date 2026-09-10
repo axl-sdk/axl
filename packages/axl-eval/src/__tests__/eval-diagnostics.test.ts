@@ -617,7 +617,7 @@ describe('operation refs are added to an item, never swapped for its own (N11)',
     channel.noteOperation({
       operationId: 'op_new',
       kind: 'chat',
-      status: 'complete',
+      status: 'recorded',
       caseIndex: 0,
     });
 
@@ -628,7 +628,7 @@ describe('operation refs are added to an item, never swapped for its own (N11)',
         // What a rescored item carries in: the ORIGINAL run's generation refs,
         // copied forward deliberately.
         diagnostics: {
-          operations: [{ operationId: 'op_source', kind: 'chat' as const, status: 'complete' }],
+          operations: [{ operationId: 'op_source', kind: 'chat' as const, status: 'recorded' }],
         },
       },
     ] as unknown as Parameters<typeof attachOperationRefs>[0];

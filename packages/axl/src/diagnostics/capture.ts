@@ -492,8 +492,13 @@ export class RequestCaptureChannel {
       this.refs.set(ref.operationId, { ...ref });
       return;
     }
-    // A truncation verdict is sticky: a later `recorded` must not erase it.
-    if (existing.status !== 'truncated') existing.status = ref.status;
+    // A loss verdict is sticky: a later `recorded` must not erase it. Both
+    // kinds count — an operation whose retry record was stubbed is not fully
+    // recorded just because its `end` landed, and a reader following the ref to
+    // find that attempt would come back empty with nothing having warned them.
+    if (existing.status !== 'truncated' && existing.status !== 'omitted') {
+      existing.status = ref.status;
+    }
     if (ref.attempt !== undefined) existing.attempt = ref.attempt;
     if (ref.turn !== undefined && existing.turn === undefined) existing.turn = ref.turn;
   }

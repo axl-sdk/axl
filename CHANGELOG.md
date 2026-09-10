@@ -124,8 +124,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whenever `trace.redact` is on. A call that never returned leaves a `start`
   record with no `end` — the one you most want to read. A request or response
   that cannot be projected at all costs that ONE record — the same stub the byte
-  bound produces, carrying a `captured.reason` — never the rest of the run;
-  `status: 'unavailable'` is reserved for a failure that really is run-wide. A
+  bound produces, told apart by a `captured.reason` where an over-size stub
+  carries `bytes` — never the rest of the run; `status: 'unavailable'` is
+  reserved for a failure that really is run-wide. The reason names the error's
+  class, never its message, because a stub is written straight to the sink and
+  a message can carry the very call redaction was meant to scrub. A retry record
+  that could not be projected costs only itself: the response that follows is
+  still captured. A
   stream that was closed
   early, aborted, ended without a `done` chunk, or threw mid-iteration is
   instead sealed with an `end` record carrying an explicit `termination`, so the
@@ -159,8 +164,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and every degraded rescore reports `artifactId: ''` rather than naming the
   source run's artifact — dropping the per-item refs into it with it. The copy
   may take at most three quarters of the run bound, so the judging it exists to
-  record always has room. A rescore asked to capture on a runtime that cannot
-  host capture throws before any judging, exactly as `runEval` does. A manifest's `redaction` now reports what the writer
+  record always has room, and a rescore reports the WORSE of its two halves —
+  `unavailable` over `truncated` over `complete` — so a sink that died is never
+  reported as a limit the caller set. A rescore asked to capture on a runtime
+  that cannot host capture throws before any judging, exactly as `runEval` does.
+  Every path that stages an artifact releases it if it then fails — the runner,
+  the rescore, and Studio's import — so no failure leaves a directory renewing a
+  lease no sweep can reclaim. A manifest's `redaction` now reports what the writer
   actually applied — a run captured under `trace.redact` reads back as
   `applied`, an artifact holding copied records only claims `applied` when both
   halves were scrubbed, and an imported bundle is described by its own records rather than

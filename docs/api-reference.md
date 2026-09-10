@@ -1863,6 +1863,11 @@ Eval results are automatically persisted when using `runRegisteredEval()`. Histo
 
 `runRegisteredEval` and `eval` also accept `captureRequests`, forwarded verbatim to `runEval`.
 
+Both types in that signature are exported from `@axlsdk/axl` itself —
+`RuntimeEvalConfigShape` (the `config` argument of `runtime.eval`) and
+`EvalProgressEventShape` (the `onProgress` event) — so a caller can type the
+call without importing the optional `@axlsdk/eval` peer dependency.
+
 ### Diagnostic artifacts
 
 Storage for [captured requests](observability.md#captured-requests-opt-in), configured by `config.diagnostics.artifacts`:

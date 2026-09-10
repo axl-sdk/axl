@@ -130,6 +130,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   early, aborted, ended without a `done` chunk, or threw mid-iteration is
   instead sealed with an `end` record carrying an explicit `termination`, so the
   two cases stay distinguishable.
+- **`RuntimeEvalConfigShape` and `EvalProgressEventShape` are exported from
+  `@axlsdk/axl`.** Both appear in the signature of `runtime.eval()`, so typing
+  that call no longer needs the optional `@axlsdk/eval` peer dependency.
 - **Diagnostic artifact store.** `diagnostics.artifacts` configures where
   captured requests live: `root` for the built-in `FileDiagnosticArtifactStore`,
   or a custom `store` implementing `DiagnosticArtifactStore`. Artifacts follow

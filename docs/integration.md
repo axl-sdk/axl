@@ -265,7 +265,17 @@ getEvalRetention?(id: string): Promise<{ exists: boolean; expiresAt?: number }>;
 
 `MemoryStore` and `SQLiteStore` report existence with no expiry; `RedisStore`
 derives both from `PTTL`, so a configured `ttls.evalHistory` is mirrored onto
-the artifact as an absolute `expiresAt`. Physical deletion is **eventual**: the
+the artifact as an absolute `expiresAt`.
+
+**Re-saving an existing eval result never extends its retention.** Only a
+genuinely new row gets the configured `ttls.evalHistory` window; an existing one
+keeps the time it had left (`RedisStore` reads `PTTL` and re-applies it as
+`PX`). A result is re-saved by corrections that have nothing to do with your
+retention policy — the diagnostics sweep rewriting a row whose artifact it just
+reclaimed, a commit failure downgrading one — and renewing the window on each of
+those would keep item inputs, outputs and scores alive indefinitely on a busy
+server. `MemoryStore` and `SQLiteStore` have no automatic expiry at all, so the
+rule is vacuous for them. Physical deletion is **eventual**: the
 row disappears the instant Redis expires it, and the bytes are reclaimed by the
 next sweep (or the next startup). Reads are gated on the logical expiry, so an
 expired artifact stops being served immediately regardless.

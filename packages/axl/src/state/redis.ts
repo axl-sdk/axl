@@ -23,7 +23,7 @@ interface RedisClient {
   hDel(key: string, field: string | string[]): Promise<number>;
   // SET with optional `EX` (expiration in seconds). When `EX` is undefined,
   // the key has no TTL — same behavior as the pre-#3 single-arg form.
-  set(key: string, value: string, options?: { EX?: number }): Promise<string | null>;
+  set(key: string, value: string, options?: { EX?: number; PX?: number }): Promise<string | null>;
   // EXPIRE applies a TTL to an existing key (e.g. after `hSet`, since
   // node-redis has no `HSET ... EX` primitive). `mode: 'NX'` only sets the
   // TTL when none already exists — used for fixed-window semantics so a
@@ -79,7 +79,7 @@ interface RedisClient {
 // when `.exec()` is awaited. Same surface as node-redis v5's `RedisMulti`,
 // scoped to commands we actually use.
 interface RedisMulti {
-  set(key: string, value: string, options?: { EX?: number }): RedisMulti;
+  set(key: string, value: string, options?: { EX?: number; PX?: number }): RedisMulti;
   del(key: string | string[]): RedisMulti;
   sAdd(key: string, member: string | string[]): RedisMulti;
   sRem(key: string, member: string | string[]): RedisMulti;
@@ -907,17 +907,42 @@ export class RedisStore implements StateStore {
 
   // ── Eval History ────────────────────────────────────────────────────
 
+  /**
+   * Write an eval history row.
+   *
+   * **Re-saving an existing eval result never extends its retention.** Only a
+   * genuinely new key gets the configured window; an existing one keeps the
+   * time it had left. A result is re-saved by corrections that have nothing to
+   * do with the operator's retention policy — the diagnostics sweep rewriting a
+   * row whose artifact it just reclaimed, a commit failure downgrading one —
+   * and a plain `SET ... EX` would renew a full window on every one of them,
+   * silently keeping item inputs, outputs and scores alive indefinitely on a
+   * server that corrects rows often enough.
+   *
+   * The remaining window is read with `PTTL` and re-applied as `PX` rather than
+   * using `KEEPTTL`. Both need an existence check the SET cannot share a
+   * transaction with, so both race a key expiring in between — but the failure
+   * modes differ, and only one is safe: `KEEPTTL` on a key that expired in the
+   * gap recreates it with NO expiry at all, an immortal row holding exactly the
+   * data retention exists to age out. Every `PX` branch leaves a bounded
+   * lifetime, so the race costs at most one window's length, never the window
+   * itself. It also carries no Redis version floor, where `KEEPTTL` needs 6.0.
+   *
+   * The index entries carry no TTL and age out lazily, as with `saveExecution`.
+   */
   async saveEvalResult(entry: EvalHistoryEntry): Promise<void> {
-    // Atomic, same partial-write concern as saveExecution; also writes the
-    // sorted-set entry scored by timestamp for the listEvalResults fast path.
-    // TTL semantics identical to saveExecution — data blob is fixed-window;
-    // index entries have no TTL and age out lazily.
     const ttl = this.ttlFor('evalHistory');
-    const setOptions = ttl !== undefined ? { EX: ttl } : undefined;
+    const key = this.evalHistoryKey(entry.id);
+    let setOptions: { EX: number } | { PX: number } | undefined;
+    if (ttl !== undefined) {
+      // -2 no such key, -1 the key exists with no TTL, otherwise ms remaining.
+      const remaining = await this.client.pTTL(key);
+      setOptions = remaining > 0 ? { PX: remaining } : { EX: ttl };
+    }
     await this.client
       .multi()
       .sAdd(this.evalHistorySetKey(), entry.id)
-      .set(this.evalHistoryKey(entry.id), JSON.stringify(entry), setOptions)
+      .set(key, JSON.stringify(entry), setOptions)
       .zAdd(this.evalHistoryZsetKey(), { score: entry.timestamp, value: entry.id })
       .exec();
   }

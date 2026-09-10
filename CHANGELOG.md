@@ -156,7 +156,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   make a liveness call to discover its evidence is gone. That correction is
   written back only while the state store still holds the row, so it can never
   resurrect a result that expired or was deleted, nor extend the retention an
-  operator configured. The writer's lease is renewed on
+  operator configured — re-saving an existing eval result now keeps the time it
+  had left rather than starting its `ttls.evalHistory` window over. The writer's lease is renewed on
   a timer for as long as it holds the artifact — not by writing — so a run that
   exhausted its capture bound early, or that is waiting on a tool or a human,
   keeps its records; the hold is bounded by `artifacts.maxHoldMs` (24 h) and a

@@ -436,6 +436,15 @@ describe('MemoryStore', () => {
       expect(list[0].id).toBe('ev2');
     });
 
+    it('re-saving an eval result does not give it an expiry', async () => {
+      const store = new MemoryStore();
+      await store.saveEvalResult({ id: 'ev1', eval: 'test', timestamp: 1000, data: { v: 1 } });
+      await store.saveEvalResult({ id: 'ev1', eval: 'test', timestamp: 1000, data: { v: 2 } });
+      // In-memory history never expires, so a re-save has no retention to
+      // extend — the same contract Redis now holds by carrying PTTL forward.
+      expect(await store.getEvalRetention('ev1')).toEqual({ exists: true });
+    });
+
     it('deleteEvalResult removes the entry and returns true', async () => {
       const store = new MemoryStore();
       await store.saveEvalResult({ id: 'ev1', eval: 'test', timestamp: 1000, data: {} });
@@ -898,6 +907,16 @@ describe('SQLiteStore', () => {
       store.close();
     });
 
+    it('re-saving an eval result does not give it an expiry', async () => {
+      const store = createStore();
+      await store.saveEvalResult({ id: 'ev1', eval: 'test', timestamp: 1000, data: { v: 1 } });
+      await store.saveEvalResult({ id: 'ev1', eval: 'test', timestamp: 1000, data: { v: 2 } });
+      // SQLite history has no automatic expiry, so a re-save has no retention
+      // to extend — the same contract Redis now holds by carrying PTTL forward.
+      expect(await store.getEvalRetention('ev1')).toEqual({ exists: true });
+      store.close();
+    });
+
     it('deleteEvalResult removes the row and returns true', async () => {
       const store = createStore();
       await store.saveEvalResult({ id: 'ev1', eval: 'test', timestamp: 1000, data: {} });
@@ -942,10 +961,12 @@ describe('RedisStore', () => {
     type QueuedOp = () => unknown;
     const queue: QueuedOp[] = [];
     const chain = {
-      set(key: string, value: string, options?: { EX?: number }) {
+      set(key: string, value: string, options?: { EX?: number; PX?: number }) {
         queue.push(() => {
           data.set(key, value);
+          // The side map is in seconds; PX arrives in milliseconds.
           if (options?.EX !== undefined) ttls.set(key, options.EX);
+          else if (options?.PX !== undefined) ttls.set(key, options.PX / 1000);
           else ttls.delete(key);
           return 'OK';
         });
@@ -2417,6 +2438,38 @@ describe('RedisStore', () => {
         });
         await store.saveEvalResult({ id: 'ev1', eval: 't', timestamp: 0, data: {} });
         expect(ttls.get('axl:eval-history:ev1')).toBe(60 * 60 * 24 * 7);
+      });
+
+      it('re-saving an existing eval result never extends its retention', async () => {
+        const { store, ttls, mockClient } = createRedisStoreWithMockClient(undefined, {
+          evalHistory: 120,
+        });
+        const key = 'axl:eval-history:ev-keep';
+
+        await store.saveEvalResult({ id: 'ev-keep', eval: 't', timestamp: 0, data: { v: 1 } });
+        // A genuinely new key gets the configured window.
+        expect(ttls.get(key)).toBe(120);
+
+        // Time passes; the row has 30s left. A re-save — the diagnostics sweep
+        // correcting a downgraded row, say — must not hand it a fresh 120s
+        // window. Retention is what the operator configured, not something a
+        // background correction quietly renews.
+        ttls.set(key, 30);
+        await store.saveEvalResult({ id: 'ev-keep', eval: 't', timestamp: 0, data: { v: 2 } });
+        expect(ttls.get(key)).toBe(30);
+
+        // The remaining window was carried explicitly. A bare SET would clear
+        // the TTL outright, which is worse than extending it: the row would
+        // never expire at all.
+        const calls = (mockClient.pTTL as unknown as { mock: { calls: unknown[][] } }).mock.calls;
+        expect(calls.some((c) => c[0] === key)).toBe(true);
+      });
+
+      it('a re-saved eval row with no TTL configured stays untimed', async () => {
+        const { store, ttls } = createRedisStoreWithMockClient(undefined, { evalHistory: null });
+        await store.saveEvalResult({ id: 'ev-none', eval: 't', timestamp: 0, data: {} });
+        await store.saveEvalResult({ id: 'ev-none', eval: 't', timestamp: 0, data: {} });
+        expect(ttls.get('axl:eval-history:ev-none')).toBeUndefined();
       });
 
       it('saveExecutionState applies TTL via SET ... EX (refreshes on overwrite)', async () => {

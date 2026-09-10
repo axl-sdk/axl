@@ -185,6 +185,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   line inside the overall ceiling is refused — re-staged under a **new**
   artifact id owned by the new history row — an imported bundle can never name a path, a URL, or storage in
   the deployment it came from.
+- **Studio inspects and downloads captured requests.** A run whose result
+  carries a `diagnostics` block gets a "Captured requests" panel on its run
+  detail and a marker on its History row: status with what it means, record
+  count and size, fidelity, whether the **stored** bytes are redacted, expiry,
+  and a rescore's `copiedFrom` provenance. "Download records (.jsonl)" saves the
+  NDJSON as `<eval>-<id>.requests.jsonl`, and an inline viewer parses the same
+  stream line by line — capped at 200 records, which it says — with a per-record
+  request/response view. A manifest that reads `unavailable`, or whose artifact
+  was swept since the result was loaded, shows the reason and disables both
+  actions instead of repeating counters for evidence that is gone; a run that
+  captured nothing renders nothing.
 
 ### Changed
 

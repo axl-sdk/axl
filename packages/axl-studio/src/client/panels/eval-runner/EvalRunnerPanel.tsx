@@ -39,6 +39,7 @@ import {
   readAccounting,
 } from './accounting';
 import { BudgetStoppedBadge } from './RunAccountingPanel';
+import { RunDiagnosticsPanel } from './RunDiagnosticsPanel';
 import { ScorerCoverageCaveat } from './ScorerCoverageCaveat';
 import { DroppedAnnotationKeysBanner } from './DroppedAnnotationKeysBanner';
 import { ScorerFilteredBanner } from './ScorerFilteredBanner';
@@ -1397,6 +1398,18 @@ export function EvalRunnerPanel() {
                         ) : (
                           <div className="p-6 space-y-6">
                             <EvalSummaryTable result={displayResult} scorerTypes={scorerTypes} />
+
+                            {/* Its own block, deliberately not inside the
+                                accounting footer: capture is diagnostics and
+                                must never move a spend or coverage figure. */}
+                            <RunDiagnosticsPanel
+                              result={displayResult}
+                              evalName={
+                                history.find((h) => h.id === displayResult.id)?.eval ||
+                                selectedEval ||
+                                undefined
+                              }
+                            />
 
                             <ScoreDistribution
                               items={displayResult.items}

@@ -14,6 +14,7 @@ import {
 import { isRunBudgetStopped, readAccounting } from './accounting';
 import { SpendBadge } from './SpendBadge';
 import { BudgetStoppedBadge } from './RunAccountingPanel';
+import { CapturedRequestsBadge } from './RunDiagnosticsPanel';
 import type { EvalResultData } from './types';
 import type { EvalHistoryEntry } from '../../lib/types';
 
@@ -327,6 +328,7 @@ export function EvalHistoryTable({
             <span className="inline-flex items-center gap-1 justify-end">
               <SpendBadge accounting={readAccounting(data)} />
               <BudgetStoppedBadge result={data} />
+              <CapturedRequestsBadge result={data} />
             </span>
           </td>
           {(() => {

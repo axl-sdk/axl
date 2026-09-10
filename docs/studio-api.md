@@ -50,6 +50,22 @@ Studio exposes a REST API that the SPA consumes. You can also call these directl
 
 All endpoints return `{ ok: true, data: {...} }` on success or `{ ok: false, error: { code, message } }` on error.
 
+**How the Studio client reads the two diagnostics routes.** A run whose result
+carries a `diagnostics` block renders a "Captured requests" panel on the run
+detail, beside the accounting footer, and a marker on its History row. The panel
+shows the result's own manifest immediately and then confirms availability
+against `GET /api/evals/:id/diagnostics` — that route is the only place a
+rescore's `copiedFrom` provenance exists, and a 404 from it means the bytes were
+swept since the result was loaded, which downgrades the panel to `unavailable`
+and disables the download. A manifest reading `unavailable` (or carrying the
+empty-string artifact id) never repeats its `records`/`bytes` figures, because
+they describe evidence that has just been declared absent. "Download records
+(.jsonl)" takes the whole `/diagnostics/records` body and saves it as
+`<eval>-<id>.requests.jsonl`; the inline viewer parses the same stream line by
+line and stops at 200 records, says so, and points at the download for the rest.
+A result with no `diagnostics` block — every pre-0.24 artifact and every run that
+did not opt in — renders nothing.
+
 ### Versioned execution history and tool aggregates
 
 `GET /api/executions/:id` returns historical execution data without rewriting

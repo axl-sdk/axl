@@ -272,6 +272,7 @@ npx axl-eval ./evals/ --conditions development      # add Node.js import conditi
 npx axl-eval ./evals/qa.eval.ts --concurrency 10    # override item concurrency for this run
 npx axl-eval ./evals/qa.eval.ts --scorers accuracy  # run only named scorer(s) (single file)
 npx axl-eval ./evals/qa.eval.ts --capture-requests  # also record the requests Axl submitted
+npx axl-eval ./evals/qa.eval.ts --budget 2.50       # stop admitting paid work once known spend reaches $2.50
 ```
 
 The CLI resolves a runtime automatically: `--config <path>` > auto-detect `axl.config.*` > bare `new AxlRuntime()` (providers from env vars). Use `--conditions` when your eval file imports from monorepo packages that use conditional exports (e.g., `"development"` condition for source TypeScript instead of compiled dist).

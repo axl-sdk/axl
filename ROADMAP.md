@@ -13,6 +13,24 @@
 
 ### Complete
 
+- **Trustworthy eval accounting, budgets, and attempt diagnostics** — Cost is
+  measured from operation settlement rather than trace events:
+  `runtime.trackOutcome()` returns an `Accounting` record whose `knownCost` is
+  a lower bound with an explicit `completeness` and reasons, so a known $0 is
+  never confused with an unknown charge. `AdmissionController` closes a
+  budget before the request leaves the process, checked again before every
+  fetch attempt; `EvalConfig.budget` / `axl-eval --budget` stop a run with
+  distinct `budget_skipped` / `budget_interrupted` outcomes, coverage counts,
+  and a CLI exit rule keyed to refused work, not to a closed controller.
+  Comparisons certify cost only on complete, like-for-like data. Opt-in
+  request capture writes attempt-level diagnostics to a managed artifact
+  store with leases, retention mirroring, writer-applied redaction, and
+  Studio import/export; Studio presents spend with its completeness
+  everywhere and keeps its client mirror pinned to the eval package by a
+  drift test. See [observability.md](docs/observability.md),
+  [testing.md](docs/testing.md), and
+  [migration/eval-accounting.md](docs/migration/eval-accounting.md).
+
 - **Completed-file transcription** — `ctx.transcribe()` is a dedicated,
   non-chat finite-recording operation with OpenAI, Gemini Interactions/Files,
   and catalog-capable OpenRouter STT adapters; paired safe lifecycle events,

@@ -1100,4 +1100,27 @@ async function seedAccountingEval(runtime: AxlRuntime): Promise<void> {
   delete (legacy as { accounting?: unknown }).accounting;
   legacy.totalCost = 0.42;
   await save(legacy, 9);
+
+  // 5) A run that captured requests — which the dev server cannot actually
+  //    serve, and that is the point of seeding it.
+  //
+  //    The dev fixtures configure no `diagnostics.artifacts` store, so
+  //    `saveEvalResult` finds no artifact behind this manifest and rewrites it
+  //    to `status: 'unavailable'` with zeroed counters. The run therefore
+  //    renders the DOWNGRADED "Captured requests" block — reason shown,
+  //    download disabled, no record count — which is the state hardest to get
+  //    right and the one a dev is least likely to reproduce by hand. A block
+  //    with live records needs a real capture run against a configured
+  //    artifact store; see `docs/observability.md`.
+  const captured = base(measuredItems, acc({ knownCost: 0.75 }));
+  captured.diagnostics = {
+    version: 1,
+    artifactId: 'dev-fixture-artifact',
+    fidelity: 'runtime_request',
+    status: 'complete',
+    records: 6,
+    bytes: 24_576,
+    redaction: 'none',
+  };
+  await save(captured, 8);
 }

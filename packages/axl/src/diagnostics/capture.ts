@@ -442,6 +442,12 @@ export class RequestCaptureChannel {
           redacted: record.captured.redacted,
           truncated: true,
           omitted: ['record'],
+          // Carried, not dropped: a projection stub that is itself over-size
+          // would otherwise come back indistinguishable from an ordinary
+          // over-size record, which is the one distinction `reason` exists to
+          // make. It is a bounded literal (see `describeCaptureFailure`), so it
+          // cannot be what pushed the record over the bound.
+          ...(record.captured.reason !== undefined ? { reason: record.captured.reason } : {}),
         },
         bytes,
       };

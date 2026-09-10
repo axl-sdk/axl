@@ -198,6 +198,12 @@ function isMissing(error: unknown): boolean {
  * Record appends are serialized per artifact through a promise chain so
  * concurrent writers cannot interleave partial lines.
  */
+/**
+ * How many deleted ids the store remembers, to drop writes that were already in
+ * flight when the delete landed. See `FileDiagnosticArtifactStore.deleted`.
+ */
+const DELETED_MEMORY = 1024;
+
 export class FileDiagnosticArtifactStore implements DiagnosticArtifactStore {
   private readonly root: string;
   /** Per-artifact serialization chain for appends. */
@@ -205,13 +211,21 @@ export class FileDiagnosticArtifactStore implements DiagnosticArtifactStore {
   /** Live byte/record counters, folded into the manifest at finalize. */
   private readonly counters = new Map<string, { records: number; bytes: number }>();
   /**
-   * Ids this store has deleted.
+   * The most recently deleted ids, newest last.
    *
-   * Ids are minted, never reused, so "deleted" is permanent and a late write
-   * for one is always a bug in the caller rather than a legitimate resurrection.
-   * Remembering them is what stops such a write from recreating a directory
-   * holding records with no manifest — a shape `list()` skips and reconciliation
-   * therefore never reclaims.
+   * Ids are minted, never reused, so a write for one of these is always a
+   * caller bug rather than a legitimate resurrection. Remembering them is what
+   * stops such a write from recreating a directory holding records with no
+   * manifest — a shape `list()` skips and reconciliation therefore never
+   * reclaims.
+   *
+   * Bounded, because a long-lived Studio server deletes an artifact for every
+   * eval it ever expires and an unbounded set would hold every id for the life
+   * of the process. The window that matters is short: a dropped write is one
+   * already in flight when the delete landed, i.e. queued behind it on the same
+   * serializer. Keeping the last {@link DELETED_MEMORY} ids covers that window
+   * by orders of magnitude, and an id evicted from it can at worst recreate a
+   * directory the sweeper will reclaim on its next pass.
    */
   private readonly deleted = new Set<string>();
 
@@ -462,11 +476,23 @@ export class FileDiagnosticArtifactStore implements DiagnosticArtifactStore {
     // skips and reconciliation therefore never reclaims. `deleted` closes the
     // window for good, since an id is never reused.
     await this.serialize(artifactId, async () => {
-      this.deleted.add(artifactId);
+      this.rememberDeleted(artifactId);
       this.counters.delete(artifactId);
       await rm(this.dir(artifactId), { recursive: true, force: true });
     });
     this.writeChains.delete(artifactId);
+  }
+
+  /** Record a deletion, evicting the oldest id once the window is full. */
+  private rememberDeleted(artifactId: string): void {
+    // Re-adding would not move an existing id to the back of a Set's insertion
+    // order, but an id is deleted at most once, so there is nothing to refresh.
+    this.deleted.add(artifactId);
+    while (this.deleted.size > DELETED_MEMORY) {
+      const oldest = this.deleted.values().next();
+      if (oldest.done) break;
+      this.deleted.delete(oldest.value);
+    }
   }
 
   async list(): Promise<ArtifactManifest[]> {

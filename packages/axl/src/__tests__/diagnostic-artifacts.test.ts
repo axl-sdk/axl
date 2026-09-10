@@ -653,6 +653,36 @@ describe('a vanished artifact is reported, not published (M5)', () => {
     await runtime.shutdown();
   });
 
+  it('drops the counters and expiry of the artifact it just declared gone (N7)', async () => {
+    const runtime = artifactRuntime();
+    const staged = await stagedResult(runtime, 'run-stale');
+    await runtime.getDiagnosticArtifactStore()!.delete(staged.artifactId);
+
+    // The shape a real result carries: a record count, a byte count and an
+    // expiry, all describing the artifact that has just vanished.
+    const data = {
+      ...staged.data,
+      diagnostics: {
+        ...(staged.data.diagnostics as Record<string, unknown>),
+        status: 'complete',
+        records: 137,
+        bytes: 2_100_000,
+        expiresAt: Date.now() + 86_400_000,
+      },
+    };
+    await runtime.saveEvalResult({ id: 'run-stale', eval: 'e', timestamp: 1, data });
+
+    const stored = (await runtime.getEvalHistory()).find((e) => e.id === 'run-stale')!;
+    const diagnostics = (stored.data as { diagnostics: Record<string, unknown> }).diagnostics;
+    // `status: 'unavailable', records: 137` is a count of something nobody can
+    // read — and an `expiresAt` for bytes that are already gone tells a reader
+    // the evidence is still in retention.
+    expect(diagnostics.records).toBe(0);
+    expect(diagnostics.bytes).toBe(0);
+    expect(diagnostics.expiresAt).toBeUndefined();
+    await runtime.shutdown();
+  });
+
   it('reports a missing artifact from commit, markDeletePending and refreshExpiry', async () => {
     const store = new FileDiagnosticArtifactStore({ root });
     expect(await store.commit('art_nope', {})).toEqual({ ok: false, reason: 'missing' });

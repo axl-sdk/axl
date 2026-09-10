@@ -189,10 +189,24 @@ function stubRecord(
   });
 }
 
-/** A capture-side failure reason. Never serializes the thrown value itself. */
+/**
+ * A capture-side failure reason: the error's CLASS, never its message.
+ *
+ * The reason lands in `captured.reason` on a stub, and a stub is written
+ * straight to the channel rather than through `redactCapturedRequest` — it has
+ * no request or response to scrub. That is only safe while the reason cannot
+ * carry content: a `DataCloneError` stringifies the value it choked on, and an
+ * adapter that throws from a response getter can put model output in the
+ * message, which under `trace.redact` would land in the artifact labelled
+ * scrubbed. A name and an error code identify the defect and carry nothing of
+ * the call.
+ */
 function describeCaptureFailure(error: unknown): string {
-  if (error instanceof Error) return `${error.name}: ${error.message}`;
-  return typeof error === 'string' ? error : Object.prototype.toString.call(error);
+  if (error instanceof Error) {
+    const code = (error as { code?: unknown }).code;
+    return typeof code === 'string' ? `${error.name} (${code})` : error.name;
+  }
+  return typeof error === 'string' ? 'thrown string' : Object.prototype.toString.call(error);
 }
 
 class CaptureRecorder {
@@ -274,7 +288,12 @@ class CaptureRecorder {
       // for a channel-wide failure (a dead sink), which is what §12.3's
       // `unavailable` means — a projection failure on one call is the
       // truncation case, and saying otherwise throws away every later record.
-      this.ended = true;
+      //
+      // `ended` is deliberately NOT set here. A retry record that failed to
+      // project says nothing about the response that follows: the call is still
+      // running and still returns normally, so suppressing its `end` would drop
+      // a record capture could perfectly well have written. Only `end()` seals
+      // the operation, and it sets the flag itself.
       stubRecord(
         this.channel,
         {

@@ -819,6 +819,72 @@ describe('capture failures never reach the run', () => {
     // call that was never made.
     expect(stub.operationId).toBeTruthy();
     expect(channel.operations()[0].status).toBe('omitted');
+    // The reason names the DEFECT, never the value that caused it. A
+    // DataCloneError's message stringifies the thing it choked on — here the
+    // schema's `validate` function, elsewhere a prompt — and this record goes
+    // straight to the sink without passing through `redactCapturedRequest`,
+    // so a message would land in the artifact stamped `redacted: true`.
+    expect(stub.captured.reason).not.toMatch(/validate/);
+    expect(stub.captured.reason).toMatch(/DataCloneError/);
+  });
+
+  it('a retry record that could not be projected still lets the response be captured', async () => {
+    // The failure is aimed at the ATTEMPT record only: the provider raises the
+    // flag immediately before the second dispatch, and the getter lowers it as
+    // soon as it has thrown once, so the start and end records project normally.
+    let hostile = false;
+    const options = {
+      get model(): string {
+        if (hostile) {
+          hostile = false;
+          throw new Error('the model could not be read');
+        }
+        return 'm';
+      },
+    } as unknown as ChatOptions;
+
+    class RetryingProvider implements Provider {
+      readonly name = 'retry';
+      readonly reportsRequestLifecycle = true as const;
+      async chat(_messages: ChatMessage[], opts: ChatOptions): Promise<ProviderResponse> {
+        opts.requestLifecycle?.onDispatch?.();
+        opts.requestLifecycle?.onRetry?.();
+        hostile = true;
+        opts.requestLifecycle?.onDispatch?.();
+        return {
+          content: 'ok',
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        };
+      }
+      async *stream(): AsyncGenerator<StreamChunk> {
+        yield { type: 'done' };
+      }
+    }
+    const runtime = new AxlRuntime({ defaultProvider: 'retry' });
+    runtime.registerProvider('retry', new RetryingProvider());
+    const { provider: facade } = runtime.resolveProvider('retry:m');
+
+    const sink = new CollectingSink();
+    const channel = channelWith(sink);
+    const outcome = await runtime.trackOutcome(
+      () => facade.chat([{ role: 'user', content: 'hi' }], options),
+      { capture: channel },
+    );
+    const status = await channel.close();
+
+    expect(outcome.status).toBe('fulfilled');
+    expect(status.status).toBe('complete');
+    // The attempt record is the one that degraded.
+    const attempt = phase(sink.records(), 'attempt')[0];
+    expect(attempt.captured.truncated).toBe(true);
+    expect(attempt.captured.reason).toBeTruthy();
+    // And the RESPONSE still lands. A retry record nobody could project says
+    // nothing about the response that follows: the call ran and returned. Only
+    // `end()` seals an operation, so a failed attempt must not stand in for it —
+    // an operation with no `end` is the shape that means "never came back".
+    const end = phase(sink.records(), 'end');
+    expect(end).toHaveLength(1);
+    expect(end[0].response).toBeDefined();
   });
 
   it('keeps capturing the rest of the run after one un-projectable call', async () => {

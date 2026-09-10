@@ -880,7 +880,7 @@ apply (all UTF-8 bytes, all overridable via `captureRequests: { … }`):
 
 | Bound | Default | On exceeding |
 |---|---|---|
-| `maxRecordBytes` | 256 KiB | The record becomes a stub (`captured.truncated`, `omitted: ['record']`, `captured.reason`) |
+| `maxRecordBytes` | 256 KiB | The record becomes a stub (`captured.truncated`, `omitted: ['record']`) carrying `bytes`, the size of the record it replaced |
 | `maxRunBytes` | 16 MiB | Capture stops for the run; status `truncated` with a reason |
 | `maxQueueBytes` | 1 MiB | Capture stops rather than buffering behind a slow sink |
 
@@ -892,10 +892,16 @@ three quarters of it so the judging always has room. When either half is cut the
 
 A request or response that cannot be projected at all — a `responseFormat`
 schema holding a function, a content part no adapter names — costs that ONE
-record, not the run: it becomes the same stub the byte bound produces, with
-`captured.reason` saying why, and capture continues. `status: 'unavailable'` is
-reserved for a failure that really is run-wide, such as a sink that cannot be
-written to.
+record, not the run: it becomes the same stub the byte bound produces, and
+capture continues. `status: 'unavailable'` is reserved for a failure that really
+is run-wide, such as a sink that cannot be written to.
+
+The two stubs are told apart by which field they carry: an over-size record
+carries `bytes`, an un-projectable one carries `captured.reason`. The reason
+names the error's class, never its message — it is written straight to the sink
+rather than through redaction, so it must not be able to carry any of the call.
+A projection stub that is itself over-size keeps its reason through the
+re-stub.
 
 Writes are queued, never awaited by the provider path. A sink that throws stops
 capture with status `unavailable`. In every one of these cases the run

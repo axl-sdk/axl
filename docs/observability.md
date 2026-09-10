@@ -880,13 +880,22 @@ apply (all UTF-8 bytes, all overridable via `captureRequests: { … }`):
 
 | Bound | Default | On exceeding |
 |---|---|---|
-| `maxRecordBytes` | 256 KiB | The record becomes a stub (`captured.truncated`, `omitted: ['record']`) |
+| `maxRecordBytes` | 256 KiB | The record becomes a stub (`captured.truncated`, `omitted: ['record']`, `captured.reason`) |
 | `maxRunBytes` | 16 MiB | Capture stops for the run; status `truncated` with a reason |
 | `maxQueueBytes` | 1 MiB | Capture stops rather than buffering behind a slow sink |
 
 A rescore shares one `maxRunBytes` budget across both halves of its artifact —
 the source records it copied in and the judge calls it makes — so the artifact
-never grows to twice the bound you asked for.
+never grows to twice the bound you asked for, and the copy may take at most
+three quarters of it so the judging always has room. When either half is cut the
+`reason` names which.
+
+A request or response that cannot be projected at all — a `responseFormat`
+schema holding a function, a content part no adapter names — costs that ONE
+record, not the run: it becomes the same stub the byte bound produces, with
+`captured.reason` saying why, and capture continues. `status: 'unavailable'` is
+reserved for a failure that really is run-wide, such as a sink that cannot be
+written to.
 
 Writes are queued, never awaited by the provider path. A sink that throws stops
 capture with status `unavailable`. In every one of these cases the run

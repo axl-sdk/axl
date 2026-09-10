@@ -147,6 +147,16 @@ export type CapturedRequestRecord = {
     truncated: boolean;
     /** What could not be represented, e.g. `['media']`. */
     omitted: string[];
+    /**
+     * Why this record is a stub, when it is one.
+     *
+     * A stub has two causes and a reader has to be able to tell them apart:
+     * the record exceeded `maxRecordBytes` (its size is on `bytes`), or the
+     * request/response could not be projected at all — a `json_schema.schema`
+     * holding a function, a content part no adapter names. Both keep the
+     * operation's identity; neither is a call that failed.
+     */
+    reason?: string;
   };
   /** Encoded size of the record this stub replaced. Present only on stubs. */
   bytes?: number;
@@ -377,13 +387,15 @@ export class RequestCaptureChannel {
   }
 
   /**
-   * Report a capture-side failure from outside the channel.
+   * Report a CHANNEL-WIDE capture failure from outside the channel.
    *
-   * The producers on the provider path (request projection, redaction, record
-   * assembly) can throw on inputs that are perfectly legal for a provider call
-   * — a `json_schema.schema` holding a function, a content part whose `type` no
-   * adapter recognizes. None of that may fail the call, so those sites catch
-   * and report here: capture stops and says why, and nothing else changes.
+   * Terminal for the run, so it is reserved for a loss that really is
+   * run-wide: a sink that cannot be written to, a host producer that has lost
+   * its ability to record anything further. A single record that could not be
+   * projected — a `json_schema.schema` holding a function, a content part no
+   * adapter names — is NOT this: it is the truncation case, and the provider
+   * path stubs that one record and keeps capturing. Calling `fail()` for it
+   * would throw away every later record in the run.
    */
   fail(reason: string): void {
     this.stop('unavailable', reason);

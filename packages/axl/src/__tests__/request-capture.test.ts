@@ -806,9 +806,45 @@ describe('capture failures never reach the run', () => {
     expect(on.provider.calls).toHaveLength(1);
     // And the numbers are the same as the capture-off run, to the byte.
     expect(outcome.accounting).toEqual(baseline.accounting);
-    // The loss is reported on the diagnostics rail, where it belongs.
-    expect(status.status).toBe('unavailable');
-    expect(status.reason).toBeTruthy();
+    // The loss is reported on the diagnostics rail, where it belongs — as ONE
+    // stubbed record. Losing the whole run's capture over one un-projectable
+    // call is the N6 failure: an eval where one case in 200 carries an odd
+    // schema would surrender the other 199 cases of evidence.
+    expect(status.status).toBe('complete');
+    const stub = sink.records()[0];
+    expect(stub.captured.truncated).toBe(true);
+    expect(stub.captured.omitted).toContain('record');
+    expect(stub.captured.reason).toBeTruthy();
+    // The operation is still NAMED: one missing from the artifact reads as a
+    // call that was never made.
+    expect(stub.operationId).toBeTruthy();
+    expect(channel.operations()[0].status).toBe('omitted');
+  });
+
+  it('keeps capturing the rest of the run after one un-projectable call', async () => {
+    const hostile = {
+      type: 'json_schema',
+      json_schema: { name: 'answer', schema: { validate() {} } },
+    } as unknown as ChatOptions['responseFormat'];
+
+    const on = providerRuntime();
+    const sink = new CollectingSink();
+    const channel = channelWith(sink);
+    await on.runtime.trackOutcome(
+      async () => {
+        await ask(on.runtime, { responseFormat: hostile });
+        await ask(on.runtime, {});
+      },
+      { capture: channel },
+    );
+    const status = await channel.close();
+
+    expect(status.status).toBe('complete');
+    // The second call is fully recorded: request in, response out.
+    const starts = phase(sink.records(), 'start');
+    const usable = starts.filter((r) => r.request !== undefined);
+    expect(usable).toHaveLength(1);
+    expect(phase(sink.records(), 'end')).toHaveLength(1);
   });
 
   it('an unrecognized content part does not fail the call or move the numbers', async () => {
@@ -834,7 +870,9 @@ describe('capture failures never reach the run', () => {
     expect(outcome.status).toBe('fulfilled');
     expect(on.provider.calls).toHaveLength(1);
     expect(outcome.accounting).toEqual(baseline.accounting);
-    expect(status.status).toBe('unavailable');
+    // One stubbed record, not a silenced run.
+    expect(status.status).toBe('complete');
+    expect(sink.records()[0].captured.reason).toBeTruthy();
   });
 
   it('a projection failure on the RESPONSE does not turn a success into a failure', async () => {

@@ -122,9 +122,71 @@ function beginCapture(
     // inputs are not ours to validate: `json_schema.schema` is typed `unknown`,
     // and a message rehydrated from an older session may carry a content part
     // no current adapter names.
-    channel.fail(`request could not be captured: ${describeCaptureFailure(error)}`);
+    //
+    // ONE record is lost, not the run's. An eval where one case in 200 carries
+    // an odd content part must not surrender the other 199 cases of evidence,
+    // so this degrades exactly as the per-record byte bound does: a stub in
+    // place of the record, and capture continues.
+    stubRecord(
+      channel,
+      {
+        operationId,
+        kind,
+        provider: raw.name ?? 'unknown',
+        model: options.model,
+        transportAttempts: 1,
+      },
+      'start',
+      `the request could not be captured: ${describeCaptureFailure(error)}`,
+    );
     return undefined;
   }
+}
+
+/** The identity a stub keeps when its content could not be projected. */
+type StubIdentity = {
+  operationId: string;
+  kind: 'chat' | 'stream';
+  provider: string;
+  model: string;
+  transportAttempts: number;
+};
+
+/**
+ * Record that one operation could not be projected, and say so in the artifact.
+ *
+ * Deliberately built from literals only: this runs on a path that has already
+ * failed once, and it must not be able to fail again. The operation is marked
+ * `omitted` rather than dropped — an operation missing from the artifact reads
+ * as a call that was never made.
+ */
+function stubRecord(
+  channel: RequestCaptureChannel,
+  identity: StubIdentity,
+  phase: CapturedRequestRecord['phase'],
+  reason: string,
+): void {
+  channel.write({
+    v: 1,
+    phase,
+    operationId: identity.operationId,
+    kind: identity.kind,
+    transportAttempts: identity.transportAttempts,
+    provider: identity.provider,
+    model: identity.model,
+    captured: {
+      fidelity: 'runtime_request',
+      redacted: channel.redact,
+      truncated: true,
+      omitted: ['record'],
+      reason,
+    },
+  });
+  channel.noteOperation({
+    operationId: identity.operationId,
+    kind: identity.kind,
+    status: 'omitted',
+  });
 }
 
 /** A capture-side failure reason. Never serializes the thrown value itself. */
@@ -204,12 +266,27 @@ class CaptureRecorder {
    * of them may throw. `RequestCaptureChannel.write()` is already total for the
    * same reason; this extends that discipline to the producers.
    */
-  private guarded(what: string, step: () => void): void {
+  private guarded(what: string, phase: CapturedRequestRecord['phase'], step: () => void): void {
     try {
       step();
     } catch (error) {
+      // One record degrades; the run's capture continues. `fail()` is reserved
+      // for a channel-wide failure (a dead sink), which is what §12.3's
+      // `unavailable` means — a projection failure on one call is the
+      // truncation case, and saying otherwise throws away every later record.
       this.ended = true;
-      this.channel.fail(`${what} could not be captured: ${describeCaptureFailure(error)}`);
+      stubRecord(
+        this.channel,
+        {
+          operationId: this.operationId,
+          kind: this.kind,
+          provider: this.provider,
+          model: this.options.model,
+          transportAttempts: Math.max(1, this.attempts),
+        },
+        phase,
+        `${what} could not be captured: ${describeCaptureFailure(error)}`,
+      );
     }
   }
 
@@ -217,7 +294,7 @@ class CaptureRecorder {
   markDispatch(): void {
     this.attempts += 1;
     if (this.attempts <= 1) return;
-    this.guarded('a transport attempt', () => {
+    this.guarded('a transport attempt', 'attempt', () => {
       this.emit({ phase: 'attempt', transportAttempts: this.attempts });
       this.channel.noteOperation({
         operationId: this.operationId,
@@ -231,7 +308,7 @@ class CaptureRecorder {
   end(outcome: { response?: ProviderResponse; error?: unknown; termination?: string }): void {
     if (this.ended) return;
     this.ended = true;
-    this.guarded('a response', () => {
+    this.guarded('a response', 'end', () => {
       this.emit({
         phase: 'end',
         transportAttempts: Math.max(1, this.attempts),

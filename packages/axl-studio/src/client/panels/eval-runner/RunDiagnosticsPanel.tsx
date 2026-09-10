@@ -108,17 +108,22 @@ function describeViewerNote(parsed: ParsedRecords): string | null {
 }
 
 /**
- * The reason this operation is a stub, in the artifact's own words.
+ * The reason ONE phase's line is a stub, in the artifact's own words.
  *
  * A stub has two causes a reader must tell apart: the record exceeded
  * `maxRecordBytes`, or the request/response could not be projected at all. The
  * writer records the second on `captured.reason` and leaves it unset for the
  * first, so the size sentence is the ONLY one this build may supply itself.
+ *
+ * Deliberately per phase, not per operation. The stub replaces the line it was
+ * written for — `capture.ts` keeps the original `phase` — and a request is the
+ * likeliest oversize record, because prompts are big. Reading a stub off any
+ * line of the operation lets a stubbed `start` answer for the missing `end` of
+ * a call that hung, which is precisely the fact the reader is looking for.
  */
-function stubCause(records: readonly RequestRecord[]): string | undefined {
-  const stub = records.find((r) => r.captured?.truncated);
-  if (!stub) return undefined;
-  return stub.captured?.reason ?? 'record exceeded the size limit';
+function stubCause(record: RequestRecord | undefined): string | undefined {
+  if (record?.captured?.truncated !== true) return undefined;
+  return record.captured.reason ?? 'record exceeded the size limit';
 }
 
 /** True when any line of this operation reached the reader scrubbed. */
@@ -157,7 +162,8 @@ function OperationRow({ operation, index }: { operation: CapturedOperation; inde
   const reported = end?.transportAttempts ?? head?.transportAttempts;
   const attempts = Number.isFinite(reported) ? reported : undefined;
   const totalMs = end?.response?.timing?.totalMs;
-  const stub = stubCause(operation.records);
+  const requestStub = stubCause(operation.start);
+  const responseStub = stubCause(end);
   // A response is missing either because the operation has no `end` line at
   // all, or because its `end` carries neither response nor error.
   const noResponse = !end || (end.response === undefined && end.error === undefined);
@@ -199,10 +205,11 @@ function OperationRow({ operation, index }: { operation: CapturedOperation; inde
           {end?.error && (
             <span className="text-red-700 dark:text-red-300">error: {end.error.message}</span>
           )}
-          {/* A stub already says why this operation's content is missing;
+          {/* A stubbed RESPONSE already says why the response is missing;
               adding "no response recorded" would read as a call that never
-              came back, which is the discrimination this row exists to keep. */}
-          {noResponse && stub === undefined && (
+              came back. A stubbed REQUEST says nothing about the response, so
+              it must not suppress this — that operation may well have hung. */}
+          {noResponse && responseStub === undefined && (
             <span
               className="text-amber-700 dark:text-amber-300"
               title={
@@ -214,8 +221,13 @@ function OperationRow({ operation, index }: { operation: CapturedOperation; inde
               no response recorded
             </span>
           )}
-          {stub !== undefined && (
-            <span className="text-amber-700 dark:text-amber-300">stub — {stub}</span>
+          {requestStub !== undefined && (
+            <span className="text-amber-700 dark:text-amber-300">request stub — {requestStub}</span>
+          )}
+          {responseStub !== undefined && (
+            <span className="text-amber-700 dark:text-amber-300">
+              response stub — {responseStub}
+            </span>
           )}
           {anyRedacted(operation.records) && (
             <span
@@ -262,7 +274,8 @@ function OperationDetail({ operation, index }: { operation: CapturedOperation; i
   const response = end?.response;
   const correction = operation.records.find((r) => r.correction)?.correction;
   const omitted = omittedAcross(operation.records);
-  const stub = stubCause(operation.records);
+  const requestStub = stubCause(start);
+  const responseStub = stubCause(end);
 
   return (
     <div className="space-y-2" data-testid={`operation-detail-${index}`}>
@@ -298,7 +311,11 @@ function OperationDetail({ operation, index }: { operation: CapturedOperation; i
         </>
       ) : (
         <Row label="Request">
-          {start ? (
+          {requestStub !== undefined ? (
+            <span className="text-[hsl(var(--muted-foreground))]">
+              the record was replaced by a stub — {requestStub}
+            </span>
+          ) : start ? (
             <Unknown what="The request" />
           ) : (
             <span className="text-[hsl(var(--muted-foreground))]">
@@ -325,8 +342,8 @@ function OperationDetail({ operation, index }: { operation: CapturedOperation; i
       ) : (
         <Row label="Response">
           <span className="text-[hsl(var(--muted-foreground))]">
-            {stub !== undefined ? (
-              <>the record was replaced by a stub — {stub}</>
+            {responseStub !== undefined ? (
+              <>the record was replaced by a stub — {responseStub}</>
             ) : (
               <>
                 no response recorded

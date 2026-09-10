@@ -16,9 +16,10 @@ import type { DiagnosticManifest, EvalResultData, RequestRecord } from './types'
  * An artifact is allowed to be 16 MiB across tens of thousands of records, and
  * a browser tab that parses all of them into React state to render a list is
  * how a diagnostics read takes the page down. The cap is deliberately a
- * *reader* bound, not a fetch bound: the stream is cancelled once the cap is
- * reached, so the client never holds more than this many operations regardless
- * of how large the artifact is. Anything past it is the download's job.
+ * *retention* bound, not a fetch bound: the stream is read to the end, but only
+ * the lines of this many operations are kept, so the client never holds more
+ * than this many operations regardless of how large the artifact is. Anything
+ * past it is the download's job.
  *
  * The unit is the operation, not the JSONL line, because a line is half a turn:
  * a `start` carries the request and its `end` carries the response. A cap
@@ -139,7 +140,8 @@ async function* textChunks(response: Response): AsyncGenerator<string> {
     const tail = decoder.decode();
     if (tail) yield tail;
   } finally {
-    // Releases the connection when the consumer stopped early at the cap.
+    // Releases the connection on any exit — including a consumer that threw
+    // part-way through the artifact.
     await reader.cancel().catch(() => undefined);
   }
 }
@@ -215,17 +217,26 @@ export function groupOperations(records: readonly RequestRecord[]): CapturedOper
 }
 
 /**
- * Parse an NDJSON records response line by line, stopping at `maxOperations`.
+ * Parse an NDJSON records response line by line, keeping `maxOperations`.
  *
- * Line-by-line and capped on purpose: the whole point of the route streaming
- * is lost if the client buffers the artifact into one string and then splits
- * it. Once the cap is hit the generator's `finally` cancels the underlying
- * read, so a 16 MiB artifact costs the tab the lines of `maxOperations`
- * operations, not 16 MiB.
+ * Line-by-line on purpose: the whole point of the route streaming is lost if
+ * the client buffers the artifact into one string and then splits it.
  *
- * The cap admits whole operations: a line belonging to an operation already
- * admitted is always taken, so the page can never end on a `start` whose `end`
- * was cut off — which would render as a call that never came back.
+ * The cap admits whole operations, and that is why the read does NOT stop at
+ * the first line past it. The eval runner runs cases concurrently, so the
+ * artifact interleaves operations: an `end` routinely lands after several later
+ * `start`s. Stopping at the first unadmitted `start` therefore drops the `end`
+ * lines of operations already on screen, and the viewer renders a completed
+ * call as one that never came back — a false statement about the artifact that
+ * looks exactly like a hang. So every line is read, and only the lines of
+ * admitted operations are retained: the tab's cost stays the lines of
+ * `maxOperations` operations, not 16 MiB, at the price of draining a stream
+ * whose tail is discarded.
+ *
+ * `cappedEarly` stays a boolean rather than a count of what was cut. Counting
+ * distinct skipped operations means holding their ids, which is unbounded in
+ * exactly the case the cap exists for; "there is more, download it" is what the
+ * reader can act on either way.
  */
 export async function parseRecordStream(
   response: Response,
@@ -233,53 +244,57 @@ export async function parseRecordStream(
 ): Promise<ParsedRecords> {
   const records: RequestRecord[] = [];
   const admitted = new Set<string>();
+  // Records with no usable `operationId` cannot be paired with anything:
+  // `groupOperations` gives each one its own row, so each one costs a cap slot.
+  // Grouping them under a single "unattributed" row would be the other option,
+  // but that row would show one malformed record's request above another's
+  // response — the cross-operation pairing the per-operation model exists to
+  // rule out. Counting them keeps the row count at or under `maxOperations`.
+  let unattributed = 0;
   let malformed = 0;
   let cappedEarly = false;
   let buffer = '';
 
-  const take = (line: string): boolean => {
+  const take = (line: string): void => {
     const trimmed = line.trim();
-    if (trimmed === '') return true;
+    if (trimmed === '') return;
     let parsed: unknown;
     try {
       parsed = JSON.parse(trimmed);
     } catch {
       malformed += 1;
-      return true;
+      return;
     }
     if (!parsed || typeof parsed !== 'object') {
       malformed += 1;
-      return true;
+      return;
     }
     const record = parsed as RequestRecord;
     const id = typeof record.operationId === 'string' ? record.operationId : '';
-    if (!admitted.has(id)) {
-      if (admitted.size >= maxOperations) {
+    const known = id !== '' && admitted.has(id);
+    if (!known) {
+      if (admitted.size + unattributed >= maxOperations) {
         // A record for an operation we have no room for — and therefore proof
         // that there IS more than the cap.
         cappedEarly = true;
-        return false;
+        return;
       }
-      admitted.add(id);
+      if (id === '') unattributed += 1;
+      else admitted.add(id);
     }
     records.push(record);
-    return true;
   };
 
-  outer: for await (const chunk of textChunks(response)) {
+  for await (const chunk of textChunks(response)) {
     buffer += chunk;
     let newline = buffer.indexOf('\n');
     while (newline !== -1) {
-      const line = buffer.slice(0, newline);
+      take(buffer.slice(0, newline));
       buffer = buffer.slice(newline + 1);
-      if (!take(line)) {
-        cappedEarly = true;
-        break outer;
-      }
       newline = buffer.indexOf('\n');
     }
   }
-  if (!cappedEarly && buffer.trim() !== '') take(buffer);
+  if (buffer.trim() !== '') take(buffer);
 
   return { records, malformed, cappedEarly };
 }

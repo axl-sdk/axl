@@ -8,7 +8,8 @@
  * that quietly drops records past its cap, and a redaction label that leaves
  * the reader guessing whether the bytes on disk are scrubbed.
  *
- * Test-matrix rows: A16.19–A16.29 (P5b).
+ * Test-matrix rows: A16.19–A16.39 (P5b), plus A16.40–A16.42 for the per-phase
+ * stub reading and the cap's retention semantics.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, waitFor, within } from '@testing-library/react';
@@ -21,7 +22,12 @@ import {
   CapturedRequestsBadge,
 } from '../client/panels/eval-runner/RunDiagnosticsPanel';
 import { EvalHistoryTable } from '../client/panels/eval-runner/EvalHistoryTable';
-import { MAX_INLINE_OPERATIONS, recordsFilename } from '../client/panels/eval-runner/diagnostics';
+import {
+  MAX_INLINE_OPERATIONS,
+  groupOperations,
+  parseRecordStream,
+  recordsFilename,
+} from '../client/panels/eval-runner/diagnostics';
 import type { EvalHistoryEntry } from '../client/lib/types';
 import type {
   CapturedMessage,
@@ -480,6 +486,45 @@ describe('RunDiagnosticsPanel', () => {
     expect(screen.queryByText(/Download the .jsonl for the rest/)).not.toBeInTheDocument();
   });
 
+  it('A16.26c keeps admitted operations whole when the artifact interleaves them', async () => {
+    const user = userEvent.setup();
+    // The eval runner runs cases concurrently (default 5), so an operation's
+    // `end` lands several `start`s after its own. A16.26's strictly sequential
+    // fixture cannot see a reader that stops at the first line past the cap:
+    // this one can, because the last few admitted operations only get their
+    // `end` after the cap has already been exceeded.
+    const total = MAX_INLINE_OPERATIONS + 25;
+    const lag = 5;
+    const lines: RequestRecord[] = [];
+    for (let i = 0; i < total; i += 1) {
+      lines.push(startRecord({ operationId: `op-${i}`, caseIndex: i }));
+      if (i >= lag) lines.push(endRecord({ operationId: `op-${i - lag}`, caseIndex: i - lag }));
+    }
+    for (let i = total - lag; i < total; i += 1) {
+      lines.push(endRecord({ operationId: `op-${i}`, caseIndex: i }));
+    }
+    stubFetch({ records: ndjson(lines) });
+
+    renderPanel(
+      <RunDiagnosticsPanel
+        result={result(manifest({ records: lines.length }))}
+        evalName="qa-eval"
+      />,
+    );
+    await user.click(screen.getByRole('button', { name: 'Show captured records' }));
+
+    const list = await screen.findByRole('list', { name: 'Captured request records' });
+    expect(within(list).getAllByRole('listitem')).toHaveLength(MAX_INLINE_OPERATIONS);
+    // Every admitted operation's `end` IS in the artifact. Saying otherwise
+    // describes a completed call as one that never came back.
+    expect(within(list).queryAllByText(/no response recorded/)).toHaveLength(0);
+    expect(
+      screen.getByText(
+        `Showing the first ${MAX_INLINE_OPERATIONS} operations. Download the .jsonl for the rest.`,
+      ),
+    ).toBeInTheDocument();
+  });
+
   it('A16.27 shows a rescore copy provenance from the live manifest', async () => {
     stubFetch({
       manifest: {
@@ -622,10 +667,79 @@ describe('RunDiagnosticsPanel', () => {
     ).toBeInTheDocument();
     // The projection failure must not be reported as an over-size record.
     expect(within(rows[0]).queryByText(/exceeded the size limit/)).not.toBeInTheDocument();
-    // Nor as a call that never came back: a stub says why its content is
-    // missing, and that answer is not "the response was never recorded".
-    expect(within(rows[0]).queryByText(/no response recorded/)).not.toBeInTheDocument();
-    expect(within(rows[1]).getByText(/stub — record exceeded the size limit/)).toBeInTheDocument();
+    expect(
+      within(rows[1]).getByText(/request stub — record exceeded the size limit/),
+    ).toBeInTheDocument();
+  });
+
+  it('A16.40 reads a stub per phase — a stubbed request never hides a missing response', async () => {
+    const user = userEvent.setup();
+    stubFetch({
+      records: ndjson([
+        // The likeliest oversize record is the REQUEST (prompts are big). This
+        // operation then hangs: the artifact holds no `end` at all. Both facts
+        // are true and the row has to carry both.
+        startRecord({
+          operationId: 'op-req-stub-hung',
+          caseIndex: 0,
+          request: undefined,
+          captured: {
+            fidelity: 'runtime_request',
+            redacted: false,
+            truncated: true,
+            omitted: ['record'],
+          },
+        }),
+        // A response that could not be projected: the `end` line is the stub,
+        // so "no response recorded" WOULD be the wrong reading here.
+        startRecord({ operationId: 'op-res-stub', caseIndex: 1 }),
+        endRecord({
+          operationId: 'op-res-stub',
+          caseIndex: 1,
+          response: undefined,
+          captured: {
+            fidelity: 'runtime_request',
+            redacted: false,
+            truncated: true,
+            omitted: ['record'],
+            reason: 'a response could not be captured: DataCloneError',
+          },
+        }),
+      ]),
+    });
+
+    renderPanel(<RunDiagnosticsPanel result={result(manifest())} evalName="qa-eval" />);
+    await user.click(screen.getByRole('button', { name: 'Show captured records' }));
+
+    const list = await screen.findByRole('list', { name: 'Captured request records' });
+    const rows = within(list).getAllByRole('listitem');
+    expect(rows).toHaveLength(2);
+
+    // Request stubbed AND no end in the artifact — the row states both.
+    expect(
+      within(rows[0]).getByText(/request stub — record exceeded the size limit/),
+    ).toBeInTheDocument();
+    expect(within(rows[0]).getByText(/no response recorded/)).toBeInTheDocument();
+    expect(within(rows[0]).queryByText(/response stub/)).not.toBeInTheDocument();
+
+    // Response stubbed — that IS why the response is missing, so the row must
+    // not additionally read as a call that never came back.
+    expect(
+      within(rows[1]).getByText(/response stub — a response could not be captured: DataCloneError/),
+    ).toBeInTheDocument();
+    expect(within(rows[1]).queryByText(/no response recorded/)).not.toBeInTheDocument();
+    expect(within(rows[1]).queryByText(/request stub/)).not.toBeInTheDocument();
+
+    await user.click(within(rows[0]).getByRole('button', { expanded: false }));
+    const detail = await screen.findByTestId('operation-detail-0');
+    expect(
+      within(detail).getByText(
+        /the record was replaced by a stub — record exceeded the size limit/,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      within(detail).getByText(/no response recorded — the artifact holds no end record/),
+    ).toBeInTheDocument();
   });
 
   it('A16.34 tells stored redaction apart from redaction applied on delivery', async () => {
@@ -783,5 +897,54 @@ describe('CapturedRequestsBadge', () => {
       />,
     );
     expect(screen.getAllByLabelText('Captured requests available')).toHaveLength(1);
+  });
+});
+
+/**
+ * The reader's cap, at the unit the panel cannot reach cheaply.
+ *
+ * `maxOperations` is a parameter precisely so these cases can state the cap in
+ * single digits instead of building 200 operations to exercise the boundary.
+ */
+describe('parseRecordStream', () => {
+  it('A16.41 keeps reading past the cap so an admitted operation keeps its end', async () => {
+    // `s1 s2 e1 s3 e2 e3` with cap 2: `s3` is the first line past the cap, and
+    // `e2` — the end of an ADMITTED operation — comes after it.
+    const body = ndjson([
+      startRecord({ operationId: 'op-1', caseIndex: 0 }),
+      startRecord({ operationId: 'op-2', caseIndex: 1 }),
+      endRecord({ operationId: 'op-1', caseIndex: 0 }),
+      startRecord({ operationId: 'op-3', caseIndex: 2 }),
+      endRecord({ operationId: 'op-2', caseIndex: 1 }),
+      endRecord({ operationId: 'op-3', caseIndex: 2 }),
+    ]);
+
+    const parsed = await parseRecordStream(new Response(body), 2);
+    const operations = groupOperations(parsed.records);
+
+    expect(operations.map((op) => op.operationId)).toEqual(['op-1', 'op-2']);
+    // Both admitted operations are whole. Dropping `e2` would render op-2 as a
+    // hung call, which is a false statement about the artifact.
+    expect(operations.map((op) => op.end !== undefined)).toEqual([true, true]);
+    // Nothing from the operation there was no room for leaks into the page.
+    expect(parsed.records.some((r) => r.operationId === 'op-3')).toBe(false);
+    expect(parsed.cappedEarly).toBe(true);
+    expect(parsed.malformed).toBe(0);
+  });
+
+  it('A16.42 counts records with no operation id against the cap, one row each', async () => {
+    // Malformed or future-build records: `groupOperations` gives each its own
+    // row (it cannot pair them safely), so each must consume a cap slot too.
+    const body = ndjson([
+      baseRecord({ operationId: '', caseIndex: 0 }),
+      baseRecord({ operationId: '', caseIndex: 1 }),
+      baseRecord({ operationId: '', caseIndex: 2 }),
+    ]);
+
+    const parsed = await parseRecordStream(new Response(body), 2);
+
+    expect(parsed.records).toHaveLength(2);
+    expect(groupOperations(parsed.records)).toHaveLength(2);
+    expect(parsed.cappedEarly).toBe(true);
   });
 });

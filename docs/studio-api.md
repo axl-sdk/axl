@@ -62,8 +62,11 @@ empty-string artifact id) never repeats its `records`/`bytes` figures, because
 they describe evidence that has just been declared absent. "Download records
 (.jsonl)" takes the whole `/diagnostics/records` body and saves it as
 `<eval>-<id>.requests.jsonl`; the inline viewer parses the same stream line by
-line and stops at 200 **operations** — not lines — says so, and points at the
-download for the rest. The artifact is one line per phase (`start` carries the
+line and keeps 200 **operations** — not lines — says so, and points at the
+download for the rest. It reads the stream to the end and retains only the
+admitted operations' lines: because eval cases run concurrently, an operation's
+`end` arrives after later `start`s, and stopping at the cap would drop the `end`
+of an operation already on screen. The artifact is one line per phase (`start` carries the
 request, `end` the response, error or termination), so the viewer reassembles
 them by `operationId` and renders one row per operation: an absent half is only
 ever reported when the line that would have carried it is absent, and a `start`

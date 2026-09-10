@@ -151,11 +151,17 @@ async function beginCapture(
   });
 
   const sourceId = source.diagnostics?.artifactId;
+  // Tracked outside the `try` so the degrade path can release an artifact this
+  // function staged a line before it threw. Everything after a stage — building
+  // the channel, reading the runtime's redact policy — is a throw site, and a
+  // staged artifact nobody rolls back holds its lease for `maxHoldMs`.
+  let stagedId: string | undefined;
   try {
     if (!sourceId) {
       // Nothing to carry forward, but the judging is still worth recording —
       // it is the only work a rescore actually performs.
       const staged = await runtime.stageDiagnosticArtifact({ kind: 'eval', id: ownerId });
+      stagedId = staged.artifactId;
       return { capture: { ...open(staged.artifactId, staged.sink, 0), copied: false } };
     }
     // Headroom for the judging half — see COPY_SHARE_OF_RUN_BOUND.
@@ -174,6 +180,7 @@ async function beginCapture(
         ),
       };
     }
+    stagedId = copied.artifactId;
     const capture: RescoreCapture = {
       ...open(copied.artifactId, copied.sink, copied.bytes),
       copied: true,
@@ -186,6 +193,9 @@ async function beginCapture(
     }
     return { capture };
   } catch (error) {
+    if (stagedId !== undefined) {
+      await runtime.rollbackDiagnosticArtifact(stagedId).catch(() => undefined);
+    }
     if (isDiagnosticsUnavailable(error)) throw error;
     return {
       degraded: unavailableManifest(
@@ -230,6 +240,15 @@ async function finishCapture(
   // a reader given only the second cannot tell which half is missing.
   const reason = [capture.copyTruncated, status.reason].filter(Boolean).join('; ') || undefined;
   const truncated = capture.copyTruncated !== undefined || status.status === 'truncated';
+  // Precedence, stated once: `unavailable` beats `truncated` beats `complete`.
+  // A channel that went unavailable lost records the CAPTURE RAIL could not
+  // write; a truncated one stopped at a bound the caller configured. Letting a
+  // truncated copy overwrite an unavailable channel tells a reader their own
+  // limit dropped the judge records when in fact the sink died — and the joined
+  // reason, which still names the sink failure, would contradict the status
+  // every Studio and CLI badge keys off (§12.3).
+  const finalStatus =
+    status.status === 'unavailable' ? 'unavailable' : truncated ? 'truncated' : status.status;
   // Redaction describes the BYTES, and this artifact may hold two kinds: the
   // channel's own records, scrubbed or not by this runtime's policy, and the
   // copied ones, scrubbed or not by whatever policy was in force when the
@@ -243,7 +262,7 @@ async function finishCapture(
   try {
     const manifest = await runtime.finalizeDiagnosticArtifact(
       capture.artifactId,
-      truncated ? 'truncated' : status.status,
+      finalStatus,
       reason,
       redaction,
     );
@@ -452,7 +471,12 @@ export async function rescore(
   // delayed a provider call.
   let diagnostics = degraded;
   if (capture) {
-    attachOperationRefs(rescored, capture.channel);
+    try {
+      attachOperationRefs(rescored, capture.channel);
+    } catch (error) {
+      await abandonCapture(runtime, capture);
+      throw error;
+    }
     diagnostics = await finishCapture(runtime, capture);
   }
 

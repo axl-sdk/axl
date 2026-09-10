@@ -959,8 +959,17 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
     ownerId: string,
     lines: readonly string[],
   ): Promise<EvalResult['diagnostics']> {
+    // Held outside the `try` so the degrade path can release it. Staging
+    // registers a lease-renewal timer the runtime clears only at finalize,
+    // rollback or delete, so an import that stages and then fails — a full or
+    // read-only volume under `sink.append`, a finalize whose artifact was
+    // already swept — would otherwise leave a directory renewing its lease
+    // until `maxHoldMs`, once per failed import. Same shape the eval runner
+    // and rescore guard.
+    let stagedId: string | undefined;
     try {
       const staged = await runtime.stageDiagnosticArtifact({ kind: 'eval', id: ownerId });
+      stagedId = staged.artifactId;
       let bytes = 0;
       // The bytes arrive already scrubbed or not; this deployment's own
       // `trace.redact` says nothing about them. Reading it off the records is
@@ -995,6 +1004,9 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
         redaction: manifest.redaction,
       };
     } catch (error) {
+      if (stagedId !== undefined) {
+        await runtime.rollbackDiagnosticArtifact(stagedId).catch(() => undefined);
+      }
       return {
         version: 1,
         artifactId: '',

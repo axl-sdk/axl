@@ -404,6 +404,33 @@ describe('budget and coverage are validated with the accounting (I2)', () => {
     return histBody.data.find((e: { id: string }) => e.id === data.id);
   }
 
+  it('releases the staged artifact when an import cannot store its records (F3)', async () => {
+    const { app, runtime } = createTestServer(undefined, { artifactsRoot: root });
+    // Staging registers a lease-renewal timer the runtime clears only at
+    // finalize, rollback or delete. An import that stages and then cannot write
+    // — a full or read-only volume — must release it, or every failed import
+    // leaves a directory renewing its lease until `maxHoldMs`.
+    const stage = runtime.stageDiagnosticArtifact.bind(runtime);
+    runtime.stageDiagnosticArtifact = async (owner: Parameters<typeof stage>[0]) => {
+      const staged = await stage(owner);
+      return { ...staged, sink: { append: () => Promise.reject(new Error('read-only volume')) } };
+    };
+
+    const res = await importResult(app, {
+      result: resultWithAccounting(),
+      requests: sidecar(RECORDS),
+    });
+    const { data } = await readJson(res);
+    const histBody = await readJson(await app.request('/api/evals/history'));
+    const entry = histBody.data.find((e: { id: string }) => e.id === data.id);
+
+    // The numbers still land — an import is not failed over its evidence.
+    expect(entry.data.diagnostics.status).toBe('unavailable');
+    expect(entry.data.diagnostics.artifactId).toBe('');
+    // And nothing is left holding a lease.
+    expect(await runtime.getDiagnosticArtifactStore()!.list()).toEqual([]);
+  });
+
   it('keeps a budget block whose overshoot identity holds', async () => {
     const entry = await importAndRead(budgetStopped({}));
 

@@ -18,13 +18,17 @@ import { mkdtemp, rm, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { z } from 'zod';
-import { AxlRuntime } from '@axlsdk/axl';
-import type { AxlRuntime as AxlRuntimeType, CapturedRequestRecord } from '@axlsdk/axl';
+import { AxlRuntime, FileDiagnosticArtifactStore, RequestCaptureChannel } from '@axlsdk/axl';
+import type {
+  AxlRuntime as AxlRuntimeType,
+  CapturedRequestRecord,
+  DiagnosticArtifactStore,
+} from '@axlsdk/axl';
 
 import { dataset } from '../dataset.js';
 import { scorer } from '../scorer.js';
 import { llmScorer } from '../llm-scorer.js';
-import { runEval } from '../runner.js';
+import { attachOperationRefs, runEval } from '../runner.js';
 import { rescore } from '../rescore.js';
 import {
   parseRequestRecords,
@@ -470,14 +474,18 @@ describe('a run that throws does not pin its artifact forever (N1)', () => {
     // so the sweeper could NEVER reclaim the directory — one permanent leak per
     // failed run on a long-lived server.
     await new Promise((resolve) => setTimeout(resolve, leaseMs * 3));
-    const { removed } = await runtime.reconcileDiagnosticArtifacts();
+    await runtime.reconcileDiagnosticArtifacts();
     const left = await runtime.getDiagnosticArtifactStore()!.list();
     expect(left).toEqual([]);
-    expect(removed.length + left.length).toBeGreaterThanOrEqual(0);
     await runtime.shutdown();
   });
 
-  it('reclaims the rescore artifact when scoring throws', async () => {
+  it('reclaims the rescore artifact when the tracked run scope rejects', async () => {
+    // The reachable throw is the run scope's, not a scorer's: `scoreItem`
+    // catches every scorer failure and records it as a scorer error, so a
+    // throwing scorer never rejects the item scope. `trackOutcome` is the seam
+    // that does reject — an accounting fold that fails, a store write inside
+    // the scope — and it is the one `rescore` guards.
     const leaseMs = 150;
     const runtime = captureRuntime(4);
     const original = await runEval(
@@ -493,27 +501,144 @@ describe('a run that throws does not pin its artifact forever (N1)', () => {
       diagnostics: { artifacts: { root, sweepIntervalMs: 3_600_000, leaseMs } },
     });
     rescoreRuntime.registerProvider('mock', new ScriptedProvider([], { name: 'mock' }));
-    const before = (await rescoreRuntime.getDiagnosticArtifactStore()!.list()).length;
+    const original_trackOutcome = rescoreRuntime.trackOutcome.bind(rescoreRuntime);
+    let scopes = 0;
+    rescoreRuntime.trackOutcome = (async (fn: () => Promise<unknown>, opts?: unknown) => {
+      const outcome = await original_trackOutcome(fn, opts as never);
+      // The RUN scope is the outermost one the rescore opens, and the only one
+      // whose rejection reaches the `abandonCapture` guard.
+      scopes += 1;
+      if ((opts as { purpose?: string } | undefined)?.purpose === 'judging') {
+        return { ...outcome, status: 'rejected', error: new Error('the scope failed to settle') };
+      }
+      return outcome;
+    }) as typeof rescoreRuntime.trackOutcome;
 
-    const exploding = scorer({
-      name: 'boom',
-      description: 'aborts the run',
-      score: () => {
-        throw Object.assign(new Error('scorer exploded'), { name: 'FatalScorerError' });
-      },
-    });
-    await rescore(original, [exploding], rescoreRuntime, { captureRequests: true }).catch(
-      () => undefined,
+    const before = (await rescoreRuntime.getDiagnosticArtifactStore()!.list()).map(
+      (m) => m.artifactId,
     );
 
+    await expect(
+      rescore(original, [pass], rescoreRuntime, { captureRequests: true }),
+    ).rejects.toThrow('the scope failed to settle');
+    expect(scopes).toBeGreaterThan(0);
+
+    // Rolled back, so the artifact is gone AND its renewal timer is stopped.
+    // Without the rollback the staged directory survives with a lease renewed
+    // every 75 ms, which no sweep can ever reclaim.
     await new Promise((resolve) => setTimeout(resolve, leaseMs * 3));
     await rescoreRuntime.reconcileDiagnosticArtifacts();
-    // Whatever happened to the numbers, no artifact may be left pinned.
-    expect((await rescoreRuntime.getDiagnosticArtifactStore()!.list()).length).toBeLessThanOrEqual(
-      before,
+    const after = (await rescoreRuntime.getDiagnosticArtifactStore()!.list()).map(
+      (m) => m.artifactId,
     );
+    expect(after.filter((id) => !before.includes(id))).toEqual([]);
     await rescoreRuntime.shutdown();
     await runtime.shutdown();
+  });
+});
+
+describe('a rescore reports the worse of its two halves (F1)', () => {
+  it('says `unavailable` when the sink dies over a truncated copy', async () => {
+    // Large enough that the quarter of the bound reserved for judging still
+    // exceeds a judge record: otherwise the run byte limit trips first and the
+    // channel's own verdict really is `truncated`, which is not the case here.
+    const runtime = captureRuntime(40);
+    const judge = judgeOn(runtime);
+    const original = await runEval(
+      { workflow: 'w', dataset: ds(20), scorers: [pass] } satisfies EvalConfig,
+      askExecute(),
+      runtime,
+      { captureRequests: true },
+    );
+
+    // A store that copies fine and then loses the volume: every write after the
+    // copy rejects, so the channel closes `unavailable`.
+    const inner = new FileDiagnosticArtifactStore({ root });
+    let copied = false;
+    const dying = new Proxy(inner, {
+      get(target, prop, receiver) {
+        if (prop === 'copy') {
+          return async (...args: Parameters<DiagnosticArtifactStore['copy']>) => {
+            const out = await target.copy(...args);
+            copied = true;
+            return out;
+          };
+        }
+        if (prop === 'append') {
+          return async (artifactId: string, line: string) => {
+            if (copied) throw new Error('no space left on device');
+            await target.append(artifactId, line);
+          };
+        }
+        const value = Reflect.get(target, prop, receiver) as unknown;
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as DiagnosticArtifactStore;
+    const dyingRuntime = new AxlRuntime({
+      defaultProvider: 'mock',
+      trace: { enabled: false },
+      diagnostics: { artifacts: { store: dying, sweepIntervalMs: 3_600_000 } },
+    });
+    dyingRuntime.registerProvider('mock', new ScriptedProvider([], { name: 'mock' }));
+    judgeOn(dyingRuntime);
+
+    // The bound is set so the COPY is cut (its 75% share is below the source's
+    // size) while the judging still has room — otherwise the run byte limit
+    // trips first and the channel's own verdict really is `truncated`, which is
+    // not the case under test.
+    const rescored = await rescore(original, [judge], dyingRuntime, {
+      captureRequests: { maxRunBytes: Math.floor(original.diagnostics!.bytes * 1.3) },
+    });
+
+    // `truncated` here would tell the reader their own byte limit dropped the
+    // judge records, when in fact the capture rail failed — and the reason,
+    // which names the sink, would contradict the status every badge keys off.
+    expect(rescored.diagnostics!.status).toBe('unavailable');
+    // The reason still names both halves, and it must not contradict the
+    // status: a `truncated` badge over a reason that says the sink died is the
+    // shape a reader cannot act on.
+    expect(rescored.diagnostics!.reason).toContain('sink failed');
+    expect(rescored.diagnostics!.reason).toContain('copied source records');
+    await dyingRuntime.shutdown();
+    await runtime.shutdown();
+  });
+});
+
+describe('operation refs are added to an item, never swapped for its own (N11)', () => {
+  it('keeps refs an earlier pass already attached', () => {
+    // Unit-level on purpose: no rescore reaches this today, because every
+    // provider call a rescore makes carries a `scorer` correlation and lands in
+    // the per-scorer bucket instead. This is the contract the merge exists to
+    // hold the moment one does not — a tool call made in an item scope, say.
+    const channel = new RequestCaptureChannel({
+      sink: { append: async () => undefined },
+      redact: false,
+    });
+    channel.noteOperation({
+      operationId: 'op_new',
+      kind: 'chat',
+      status: 'complete',
+      caseIndex: 0,
+    });
+
+    const items = [
+      {
+        input: {},
+        scores: {},
+        // What a rescored item carries in: the ORIGINAL run's generation refs,
+        // copied forward deliberately.
+        diagnostics: {
+          operations: [{ operationId: 'op_source', kind: 'chat' as const, status: 'complete' }],
+        },
+      },
+    ] as unknown as Parameters<typeof attachOperationRefs>[0];
+
+    attachOperationRefs(items, channel);
+
+    // Replacing rather than merging silently erases the evidence the rescore
+    // just paid to carry across.
+    const ids = items[0]!.diagnostics!.operations.map((o) => o.operationId);
+    expect(ids).toEqual(['op_source', 'op_new']);
   });
 });
 

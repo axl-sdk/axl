@@ -24,6 +24,7 @@ import { EvalHistoryTable } from '../client/panels/eval-runner/EvalHistoryTable'
 import { MAX_INLINE_OPERATIONS, recordsFilename } from '../client/panels/eval-runner/diagnostics';
 import type { EvalHistoryEntry } from '../client/lib/types';
 import type {
+  CapturedMessage,
   DiagnosticManifest,
   EvalResultData,
   RequestRecord,
@@ -113,6 +114,17 @@ function endRecord(overrides: Partial<RequestRecord> = {}): RequestRecord {
 /** The two lines one ordinary completed operation writes. */
 function operationLines(overrides: Partial<RequestRecord> = {}): RequestRecord[] {
   return [startRecord(overrides), endRecord(overrides)];
+}
+
+/**
+ * The client `CapturedMessage.tool_calls` mirror must match core's
+ * `ToolCallMessage` — `{ id, type: 'function', function: { name, arguments } }`,
+ * which is the shape `redactCapturedRequest` reaches into. A flattened mirror
+ * type-checks against nothing and hands the next reader `undefined` for
+ * `call.name` with no error. Compile-time only; `tsc` is the assertion.
+ */
+function describeToolCall(call: NonNullable<CapturedMessage['tool_calls']>[number]): string {
+  return `${call.id} → ${call.function.name}(${call.function.arguments})`;
 }
 
 // ── Fetch routing ────────────────────────────────────────────────
@@ -567,6 +579,165 @@ describe('RunDiagnosticsPanel', () => {
       <RunDiagnosticsPanel result={aggregate} evalName="qa-eval" />,
     );
     expect(container).toBeEmptyDOMElement();
+  });
+
+  it('A16.33 names a stub’s real cause instead of always blaming the size limit', async () => {
+    const user = userEvent.setup();
+    stubFetch({
+      records: ndjson([
+        // Could not be projected at all — the writer says why on `captured.reason`.
+        baseRecord({
+          operationId: 'op-unprojectable',
+          caseIndex: 0,
+          captured: {
+            fidelity: 'runtime_request',
+            redacted: false,
+            truncated: true,
+            omitted: ['record'],
+            reason: 'a response could not be captured: DataCloneError',
+          },
+        }),
+        // Over `maxRecordBytes` — no reason, and the replaced size on `bytes`.
+        baseRecord({
+          operationId: 'op-oversize',
+          caseIndex: 1,
+          bytes: 400_000,
+          captured: {
+            fidelity: 'runtime_request',
+            redacted: false,
+            truncated: true,
+            omitted: ['record'],
+          },
+        }),
+      ]),
+    });
+
+    renderPanel(<RunDiagnosticsPanel result={result(manifest())} evalName="qa-eval" />);
+    await user.click(screen.getByRole('button', { name: 'Show captured records' }));
+
+    const list = await screen.findByRole('list', { name: 'Captured request records' });
+    const rows = within(list).getAllByRole('listitem');
+    expect(
+      within(rows[0]).getByText(/stub — a response could not be captured: DataCloneError/),
+    ).toBeInTheDocument();
+    // The projection failure must not be reported as an over-size record.
+    expect(within(rows[0]).queryByText(/exceeded the size limit/)).not.toBeInTheDocument();
+    expect(within(rows[1]).getByText(/stub — record exceeded the size limit/)).toBeInTheDocument();
+  });
+
+  it('A16.34 tells stored redaction apart from redaction applied on delivery', async () => {
+    const user = userEvent.setup();
+    stubFetch({
+      // The manifest is about the STORED bytes and says they are not scrubbed.
+      manifest: { status: 200, body: { ok: true, data: { ...manifest(), redaction: 'none' } } },
+      records: ndjson([
+        startRecord({
+          operationId: 'op-scrubbed',
+          request: {
+            messages: [{ role: 'user', content: '[REDACTED]' }],
+            options: { model: 'gpt-5-mini' },
+          },
+          captured: {
+            fidelity: 'runtime_request',
+            redacted: true,
+            truncated: false,
+            omitted: [],
+          },
+        }),
+        endRecord({
+          operationId: 'op-scrubbed',
+          captured: {
+            fidelity: 'runtime_request',
+            redacted: true,
+            truncated: false,
+            omitted: [],
+          },
+        }),
+      ]),
+    });
+
+    renderPanel(<RunDiagnosticsPanel result={result(manifest())} evalName="qa-eval" />);
+    await user.click(screen.getByRole('button', { name: 'Show captured records' }));
+    await screen.findByRole('list', { name: 'Captured request records' });
+
+    // Both facts, because a reader seeing `[REDACTED]` under a "not redacted"
+    // header cannot otherwise tell whether the bytes on disk are recoverable.
+    expect(screen.getByText('none — the stored bytes are NOT redacted')).toBeInTheDocument();
+    expect(screen.getByText(/delivered redacted by this deployment/i)).toBeInTheDocument();
+  });
+
+  it('A16.35 renders a status this build does not know without a dangling separator', async () => {
+    stubFetch({});
+    const future = {
+      ...manifest(),
+      status: 'quarantined',
+    } as unknown as DiagnosticManifest;
+
+    renderPanel(<RunDiagnosticsPanel result={result(future)} evalName="qa-eval" />);
+
+    const statusText = await screen.findByText(/quarantined/);
+    expect(statusText.textContent).toBe('quarantined');
+  });
+
+  it('A16.36 keeps the embedded counters and says so when availability cannot be confirmed', async () => {
+    stubFetch({ networkError: 'Failed to fetch' });
+
+    renderPanel(
+      <RunDiagnosticsPanel result={result(manifest({ records: 6 }))} evalName="qa-eval" />,
+    );
+
+    expect(
+      await screen.findByText(/could not confirm the artifact is still stored: Failed to fetch/),
+    ).toBeInTheDocument();
+    // A probe that failed is not evidence the artifact is gone.
+    expect(screen.getByText('6')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Download records (.jsonl)' })).toBeEnabled();
+  });
+
+  it('A16.37 reports an unparseable line without rendering it', async () => {
+    const user = userEvent.setup();
+    const [start, end] = operationLines({ operationId: 'op-ok' });
+    stubFetch({
+      records: `${JSON.stringify(start)}\n{"v":1,"operationId":"op-bad"\n${JSON.stringify(end)}\n`,
+    });
+
+    renderPanel(<RunDiagnosticsPanel result={result(manifest())} evalName="qa-eval" />);
+    await user.click(screen.getByRole('button', { name: 'Show captured records' }));
+
+    const list = await screen.findByRole('list', { name: 'Captured request records' });
+    expect(within(list).getAllByRole('listitem')).toHaveLength(1);
+    expect(
+      screen.getByText('1 line(s) could not be parsed and are not shown.'),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/op-bad/)).not.toBeInTheDocument();
+  });
+
+  it('A16.39 mirrors core’s ToolCallMessage shape for a captured tool call', () => {
+    expect(
+      describeToolCall({
+        id: 'call_1',
+        type: 'function',
+        function: { name: 'lookup', arguments: '{"q":"axl"}' },
+      }),
+    ).toBe('call_1 → lookup({"q":"axl"})');
+  });
+
+  it('A16.38 states plainly that a complete artifact holds no records', async () => {
+    const user = userEvent.setup();
+    stubFetch({
+      manifest: { status: 200, body: { ok: true, data: { ...manifest(), records: 0, bytes: 0 } } },
+      records: '',
+    });
+
+    renderPanel(
+      <RunDiagnosticsPanel result={result(manifest({ records: 0 }))} evalName="qa-eval" />,
+    );
+    await user.click(screen.getByRole('button', { name: 'Show captured records' }));
+
+    expect(await screen.findByText('The artifact holds no records.')).toBeInTheDocument();
+    // Nothing was cut off and nothing failed to parse.
+    expect(screen.queryByText(/could not be parsed/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Download the .jsonl for the rest/)).not.toBeInTheDocument();
   });
 });
 

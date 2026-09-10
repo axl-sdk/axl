@@ -276,7 +276,16 @@ export type CapturedMessage = {
   content: string | null;
   input?: { kind?: string; [key: string]: unknown };
   name?: string;
-  tool_calls?: Array<{ id?: string; name?: string; arguments?: unknown; [k: string]: unknown }>;
+  /**
+   * Mirror of core's `ToolCallMessage` (`packages/axl/src/types.ts`), which is
+   * the shape `redactCapturedRequest` reaches into. Flattening it here would
+   * type-check against nothing and hand a reader `undefined` for `call.name`.
+   */
+  tool_calls?: Array<{
+    id: string;
+    type: 'function';
+    function: { name: string; arguments: string };
+  }>;
   tool_call_id?: string;
 };
 
@@ -336,9 +345,20 @@ export type RequestRecord = {
   correction?: { stage: string; reason?: string; feedbackMessage: string };
   captured: {
     fidelity: 'runtime_request';
+    /** Whether THIS record's content was scrubbed. */
     redacted: boolean;
     truncated: boolean;
     omitted: string[];
+    /**
+     * Why this record is a stub, when it is one.
+     *
+     * A stub has two causes a reader must tell apart: the record exceeded
+     * `maxRecordBytes` (its size lands on `bytes`, and no reason is written),
+     * or the request/response could not be projected at all (the writer sets
+     * this to the failure's CLASS). Without it the projection failure is
+     * reported as an over-size record, with no way to reach the real cause.
+     */
+    reason?: string;
   };
   /** Encoded size of the record this stub replaced. Present only on stubs. */
   bytes?: number;

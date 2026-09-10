@@ -107,10 +107,23 @@ function describeViewerNote(parsed: ParsedRecords): string | null {
   return notes.length > 0 ? notes.join(' ') : null;
 }
 
-/** Whether any line of this operation was written as a stub. */
+/**
+ * The reason this operation is a stub, in the artifact's own words.
+ *
+ * A stub has two causes a reader must tell apart: the record exceeded
+ * `maxRecordBytes`, or the request/response could not be projected at all. The
+ * writer records the second on `captured.reason` and leaves it unset for the
+ * first, so the size sentence is the ONLY one this build may supply itself.
+ */
 function stubCause(records: readonly RequestRecord[]): string | undefined {
   const stub = records.find((r) => r.captured?.truncated);
-  return stub ? 'record exceeded the size limit' : undefined;
+  if (!stub) return undefined;
+  return stub.captured?.reason ?? 'record exceeded the size limit';
+}
+
+/** True when any line of this operation reached the reader scrubbed. */
+function anyRedacted(records: readonly RequestRecord[]): boolean {
+  return records.some((r) => r.captured?.redacted === true);
 }
 
 /** Everything the artifact could not represent, across the operation's lines. */
@@ -200,6 +213,14 @@ function OperationRow({ operation, index }: { operation: CapturedOperation; inde
           )}
           {stub !== undefined && (
             <span className="text-amber-700 dark:text-amber-300">stub — {stub}</span>
+          )}
+          {anyRedacted(operation.records) && (
+            <span
+              className="text-[hsl(var(--muted-foreground))]"
+              title="This record's content was scrubbed — when it was written, or on the way out of this deployment."
+            >
+              redacted
+            </span>
           )}
           <span className="ml-auto font-mono text-[10px] text-[hsl(var(--muted-foreground))]">
             {totalMs !== undefined ? formatDuration(totalMs) : null}
@@ -438,6 +459,13 @@ export function RunDiagnosticsPanel({
   const redaction = liveManifest?.redaction ?? embedded.redaction;
   const fidelity = liveManifest?.fidelity ?? embedded.fidelity;
   const copiedFrom = liveManifest?.copiedFrom;
+  const explanation: string | undefined = STATUS_EXPLANATIONS[status];
+  // Under `trace.redact` the server re-scrubs an artifact on the way out, so
+  // records can read `[REDACTED]` while the manifest correctly says the STORED
+  // bytes are not. Saying only the second leaves the reader unable to tell
+  // whether anything is recoverable from disk.
+  const deliveryRedacted =
+    redaction === 'none' && (operations?.some((op) => anyRedacted(op.records)) ?? false);
 
   return (
     <section
@@ -473,8 +501,16 @@ export function RunDiagnosticsPanel({
 
       <div className="px-4 py-3 space-y-2">
         <Row label="Status">
-          <span className={cn('font-mono text-[11px]', STATUS_TONE[status])}>
-            {status} — {STATUS_EXPLANATIONS[status]}
+          <span
+            className={cn(
+              'font-mono text-[11px]',
+              STATUS_TONE[status] ?? 'text-amber-700 dark:text-amber-300',
+            )}
+          >
+            {/* A manifest written by a later build can carry a status this one
+                does not know. Naming it alone is honest; appending an empty
+                explanation after a dash is not. */}
+            {explanation === undefined ? status : `${status} — ${explanation}`}
           </span>
         </Row>
         {reason && (
@@ -543,6 +579,11 @@ export function RunDiagnosticsPanel({
         <div className="border-t border-[hsl(var(--border))]">
           {viewerNote && (
             <p className="px-4 py-2 text-[11px] text-amber-700 dark:text-amber-300">{viewerNote}</p>
+          )}
+          {deliveryRedacted && (
+            <p className="px-4 py-2 text-[11px] text-amber-700 dark:text-amber-300">
+              Delivered redacted by this deployment&rsquo;s trace.redact; the stored bytes are not.
+            </p>
           )}
           {operations.length === 0 ? (
             <p className="px-4 py-3 text-[11px] text-[hsl(var(--muted-foreground))]">

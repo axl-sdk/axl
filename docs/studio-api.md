@@ -62,9 +62,24 @@ empty-string artifact id) never repeats its `records`/`bytes` figures, because
 they describe evidence that has just been declared absent. "Download records
 (.jsonl)" takes the whole `/diagnostics/records` body and saves it as
 `<eval>-<id>.requests.jsonl`; the inline viewer parses the same stream line by
-line and stops at 200 records, says so, and points at the download for the rest.
-A result with no `diagnostics` block — every pre-0.24 artifact and every run that
-did not opt in — renders nothing.
+line and stops at 200 **operations** — not lines — says so, and points at the
+download for the rest. The artifact is one line per phase (`start` carries the
+request, `end` the response, error or termination), so the viewer reassembles
+them by `operationId` and renders one row per operation: an absent half is only
+ever reported when the line that would have carried it is absent, and a `start`
+with no `end` reads as "no response recorded" rather than as a completed call.
+Per-run only: the multi-run aggregate view renders no panel, because a group's
+result carries run 1's `diagnostics`. A result with no `diagnostics` block —
+every pre-0.24 artifact and every run that did not opt in — renders nothing.
+
+Two honesty details worth knowing when reading the panel. Its `redaction` line
+describes the **stored** bytes; when this deployment re-redacts on delivery
+(`trace.redact`) the rendered records also carry `captured.redacted`, and the
+viewer says so separately so scrubbed content under a "not redacted" header is
+not mistaken for scrubbed bytes on disk. And the History-row marker reads only
+the embedded manifest: a sweep downgrades the owning history row, so the marker
+goes stale only between that sweep and the next history fetch — the panel's
+route confirmation closes that window when the run is opened.
 
 ### Versioned execution history and tool aggregates
 

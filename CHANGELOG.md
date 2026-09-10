@@ -203,11 +203,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   count and size, fidelity, whether the **stored** bytes are redacted, expiry,
   and a rescore's `copiedFrom` provenance. "Download records (.jsonl)" saves the
   NDJSON as `<eval>-<id>.requests.jsonl`, and an inline viewer parses the same
-  stream line by line — capped at 200 records, which it says — with a per-record
-  request/response view. A manifest that reads `unavailable`, or whose artifact
-  was swept since the result was loaded, shows the reason and disables both
-  actions instead of repeating counters for evidence that is gone; a run that
-  captured nothing renders nothing.
+  stream line by line — capped at 200 operations, which it says — reassembling
+  the artifact's per-phase lines into one row per operation, so a completed call
+  shows its request and its response together and only a genuinely missing
+  record reads as missing. A stub names its own cause (over the size limit vs a
+  request that could not be projected), and a record scrubbed on delivery is
+  distinguished from stored bytes that are scrubbed. A manifest that reads
+  `unavailable`, or whose artifact was swept since the result was loaded, shows
+  the reason and disables both actions instead of repeating counters for
+  evidence that is gone; a run that captured nothing, and a multi-run aggregate
+  view (whose result carries run 1's manifest), render nothing.
 
 ### Changed
 

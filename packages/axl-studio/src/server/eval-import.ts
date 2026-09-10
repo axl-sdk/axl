@@ -83,6 +83,10 @@ export function isValidImportedBudget(value: unknown): boolean {
   // export, overshooting runs included. Without this check the cheapest possible
   // forgery of the budget-stopped badge (`status: 'closed'` beside a $0 spend
   // against a $10 limit) passes every other identity.
+  //
+  // Reads as `(knownSpend >= limit) !== (status === 'closed')`: relational binds
+  // tighter than equality. Prettier strips the explicit parentheses, so the
+  // grouping is stated here instead.
   if (b.knownSpend >= b.limit !== (b.status === 'closed')) return false;
   const expected = Math.max(0, b.knownSpend - b.limit);
   return Math.abs(b.knownOvershoot - expected) <= EPSILON;

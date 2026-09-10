@@ -284,8 +284,8 @@ describe.skipIf(!REDIS_URL)('RedisStore integration (real Redis)', () => {
         // The absolute expiry may only move EARLIER or stay put. `SET ... EX`
         // pushes it forward by the full window; `SET ... XX KEEPTTL` cannot
         // move it at all. The tolerance absorbs the client/RTT jitter between
-        // two derived reads — a blind `EX` moves it by 120 s, three orders of
-        // magnitude past the slack.
+        // two derived reads — a blind `EX` moves it forward by the time
+        // elapsed since the first save (about 1.1 s here), well past the slack.
         const after = (await expiring.getEvalRetention(id)).expiresAt!;
         expect(after).toBeLessThanOrEqual(before + 250);
 
@@ -313,7 +313,10 @@ describe.skipIf(!REDIS_URL)('RedisStore integration (real Redis)', () => {
         await runtime.getDiagnosticArtifactStore()!.refreshExpiry(second, Date.now() - 1);
 
         const { removed } = await runtime.reconcileDiagnosticArtifacts();
-        // Proof the write-back was actually reached this time.
+        // The sweep reclaimed the committed artifact, so the correction path
+        // was entered. (`getEvalResult` notices the row is gone and drops it
+        // before any `SET XX` is issued, so this row guards resurrection; the
+        // `XX` refusal itself is exercised by the next test.)
         expect(removed).toContain(second);
         expect(await expiring.getEvalRetention(id)).toEqual({ exists: false });
         await runtime.shutdown();
@@ -534,6 +537,20 @@ describe.skipIf(!REDIS_URL)('RedisStore integration (real Redis)', () => {
       const removed = await store.deleteEvalResult(id);
       expect(removed).toBe(true);
 
+      const refetch = await store.listEvalResults();
+      expect(refetch.find((e) => e.id === id)).toBeUndefined();
+    });
+
+    it('updateEvalResult refuses a row the store no longer holds (SET XX)', async () => {
+      const id = `ev-upd-${randomUUID()}`;
+      const entry = { id, eval: 'integration-test', timestamp: 6000, data: { score: 0.5 } };
+      await store.saveEvalResult(entry);
+      expect(await store.updateEvalResult(entry)).toBe(true);
+
+      expect(await store.deleteEvalResult(id)).toBe(true);
+      // A correction can only rewrite a row that still exists: `XX` makes
+      // Redis refuse to create one, so a deleted row cannot be resurrected.
+      expect(await store.updateEvalResult(entry)).toBe(false);
       const refetch = await store.listEvalResults();
       expect(refetch.find((e) => e.id === id)).toBeUndefined();
     });

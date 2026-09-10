@@ -113,6 +113,8 @@ const DEFAULT_STREAMING_BATCH_INTERVAL = 1_000; // ms
 const DEFAULT_ARTIFACT_SWEEP_MS = 60_000;
 /** How long an actively-written (staged) artifact is protected from the sweep. */
 const DEFAULT_ARTIFACT_LEASE_MS = 300_000;
+/** How long one artifact's lease is renewed before the runtime gives up on it. */
+const DEFAULT_ARTIFACT_MAX_HOLD_MS = 24 * 60 * 60 * 1000;
 
 /** Sentinel workflow name on synthesized ExecutionInfos when the streaming
  *  buffer doesn't include a `workflow_start` event. The `__axl/` prefix
@@ -838,6 +840,7 @@ export class AxlRuntime extends EventEmitter {
   /** Resolved diagnostic artifact backend, when `diagnostics.artifacts` is set. */
   private artifactStore?: DiagnosticArtifactStore;
   private artifactLeaseMs = DEFAULT_ARTIFACT_LEASE_MS;
+  private artifactMaxHoldMs = DEFAULT_ARTIFACT_MAX_HOLD_MS;
   private artifactSweepTimer?: ReturnType<typeof setInterval>;
   /** Lease-renewal timers for artifacts currently being written, by id. */
   private readonly artifactRenewals = new Map<string, ReturnType<typeof setInterval>>();
@@ -937,6 +940,10 @@ export class AxlRuntime extends EventEmitter {
       typeof artifacts.leaseMs === 'number' && artifacts.leaseMs > 0
         ? artifacts.leaseMs
         : DEFAULT_ARTIFACT_LEASE_MS;
+    this.artifactMaxHoldMs =
+      typeof artifacts.maxHoldMs === 'number' && artifacts.maxHoldMs > 0
+        ? artifacts.maxHoldMs
+        : DEFAULT_ARTIFACT_MAX_HOLD_MS;
     const sweepMs =
       typeof artifacts.sweepIntervalMs === 'number' && artifacts.sweepIntervalMs > 0
         ? artifacts.sweepIntervalMs
@@ -1003,8 +1010,19 @@ export class AxlRuntime extends EventEmitter {
     sink: RequestCaptureSink;
   } {
     const store = this.requireArtifactStore();
+    // A caller that neither finalizes nor rolls back would otherwise pin this
+    // artifact FOREVER: the sweeper only reclaims a lease that expired, so a
+    // renewal nobody stops removes the last self-healing path. The hold is
+    // therefore bounded — past `maxHoldMs` the runtime lets go, the lease runs
+    // out, and the artifact is reclaimed like any abandoned writer's. Callers
+    // still stop their own timers; this is the floor under a caller bug.
+    const heldUntil = Date.now() + this.artifactMaxHoldMs;
     const timer = setInterval(
       () => {
+        if (Date.now() >= heldUntil) {
+          this.stopArtifactRenewal(staged.artifactId);
+          return;
+        }
         void staged.renewLease().catch(() => undefined);
       },
       Math.max(1, Math.floor(this.artifactLeaseMs / 2)),
@@ -1065,7 +1083,15 @@ export class AxlRuntime extends EventEmitter {
     owner: ArtifactOwner,
     opts: { maxBytes: number },
   ): Promise<
-    { artifactId: string; truncated: boolean; bytes: number; sink: RequestCaptureSink } | undefined
+    | {
+        artifactId: string;
+        truncated: boolean;
+        bytes: number;
+        /** What the SOURCE manifest said about the copied bytes. Never inferred. */
+        redaction: 'applied' | 'none';
+        sink: RequestCaptureSink;
+      }
+    | undefined
   > {
     const copied = await this.requireArtifactStore().copy(sourceId, owner, {
       maxBytes: opts.maxBytes,
@@ -1076,6 +1102,7 @@ export class AxlRuntime extends EventEmitter {
       ...this.holdStagedArtifact(copied),
       truncated: copied.truncated,
       bytes: copied.bytes,
+      redaction: copied.redaction,
     };
   }
 
@@ -1165,11 +1192,20 @@ export class AxlRuntime extends EventEmitter {
     const data = entry.data as { diagnostics?: Record<string, unknown> } | undefined;
     if (!data?.diagnostics) return;
     if (data.diagnostics.artifactId === '' && data.diagnostics.status === 'unavailable') return;
+    // `records`, `bytes` and `expiresAt` described evidence this rewrite has
+    // just declared absent. Spreading them through would leave a result reading
+    // `status: 'unavailable', records: 137, bytes: 2100000` — a count of
+    // something nobody can read. `unavailableManifest` on the eval side zeroes
+    // them for the same reason.
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const { expiresAt, ...rest } = data.diagnostics;
     data.diagnostics = {
-      ...data.diagnostics,
+      ...rest,
       artifactId: '',
       status: 'unavailable',
       reason: 'the captured-request artifact for this result is no longer available',
+      records: 0,
+      bytes: 0,
     };
   }
 

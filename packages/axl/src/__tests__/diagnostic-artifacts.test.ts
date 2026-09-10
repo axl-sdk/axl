@@ -47,6 +47,7 @@ function artifactRuntime(options?: {
   store?: StateStore;
   sweepIntervalMs?: number;
   leaseMs?: number;
+  maxHoldMs?: number;
   artifactStore?: DiagnosticArtifactStore;
 }): AxlRuntime {
   return new AxlRuntime({
@@ -57,6 +58,7 @@ function artifactRuntime(options?: {
         // Long enough that nothing sweeps during a test unless the test says so.
         sweepIntervalMs: options?.sweepIntervalMs ?? 3_600_000,
         leaseMs: options?.leaseMs ?? 3_600_000,
+        ...(options?.maxHoldMs !== undefined ? { maxHoldMs: options.maxHoldMs } : {}),
       },
     },
   });
@@ -525,6 +527,45 @@ describe('a live writer keeps its lease without writing (H3)', () => {
     const { removed } = await runtime.reconcileDiagnosticArtifacts();
     expect(removed).toContain(staged.artifactId);
     await runtime.shutdown();
+  });
+});
+
+describe('a lease is held for a bounded time, not forever (N1)', () => {
+  it('lets go of an artifact nobody ever finalized', async () => {
+    const leaseMs = 150;
+    const runtime = artifactRuntime({ leaseMs, maxHoldMs: 200 });
+    const staged = await runtime.stageDiagnosticArtifact({ kind: 'eval', id: 'run-forgotten' });
+    await staged.sink.append('{"v":1}');
+
+    // Nobody finalizes and nobody rolls back — a caller that threw between the
+    // two. Before the hold bound this renewed the lease forever and the sweeper
+    // could NEVER reclaim it: an unbounded leak with no self-healing path,
+    // which is worse than the write-driven renewal it replaced.
+    await new Promise((resolve) => setTimeout(resolve, 200 + leaseMs * 3));
+
+    const { removed } = await runtime.reconcileDiagnosticArtifacts();
+    expect(removed).toContain(staged.artifactId);
+    await runtime.shutdown();
+  });
+});
+
+describe('a deleted artifact stays deleted (N9)', () => {
+  it('drops a record that arrives after the delete instead of resurrecting it', async () => {
+    const store = new FileDiagnosticArtifactStore({ root });
+    const staged = await store.stage(OWNER, { leaseMs: 1000 });
+    await store.append(staged.artifactId, '{"v":1}');
+    await store.delete(staged.artifactId);
+
+    // A capture queue is fire-and-forget: a line can still be in flight when the
+    // owner row is deleted. The write must be DROPPED — not left to fail into
+    // the channel (which reads a dead artifact as a dead sink and stops
+    // capturing the rest of the run), and not left to recreate the directory as
+    // records with no manifest, a shape `list()` skips and reconciliation
+    // therefore never reclaims.
+    await expect(store.append(staged.artifactId, '{"v":1,"late":true}')).resolves.toBeUndefined();
+
+    expect(await store.list()).toEqual([]);
+    expect(await store.open(staged.artifactId)).toBeUndefined();
   });
 });
 

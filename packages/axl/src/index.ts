@@ -56,6 +56,7 @@ export type {
   ArtifactManifest,
   ArtifactOwner,
   ArtifactStatus,
+  ArtifactWriteResult,
   DiagnosticArtifactStore,
   OpenedArtifact,
   StagedArtifact,

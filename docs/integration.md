@@ -197,7 +197,13 @@ const runtime = new AxlRuntime({
 ```
 
 Supply `store` instead of `root` to plug in your own `DiagnosticArtifactStore`
-(S3, a blob column, anything). Supplying neither while a run asks for capture
+(S3, a blob column, anything). `commit`, `markDeletePending` and `refreshExpiry`
+return an `ArtifactWriteResult` (`{ ok: true, manifest } | { ok: false, reason:
+'missing' }`) — both the interface and that type are exported from `@axlsdk/axl`
+— so an artifact that has already gone is reported rather than silently
+succeeding. `copy` returns a **staged** artifact (`renewLease` included) plus
+the bytes it carried and the source's `redaction`, because a copy is the start
+of the new owner's capture, not the end of it. Supplying neither while a run asks for capture
 raises `AxlError('DIAGNOSTICS_UNAVAILABLE')` **before** the run starts, never
 halfway through.
 
@@ -237,7 +243,10 @@ holds the process open; stopped by `runtime.shutdown()`). It removes:
 - staged artifacts whose writer lease expired — a crashed run
 
 The lease is held for the **writer's lifetime**, renewed on a timer the runtime
-owns and stopped at finalize or rollback — not renewed by writing. A run that
+owns and stopped at finalize or rollback — not renewed by writing. It is also
+bounded: past `maxHoldMs` (24 h by default) the runtime lets go, so a caller
+that never finalizes degrades to an ordinary abandoned writer instead of pinning
+the artifact forever. A run that
 exhausts its capture byte bound early, or that waits on a tool or a human for
 longer than a lease, therefore keeps its artifact.
 

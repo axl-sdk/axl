@@ -162,7 +162,15 @@ export interface DiagnosticArtifactStore {
     sourceId: string,
     owner: ArtifactOwner,
     opts: { maxBytes: number; leaseMs: number },
-  ): Promise<(StagedArtifact & { truncated: boolean; bytes: number }) | undefined>;
+  ): Promise<
+    | (StagedArtifact & {
+        truncated: boolean;
+        bytes: number;
+        /** What the SOURCE said about the bytes just copied. Never inferred. */
+        redaction: 'applied' | 'none';
+      })
+    | undefined
+  >;
   /** Record an idempotent deletion intent. Reports an artifact already gone. */
   markDeletePending(artifactId: string): Promise<ArtifactWriteResult>;
   /** Physically remove an artifact. Idempotent. */
@@ -196,6 +204,16 @@ export class FileDiagnosticArtifactStore implements DiagnosticArtifactStore {
   private readonly writeChains = new Map<string, Promise<void>>();
   /** Live byte/record counters, folded into the manifest at finalize. */
   private readonly counters = new Map<string, { records: number; bytes: number }>();
+  /**
+   * Ids this store has deleted.
+   *
+   * Ids are minted, never reused, so "deleted" is permanent and a late write
+   * for one is always a bug in the caller rather than a legitimate resurrection.
+   * Remembering them is what stops such a write from recreating a directory
+   * holding records with no manifest — a shape `list()` skips and reconciliation
+   * therefore never reclaims.
+   */
+  private readonly deleted = new Set<string>();
 
   constructor(options: { root: string }) {
     const root = options?.root;
@@ -306,6 +324,10 @@ export class FileDiagnosticArtifactStore implements DiagnosticArtifactStore {
   async append(artifactId: string, line: string): Promise<void> {
     const file = path.join(this.dir(artifactId), RECORDS_FILE);
     await this.serialize(artifactId, async () => {
+      // A write that arrives after the delete would otherwise recreate the
+      // directory with records and no manifest, which nothing lists and nothing
+      // reclaims. Dropping it is right: the artifact is gone.
+      if (this.deleted.has(artifactId)) return;
       await appendFile(file, `${line}\n`, 'utf-8');
       const counter = this.counters.get(artifactId) ?? { records: 0, bytes: 0 };
       counter.records += 1;
@@ -402,7 +424,10 @@ export class FileDiagnosticArtifactStore implements DiagnosticArtifactStore {
     sourceId: string,
     owner: ArtifactOwner,
     opts: { maxBytes: number; leaseMs: number },
-  ): Promise<(StagedArtifact & { truncated: boolean; bytes: number }) | undefined> {
+  ): Promise<
+    | (StagedArtifact & { truncated: boolean; bytes: number; redaction: 'applied' | 'none' })
+    | undefined
+  > {
     const source = await this.open(sourceId);
     if (!source) return undefined;
     const staged = await this.stage(owner, { leaseMs: opts.leaseMs });
@@ -422,7 +447,7 @@ export class FileDiagnosticArtifactStore implements DiagnosticArtifactStore {
       redaction: source.manifest.redaction,
       copiedFrom: { artifactId: sourceId, ownerId: source.manifest.owner.id },
     }));
-    return { ...staged, truncated, bytes };
+    return { ...staged, truncated, bytes, redaction: source.manifest.redaction };
   }
 
   async markDeletePending(artifactId: string): Promise<ArtifactWriteResult> {
@@ -431,10 +456,17 @@ export class FileDiagnosticArtifactStore implements DiagnosticArtifactStore {
   }
 
   async delete(artifactId: string): Promise<void> {
-    await this.writeChains.get(artifactId)?.catch(() => undefined);
+    // Inside the serializer, not before it: draining the chain and THEN
+    // removing the directory leaves a window in which a late `append`
+    // recreates it as a `records.jsonl` with no manifest — which `list()`
+    // skips and reconciliation therefore never reclaims. `deleted` closes the
+    // window for good, since an id is never reused.
+    await this.serialize(artifactId, async () => {
+      this.deleted.add(artifactId);
+      this.counters.delete(artifactId);
+      await rm(this.dir(artifactId), { recursive: true, force: true });
+    });
     this.writeChains.delete(artifactId);
-    this.counters.delete(artifactId);
-    await rm(this.dir(artifactId), { recursive: true, force: true });
   }
 
   async list(): Promise<ArtifactManifest[]> {

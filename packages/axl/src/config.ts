@@ -167,6 +167,19 @@ export type DiagnosticArtifactsConfig = {
   /** How long a staged (actively written) artifact is protected from the
    *  sweeper before it counts as abandoned. Default `300_000`. */
   leaseMs?: number;
+  /**
+   * Longest a single artifact's lease is renewed before the runtime lets go.
+   * Default `86_400_000` (24 h).
+   *
+   * The lease renewal is a timer, and a caller that never finalizes or rolls
+   * back its artifact would otherwise pin it forever — a leak with no
+   * self-healing path, because the sweeper only reclaims a lease that expired.
+   * Past this bound the runtime stops renewing, the lease runs out, and the
+   * artifact is reclaimed on the next sweep like any abandoned writer's. Set it
+   * above the longest run you expect; a run that outlives it keeps working and
+   * only loses its captured requests.
+   */
+  maxHoldMs?: number;
 };
 
 import type { TelemetryConfig } from './telemetry/types.js';

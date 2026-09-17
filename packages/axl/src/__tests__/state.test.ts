@@ -1158,8 +1158,14 @@ describe('RedisStore', () => {
     const ttls = new Map<string, number>();
     // Lists for streaming-event persistence (RPUSH / LRANGE).
     const listData = new Map<string, string[]>();
+    // node-redis exposes an open socket as `isOpen` and rejects a QUIT on a
+    // closed client; a real Redis run proved it, so the mock reproduces it.
+    let clientOpen = true;
 
     const mockClient = {
+      get isOpen() {
+        return clientOpen;
+      },
       hSet: vi.fn(async (key: string, field: string, value: string) => {
         if (!hashData.has(key)) hashData.set(key, new Map());
         hashData.get(key)!.set(field, value);
@@ -1378,7 +1384,10 @@ describe('RedisStore', () => {
         return seconds === undefined ? -1 : seconds * 1000;
       }),
       multi: vi.fn(() => createMockMulti(data, hashData, setData, zsetData, ttls, listData)),
-      quit: vi.fn(async () => undefined),
+      quit: vi.fn(async () => {
+        if (!clientOpen) throw new Error('The client is closed');
+        clientOpen = false;
+      }),
     };
 
     // Bypass the private constructor and inject the mock client.
@@ -1552,6 +1561,19 @@ describe('RedisStore', () => {
       const { store, mockClient } = createRedisStoreWithMockClient();
 
       await store.close();
+
+      expect(mockClient.quit).toHaveBeenCalledOnce();
+    });
+
+    it('closes idempotently, so a caller may close a store its runtime already closed', async () => {
+      const { store, mockClient } = createRedisStoreWithMockClient();
+
+      // `runtime.shutdown()` closes the state store it was handed. A caller
+      // that also closes its own store is doing the ordinary thing, and it
+      // must not be punished for it — MemoryStore and better-sqlite3 both
+      // treat a second close as a no-op.
+      await store.close();
+      await expect(store.close()).resolves.toBeUndefined();
 
       expect(mockClient.quit).toHaveBeenCalledOnce();
     });

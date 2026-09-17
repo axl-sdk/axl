@@ -77,6 +77,11 @@ interface RedisClient {
   // saveExecution, etc.) that previously could half-commit on failure.
   multi(): RedisMulti;
   quit(): Promise<void>;
+  // node-redis reports its socket state here and rejects a QUIT once the
+  // client is closed. Optional because a caller may inject a minimal client
+  // shim that does not expose it — one that omits it keeps the old
+  // quit-unconditionally behavior.
+  readonly isOpen?: boolean;
 }
 
 // Chainable transaction builder returned by `client.multi()`. Queues
@@ -1193,8 +1198,17 @@ export class RedisStore implements StateStore {
     });
   }
 
-  /** Close the Redis connection. */
+  /**
+   * Close the Redis connection.
+   *
+   * Idempotent: `runtime.shutdown()` closes the state store it was handed, so
+   * a caller that also closes its own store is doing the ordinary thing and
+   * must not get a rejected promise for it. `MemoryStore.close()` and
+   * better-sqlite3's `close()` are both no-ops the second time; node-redis
+   * instead rejects with "The client is closed", so absorb that here.
+   */
   async close(): Promise<void> {
+    if (this.client.isOpen === false) return;
     await this.client.quit();
   }
 

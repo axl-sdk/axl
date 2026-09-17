@@ -25,6 +25,8 @@ import { z } from 'zod';
 import { agent } from '../agent.js';
 import { workflow } from '../workflow.js';
 import { AxlRuntime } from '../runtime.js';
+import { InMemoryVectorStore } from '../memory/vector-memory.js';
+import { OpenAIEmbedder } from '../memory/embedder-openai.js';
 import { AdmissionController } from '../accounting.js';
 import { AdmissionDeniedError } from '../errors.js';
 import type { CapturedRequestRecord } from '../diagnostics/capture.js';
@@ -271,20 +273,17 @@ describe.skipIf(!TABLE_PRICED)(`L7 termination fidelity (${TABLE_PRICED?.label})
  * the OpenAI and Gemini transcription adapters, and the OpenAI embedder, carry
  * the same one-line change and remain unverified for want of credentials.
  *
- * Only the refusal runs by default. OpenRouter's `/audio/transcriptions`
- * endpoint serves no model on a default account — the sole audio model in its
- * catalog (`mistralai/voxtral-small-24b-2507`) is chat-completions only and the
- * endpoint answers `400 Model ... does not exist` — so the settlement half is
- * gated on an explicitly configured model, the way the Bedrock preset test is.
- * That leaves the refusal proving that admission is read at this call site, and
- * NOT proving that an admitted transcription reaches the provider.
+ * Both halves run: the refusal proves admission is read at this call site, and
+ * the settlement proves an admitted transcription still reaches the provider —
+ * a refusal test alone would pass just as well if transcription were broken
+ * outright. `OPENROUTER_TRANSCRIPTION_MODEL` overrides the model.
  */
 describe.skipIf(!process.env.OPENROUTER_API_KEY)(
   'L4 transcription dispatch scope (openrouter)',
   () => {
     const MODEL = process.env.OPENROUTER_TRANSCRIPTION_MODEL
       ? `openrouter-transcription:${process.env.OPENROUTER_TRANSCRIPTION_MODEL}`
-      : 'openrouter-transcription:mistralai/voxtral-small-24b-2507';
+      : 'openrouter-transcription:openai/whisper-1';
 
     const audio = () => ({
       type: 'bytes' as const,
@@ -307,18 +306,14 @@ describe.skipIf(!process.env.OPENROUTER_API_KEY)(
       return runtime;
     }
 
-    it.skipIf(!process.env.OPENROUTER_TRANSCRIPTION_MODEL)(
-      'settles a real transcription as one terminal operation',
-      async () => {
-        const runtime = transcriber();
-        const outcome = await runtime.trackOutcome(() => runtime.execute('listen', {}));
+    it('settles a real transcription as one terminal operation', async () => {
+      const runtime = transcriber();
+      const outcome = await runtime.trackOutcome(() => runtime.execute('listen', {}));
 
-        expect(outcome.status).toBe('fulfilled');
-        expect(outcome.accounting.operations.total).toBe(1);
-        expect(outcome.accounting.operations.settled).toBe(1);
-      },
-      60_000,
-    );
+      expect(outcome.status).toBe('fulfilled');
+      expect(outcome.accounting.operations.total).toBe(1);
+      expect(outcome.accounting.operations.settled).toBe(1);
+    }, 60_000);
 
     it('refuses a transcription on a closed budget before the audio leaves the process', async () => {
       const runtime = transcriber();
@@ -343,3 +338,162 @@ describe.skipIf(!process.env.OPENROUTER_API_KEY)(
     });
   },
 );
+
+// ── L2 / L6: the changed native adapters ─────────────────────────────────
+
+/**
+ * `anthropic.ts`, `gemini.ts` and `openai-responses.ts` each rewrite the
+ * provider-neutral request into their own wire shape — Anthropic hoists the
+ * system message out of `messages`, Gemini renames roles and wraps content in
+ * `parts`. Capture snapshots by value at the facade, BEFORE the adapter runs,
+ * so what lands in a record must still be the caller's request. A10.6 proves
+ * that against a hand-written mutating mock; these prove it against the
+ * adapters that actually mutate.
+ */
+const NATIVE = [
+  { env: 'OPENAI_API_KEY', label: 'openai-responses', uri: 'openai-responses:gpt-4o-mini' },
+  { env: 'ANTHROPIC_API_KEY', label: 'anthropic', uri: 'anthropic:claude-haiku-4-5' },
+  { env: 'GOOGLE_API_KEY', label: 'gemini', uri: 'google:gemini-3.5-flash-lite' },
+] as const;
+
+const Answer = z.object({ answer: z.number() });
+const SYSTEM = 'You are terse. Answer with JSON only.';
+const QUESTION = 'What is 2 + 2?';
+
+for (const native of NATIVE) {
+  describe.skipIf(!process.env[native.env])(`L2/L6 native capture parity (${native.label})`, () => {
+    function askRuntime(): AxlRuntime {
+      const runtime = new AxlRuntime({
+        defaultProvider: native.uri.split(':')[0],
+        trace: { enabled: false },
+      });
+      const asker = agent({ name: 'native', model: native.uri, system: SYSTEM });
+      runtime.register(
+        workflow({
+          name: 'ask',
+          input: z.any(),
+          handler: (ctx) => ctx.ask(asker, QUESTION, { schema: Answer, maxTokens: 64 }),
+        }),
+      );
+      return runtime;
+    }
+
+    it('captures the submitted request and its effective settings (L2)', async () => {
+      const runtime = askRuntime();
+      const { records, outcome } = await captured(runtime, () => runtime.execute('ask', {}));
+
+      expect(outcome.status).toBe('fulfilled');
+      expect(outcome.accounting.operations.total).toBeGreaterThanOrEqual(1);
+      expect(outcome.accounting.operations.settled).toBe(outcome.accounting.operations.total);
+
+      const starts = phase(records, 'start');
+      expect(starts.length).toBeGreaterThanOrEqual(1);
+      const request = starts[0].request!;
+      // The model actually dispatched to, not the URI the caller wrote.
+      expect(request.options.model).toBe(native.uri.slice(native.uri.indexOf(':') + 1));
+      expect(request.options.maxTokens).toBe(64);
+      // Structured output is part of the submitted request, so a record that
+      // cannot show the response format cannot explain a schema rejection.
+      expect(request.responseFormat).toBeDefined();
+      // Nothing credential-bearing leaks in through the option allowlist.
+      expect(JSON.stringify(request.options)).not.toContain('apiKey');
+    });
+
+    it('captures the caller request by value, not the adapter wire shape (L6)', async () => {
+      const runtime = askRuntime();
+      const { records } = await captured(runtime, () => runtime.execute('ask', {}));
+
+      const request = phase(records, 'start')[0].request!;
+      const roles = request.messages.map((m) => m.role);
+      // Anthropic sends `system` as a top-level field and Gemini calls the
+      // assistant `model` and wraps text in `parts`. Either shape appearing
+      // here would mean the record was taken after the adapter rewrote it.
+      expect(roles).toContain('system');
+      expect(roles).toContain('user');
+      expect(request.messages.find((m) => m.role === 'system')?.content).toBe(SYSTEM);
+      // `toContain`, not equality: Axl appends its schema instruction to the
+      // user turn at the neutral layer. That the appended text is here is the
+      // point — the record is the normalized request Axl submitted, taken
+      // before the adapter rewrote it, not the caller's raw string and not the
+      // provider's wire body.
+      expect(request.messages.find((m) => m.role === 'user')?.content).toContain(QUESTION);
+      expect(roles).not.toContain('model');
+      expect(JSON.stringify(request.messages)).not.toContain('parts');
+    });
+  });
+}
+
+// ── L4 (native half): transcription and embedding settlement ─────────────
+
+describe.skipIf(!process.env.OPENAI_API_KEY)('L4 embedding settlement (openai)', () => {
+  it('settles a real embed as one adapter-reported embedding operation', async () => {
+    const runtime = new AxlRuntime({
+      memory: { vectorStore: new InMemoryVectorStore(), embedder: new OpenAIEmbedder({}) },
+      trace: { enabled: false },
+    });
+
+    const outcome = await runtime.trackOutcome(async () => {
+      const ctx = runtime.createContext({ metadata: { sessionId: 'live-embed' } });
+      await ctx.remember('pet', 'I love my cat', { embed: true });
+    });
+
+    expect(outcome.status).toBe('fulfilled');
+    expect(outcome.accounting.operations.total).toBe(1);
+    expect(outcome.accounting.operations.settled).toBe(1);
+    // `embedAsOperation` settles with `provenance: 'adapter_reported'` — the
+    // embedder reports its own charge rather than being priced from a table.
+    expect(Object.keys(outcome.accounting.provenance)).toContain('adapter_reported');
+  }, 60_000);
+});
+
+const NATIVE_TRANSCRIPTION = [
+  { env: 'OPENAI_API_KEY', label: 'openai', model: 'openai-transcription:gpt-transcribe' },
+  { env: 'GOOGLE_API_KEY', label: 'gemini', model: 'gemini-transcription:gemini-3.5-transcribe' },
+] as const;
+
+for (const t of NATIVE_TRANSCRIPTION) {
+  describe.skipIf(!process.env[t.env])(`L4 transcription settlement (${t.label})`, () => {
+    it('settles a real transcription as one terminal operation', async () => {
+      const runtime = new AxlRuntime({ trace: { enabled: false } });
+      runtime.register(
+        workflow({
+          name: 'listen',
+          input: z.any(),
+          handler: (ctx) =>
+            ctx.transcribe({
+              model: t.model,
+              audio: {
+                type: 'bytes',
+                data: Buffer.from(
+                  readFileSync(
+                    new URL('./fixtures/recorded-call.mp3.b64', import.meta.url),
+                    'utf-8',
+                  ).trim(),
+                  'base64',
+                ),
+                mediaType: 'audio/mpeg',
+              },
+            }),
+        }),
+      );
+
+      const outcome = await runtime.trackOutcome(() => runtime.execute('listen', {}));
+
+      expect(outcome.status).toBe('fulfilled');
+      const { operations, usage } = outcome.accounting;
+      // Correct category, and terminal: one transcription operation that
+      // reached an end state rather than being left open or abandoned.
+      expect(operations.byKind.transcription).toBe(1);
+      expect(operations.total).toBe(1);
+      expect(operations.settled + operations.unknown).toBe(operations.total);
+      expect(operations.denied).toBe(0);
+      // Usage in the units transcription is billed in. These built-in models
+      // return usage without a price, so the operation lands `unknown` with
+      // `unpriced_model` and `knownCost` stays an explicit lower bound — the
+      // rail reports the gap instead of inventing a charge.
+      expect(usage.audioSeconds + usage.inputTokens).toBeGreaterThan(0);
+      expect(outcome.accounting.completeness).toBe('incomplete');
+      expect(outcome.accounting.reasons.unpriced_model).toBe(1);
+    }, 120_000);
+  });
+}

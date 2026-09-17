@@ -496,6 +496,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`SQLiteStore`, `SqliteVectorStore` and `RedisStore` work from the ESM
+  build.** Each loads its optional dependency with a synchronous `require()`,
+  which the bundler rewrote to a shim that has no `require` to bind in an ESM
+  output and throws on call. The stores caught that throw and reported it as a
+  missing dependency, so an ESM consumer saw "better-sqlite3 is required" /
+  "redis is required" with the package installed and resolvable. The CJS build
+  was unaffected. The ESM bundle now defines `require` via `createRequire`, and
+  a smoke test constructs each store from the built ESM entry point.
+
 - **Gemini Interactions now honors response service tiers when estimating cost.**
   Top-level response tiers, the `x-gemini-service-tier` header, and streaming
   lifecycle events are checked together. Any non-standard, unknown, or

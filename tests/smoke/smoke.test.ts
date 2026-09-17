@@ -3,6 +3,7 @@ import { execSync } from 'node:child_process';
 import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 const ROOT = join(import.meta.dirname, '../..');
 
@@ -387,4 +388,67 @@ describe('Smoke: Packaged Runtime Contract', () => {
     expect(report.budget.status).toBe('closed');
     expect(report.budget.knownSpend).toBeCloseTo(report.knownCost, 10);
   }, 150_000);
+});
+
+/**
+ * Optional-dependency loading in the ESM bundle.
+ *
+ * `SQLiteStore`, `SqliteVectorStore` and `RedisStore` load their optional
+ * native deps with a synchronous `require()` — a sync constructor like
+ * `new SQLiteStore(path)` cannot await a dynamic import. esbuild rewrites
+ * those calls to its `__require` shim, which in an ESM output finds no
+ * `require` binding and falls back to a Proxy that throws on call. Each
+ * store caught that throw and reported it as a missing dependency, so every
+ * ESM consumer saw "better-sqlite3 is required" / "redis is required" with
+ * the package installed and resolvable. The CJS bundle was fine, and the
+ * unit suite runs against TS source, so nothing caught it.
+ *
+ * These run the built ESM bundle the way a consumer imports it.
+ */
+describe('Smoke: ESM bundle optional dependencies', () => {
+  const DIST = join(ROOT, 'packages/axl/dist/index.js');
+
+  function runEsm(body: string): string {
+    const dir = mkdtempSync(join(tmpdir(), 'axl-esm-smoke-'));
+    const script = join(dir, 'probe.mjs');
+    writeFileSync(script, body.replace('__DIST__', pathToFileURL(DIST).href));
+    return execSync(`node ${script}`, { encoding: 'utf-8', stdio: 'pipe' }).trim();
+  }
+
+  it('constructs the SQLite-backed stores from the ESM build', () => {
+    const out = runEsm(
+      [
+        "import { SQLiteStore, SqliteVectorStore } from '__DIST__';",
+        "import { mkdtempSync } from 'node:fs';",
+        "import { tmpdir } from 'node:os';",
+        "import { join } from 'node:path';",
+        "const dir = mkdtempSync(join(tmpdir(), 'axl-esm-db-'));",
+        "const store = new SQLiteStore(join(dir, 'state.db'));",
+        "const vectors = new SqliteVectorStore(join(dir, 'vectors.db'));",
+        'store.close?.();',
+        'vectors.close?.();',
+        "console.log('constructed');",
+      ].join('\n'),
+    );
+    expect(out).toBe('constructed');
+  });
+
+  it('loads the redis client from the ESM build, failing only on the connection', () => {
+    // Port 1 is never a Redis server, so `create()` must reject — but on the
+    // connection, having loaded the client. A rejection naming the dependency
+    // is the bundler defect, not a missing package.
+    const out = runEsm(
+      [
+        "import { RedisStore } from '__DIST__';",
+        'try {',
+        "  await RedisStore.create({ url: 'redis://127.0.0.1:1' });",
+        "  console.log('connected-unexpectedly');",
+        '} catch (err) {',
+        '  console.log(err.message);',
+        '}',
+      ].join('\n'),
+    );
+    expect(out).not.toMatch(/redis is required for RedisStore/);
+    expect(out).not.toMatch(/does not export createClient/);
+  });
 });

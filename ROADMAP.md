@@ -87,6 +87,23 @@
 
 ### Planned
 
+#### Pricing coverage gaps
+
+Live verification on 2026-09-17 found two kinds of spend that Axl records but cannot price.
+The run is correctly flagged `incomplete` / `unpriced_model`, but a budget cannot stop spend
+it cannot price. Both are documented as known gaps in the provider docs.
+
+- **DeepSeek model ID alias.** A request for `deepseek-v4-flash` comes back reporting
+  `deepseek-flash`, and the exact-match V4 table has no row for it, so DeepSeek calls go
+  unpriced. Before changing anything: confirm current DeepSeek pricing and aliases, then decide
+  whether to add the alias to the table or fall back to the requested ID when the reported ID
+  is unknown. The fallback is broader, but it could misprice a call the provider served on a
+  different model. See [providers — known gap](docs/providers.md#openai-compatible-providers--presets).
+- **Built-in transcription pricing.** `openai-transcription:gpt-transcribe` and
+  `gemini-transcription:gemini-3.5-transcribe` report usage without cost. Decide whether to
+  price them from published per-minute / per-token rates, and keep `unpriced` wherever a rate
+  cannot be verified. See [multimodal input — known gap](docs/multimodal-input.md#completed-file-transcription).
+
 #### Strict-mode native structured output
 
 `nativeStructuredOutput` currently sends OpenAI a **non-strict** `json_schema` (schema-as-guidance, not hard constrained decoding), because a Zod-derived schema isn't automatically OpenAI-strict-compliant (strict requires every property in `required` — optionals modeled as nullable — and `additionalProperties: false` on every object). Planned: an opt-in transform that rewrites the derived schema into the provider's strict subset and sets `strict: true`, so `nativeStructuredOutput` engages real constrained decoding where the provider supports it. Needs live-API iteration per provider; client-side Zod validation remains the guarantee in the meantime.

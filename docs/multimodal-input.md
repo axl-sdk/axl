@@ -420,6 +420,17 @@ pricing status, and opaque provider metadata. `timestamps` is `'segment' |
 | `gemini-transcription:` | `gemini-3.5-transcribe` | Bytes, base64, `provider-file` scoped to `gemini-transcription` | `language`, word timestamps, diarization with word timestamps; `providerOptions: { mode?: 'verbatim' | 'smart', customVocabulary?: string[] }`. The default is `verbatim`; `customVocabulary` accepts at most 1,000 entries but cannot be combined with timestamps. Smart mode cannot request timestamps or diarization. A provider-file requires its explicit audio `mediaType`. Bytes/base64 use temporary Files upload, readiness polling when needed, stateless Interactions (`store: false`), then best-effort deletion. |
 | `openrouter-transcription:` | Any nonblank `<vendor/model>` slug | Bytes, base64 | `language`; `providerOptions: { temperature?, provider? }`. Axl sends JSON to OpenRouter's dedicated STT endpoint without a catalog lookup; selected endpoint/model compatibility is authoritative. An upstream failure is wrapped as safe `TranscriptionOperationError`; response `seconds`, token counts, and `cost` are authoritative when present; missing price is surfaced as unpriced rather than zero. |
 
+**Known gap: built-in transcription is unpriced.** `gpt-transcribe` and
+`gemini-3.5-transcribe` return usage — audio seconds from OpenAI, input tokens from Gemini —
+but no price (observed live 2026-09-17). Each call is still one `transcription` operation in
+[`Accounting`](./api-reference.md#accounting), carrying that usage, but it settles as
+`unknown` with reason `unpriced_model`, and `knownCost` is a lower bound. Because unpriced
+spend is reported but not enforceable, a `ctx.budget()` limit or an `AdmissionController`
+**will not stop transcription spend by cost**. A budget that is *already* closed still refuses
+a new transcription before any audio is uploaded. On `openrouter-transcription:`, a
+vendor-reported `cost` is used when the response includes one. Fix tracked in
+[ROADMAP](../ROADMAP.md#pricing-coverage-gaps).
+
 Gemini uploaded files are a narrow, request-scoped adapter transaction—not a
 public Files client. The adapter attempts deletion after success, failure, or
 caller cancellation and records only its bounded cleanup outcome. If deletion

@@ -291,6 +291,9 @@ authoritative. `ctx.transcribe()` wraps an OpenRouter provider failure as safe
 the original `ProviderError` as a non-enumerable cause. See
 [Multimodal model input](./multimodal-input.md#completed-file-transcription)
 for exact source/options/cost semantics and the temporary-file retention risk.
+**Budgets cannot cap built-in transcription spend today:** `gpt-transcribe` and
+`gemini-3.5-transcribe` report usage without a price, so each call is unpriced — see
+[transcription cost](./multimodal-input.md#completed-file-transcription).
 All built-in inline transcription sources are capped at 25 MiB decoded before
 copying or base64 decoding. `ctx.transcribe()` converts adapter failures into a
 safe `TranscriptionOperationError` while preserving status, retryability,
@@ -390,7 +393,7 @@ name), or rely on its env vars. Most presets read `<PRESET>_API_KEY` and
 | `openrouter` | `https://openrouter.ai/api/v1` | Bearer | `reasoning` object (effort/budget); captures `reasoning_details` | **provider-reported** (`usage.cost`, USD) |
 | `azure` | *your resource* (`AZURE_OPENAI_BASE_URL`) | `api-key` header | reuses OpenAI (o-series/GPT-5) | unknown (deployment billing is not inferred) |
 | `xai` | `https://api.x.ai/v1` | Bearer | exact Grok 4.3/4.5/4.20 Chat capabilities | **provider-reported** usage ticks |
-| `deepseek` | `https://api.deepseek.com/v1` | Bearer | captures `reasoning_content`, round-trips on tool turns; no `json_schema` | exact V4 table; cache-hit/miss split |
+| `deepseek` | `https://api.deepseek.com/v1` | Bearer | captures `reasoning_content`, round-trips on tool turns; no `json_schema` | exact V4 table; cache-hit/miss split — **currently unpriced in practice**, see below |
 | `mistral` | `https://api.mistral.ai/v1` | Bearer | `reasoning_effort` on supported families only | exact current-model table |
 | `groq` | `https://api.groq.com/openai/v1` | Bearer | `reasoning_effort` on reasoning families only | exact current-model table |
 | `bedrock` | *your region* (`BEDROCK_BASE_URL`) | Bearer (`AWS_BEARER_TOKEN_BEDROCK`) | `reasoning_effort` for gpt-oss | unknown |
@@ -409,6 +412,13 @@ Notes & caveats:
   explicit `$0`. Unknown models, Azure deployments, non-representable tiers, and unsupported
   billing modifiers return `undefined` (**unknown**, never a misleading `$0`). Built-in tables
   match exact IDs; custom profile tables retain prefix matching unless `match: 'exact'` is set.
+- **Known gap: DeepSeek calls are currently unpriced.** Axl prices a call by the model ID the
+  response reports. A request for `deepseek-v4-flash` comes back reporting `deepseek-flash`
+  (observed live 2026-09-17), which the exact-match table has no row for, so the call carries
+  usage but **no cost**: `unpriced` / `unpriced_model`, with `knownCost` a lower bound. Because
+  unpriced spend is reported but not enforceable, a `ctx.budget()` limit or an
+  `AdmissionController` **will not stop DeepSeek spend**. `deepseek-v4-pro` has not been
+  checked live. Fix tracked in [ROADMAP](../ROADMAP.md#pricing-coverage-gaps).
 - **Capability is per-model on marketplaces** (OpenRouter/Groq): one model supports
   strict `json_schema` and the next doesn't. Profile flags are sensible defaults; use
   [`providerOptions`](#provideroptions) for per-call overrides.

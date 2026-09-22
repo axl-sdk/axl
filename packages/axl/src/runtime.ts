@@ -542,6 +542,8 @@ export type RuntimeEvalConfigShape = {
   scorerConcurrency?: number;
   budget?: string;
   failOnScorerErrorRate?: number;
+  /** Mirrors `EvalConfig.failOnItemErrorRate` (default `0.05`; `1` disables the gate). */
+  failOnItemErrorRate?: number;
   metadata?: Record<string, unknown>;
 };
 

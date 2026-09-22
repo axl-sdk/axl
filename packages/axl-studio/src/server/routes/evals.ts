@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { Hono } from 'hono';
 import type { StudioEnv } from '../types.js';
 import type { ConnectionManager } from '../ws/connection-manager.js';
-import type { DegradedScorer, EvalResult, Scorer } from '@axlsdk/eval';
+import type { DegradedScorer, EvalResult, ItemErrorRate, Scorer } from '@axlsdk/eval';
 import type { CapturedRequestRecord } from '@axlsdk/axl';
 import {
   redactEvalHistoryList,
@@ -334,11 +334,16 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
         // Mirrors the client's `buildMultiRunResult` so the sync (stream:false)
         // and streaming (stream:true, client-rebuilt) paths behave identically.
         const aggDegraded = unionDegradedScorers(results);
+        // The item gate is judged per run (as the CLI does), so the aggregate
+        // carries the worst run's rate, never run[0]'s — mirrors the client's
+        // `worstItemErrorRate`.
+        const worstItemRate = worstItemErrorRate(results);
         const result = {
           ...first,
           summary: {
             ...first.summary,
             ...(aggDegraded.length > 0 ? { degraded: aggDegraded } : {}),
+            ...(worstItemRate ? { itemErrorRate: worstItemRate } : {}),
           },
           _multiRun: {
             aggregate,
@@ -1037,6 +1042,28 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
   }
 
   return { app, closeActiveRuns };
+}
+
+/**
+ * The worst per-run `summary.itemErrorRate` in a multi-run group (highest
+ * `rate`; the first run wins a tie), stamped with `runsExceeded` — how many
+ * runs exceeded their limit. The CLI gates every run individually, so a pooled
+ * rate would let clean runs dilute a thinned one. `undefined` when no run had
+ * a failed item. `runsExceeded` is a client-facing extension, like
+ * `runsAffected` below. Mirrors the client's `worstItemErrorRate`.
+ */
+function worstItemErrorRate(
+  results: EvalResult[],
+): (ItemErrorRate & { runsExceeded: number }) | undefined {
+  let worst: ItemErrorRate | undefined;
+  let runsExceeded = 0;
+  for (const run of results) {
+    const r = run.summary?.itemErrorRate;
+    if (!r) continue;
+    if (r.exceeded) runsExceeded++;
+    if (!worst || r.rate > worst.rate) worst = r;
+  }
+  return worst ? { ...worst, runsExceeded } : undefined;
 }
 
 /**

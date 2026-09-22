@@ -815,6 +815,24 @@ describe('redactEvalResult', () => {
     expect(out.items[0].scorerErrors).toEqual(['[redacted]']);
   });
 
+  it('keeps the structural failure cause while masking the error message', () => {
+    // `failure` is provider/status/retryable/requestId/name — diagnostics, no
+    // content — so it survives redact mode; the message beside it does not.
+    const failure = {
+      name: 'ProviderError',
+      provider: 'openai',
+      status: 429,
+      retryable: true,
+      requestId: 'req_1',
+    };
+    const result = makeResult([
+      makeItem({ error: 'openai API error (429): echo of john@acme.com', failure }),
+    ]);
+    const out = redactEvalResult(result, true);
+    expect(out.items[0].error).toBe('[redacted]');
+    expect(out.items[0].failure).toEqual(failure);
+  });
+
   it('scrubs scoreDetails[*].metadata but keeps score/duration/cost', () => {
     const result = makeResult([
       makeItem({

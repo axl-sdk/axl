@@ -351,3 +351,51 @@ describe('buildMultiRunResult', () => {
     expect(getResultDegraded(result!)).toEqual([]);
   });
 });
+
+// ── itemErrorRate across a group ─────────────────────────────────
+//
+// `summary.itemErrorRate` is run-level, and the CLI gates each run of a batch
+// individually. Spreading `...first.summary` would surface only run[0]'s rate,
+// so a group whose third run lost half its items would read as clean.
+describe('buildMultiRunResult — itemErrorRate', () => {
+  const rate = (failed: number, attempted: number, limit = 0.05) => ({
+    failed,
+    attempted,
+    rate: failed / attempted,
+    limit,
+    exceeded: failed / attempted > limit,
+  });
+  const withRate = (runIndex: number, r?: ReturnType<typeof rate>): EvalResultData => {
+    const run = makeRun(runIndex);
+    if (r) run.summary.itemErrorRate = r;
+    return run;
+  };
+
+  it('surfaces the worst run when run[0] is clean', () => {
+    const result = buildMultiRunResult([
+      withRate(0),
+      withRate(1, rate(1, 20)),
+      withRate(2, rate(10, 20)),
+    ]);
+    expect(result!.summary.itemErrorRate).toEqual({ ...rate(10, 20), runsExceeded: 1 });
+  });
+
+  it('keeps the worst rate, not run[0]’s, and counts every run over its limit', () => {
+    const result = buildMultiRunResult([
+      withRate(0, rate(2, 20)),
+      withRate(1, rate(8, 20)),
+      withRate(2, rate(4, 20)),
+    ]);
+    expect(result!.summary.itemErrorRate).toEqual({ ...rate(8, 20), runsExceeded: 3 });
+  });
+
+  it('reports runsExceeded 0 when items failed but every run stayed within its limit', () => {
+    const result = buildMultiRunResult([withRate(0, rate(1, 20)), withRate(1)]);
+    expect(result!.summary.itemErrorRate).toEqual({ ...rate(1, 20), runsExceeded: 0 });
+  });
+
+  it('adds no itemErrorRate when no run had a failed item', () => {
+    const result = buildMultiRunResult([withRate(0), withRate(1)]);
+    expect('itemErrorRate' in result!.summary).toBe(false);
+  });
+});

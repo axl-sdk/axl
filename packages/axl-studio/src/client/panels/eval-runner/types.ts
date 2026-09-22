@@ -131,11 +131,30 @@ export type ScorerDetail = {
   skipped?: boolean;
 };
 
+/**
+ * Why a `failed` item's workflow failed. Client mirror of `@axlsdk/eval`'s
+ * `EvalItemFailure`: every field comes from the first `ProviderError` on the
+ * thrown value or its `cause` chain, or only the thrown `name` when there was
+ * none. It never carries `ProviderError.body` or the message (the message stays
+ * on `EvalItem.error`). Structural only, so redaction passes it through.
+ */
+export type EvalItemFailure = {
+  name: string;
+  provider?: string;
+  /** HTTP status; `0` is a network-level failure. */
+  status?: number;
+  retryable?: boolean;
+  requestId?: string;
+};
+
 export type EvalItem = {
   input: unknown;
   annotations?: unknown;
   output: unknown;
   error?: string;
+  /** Structured cause of a `failed` item. Absent on other outcomes and on
+   *  pre-0.24 artifacts. */
+  failure?: EvalItemFailure;
   scorerErrors?: string[];
   scores: Record<string, number | null>;
   duration?: number;
@@ -206,6 +225,28 @@ export type DegradedScorer = {
    * results, where it carries no suffix.
    */
   runsAffected?: number;
+};
+
+/**
+ * A run's item error rate against its `failOnItemErrorRate` limit. Client
+ * mirror of `@axlsdk/eval`'s `ItemErrorRate`, present on a summary only when
+ * an item failed.
+ */
+export type ItemErrorRate = {
+  /** Items whose workflow threw. */
+  failed: number;
+  /** `count − cancelled − budget_skipped − budget_interrupted`. */
+  attempted: number;
+  rate: number;
+  limit: number;
+  exceeded: boolean;
+  /**
+   * Client-only extension, set on a multi-run aggregate: how many runs in the
+   * group exceeded their limit. The CLI gates every run individually, so the
+   * aggregate carries the WORST run's rate plus this count rather than a pooled
+   * rate that would let clean runs dilute a thinned one. Absent on single runs.
+   */
+  runsExceeded?: number;
 };
 
 export type MultiRunAggregate = {
@@ -429,6 +470,9 @@ export type EvalResultData = {
      * tripped it. Surfaced as `DegradedScorersBanner` via `getResultDegraded`.
      */
     degraded?: DegradedScorer[];
+    /** Present when an item failed — see {@link ItemErrorRate}. On a multi-run
+     *  aggregate, the worst run's rate with `runsExceeded`. */
+    itemErrorRate?: ItemErrorRate;
   };
   _multiRun?: {
     aggregate: MultiRunAggregate;
@@ -677,6 +721,9 @@ export function buildMultiRunResult(allRuns: EvalResultData[]): EvalResultData |
   // runs flagged it (`runsAffected`) so the banner can say "(in N runs)".
   const aggDegraded = unionDegraded(allRuns);
   const groupCoverage = unionCoverage(allRuns);
+  // Same reasoning for the item gate: it is judged per run, so the aggregate
+  // carries the worst run's rate (and how many runs exceeded), never run[0]'s.
+  const worstItemRate = worstItemErrorRate(allRuns);
   return {
     ...first,
     // Override the spread run[0] spend fields with the group union — see
@@ -689,6 +736,7 @@ export function buildMultiRunResult(allRuns: EvalResultData[]): EvalResultData |
       ...first.summary,
       ...(groupCoverage ? { coverage: groupCoverage } : {}),
       ...(aggDegraded.length > 0 ? { degraded: aggDegraded } : {}),
+      ...(worstItemRate ? { itemErrorRate: worstItemRate } : {}),
     },
     _multiRun: {
       aggregate,
@@ -757,6 +805,28 @@ function unionCoverage(allRuns: EvalResultData[]): EvalCoverage | undefined {
     }
   }
   return { items, scorers };
+}
+
+/**
+ * The worst per-run `itemErrorRate` in a group (highest `rate`; the first run
+ * wins a tie), stamped with `runsExceeded`. `undefined` when no run had a
+ * failed item. Mirrored server-side in `routes/evals.ts` for the sync
+ * multi-run response.
+ */
+export function worstItemErrorRate(allRuns: EvalResultData[]): ItemErrorRate | undefined {
+  let worst: ItemErrorRate | undefined;
+  let runsExceeded = 0;
+  for (const run of allRuns) {
+    const r = run.summary?.itemErrorRate;
+    if (!r) continue;
+    if (r.exceeded) runsExceeded++;
+    if (!worst || r.rate > worst.rate) worst = r;
+  }
+  if (!worst) return undefined;
+  // Strip any extension a previously aggregated input carried.
+  const { runsExceeded: _ignored, ...rate } = worst;
+  void _ignored;
+  return { ...rate, runsExceeded };
 }
 
 function unionDegraded(allRuns: EvalResultData[]): DegradedScorer[] {

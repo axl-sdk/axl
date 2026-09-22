@@ -3,7 +3,7 @@ import { JsonViewer } from '../../components/shared/JsonViewer';
 import { TraceEventList } from '../../components/shared/TraceEventList';
 import { cn, formatDuration } from '../../lib/utils';
 import type { AxlEvent } from '../../lib/types';
-import type { EvalItem } from './types';
+import type { EvalItem, EvalItemFailure } from './types';
 import {
   scoreColorClass,
   scoreTextColor,
@@ -94,6 +94,33 @@ function ItemTraces({ traces }: { traces: AxlEvent[] }) {
           <TraceEventList events={traces} />
         </div>
       )}
+    </div>
+  );
+}
+
+/**
+ * One line naming why a failed item failed: `Cause: ProviderError · openai ·
+ * HTTP 429 · retryable · request req_…`, or just the thrown name when no
+ * provider error was found. Status `0` is a network-level failure. The record
+ * never carries the provider's response body, so there is nothing to scrub.
+ */
+function FailureCause({ failure }: { failure: EvalItemFailure }) {
+  const parts: string[] = [];
+  if (failure.provider) parts.push(failure.provider);
+  if (failure.status !== undefined) {
+    parts.push(failure.status === 0 ? 'network' : `HTTP ${failure.status}`);
+  }
+  if (failure.retryable !== undefined) {
+    parts.push(failure.retryable ? 'retryable' : 'not retryable');
+  }
+  if (failure.requestId) parts.push(`request ${failure.requestId}`);
+  return (
+    <div
+      data-testid="item-failure-cause"
+      className="text-xs font-mono text-red-700 dark:text-red-300"
+    >
+      <span className="font-sans font-medium">Cause: </span>
+      {[failure.name, ...parts].join(' · ')}
     </div>
   );
 }
@@ -204,9 +231,10 @@ export function EvalItemDetail({ item, itemIndex, scorerNames, onBack }: Props) 
       )}
 
       {/* ── Error ─────────────────────────────────────── */}
-      {item.error && (
-        <div className="p-3 rounded-xl bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-800 text-red-700 dark:text-red-300 text-xs font-mono">
-          {item.error}
+      {(item.error || item.failure) && (
+        <div className="p-3 rounded-xl bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-800 text-red-700 dark:text-red-300 text-xs font-mono space-y-1.5">
+          {item.failure && <FailureCause failure={item.failure} />}
+          {item.error && <div>{item.error}</div>}
         </div>
       )}
 

@@ -243,7 +243,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   example `5 × 429 (openai), 2 × other`), so throttling reads differently from a
   bug. The field is additive: `EvalItemOutcome` and the coverage counters are
   unchanged. `rescore` carries it through, and the type is exported as
-  `EvalItemFailure`.
+  `EvalItemFailure`. Studio's Eval Runner item detail shows the cause beside
+  the message (provider, `HTTP <status>` or `network`, retryable, request id;
+  the name alone for a non-provider error), and `failure` survives
+  `trace.redact` because it carries no content. A multi-run Studio result's
+  `summary.itemErrorRate` is the **worst** run's record (not run 1's) plus
+  `runsExceeded`, the number of runs over their limit.
 
 ### Changed
 

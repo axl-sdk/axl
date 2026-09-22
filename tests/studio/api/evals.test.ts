@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { z } from 'zod';
 import { MockProvider } from '@axlsdk/testing';
 import { dataset, scorer } from '@axlsdk/eval';
-import { MemoryStore } from '@axlsdk/axl';
+import { MemoryStore, ProviderError } from '@axlsdk/axl';
 import { createTestServer } from '../helpers/setup.js';
 import { readJson } from '../helpers/json.js';
 
@@ -469,6 +469,52 @@ describe('Studio API: Evals', () => {
       expect(run.items[0].metadata.models).toBeInstanceOf(Array);
       expect(run.metadata.models).toBeInstanceOf(Array);
     }
+  });
+
+  it("POST /api/evals/:name/run multi-run surfaces the worst run's itemErrorRate, not run[0]'s", async () => {
+    // Run 0 is clean and run 1 loses its only item to a 429. The CLI gates each
+    // run individually; the aggregate landing view must not inherit run[0]'s
+    // clean summary and hide run 1.
+    const provider = MockProvider.fn((_messages, callIndex) => {
+      if (callIndex === 1) {
+        throw new ProviderError({
+          provider: 'openai',
+          status: 429,
+          retryable: true,
+          requestId: 'req_run1',
+          message: 'Rate limit reached',
+        });
+      }
+      return { content: 'ok' };
+    });
+    const { app } = createTestServer(provider);
+
+    const res = await app.request('/api/evals/test-eval/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ runs: 2 }),
+    });
+    expect(res.status).toBe(200);
+    const body = await readJson(res);
+
+    const [run0, run1] = body.data._multiRun.allRuns;
+    expect('itemErrorRate' in run0.summary).toBe(false);
+    expect(run1.summary.itemErrorRate).toMatchObject({ failed: 1, attempted: 1, exceeded: true });
+    expect(run1.items[0].failure).toEqual({
+      name: 'ProviderError',
+      provider: 'openai',
+      status: 429,
+      retryable: true,
+      requestId: 'req_run1',
+    });
+    expect(body.data.summary.itemErrorRate).toEqual({
+      failed: 1,
+      attempted: 1,
+      rate: 1,
+      limit: 0.05,
+      exceeded: true,
+      runsExceeded: 1,
+    });
   });
 
   // --- Compare endpoint (ID-based) ---

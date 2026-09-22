@@ -294,6 +294,7 @@ export function sanitizeRichInputFailure(event: HistoricalAxlEvent): HistoricalA
  *
  * Preserved fields (structural / metrics):
  *   scores (numeric), duration, cost, scorerCost
+ *   failure (name/provider/status/retryable/requestId — never a body or message)
  *   scoreDetails[*].{score, duration, cost, skipped} (but not metadata)
  *   metadata (execution metadata: models, tokens, agentCalls, workflows)
  *   traces (trace events — already redacted at emission time)

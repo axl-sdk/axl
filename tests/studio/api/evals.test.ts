@@ -517,6 +517,106 @@ describe('Studio API: Evals', () => {
     });
   });
 
+  it('POST /api/evals/:name/run redacts every run of a sync multi-run response', async () => {
+    // `_multiRun.allRuns` carries each run's full items. Redacting only the
+    // top-level `items` (run[0]'s) left every run's input/output/error raw.
+    // Run 0 succeeds, run 1's only item fails with a content-echoing error, and
+    // run 2's dataset load fails, so the batch is partial with a batchFailure.
+    const provider = MockProvider.fn((_messages, callIndex) => {
+      if (callIndex === 1) throw new Error('SENTINEL_ITEM_ERROR john@acme.com');
+      return { content: 'SENTINEL_OUTPUT' };
+    });
+    const { app, runtime } = createTestServer(provider, { redact: true });
+
+    let getItemsCalls = 0;
+    const leakyDataset = dataset({
+      name: 'leaky-dataset',
+      schema: z.object({ message: z.string() }),
+      items: [{ input: { message: 'SENTINEL_INPUT' } }],
+    });
+    const originalGetItems = leakyDataset.getItems.bind(leakyDataset);
+    leakyDataset.getItems = async () => {
+      getItemsCalls++;
+      if (getItemsCalls === 3) throw new Error('SENTINEL_BATCH_FAILURE');
+      return originalGetItems();
+    };
+    runtime.registerEval('leaky-eval', {
+      workflow: 'test-wf',
+      dataset: leakyDataset,
+      scorers: [scorer({ name: 's', description: 's', score: () => 1 })],
+    });
+
+    const res = await app.request('/api/evals/leaky-eval/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ runs: 3 }),
+    });
+    expect(res.status).toBe(200);
+    const body = await readJson(res);
+    expect(body.ok).toBe(true);
+
+    const { allRuns } = body.data._multiRun;
+    expect(allRuns.length).toBe(2);
+    for (const run of allRuns) {
+      for (const item of run.items) {
+        expect(item.input).toBe('[redacted]');
+        expect(item.output).toBe('[redacted]');
+      }
+    }
+    expect(allRuns[1].items[0].outcome).toBe('failed');
+    expect(allRuns[1].items[0].error).toBe('[redacted]');
+    expect(body.data._multiRun.batchFailure).toBe('[redacted]');
+    // Structural fields still survive in each run.
+    expect(allRuns[0].items[0].scores.s).toBe(1);
+    expect(allRuns[1].summary.itemErrorRate).toMatchObject({ failed: 1, attempted: 1 });
+
+    const raw = JSON.stringify(body);
+    expect(raw).not.toContain('SENTINEL_INPUT');
+    expect(raw).not.toContain('SENTINEL_OUTPUT');
+    expect(raw).not.toContain('SENTINEL_ITEM_ERROR');
+    expect(raw).not.toContain('SENTINEL_BATCH_FAILURE');
+  });
+
+  it('GET /api/evals/history redacts an imported artifact that carries _multiRun.allRuns', async () => {
+    // A saved sync multi-run response has the same shape; import stores it
+    // verbatim, so the history read must scrub every nested run too.
+    const { app } = createTestServer(undefined, { redact: true });
+    const run = (input: string) => ({
+      id: 'r',
+      workflow: 'wf',
+      dataset: 'ds',
+      metadata: {},
+      timestamp: new Date().toISOString(),
+      totalCost: 0,
+      duration: 1,
+      items: [
+        { input, output: 'SENTINEL_NESTED_OUTPUT', error: 'SENTINEL_NESTED_ERROR', scores: {} },
+      ],
+      summary: { count: 1, failures: 1, scorers: {} },
+    });
+    const artifact = {
+      ...run('top'),
+      _multiRun: {
+        aggregate: { runCount: 2 },
+        allRuns: [run('SENTINEL_NESTED_INPUT_0'), run('SENTINEL_NESTED_INPUT_1')],
+        partial: true,
+        batchFailure: 'SENTINEL_NESTED_BATCH_FAILURE',
+      },
+    };
+    const imported = await app.request('/api/evals/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ result: artifact }),
+    });
+    expect(imported.status).toBe(200);
+
+    const body = await readJson(await app.request('/api/evals/history'));
+    const served = body.data[0].data;
+    expect(served._multiRun.allRuns[1].items[0].input).toBe('[redacted]');
+    expect(served._multiRun.aggregate.runCount).toBe(2);
+    expect(JSON.stringify(body)).not.toMatch(/SENTINEL_NESTED/);
+  });
+
   // --- Compare endpoint (ID-based) ---
   //
   // Compare resolves baseline/candidate from runtime history by ID rather

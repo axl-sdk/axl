@@ -396,6 +396,11 @@ function redactEvalItem(item: EvalItem): EvalItem {
  * error string that may quote user input (e.g. a guardrail rejection that
  * echoes the prompt). Scrub it here so imports under redact mode don't
  * leak.
+ *
+ * A sync multi-run response also carries `_multiRun.allRuns` — every run's
+ * full `EvalResult`, items included — so each run is scrubbed the same way,
+ * along with `_multiRun.batchFailure`. `_multiRun.aggregate` is scorer
+ * statistics, cost and counts, and passes through.
  */
 export function redactEvalResult(result: EvalResult, redact: boolean): EvalResult {
   if (!redact) return result;
@@ -404,10 +409,26 @@ export function redactEvalResult(result: EvalResult, redact: boolean): EvalResul
     meta && typeof meta.batchFailure === 'string'
       ? { ...meta, batchFailure: REDACTED }
       : result.metadata;
+  const multiRun = (result as { _multiRun?: unknown })._multiRun;
   return {
     ...result,
     metadata: scrubbedMetadata,
     items: result.items.map(redactEvalItem),
+    ...(multiRun && typeof multiRun === 'object'
+      ? { _multiRun: redactMultiRun(multiRun as Record<string, unknown>) }
+      : {}),
+  };
+}
+
+function redactMultiRun(multiRun: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ...multiRun,
+    ...(Array.isArray(multiRun.allRuns)
+      ? {
+          allRuns: (multiRun.allRuns as EvalResult[]).map((run) => redactEvalResult(run, true)),
+        }
+      : {}),
+    ...(typeof multiRun.batchFailure === 'string' ? { batchFailure: REDACTED } : {}),
   };
 }
 

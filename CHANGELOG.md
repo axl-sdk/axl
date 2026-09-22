@@ -497,6 +497,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AbortController` for a whole run) left a listener behind until that signal
   was aborted or collected, which could trigger Node's
   `MaxListenersExceededWarning`.
+- **Studio: every run of a multi-run eval response is redacted.** Under
+  `trace.redact`, a synchronous `POST /api/evals/:name/run` with `runs > 1`
+  masked only the top-level `items`, while `_multiRun.allRuns` served each
+  run's inputs, outputs and error messages raw. Each run is now scrubbed the
+  same way as the top-level result, and so is `_multiRun.batchFailure`. The
+  history read applies the same rule to an imported artifact that carries
+  `_multiRun`.
 
 ## [0.23.3] - 2026-09-09
 

@@ -4,7 +4,10 @@ Agents reference models using the `provider:model` URI scheme. Axl ships four na
 adapters plus OpenAI-compatible presets, all built on raw `fetch` with no provider SDKs.
 
 All providers retry `429` (rate limit), `503` (unavailable), and `529` (overloaded)
-responses with exponential backoff.
+responses with exponential backoff. On first-party OpenAI and Anthropic a rate-limit
+`429` also pauses every call on the same account and model until the provider's
+`Retry-After`, and a spend-cap `429` fails fast; see
+[Rate limiting](#rate-limiting).
 
 The base catalog and pricing were reviewed against first-party documentation on
 August 3, 2026; native image transport and the current GPT-5.6, Claude Opus 5,
@@ -522,9 +525,53 @@ defeat a trusted TLS-inspection root installed on the backend host; that host is
 part of the application's trust boundary. See
 [Security > Prompt confidentiality](./security.md#prompt-confidentiality-and-the-trusted-backend).
 
-### Rate limiting (opt-in)
+<a id="rate-limiting-opt-in"></a>
 
-The automatic 429/503/529 backoff above is **reactive** — it only kicks in after a
+### Rate limiting
+
+#### Rate-limit 429s on OpenAI and Anthropic (on by default)
+
+First-party OpenAI (`openai:` and `openai-responses:`) and Anthropic (`anthropic:`)
+are the only providers with a **quota dialect**: Axl can tell a rate-limit `429` from
+a spend-cap `429` in their error bodies. On those scopes (see "one governor per
+scope" below) a `429` is handled differently from other providers, with no
+configuration:
+
+- **A spend cap fails fast.** Anthropic's `enforced_spend_limit_reached`, and OpenAI's
+  `insufficient_quota` and its billing codes (`credit_balance_exhausted`,
+  `organization_spend_limit_exceeded`, `project_spend_limit_exceeded`,
+  `organization_usage_limit_exceeded`) are returned at once as a `ProviderError`
+  with `status: 429` and the raw body. They are not retried and hold up no other call,
+  because waiting cannot fix them.
+- **A rate limit brakes the whole scope.** Any other `429` (including one whose body
+  can't be read) pauses **every** call on that scope until its `Retry-After`, clamped
+  at 60 s. Without `Retry-After` the pause is the usual backoff: 1 s, then 2 s, doubling
+  for each further consecutive 429. During the pause nothing on the scope is sent: not
+  calls queued for a permit, and not calls waking from a `503` backoff. The call that
+  hit the 429 gives its permit back while it waits and retries first once the pause
+  ends, ahead of calls that have not been sent yet.
+- **Rate limits have their own retry budget,** `maxRateLimitRetries` (default 8),
+  separate from the 2 retries for `503`/`529`/network errors. A call against a
+  saturated account can therefore take several minutes (up to about 8 × 60 s), without
+  holding a permit. Your ask `timeout`, signal and `AdmissionController` still stop it.
+  When the budget runs out, the last `429` surfaces as a `ProviderError` with its raw
+  body and raw `retryAfterMs`.
+- **Nothing changes before the first rate-limit 429.** With no `rateLimit` configured
+  there is no cap, no spacing and no warning; calls go out exactly as before.
+
+Set `rateLimit: { adaptive: false }` to turn this off for a provider: a `429` then shares
+the transient budget and holds up no other call, as on every other provider. Other
+providers (Gemini, OpenAI-compatible presets such as Azure or OpenRouter, custom
+adapters) are unchanged.
+
+The spend-cap body shapes come from the providers' documentation and have not yet been
+checked against live spend-cap responses. A spend-cap 429 whose body Axl does not
+recognize is treated as a rate limit: it retries on the rate-limit budget and then fails
+with the same `ProviderError`.
+
+#### Proactive pacing (opt-in)
+
+The automatic 429/503/529 handling above is **reactive**: it only kicks in after a
 request is rejected. For **proactive** pacing (so you don't storm a provider in the
 first place), set `rateLimit` on a provider config. This is most useful when a large
 fan-out shares one API key — e.g. an eval running `concurrency × scorerConcurrency`
@@ -551,7 +598,9 @@ export default defineConfig({
 |-------|------|-------------|
 | `maxConcurrent` | `number` | Max requests in flight for this provider. Must be a finite integer ≥ 1 (invalid values disable the cap with a warning). `1` serializes all requests (a throughput floor, not a deadlock — see below). |
 | `minIntervalMs` | `number` | Minimum ms between successive request *grants* (global spacing, no burst bucket). |
-| `acquireTimeoutMs` | `number` | If set, a call that waits longer than this in the queue rejects (fail loud) instead of hanging on a misconfigured cap. |
+| `acquireTimeoutMs` | `number` | If set, a call that waits longer than this in the queue for its **first** permit rejects (fail loud) instead of hanging on a misconfigured cap. A call that arrives during a rate-limit pause waits the pause out before this clock starts; a call already queued when a pause begins keeps its clock running. A retry after a rate-limit 429 is exempt. |
+| `adaptive` | `boolean` | Default `true` on OpenAI and Anthropic, where a rate-limit 429 pauses the scope and a spend-cap 429 fails fast (above). `false` restores the plain retry. No effect on other providers. |
+| `maxRateLimitRetries` | `number` | Retries after a rate-limit 429 where `adaptive` applies. Default `8`; an integer ≥ 0 (invalid values warn and use the default). Separate from the `503`/`529` budget. |
 
 **Scope & caveats:**
 
@@ -582,8 +631,9 @@ export default defineConfig({
 - **`openai-responses` inherits `openai`'s `rateLimit`** when it has no block of its
   own (same fallback as `apiKey`/`baseUrl`). If both blocks exist with the same key
   and origin, they are still one scope: each field takes the **strictest** value
-  either block sets (smaller `maxConcurrent` and `acquireTimeoutMs`, larger
-  `minIntervalMs`), and Axl warns once. A block without `rateLimit` on that scope
+  either block sets (smaller `maxConcurrent`, `acquireTimeoutMs` and
+  `maxRateLimitRetries`, larger `minIntervalMs`, and `adaptive: true` over `false`,
+  since adapting only ever slows a scope down), and Axl warns once. A block without `rateLimit` on that scope
   is governed by the other block's settings.
 - **Across runtimes, sharing is explicit.** Two `AxlRuntime`s never share a
   governor by inference, even on the same key (that would merge tenants). To pace
@@ -614,7 +664,8 @@ export default defineConfig({
     its governors do not persist across asks.
 - **The "request queued" warning is per scope.** The one-time
   `[axl] RateLimiter: request queued` warning fires the first time a call waits on
-  a given scope, so a run that queues on three models sees it three times.
+  a given scope's `maxConcurrent` or `minIntervalMs`, so a run that queues on three
+  models sees it three times. Waiting out a rate-limit pause does not trigger it.
 - **No deadlock on nesting.** A permit is held only across a single HTTP call, never
   across a nested `ctx.ask()` (tool handlers run between provider calls, not during),
   so an agent-as-tool chain on the same provider under `maxConcurrent: 1` still
@@ -642,12 +693,16 @@ Every call through a built-in chat adapter reports a `CallTiming` block — on
 apart: your own pacing, the provider's throttling, and the model's latency. Field-by-field
 reference: [api-reference.md → `CallTiming`](api-reference.md#calltiming).
 
-- **`queuedMs`** — time parked in *this* governor, measured around the permit acquire.
-  `minIntervalMs` spacing counts here too, because waiting for the interval is
-  self-imposed. `0` when the provider has no `rateLimit`.
-- **`retryMs` and `attempts`** — the reactive 429/503/529 loop. Failed attempts and their
-  backoff sleeps land here, not in `wireMs`, so a provider having a bad throttling day
-  does not silently inflate its measured latency.
+- **`queuedMs`** — every wait Axl imposes on itself: the first permit, `minIntervalMs`
+  spacing, a rate-limit pause, and the re-acquire after a rate-limit 429. `0` when
+  nothing waited, which includes every call before a scope's first rate-limit 429 when
+  it has no `rateLimit`.
+- **`retryMs` and `attempts`** — the retry loop, excluding the waits already in
+  `queuedMs`: failed attempts and their `503`/`529`/network backoff sleeps land here,
+  not in `wireMs`, so a provider having a bad day does not silently inflate its
+  measured latency. The two never overlap: on `429` → 30 s pause → `200`, `queuedMs` is
+  about 30 s and `retryMs` is only the first attempt's own time. `attempts` counts
+  requests actually sent.
 - **`ttfbMs` and `firstTokenMs`** — response headers and, on a stream, the first content
   delta. Consumer suspension after an earlier tool delta is excluded. Headers land at
   roughly one round trip on any model; first token is the figure that actually separates a
@@ -735,15 +790,22 @@ present). Branch on the presence of `timing`, never on the status.
 
 ### Retry backoff — worst case
 
-The reactive retry does up to **2 retries (3 attempts total)** on `429`/`503`/`529`.
-Delay per attempt honors a `Retry-After` header when present; otherwise it's
-`1000ms × 2^attempt` (1s, then 2s) with ±25% jitter, and the wait is abort-aware
-(a cancelled signal short-circuits the sleep). Worst case for a single call that
+The reactive retry does up to **2 retries (3 attempts total)** on `503`/`529` and
+network errors, and on `429` wherever `adaptive` does not apply. Delay per attempt
+honors a `Retry-After` header when present (clamped at 60 s); otherwise it's
+`1000ms × 2^n` (1s, then 2s) with ±25% jitter, and the wait is abort-aware (a
+cancelled signal short-circuits the sleep). Worst case for a single call that
 exhausts retries without `Retry-After`: roughly `1s + 2s ≈ 3s` of backoff plus three
-request round-trips before the final error surfaces. Combined with the governor, the
-whole retry loop runs inside one held permit, so backoff naturally applies
-backpressure to other queued calls rather than letting them pile on a struggling
-provider.
+request round-trips before the final error surfaces. Under a governor that backoff
+runs inside the call's held permit, so it applies backpressure to other queued calls
+rather than letting them pile on a struggling provider. The body of each discarded
+response is cancelled before the sleep, so its connection is released.
+
+On OpenAI and Anthropic a rate-limit `429` instead retries up to `maxRateLimitRetries`
+(default 8) times, each after a scope-wide pause of up to 60 s, **without** holding a
+permit during the pause (see [Rate limiting](#rate-limiting)). A `503` sleeper that
+wakes during such a pause gives its permit back before waiting. An abort during any
+of these waits rejects with the signal's own `reason`.
 
 ### Dispatch admission
 

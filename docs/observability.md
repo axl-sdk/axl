@@ -287,7 +287,8 @@ The same unknown-cost condition is surfaced on the budget rail. A [`ctx.budget()
 ### Per-call timing
 
 `agent_call_end.duration` is the whole turn's wall clock. Under an opt-in
-[`rateLimit`](providers.md#rate-limiting-opt-in) that number folds three unrelated things
+[`rateLimit`](providers.md#proactive-pacing-opt-in), or the default
+[rate-limit pause](providers.md#rate-limiting) on OpenAI and Anthropic, that number folds three unrelated things
 together — the SDK's own queue wait, the provider's 429 backoff, and the model's actual
 latency — so it cannot answer "was the model slow, or was I pacing myself?".
 

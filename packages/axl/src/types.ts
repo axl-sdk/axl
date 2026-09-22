@@ -1486,17 +1486,22 @@ export type ToolCallMessage = {
  */
 export type CallTiming = {
   /**
-   * Time parked in Axl's own opt-in `RateLimiter` (concurrency cap plus
-   * `minIntervalMs` spacing) before the request was allowed out. `0` when the
-   * provider has no `rateLimit` configured. This is self-imposed wait, not
-   * provider latency.
+   * Every wait Axl imposed on itself: the first permit (concurrency cap),
+   * `minIntervalMs` spacing, a rate-limit pause on the scope, and the
+   * re-acquire after a rate-limit 429. `0` when nothing waited. This is
+   * self-imposed wait, not provider latency.
    */
   queuedMs: number;
-  /** `fetch` attempts made for this call, including the final one (≥ 1). */
+  /**
+   * Requests actually sent for this call, including the final one (≥ 1). A call
+   * held back by a rate-limit pause before sending is not an attempt.
+   */
   attempts: number;
   /**
-   * First attempt's dispatch → final attempt's dispatch, i.e. everything spent
-   * on failed attempts and their backoff sleeps. `0` for a single attempt.
+   * First attempt's dispatch → final attempt's dispatch, minus the
+   * self-imposed waits inside that span (which are in `queuedMs`): failed
+   * attempts and their 503/529/network backoff sleeps. Disjoint from
+   * `queuedMs`. `0` for a single attempt.
    */
   retryMs: number;
   /** Final dispatch → response headers. Time to first byte. */

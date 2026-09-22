@@ -492,6 +492,10 @@ describe('CallTiming — permit lifetime', () => {
 // ---------------------------------------------------------------------------
 
 describe('CallTiming — adapter-level retry (A8)', () => {
+  // `adaptive: false` keeps these on the plain retry path, where a 429's
+  // backoff is retry time. On an adaptive scope the same 429 brakes the scope
+  // and its wait is queue time instead (AC33, covered in rate-brake.test.ts).
+  const plain = () => new OpenAIProvider({ apiKey: 'k', rateLimit: { adaptive: false } });
   const BACKOFF = 300; // Retry-After: 0.3 ⇒ jittered to 225..375ms
   const WIRE = 150; // the successful attempt's own latency
 
@@ -534,7 +538,7 @@ describe('CallTiming — adapter-level retry (A8)', () => {
 
   it('chat(): retryMs holds the backoff and wireMs holds only the final attempt', async () => {
     mock429ThenOk(() => OPENAI_CHAT_JSON);
-    const res = await new OpenAIProvider({ apiKey: 'k' }).chat(messages, { model: 'gpt-4o' });
+    const res = await plain().chat(messages, { model: 'gpt-4o' });
 
     const t = res.timing!;
     expect(t.attempts).toBe(2);
@@ -549,9 +553,7 @@ describe('CallTiming — adapter-level retry (A8)', () => {
 
   it('stream(): same anchoring on the done chunk', async () => {
     mock429ThenOk(() => OPENAI_CHAT_JSON, true);
-    const chunks = await drain(
-      new OpenAIProvider({ apiKey: 'k' }).stream(messages, { model: 'gpt-4o' }),
-    );
+    const chunks = await drain(plain().stream(messages, { model: 'gpt-4o' }));
 
     const t = doneChunk(chunks).timing!;
     expect(t.attempts).toBe(2);
@@ -766,8 +768,12 @@ describe('CallTiming — error path, exhausted retries', () => {
       };
     }) as unknown as typeof fetch;
 
+    // `adaptive: false`: the plain path, where a 429 shares the transient
+    // budget. An adaptive scope retries a 429 on its own budget (AC19).
     const err = await caught(() =>
-      new OpenAIProvider({ apiKey: 'k' }).chat(messages, { model: 'gpt-4o' }),
+      new OpenAIProvider({ apiKey: 'k', rateLimit: { adaptive: false } }).chat(messages, {
+        model: 'gpt-4o',
+      }),
     );
 
     expect(err.status).toBe(429);

@@ -37,22 +37,164 @@
  * Internal: nothing here is barrel-exported.
  */
 import { RateLimiter, sanitizeRateLimitConfig, type RateLimitConfig } from './rate-limiter.js';
+import { quotaDialectFor, type QuotaDialect } from './quota.js';
 import type { ApiKeySource } from './types.js';
+
+/** Default for `RateLimitConfig.maxRateLimitRetries` (plan §4.1, Q8). */
+export const DEFAULT_MAX_RATE_LIMIT_RETRIES = 8;
 
 /**
  * The governor for one scope. A {@link RateLimiter} whose limits can be
  * tightened in place when a second provider block reaches the same account.
+ *
+ * On a scope with a quota dialect and `adaptive` not `false`
+ * ({@link ScopeGovernor.adapts}), it is also the scope's **fleet brake**:
+ * `fetchWithRetry` calls {@link brake} after classifying a rate-limit 429, and
+ * from then until `brakeUntil` no call on the scope is granted a permit or
+ * dispatches. `braked()`, `awaitClear()` and `pump()` share one predicate,
+ * `Date.now() < brakeUntil`. A scope that does not adapt never brakes, so it
+ * behaves exactly as a plain `RateLimiter`.
  */
 export class ScopeGovernor extends RateLimiter {
-  /** @param limits already sanitized (see `sanitizeRateLimitConfig`). */
-  constructor(limits: RateLimitConfig) {
+  // `RateLimiter`'s constructor runs the overridden `pump()` before these
+  // fields are initialized, so every brake read must treat `undefined` as
+  // "not braked" (see `braked()`).
+  private brakeUntil?: number;
+  private brakeEndTimer?: ReturnType<typeof setTimeout>;
+  private brakeEndAt?: number;
+  private adaptive = true;
+  private rateLimitRetries = DEFAULT_MAX_RATE_LIMIT_RETRIES;
+  private warnedHint = false;
+  /**
+   * The last 2xx quota hint (`remaining / limit`, see `quota.ts`), for the
+   * adaptive-rate phase to hold recovery on. Not read yet.
+   */
+  lastHint: number | undefined;
+  /**
+   * `dispatchedAt` of the most recent request that drew a rate-limit 429.
+   * The adaptive-rate phase cuts at most once per congestion epoch by
+   * comparing it with the time of the last cut. Not read yet.
+   */
+  lastRateLimitedDispatchAt: number | undefined;
+
+  /**
+   * @param limits already sanitized (see `sanitizeRateLimitConfig`).
+   * @param dialect the scope's quota dialect; `undefined` for a dialect-less scope.
+   * @param family the provider family, only to name the scope in a warning.
+   */
+  constructor(
+    limits: RateLimitConfig,
+    readonly dialect?: QuotaDialect,
+    private readonly family = 'provider',
+  ) {
     super();
-    this.applyLimits(limits);
+    this.reconfigure(limits);
   }
 
   /** Adopt the account's merged limits. Merges only tighten (see {@link STRICTEST}). */
   reconfigure(limits: RateLimitConfig): void {
+    this.adaptive = limits.adaptive ?? true;
+    this.rateLimitRetries = limits.maxRateLimitRetries ?? DEFAULT_MAX_RATE_LIMIT_RETRIES;
     this.applyLimits(limits);
+  }
+
+  /** Whether this scope brakes and retries rate-limit 429s on their own budget. */
+  get adapts(): boolean {
+    return this.dialect !== undefined && this.adaptive;
+  }
+
+  /** The rate-limit retry budget (`maxRateLimitRetries`). */
+  get maxRateLimitRetries(): number {
+    return this.rateLimitRetries;
+  }
+
+  /** The brake predicate shared by `awaitClear`, `pump` and `fetchWithRetry`. */
+  braked(): boolean {
+    return this.brakeUntil !== undefined && Date.now() < this.brakeUntil;
+  }
+
+  /**
+   * Brake every call on the scope for `ms` (already clamped by the caller to
+   * the transport's backoff ceiling). Extends, never shortens, an active
+   * brake. `dispatchedAt` is when the 429'd request left.
+   *
+   * This is the seam the adaptive-rate cut attaches to.
+   */
+  brake(ms: number, dispatchedAt: number): void {
+    this.lastRateLimitedDispatchAt = dispatchedAt;
+    const until = Date.now() + Math.max(0, ms);
+    if (this.brakeUntil === undefined || until > this.brakeUntil) this.brakeUntil = until;
+    this.pump();
+  }
+
+  /**
+   * Resolve once the scope is not braked. Rejects with `signal.reason` if the
+   * signal is already aborted (even when not braked) or aborts while waiting.
+   */
+  async awaitClear(signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) throw signal.reason;
+    while (this.braked()) await this.sleepUntilBrakeEnd(signal);
+  }
+
+  /**
+   * Re-acquire a permit for a call that already dispatched (after a
+   * rate-limit 429, or a transient backoff that woke into a brake): queued
+   * ahead of first-time callers and exempt from `acquireTimeoutMs`.
+   */
+  reacquire(signal?: AbortSignal): Promise<void> {
+    return this.enqueue(signal, { priority: true, timeoutMs: undefined });
+  }
+
+  /** Read the quota hint on a 2xx. Total: a throwing dialect warns once and is ignored. */
+  override observe(res: Response): void {
+    if (!this.adapts || !res.ok) return;
+    try {
+      this.lastHint = this.dialect!.hint(res.headers);
+    } catch {
+      this.lastHint = undefined;
+      if (!this.warnedHint) {
+        this.warnedHint = true;
+        // Never includes header values.
+        console.warn(
+          `[axl] Rate governor: could not read ${this.family} quota headers; ignoring them for this scope.`,
+        );
+      }
+    }
+  }
+
+  /** Grants nothing while braked; re-pumps at the brake's end if anyone is queued. */
+  protected override pump(): void {
+    if (this.braked()) {
+      if (this.hasWaiters()) this.armBrakeEnd();
+      return;
+    }
+    super.pump();
+  }
+
+  private armBrakeEnd(): void {
+    const until = this.brakeUntil!;
+    if (this.brakeEndTimer !== undefined && this.brakeEndAt === until) return;
+    if (this.brakeEndTimer !== undefined) clearTimeout(this.brakeEndTimer);
+    this.brakeEndAt = until;
+    this.brakeEndTimer = setTimeout(() => {
+      this.brakeEndTimer = undefined;
+      this.brakeEndAt = undefined;
+      this.pump();
+    }, until - Date.now());
+  }
+
+  private sleepUntilBrakeEnd(signal?: AbortSignal): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const onAbort = () => {
+        clearTimeout(timer);
+        reject(signal!.reason);
+      };
+      const timer = setTimeout(() => {
+        signal?.removeEventListener('abort', onAbort);
+        resolve();
+      }, this.brakeUntil! - Date.now());
+      signal?.addEventListener('abort', onAbort, { once: true });
+    });
   }
 }
 
@@ -70,6 +212,10 @@ const STRICTEST: {
   maxConcurrent: (a, b) => Math.min(a, b),
   minIntervalMs: (a, b) => Math.max(a, b),
   acquireTimeoutMs: (a, b) => Math.min(a, b),
+  // Adapting only ever slows a scope down, and it is what prevents item loss
+  // under a rate limit, so an explicit `true` beats an explicit `false`.
+  adaptive: (a, b) => a || b,
+  maxRateLimitRetries: (a, b) => Math.min(a, b),
 };
 
 type MergeResult = {
@@ -82,17 +228,21 @@ type MergeResult = {
 function mergeStrictest(a: RateLimitConfig, b: RateLimitConfig): MergeResult {
   const merged: RateLimitConfig = { ...a };
   const conflicts: string[] = [];
-  for (const field of Object.keys(STRICTEST) as (keyof RateLimitConfig)[]) {
+  const mergeField = <K extends keyof RateLimitConfig>(field: K): void => {
     const av = a[field];
     const bv = b[field];
-    if (bv === undefined) continue;
+    if (bv === undefined) return;
     if (av === undefined) {
       merged[field] = bv;
-      continue;
+      return;
     }
     if (av !== bv) conflicts.push(`${field}: ${av} vs ${bv}`);
-    merged[field] = STRICTEST[field](av, bv);
-  }
+    merged[field] = STRICTEST[field](
+      av as NonNullable<RateLimitConfig[K]>,
+      bv as NonNullable<RateLimitConfig[K]>,
+    );
+  };
+  for (const field of Object.keys(STRICTEST) as (keyof RateLimitConfig)[]) mergeField(field);
   return { merged, conflicts };
 }
 
@@ -125,11 +275,14 @@ export class AccountScope {
   private readonly adapterNames: string[] = [];
   private warnedConflict = false;
   private readonly governors = new Map<string, ScopeGovernor>();
+  private readonly dialect: QuotaDialect | undefined;
 
   constructor(
     private readonly family: string,
     private readonly origin: string,
-  ) {}
+  ) {
+    this.dialect = quotaDialectFor(family);
+  }
 
   /** Record one provider block's (sanitized) `rateLimit`, merging strictest. */
   contribute(adapterName: string, limits: RateLimitConfig | undefined): void {
@@ -138,6 +291,8 @@ export class AccountScope {
     if (limits === undefined) return;
     if (this.limits === undefined) {
       this.limits = { ...limits };
+      // A dialect scope has governors before any block sets `rateLimit`.
+      for (const governor of this.governors.values()) governor.reconfigure(this.limits);
       return;
     }
     const { merged, conflicts } = mergeStrictest(this.limits, limits);
@@ -162,17 +317,20 @@ export class AccountScope {
   /**
    * The governor for `model`, created on first use and memoized.
    *
-   * Returns `undefined` while no block reaching this account configured
-   * `rateLimit`, so an unconfigured scope takes `fetchWithRetry`'s no-governor
-   * path, byte-identical to before pooling. Re-evaluated on every call: a block
-   * contributing `rateLimit` later governs every adapter on the account from
-   * its next call on.
+   * A scope with a quota dialect (first-party OpenAI, Anthropic) always has
+   * one, so its fleet brake works with no configuration; with no `rateLimit`
+   * it applies no cap and no spacing, so nothing waits before the first
+   * rate-limit 429. A dialect-less scope returns `undefined` while no block
+   * reaching this account configured `rateLimit`, so it takes
+   * `fetchWithRetry`'s no-governor path, byte-identical to before pooling.
+   * Re-evaluated on every call: a block contributing `rateLimit` later governs
+   * every adapter on the account from its next call on.
    */
   governorFor(model: string): ScopeGovernor | undefined {
-    if (this.limits === undefined) return undefined;
+    if (this.limits === undefined && this.dialect === undefined) return undefined;
     let governor = this.governors.get(model);
     if (!governor) {
-      governor = new ScopeGovernor(this.limits);
+      governor = new ScopeGovernor(this.limits ?? {}, this.dialect, this.family);
       this.governors.set(model, governor);
     }
     return governor;

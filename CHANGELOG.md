@@ -234,6 +234,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A 429 from OpenAI or Anthropic now waits and retries instead of failing
+  fast, and a spend cap fails immediately.** On first-party OpenAI (`openai:`,
+  `openai-responses:`) and Anthropic (`anthropic:`), the transport reads the
+  429 body before deciding what to do. This is on by default and needs no
+  configuration:
+  - **Spend caps fail fast.** Anthropic `enforced_spend_limit_reached`, and
+    OpenAI `insufficient_quota` and its billing codes, return at once as
+    `ProviderError { status: 429 }` with the raw body. They are not retried and
+    hold up no other call.
+  - **Other 429s pause the scope.** Every other 429 pauses **every** call on the
+    scope (one model on one account) until its `Retry-After`, clamped at 60 s,
+    or else the usual backoff. The call then retries on a new
+    `RateLimitConfig.maxRateLimitRetries` budget (default 8), separate from the
+    2 retries for 503/529/network errors, so a throttled fan-out stops losing
+    items to exhausted retries. The retrying call gives its permit back while
+    it waits and goes first when the pause ends.
+  - **Nothing changes before the first rate-limit 429.**
+  - **Opting out.** `rateLimit: { adaptive: false }` restores the previous
+    behavior per provider. Other providers are unchanged.
+
+  Also:
+  - A call against a saturated account can now take several minutes rather than
+    failing after about 3 s. Your ask `timeout`, signal and
+    `AdmissionController` still stop it.
+  - An abort during a pause, a queue wait or a `503` backoff on these providers
+    now rejects with the signal's own `reason` rather than `fetch`'s
+    `AbortError`.
+  - `acquireTimeoutMs` bounds only a call's first permit wait, and a call
+    arriving during a pause starts that clock only once the pause ends.
+  - The spend-cap body shapes follow the providers' documentation and have not
+    yet been checked against live responses.
+- **`CallTiming.queuedMs` and `retryMs` no longer overlap.** `queuedMs` now
+  covers every wait Axl imposes on itself (the first permit, spacing, a
+  rate-limit pause, the re-acquire after a 429). `retryMs` is the span between
+  the first and final dispatch *minus* those waits. So `429` → 30 s pause →
+  `200` reports about 30 s of `queuedMs` and a `retryMs` of only the first
+  attempt. On paths without a pause (for example `503` retries) `retryMs` is
+  unchanged. `attempts` counts requests actually sent.
 - **Rate governors are pooled per runtime, one per scope.** A scope is provider
   family + base-URL origin + credential source + model. `openai` and
   `openai-responses` are one family, a string `apiKey` is compared by value and

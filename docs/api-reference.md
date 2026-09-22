@@ -1982,7 +1982,7 @@ const runtime3 = new AxlRuntime({
 | `baseUrl` | `string` | provider default | Override the API base URL (proxies, gateways) |
 | `dangerouslyAllowInsecureHttp` | `boolean` | `false` | Permit a non-loopback HTTP `baseUrl` for this provider block. Without it, built-in providers accept HTTPS plus literal loopback HTTP (`localhost`, IPv4 `127/8`, IPv6 `::1`) and reject all other HTTP before async credential callbacks or network I/O. Does not permit malformed/non-HTTP(S) URLs. `openai-responses` inherits it from `openai` only when its own block is absent |
 | `authHeader` | `AuthHeader` | profile default | OpenAI-compatible presets only: override the profile auth header shape. Use `providers.azure.authHeader: 'bearer'` with an Entra token callback; the Azure preset defaults to `'api-key'` for API-key auth |
-| `rateLimit` | `RateLimitConfig` | — | Opt-in client-side rate governor for this provider's chat calls. See below. Governors are pooled per runtime, **one per scope** = provider family (`openai` for both `openai` and `openai-responses`) + base-URL origin + credential source + model. `openai-responses` inherits the `openai` block (incl. `rateLimit`) when it has no config of its own, and on the same key and origin both adapters share one governor per model. Two blocks reaching one scope use the strictest value per field, with one `console.warn` |
+| `rateLimit` | `RateLimitConfig` | — | Client-side rate governor for this provider's chat calls. See below. On first-party OpenAI and Anthropic a governor exists even without this block, so a rate-limit 429 pauses the scope and a spend-cap 429 fails fast by default (`adaptive`). Governors are pooled per runtime, **one per scope** = provider family (`openai` for both `openai` and `openai-responses`) + base-URL origin + credential source + model. `openai-responses` inherits the `openai` block (incl. `rateLimit`) when it has no config of its own, and on the same key and origin both adapters share one governor per model. Two blocks reaching one scope use the strictest value per field, with one `console.warn` |
 
 **`RateLimitConfig`** — proactive pacing through the shared `fetchWithRetry` chokepoint (complementary to the automatic 429/503/529 backoff). Exported from `@axlsdk/axl` alongside the `RateLimiter` class.
 
@@ -1990,9 +1990,11 @@ const runtime3 = new AxlRuntime({
 |-------|------|-------------|
 | `maxConcurrent` | `number` | Max requests in flight per scope (one model on one account, see above). Finite integer ≥ 1; invalid values disable the cap (with a `console.warn`). `1` serializes (a throughput floor, not a deadlock — permits aren't held across a nested `ctx.ask()`) |
 | `minIntervalMs` | `number` | Minimum ms between successive request *grants* (global spacing, no burst bucket) |
-| `acquireTimeoutMs` | `number` | If set, a call queued longer than this rejects (fail loud) instead of hanging on a misconfigured cap |
+| `acquireTimeoutMs` | `number` | If set, a call queued longer than this for its **first** permit rejects (fail loud) instead of hanging on a misconfigured cap. A call arriving during a rate-limit pause starts this clock only once the pause ends; a call already queued when a pause begins keeps its clock running through it. A retry's re-acquire after a rate-limit 429 is exempt |
+| `adaptive` | `boolean` | Default `true`, and effective only on first-party OpenAI (`openai`, `openai-responses`) and Anthropic. A rate-limit 429 pauses every call on the scope for its `Retry-After` (else the exponential backoff), clamped at 60 s, then retries on `maxRateLimitRetries`; the retrier re-acquires ahead of first-time callers. A spend-cap 429 is returned at once (no retry, no pause). `false` restores the plain behavior: a 429 shares the transient budget and holds up no other call. Two blocks on one scope: `true` wins. Ignored by a directly constructed `RateLimiter` |
+| `maxRateLimitRetries` | `number` | Default `8`. Retries after a rate-limit 429 where `adaptive` applies, separate from the 2 transient (`503`/`529`/network) retries. Integer ≥ 0; invalid values warn and use the default. Two blocks on one scope: the smaller wins |
 
-> **Scope:** caps request *concurrency*, not token throughput (TPM) — a permit releases at response headers. Governs **chat calls only** (memory embedder and transcription calls keep their own per-adapter behavior) and is **per runtime and scope**: never shared across processes, and shared across runtimes only when one provider instance is registered in both. Full caveats in [providers.md → Rate limiting](providers.md#rate-limiting-opt-in).
+> **Scope:** caps request *concurrency*, not token throughput (TPM) — a permit releases at response headers. Governs **chat calls only** (memory embedder and transcription calls keep their own per-adapter behavior) and is **per runtime and scope**: never shared across processes, and shared across runtimes only when one provider instance is registered in both. Full caveats in [providers.md → Rate limiting](providers.md#rate-limiting).
 
 ### `CallTiming`
 
@@ -2008,9 +2010,9 @@ valid, so treat every field as possibly absent.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `queuedMs` | `number` | Time parked in Axl's own opt-in `RateLimiter` (concurrency cap plus `minIntervalMs` spacing) before the request was allowed out. `0` when the provider has no `rateLimit`. Self-imposed wait, not provider latency |
-| `attempts` | `number` | `fetch` attempts made for this call, including the final one (≥ 1) |
-| `retryMs` | `number` | First attempt's dispatch → final attempt's dispatch: failed attempts plus their backoff sleeps. `0` for a single attempt |
+| `queuedMs` | `number` | Every wait Axl imposes on itself: the first permit (concurrency cap), `minIntervalMs` spacing, a rate-limit pause on the scope, and the re-acquire after a rate-limit 429. `0` when nothing waited. Self-imposed wait, not provider latency |
+| `attempts` | `number` | Requests actually sent for this call, including the final one (≥ 1). A call held back by a pause before sending is not an attempt |
+| `retryMs` | `number` | First attempt's dispatch → final attempt's dispatch, **minus** the self-imposed waits inside that span (already in `queuedMs`): failed attempts plus their `503`/`529`/network backoff sleeps. Disjoint from `queuedMs`, so `queuedMs + retryMs` never exceeds the call's wall clock. `0` for a single attempt |
 | `ttfbMs` | `number` | Final dispatch → response headers |
 | `firstTokenMs` | `number?` | Final dispatch → first `text_delta`/`thinking_delta`, excluding consumer suspension after an earlier non-content chunk such as a tool delta. **Streaming only**, and absent on a stream that ends without a content delta. The model-discriminating figure — headers arrive at roughly one round trip regardless of model, first token does not |
 | `wireMs` | `number` | Time attributable to the provider. `chat()`: final dispatch → response body parsed. `stream()`: `ttfbMs` plus cumulative body-read waits, floored at `firstTokenMs` when content arrives. Thus `wireMs >= firstTokenMs`; parsing needed to deliver the first delta is included, while pauses after a yielded delta (event fan-out, tool-call buffering, a slow `ctx.events` consumer) remain excluded |
@@ -2018,7 +2020,7 @@ valid, so treat every field as possibly absent.
 `agent_call_end.duration` is unchanged and still measures the whole turn's wall clock,
 queue and retries included. `timing` sits beside it; it does not replace it. Nothing in core
 sums `timing` across the calls of one ask — a sum across parallel branches would exceed wall
-clock. See [providers.md → Rate limiting](providers.md#rate-limiting-opt-in) for what
+clock. See [providers.md → Rate limiting](providers.md#rate-limiting) for what
 `queuedMs` does and does not bound under streaming.
 
 ### MCP server configuration

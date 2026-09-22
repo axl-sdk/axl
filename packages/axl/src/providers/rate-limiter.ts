@@ -32,8 +32,9 @@
  *   never across a nested `ctx.ask`, so an agent-as-tool chain on the same
  *   provider under `maxConcurrent: 1` still completes — permits don't stack.
  *
- * `observe(res)` is a no-op seam in v1 for a future adaptive (header-driven)
- * pacing follow-up.
+ * `observe(res)` is a no-op here. The per-scope governor in `governor-pool.ts`
+ * overrides it (quota-header hint) and adds the rate-limit brake; a directly
+ * constructed `RateLimiter` is never adaptive.
  */
 
 /** Configuration for a provider's {@link RateLimiter}. All fields optional. */
@@ -56,8 +57,32 @@ export type RateLimitConfig = {
    * If set, `acquire()` rejects (fail loud) when a caller has queued longer than
    * this many ms, instead of waiting indefinitely — surfaces a misconfigured
    * cap rather than silently hanging the run.
+   *
+   * Bounds only a call's FIRST wait for a permit. On a scope that adapts (see
+   * `adaptive`), a call first waits out any active rate-limit brake and only
+   * then starts this clock; a call already queued when a brake begins keeps
+   * its clock running through it. A retry's re-acquire after a rate-limit 429
+   * is exempt: it is bounded by `maxRateLimitRetries` and the ask's `timeout`.
    */
   acquireTimeoutMs?: number;
+  /**
+   * Feedback-driven pacing on scopes with a quota dialect: first-party OpenAI
+   * (`openai:` and `openai-responses:`) and Anthropic. Default `true` there;
+   * it has no effect anywhere else. When on, a rate-limit 429 brakes every
+   * call on the scope for its `Retry-After` (clamped at 60 s) and the call
+   * retries on its own budget (`maxRateLimitRetries`); a spend-cap 429 fails
+   * fast. `false` restores the plain behavior: a 429 shares the transient
+   * retry budget and holds up no other call. Ignored by a directly constructed
+   * `RateLimiter`, which is never adaptive.
+   */
+  adaptive?: boolean;
+  /**
+   * Retries after a rate-limit 429 on an adaptive scope, separate from the
+   * transient (503/529/network) budget. Default `8`. A non-negative integer;
+   * `0` still brakes the scope but returns the 429. Ignored where
+   * `adaptive` has no effect.
+   */
+  maxRateLimitRetries?: number;
 };
 
 type Waiter = {
@@ -70,6 +95,8 @@ type Waiter = {
   settled?: boolean;
   /** Set synchronously when the waiter is granted a permit (vs. parked in the queue). */
   granted?: boolean;
+  /** Queued ahead of every non-priority waiter (a retry re-acquiring its permit). */
+  priority?: boolean;
 };
 
 /**
@@ -115,6 +142,25 @@ export function sanitizeRateLimitConfig(config: RateLimitConfig): RateLimitConfi
     config.acquireTimeoutMs > 0
   ) {
     limits.acquireTimeoutMs = config.acquireTimeoutMs;
+  }
+  if (config.adaptive != null) {
+    if (typeof config.adaptive === 'boolean') {
+      limits.adaptive = config.adaptive;
+    } else {
+      console.warn(
+        `[axl] RateLimiter: ignoring invalid adaptive (${String(config.adaptive)}); expected a boolean.`,
+      );
+    }
+  }
+  const rlr = config.maxRateLimitRetries;
+  if (rlr != null) {
+    if (typeof rlr === 'number' && Number.isInteger(rlr) && rlr >= 0) {
+      limits.maxRateLimitRetries = rlr;
+    } else {
+      console.warn(
+        `[axl] RateLimiter: ignoring invalid maxRateLimitRetries (${String(rlr)}); expected an integer >= 0. The default applies.`,
+      );
+    }
   }
   return limits;
 }
@@ -174,10 +220,25 @@ export class RateLimiter {
    * With `acquireTimeoutMs`, a waiter that sits in the queue too long rejects.
    */
   acquire(signal?: AbortSignal): Promise<void> {
+    return this.enqueue(signal, { priority: false, timeoutMs: this.acquireTimeoutMs });
+  }
+
+  /**
+   * Queue for a permit. A `priority` waiter goes ahead of every non-priority
+   * waiter (FIFO among priority waiters) and never warns about queueing;
+   * `timeoutMs` arms the fail-loud queue timeout (`undefined`: none).
+   *
+   * @internal Extension point for Axl's own per-scope governor (a retry's
+   * re-acquire); not a supported public contract and may change without notice.
+   */
+  protected enqueue(
+    signal: AbortSignal | undefined,
+    options: { priority: boolean; timeoutMs: number | undefined },
+  ): Promise<void> {
     if (signal?.aborted) return Promise.reject(signal.reason);
 
     return new Promise<void>((resolve, reject) => {
-      const waiter: Waiter = { resolve, reject, signal };
+      const waiter: Waiter = { resolve, reject, signal, priority: options.priority };
 
       if (signal) {
         waiter.onAbort = () => this.settleWaiter(waiter, signal.reason);
@@ -185,7 +246,7 @@ export class RateLimiter {
       }
       // Capture the timeout this waiter is armed with: a pooled governor can be
       // tightened while it waits, and the message must name the value that fired.
-      const timeoutMs = this.acquireTimeoutMs;
+      const timeoutMs = options.timeoutMs;
       if (timeoutMs != null) {
         waiter.timer = setTimeout(
           () =>
@@ -197,11 +258,18 @@ export class RateLimiter {
         );
       }
 
-      this.queue.push(waiter);
+      if (options.priority) {
+        const firstOrdinary = this.queue.findIndex((w) => !w.priority);
+        this.queue.splice(firstOrdinary === -1 ? this.queue.length : firstOrdinary, 0, waiter);
+      } else {
+        this.queue.push(waiter);
+      }
       this.pump();
 
       // If pump() couldn't grant this waiter synchronously, it genuinely queued.
-      if (!waiter.granted && !this.warnedQueued) {
+      // Warn only about the configured caps: a queue caused by something else
+      // (a rate-limit brake on a pooled governor) is not a cap to raise.
+      if (!waiter.granted && !options.priority && this.hasStaticCap() && !this.warnedQueued) {
         this.warnedQueued = true;
         console.warn(
           `[axl] RateLimiter: request queued (maxConcurrent=${this.maxConcurrent}${this.minIntervalMs ? `, minIntervalMs=${this.minIntervalMs}` : ''}). ` +
@@ -209,6 +277,19 @@ export class RateLimiter {
         );
       }
     });
+  }
+
+  private hasStaticCap(): boolean {
+    return this.maxConcurrent !== Infinity || this.minIntervalMs > 0;
+  }
+
+  /**
+   * Whether any caller is queued for a permit.
+   *
+   * @internal Extension point for Axl's own per-scope governor.
+   */
+  protected hasWaiters(): boolean {
+    return this.queue.length > 0;
   }
 
   /** Release a previously acquired permit and wake the next waiter. */
@@ -227,7 +308,7 @@ export class RateLimiter {
     this.pump();
   }
 
-  /** v1 no-op seam for a future adaptive (rate-limit-header-driven) pacing follow-up. */
+  /** No-op; the per-scope governor overrides it to read quota headers. */
   observe(_res: Response): void {
     // intentionally empty
   }

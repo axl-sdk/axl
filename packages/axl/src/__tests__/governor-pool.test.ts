@@ -784,11 +784,35 @@ describe('AC15: two rateLimit blocks on one scope merge strictest', () => {
 // RQ13 / F1 — an unconfigured scope has no governor at all.
 // ---------------------------------------------------------------------------
 
-describe('no rateLimit anywhere: no governor, as before pooling', () => {
+describe('no rateLimit anywhere', () => {
+  // A dialect scope (first-party OpenAI, Anthropic) has a governor even with no
+  // `rateLimit`, so its fleet brake works with zero configuration (F1). Before
+  // any 429 it applies no cap, no spacing and no warning.
   it.each([
     ['openai', 'gpt-4o'],
     ['openai-responses', 'gpt-4o'],
     ['anthropic', 'claude-sonnet-4'],
+  ])(
+    '%s: a governor that admits everything at once, queuedMs 0, no warning',
+    async (name, model) => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+      const acquire = vi.spyOn(RateLimiter.prototype, 'acquire');
+      const net = stubFetch();
+      const runtime = new AxlRuntime({ providers: { [name]: { apiKey: 'k' } } });
+      const { provider } = resolveVia(runtime, `${name}:${model}`);
+      const calls = [chat(provider, model), chat(provider, model), chat(provider, model)];
+      await settle();
+      expect(net.inFlight).toBe(3);
+      net.releaseAll();
+      const results = await Promise.all(calls);
+      expect(acquire).toHaveBeenCalledTimes(3);
+      for (const r of results) expect(r.timing?.queuedMs).toBe(0);
+      expect(warn).not.toHaveBeenCalled();
+    },
+  );
+
+  // A dialect-less scope keeps no governor at all, as before pooling (AC21).
+  it.each([
     ['google', 'gemini-2.5-flash'],
     ['groq', 'llama-3.3-70b'],
   ])('%s never touches a RateLimiter and reports queuedMs 0', async (name, model) => {

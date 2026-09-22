@@ -876,7 +876,12 @@ export class AnthropicProvider implements Provider {
 
   private baseUrl: string;
   private apiKeySource: ApiKeySource;
-  private readonly governors: AdapterGovernors;
+  /**
+   * Namespaced so it cannot collide with a member a downstream subclass
+   * declares. A plain property (not `#private` or a WeakMap keyed by `this`)
+   * so a caller's own Proxy around the adapter still reaches it.
+   */
+  private readonly axlRateGovernors: AdapterGovernors;
 
   constructor(
     options: {
@@ -893,7 +898,7 @@ export class AnthropicProvider implements Provider {
       'Anthropic provider',
       options.dangerouslyAllowInsecureHttp,
     );
-    this.governors = new AdapterGovernors(
+    this.axlRateGovernors = new AdapterGovernors(
       this,
       {
         family: this.name,
@@ -915,7 +920,7 @@ export class AnthropicProvider implements Provider {
 
   /** The rate governor for one call to `model`, from the runtime's per-scope pool. */
   protected governorFor(model: string): ScopeGovernor | undefined {
-    return this.governors.governorFor(model);
+    return this.axlRateGovernors.governorFor(model);
   }
 
   /** Resolve the API key for one request (supports an expiring-token callback). */

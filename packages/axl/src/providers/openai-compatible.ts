@@ -679,7 +679,12 @@ export class OpenAICompatibleProvider implements Provider {
   /** A key string, or a resolver invoked per request (expiring tokens). */
   protected readonly apiKeySource: ApiKeySource;
   protected readonly authHeader?: AuthHeader;
-  private readonly governors: AdapterGovernors;
+  /**
+   * Namespaced so it cannot collide with a member a downstream subclass
+   * declares. A plain property (not `#private` or a WeakMap keyed by `this`)
+   * so a caller's own Proxy around the adapter still reaches it.
+   */
+  private readonly axlRateGovernors: AdapterGovernors;
 
   constructor(options: OpenAICompatibleOptions) {
     const p = options.profile;
@@ -696,7 +701,7 @@ export class OpenAICompatibleProvider implements Provider {
       `${p.label ?? p.name} provider`,
       options.dangerouslyAllowInsecureHttp,
     );
-    this.governors = new AdapterGovernors(
+    this.axlRateGovernors = new AdapterGovernors(
       this,
       {
         family: p.name,
@@ -731,7 +736,7 @@ export class OpenAICompatibleProvider implements Provider {
    * `governor`.
    */
   protected governorFor(model: string): ScopeGovernor | undefined {
-    return this.governors.governorFor(model);
+    return this.axlRateGovernors.governorFor(model);
   }
 
   /** Resolve the API key for one request, validating against allowMissingApiKey. */

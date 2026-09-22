@@ -180,14 +180,17 @@ export class RateLimiter {
         waiter.onAbort = () => this.settleWaiter(waiter, signal.reason);
         signal.addEventListener('abort', waiter.onAbort, { once: true });
       }
-      if (this.acquireTimeoutMs != null) {
+      // Capture the timeout this waiter is armed with: a pooled governor can be
+      // tightened while it waits, and the message must name the value that fired.
+      const timeoutMs = this.acquireTimeoutMs;
+      if (timeoutMs != null) {
         waiter.timer = setTimeout(
           () =>
             this.settleWaiter(
               waiter,
-              new Error(`RateLimiter.acquire timed out after ${this.acquireTimeoutMs}ms`),
+              new Error(`RateLimiter.acquire timed out after ${timeoutMs}ms`),
             ),
-          this.acquireTimeoutMs,
+          timeoutMs,
         );
       }
 
@@ -229,7 +232,9 @@ export class RateLimiter {
   /**
    * Drain the queue: grant head waiters while a permit is free and spacing allows.
    * Protected so the internal per-scope governor can gate grants on its own
-   * state (for example a brake) by overriding it.
+   * state (for example a brake) by overriding it. Not part of the documented API.
+   *
+   * @internal
    */
   protected pump(): void {
     while (this.queue.length > 0 && this.active < this.maxConcurrent) {

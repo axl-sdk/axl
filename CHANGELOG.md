@@ -236,7 +236,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   captured before the thrown value is flattened to `error`. Every field comes
   from the first `ProviderError` on the thrown value or its `cause` chain
   (bounded walk). With none, only the thrown `name` is recorded.
-  `ProviderError.body` is never recorded. The CLI summary adds a
+  `failure` never records `ProviderError.body`; `item.error` keeps the error
+  message as before, which for some providers can include error-response text.
+  The CLI summary adds a
   `Failure causes:` line that groups failed items by status and provider (for
   example `5 × 429 (openai), 2 × other`), so throttling reads differently from a
   bug. The field is additive: `EvalItemOutcome` and the coverage counters are

@@ -308,8 +308,9 @@ function isProviderErrorLike(value: unknown): value is ProviderError {
  * cause chain is caller-built data and may be cyclic — and takes EVERY
  * field from the first `ProviderError` it meets. With none, only the thrown
  * value's `name` is kept. Each field is copied by name with a type check, never
- * by spreading the error, so `body` (which can echo prompt text) and any other
- * property cannot reach the artifact.
+ * by spreading the error, so `body` (which can echo prompt text), `message` and
+ * any other property never reach the `failure` record. (`item.error` keeps the
+ * message as before; for some providers that includes error-response text.)
  */
 export function describeItemFailure(thrown: unknown): EvalItemFailure | undefined {
   let current: unknown = thrown;

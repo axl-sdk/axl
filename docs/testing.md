@@ -497,13 +497,15 @@ result.summary.itemErrorRate;
 ```
 
 Each failed item says why on `item.failure`, taken from the first `ProviderError` on the
-thrown value or its `cause` chain (the provider's raw `body` is never stored), and the CLI
+thrown value or its `cause` chain, and the CLI
 groups the failed items by it (`Failure causes: 5 × 429 (openai), 1 × other`):
 
 ```ts
 result.items[0].failure;
 // { name: 'ProviderError', provider: 'openai', status: 429, retryable: true, requestId: 'req_…' }
 ```
+
+`failure` never records `ProviderError.body`; `item.error` keeps the error message as before, which for some providers can include error-response text.
 
 To test the gate, have the workflow throw for chosen items — a `ProviderError` with
 `status: 429` reproduces a rate-limit storm without a provider. From the CLI,

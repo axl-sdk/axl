@@ -6,7 +6,10 @@
  * a failed item was flattened to `error: string`, so a run thinned by a
  * rate-limit storm read the same as one broken by a bug. These cases pin that
  * the cause survives — through the real runtime path and through `cause`
- * chains — and that the provider's raw `body` never reaches the artifact.
+ * chains — and that the `failure` record never copies the provider's raw
+ * `body` (or the message). `item.error` keeps the error message as before, which
+ * for some providers embeds error-response text; that is outside this record's
+ * guarantee and is not asserted here.
  */
 
 import { describe, it, expect } from 'vitest';
@@ -70,8 +73,9 @@ const sortedKeys = (o: object) => Object.keys(o).sort();
 
 describe('item.failure capture', () => {
   // E-07a + E-07e: through the real runtime path (ctx.ask → provider throws),
-  // with trace capture on, the artifact carries the cause and never the body.
-  it('records a provider 429 raised through ctx.ask, and the body appears nowhere', async () => {
+  // with trace capture on, the artifact carries the cause and the failure record
+  // never copies the body.
+  it('records a provider 429 raised through ctx.ask without copying its body', async () => {
     const { runtime } = scriptedRuntime([{ throws: rateLimited() }]);
     const result = await runEval(config(1), askExecute(), runtime, { captureTraces: true });
     const item = result.items[0];
@@ -95,10 +99,30 @@ describe('item.failure capture', () => {
     // The trace path still reports the status (so the traces were captured)…
     const callEnd = item.traces?.find((e) => e.type === 'agent_call_end');
     expect(JSON.stringify(callEnd)).toContain('429');
-    // …and neither the traces, the failure, the error string nor any other
-    // field of the persisted artifact carries the provider body.
+    // …and the failure record carries neither the body nor the message. With a
+    // message that does not embed the body (this fixture), nothing else in the
+    // artifact carries it either — the traces included.
+    expect('message' in item.failure!).toBe(false);
+    expect(JSON.stringify(item.failure)).not.toContain(SENTINEL);
     expect(item.error).not.toContain(SENTINEL);
     expect(JSON.stringify(result, null, 2)).not.toContain(SENTINEL);
+  });
+
+  // The real adapter shape for a non-JSON error response: the message embeds
+  // the response text (`openai API error (429): <body>`). `item.error` keeps
+  // that message as before; the `failure` record still copies neither.
+  it('keeps body text out of the failure record even when the message embeds it', async () => {
+    const item = await failWith(
+      rateLimited({ message: `openai API error (429): ${SENTINEL}`, body: SENTINEL }),
+    );
+    expect(item.failure).toEqual({
+      name: 'ProviderError',
+      provider: 'openai',
+      status: 429,
+      retryable: true,
+      requestId: 'req_1',
+    });
+    expect(JSON.stringify(item.failure)).not.toContain(SENTINEL);
   });
 
   it('records a ProviderError thrown directly by the workflow', async () => {

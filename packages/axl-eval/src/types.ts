@@ -370,8 +370,11 @@ export type ModelTimingStats = {
  *
  * When a `ProviderError` is found — the thrown value itself or the first one
  * down its `cause` chain — every field comes from it. Otherwise only the thrown
- * value's `name` is recorded. `ProviderError.body` is NEVER recorded: it can
- * echo prompt text and is redaction-eligible.
+ * value's `name` is recorded. This record never copies `ProviderError.body` or
+ * the message: the body can echo prompt text and is redaction-eligible.
+ * `EvalItem.error` keeps the error message as before, which for some providers
+ * (a non-JSON error response) embeds the response text — that is outside this
+ * record's guarantee.
  */
 export type EvalItemFailure = {
   /** `'ProviderError'` when one was found, else the thrown value's own `name`. */

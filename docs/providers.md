@@ -575,8 +575,9 @@ export default defineConfig({
     flight **per model**. There is no model-family table.
 
   So with one `providers.openai` block, `openai:gpt-4o` and
-  `openai-responses:gpt-4o` share **one** cap. **This changed in 0.24:** before,
-  each adapter had its own governor and using both added the caps together. If
+  `openai-responses:gpt-4o` share **one** cap. **This is a behavior change** (see
+  the CHANGELOG): before, each adapter had its own governor and using both added
+  the caps together. If
   you sized `maxConcurrent` for that sum, halve your expectation or raise it.
 - **`openai-responses` inherits `openai`'s `rateLimit`** when it has no block of its
   own (same fallback as `apiKey`/`baseUrl`). If both blocks exist with the same key
@@ -604,8 +605,16 @@ export default defineConfig({
     would be separate governors again.
   - Two separately constructed instances (like `openai` and `responses` above)
     have separate pools even on one key; only a shared instance shares.
+  - The same holds for a factory you register with `registry.register(name,
+    factory)`: only the built-in factories join the runtime's pool, so an adapter
+    your factory builds keeps a private pool and does not pool with the built-in
+    adapters (for example a custom `openai` factory and the built-in
+    `openai-responses:`).
   - A standalone `agent.ask()` (no runtime) builds a fresh registry per call, so
     its governors do not persist across asks.
+- **The "request queued" warning is per scope.** The one-time
+  `[axl] RateLimiter: request queued` warning fires the first time a call waits on
+  a given scope, so a run that queues on three models sees it three times.
 - **No deadlock on nesting.** A permit is held only across a single HTTP call, never
   across a nested `ctx.ask()` (tool handlers run between provider calls, not during),
   so an agent-as-tool chain on the same provider under `maxConcurrent: 1` still

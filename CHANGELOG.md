@@ -258,7 +258,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Breaking for `OpenAICompatibleProvider` subclasses:** the protected
     `governor` field is replaced by `protected governorFor(model)`. A subclass
     that issued its own `fetchWithRetry({ governor: this.governor })` must pass
-    `this.governorFor(model)` instead.
+    `this.governorFor(model)` instead. The adapters' new private member is
+    namespaced (`axlRateGovernors`) so it does not collide with subclass members.
+  - `RateLimiter.pump()` is now `protected` so an internal subclass can gate
+    grants. It is not part of the documented API.
+  - A factory registered with `register()` is not joined to the runtime's pool,
+    like a registered instance. The one-time "request queued" warning now fires
+    once per scope rather than once per adapter.
   - Transcription adapters and the memory embedder keep their per-instance
     behavior.
 - **Breaking: `runtime.resolveProvider(uri)` returns a scoped facade**, so

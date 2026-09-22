@@ -149,6 +149,9 @@ export class RateLimiter {
    * Apply already-sanitized limits (see {@link sanitizeRateLimitConfig}). An
    * absent field means "no limit". Takes effect for the next grant; a waiter
    * already queued keeps the `acquireTimeoutMs` timer it was armed with.
+   *
+   * @internal Extension point for Axl's own per-scope governor; not a supported
+   * public contract and may change without notice.
    */
   protected applyLimits(limits: RateLimitConfig): void {
     this.maxConcurrent = limits.maxConcurrent ?? Infinity;
@@ -232,9 +235,10 @@ export class RateLimiter {
   /**
    * Drain the queue: grant head waiters while a permit is free and spacing allows.
    * Protected so the internal per-scope governor can gate grants on its own
-   * state (for example a brake) by overriding it. Not part of the documented API.
+   * state (for example a brake) by overriding it.
    *
-   * @internal
+   * @internal Extension point for Axl's own per-scope governor; not a supported
+   * public contract and may change without notice.
    */
   protected pump(): void {
     while (this.queue.length > 0 && this.active < this.maxConcurrent) {

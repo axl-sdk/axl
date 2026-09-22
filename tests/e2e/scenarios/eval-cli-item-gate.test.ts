@@ -181,6 +181,26 @@ describe('axl-eval item error rate gate (CLI)', () => {
     }
   });
 
+  it('rejects an invalid failOnItemErrorRate in the eval file before running anything', () => {
+    const dir = tempDir('item-gate-invalid-config');
+    try {
+      // 1.5 is not a rate; warning and skipping would silently disable a
+      // default-on gate, so load-time validation must fail the file instead.
+      const file = writeEvalFile(dir, { items: 2, failCalls: [], failOnItemErrorRate: 1.5 });
+      const out = join(dir, 'result.json');
+      const run = runCli([file, '--output', out]);
+
+      expect(run.status).toBe(1);
+      expect(run.stderr).toContain(
+        'exports an invalid failOnItemErrorRate (1.5) — must be a number between 0 and 1',
+      );
+      expect(run.stdout).not.toContain('Eval:');
+      expect(existsSync(out)).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('gates each run of a --runs batch individually and names the thinned run', () => {
     const dir = tempDir('item-gate-runs');
     try {

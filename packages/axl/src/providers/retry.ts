@@ -51,6 +51,22 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 }
 
 /**
+ * Cancel the body of a response the retry loop is about to discard, so its
+ * connection is released instead of held until garbage collection. Only for a
+ * response the loop does NOT return: a returned response keeps its body for the
+ * adapter's `res.text()` / `res.json()` (and so for `ProviderError.body`).
+ *
+ * Null-safe for bodyless fixtures. A rejected cancel (for example an already
+ * locked stream) is ignored on purpose: releasing a discarded body is
+ * best-effort cleanup, and failing the call over it would lose a retry that is
+ * otherwise sound.
+ */
+function discardBody(res: Response): void {
+  const cancelled = (res.body as { cancel?: () => unknown } | null | undefined)?.cancel?.();
+  if (cancelled instanceof Promise) cancelled.catch(() => {});
+}
+
+/**
  * Transport-level timing for one {@link fetchWithRetry} call, reported to
  * `FetchWithRetryOptions.timing.onComplete` on the return path.
  *
@@ -273,6 +289,9 @@ export async function fetchWithRetry(
           : BASE_DELAY_MS * 2 ** attempt;
 
       observer?.onRetry?.(attempt + 1, Date.now());
+      // The loop continues with a new request, so this response is discarded:
+      // release its connection now rather than when it is garbage-collected.
+      discardBody(res);
       await sleep(jitter(baseDelay), init?.signal ?? undefined);
     }
   } finally {

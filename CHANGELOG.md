@@ -384,6 +384,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cause, instead of a bare `TypeError`. The new `isAdmissionDeniedError(err)`
   predicate is exported for callers that classify errors themselves.
 
+### Fixed
+
+- **Retried provider responses no longer leak their connection.** When the
+  transport retries a 429, 503 or 529, it now cancels the discarded response's
+  body before backing off, instead of leaving it open until garbage collection.
+  A response that is returned (success, a non-retryable error, or the last
+  attempt after retries run out) keeps its body, so `ProviderError.body` is
+  still the raw provider text.
+
 ## [0.23.3] - 2026-09-09
 
 ### Added

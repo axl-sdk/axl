@@ -615,6 +615,83 @@ describe('Studio API: Evals', () => {
     expect(served._multiRun.allRuns[1].items[0].input).toBe('[redacted]');
     expect(served._multiRun.aggregate.runCount).toBe(2);
     expect(JSON.stringify(body)).not.toMatch(/SENTINEL_NESTED/);
+    expect(served.metadata.importedMultiRun).toBeUndefined();
+  });
+
+  it('POST /api/evals/import drops and marks a malformed _multiRun, and history still serves', async () => {
+    const { app } = createTestServer(undefined, { redact: true });
+    const base = {
+      workflow: 'wf',
+      dataset: 'ds',
+      metadata: {},
+      timestamp: new Date().toISOString(),
+      totalCost: 0,
+      duration: 1,
+      items: [{ input: 'in', output: 'out', scores: {} }],
+      summary: { count: 1, failures: 0, scorers: {} },
+    };
+    const malformed = [
+      { allRuns: [{ id: 'x', note: 'SENTINEL_A' }] },
+      { allRuns: ['SENTINEL_B'] },
+      { allRuns: [{ items: [null, 'SENTINEL_C'] }] },
+      { allRuns: 'SENTINEL_D' },
+      'SENTINEL_E',
+    ];
+    for (const _multiRun of malformed) {
+      const res = await app.request('/api/evals/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ result: { ...base, _multiRun } }),
+      });
+      expect(res.status).toBe(200);
+    }
+
+    const hist = await app.request('/api/evals/history');
+    expect(hist.status).toBe(200);
+    const body = await readJson(hist);
+    expect(body.data.length).toBe(malformed.length);
+    for (const entry of body.data) {
+      expect(entry.data._multiRun).toBeUndefined();
+      expect(entry.data.metadata.importedMultiRun).toBe('invalid');
+      // A refused _multiRun is not an accounting verdict.
+      expect(entry.data.metadata.importedAccounting).toBeUndefined();
+    }
+    expect(JSON.stringify(body)).not.toContain('SENTINEL');
+  });
+
+  it('GET /api/evals/history serves a stored row whose nested shapes are malformed', async () => {
+    // A row written before import validated `_multiRun` (or by any other
+    // writer) must not fail the whole redacted list, nor leak what it can't walk.
+    const { app, runtime } = createTestServer(undefined, { redact: true });
+    await runtime.saveEvalResult({
+      id: 'stored-malformed',
+      eval: 'stored',
+      timestamp: Date.now(),
+      data: {
+        id: 'stored-malformed',
+        workflow: 'wf',
+        dataset: 'ds',
+        metadata: {},
+        timestamp: new Date().toISOString(),
+        totalCost: 0,
+        duration: 1,
+        items: [null, 'SENTINEL_TOP_ITEM', { input: 'SENTINEL_INPUT', scores: {} }],
+        summary: { count: 3, failures: 0, scorers: {} },
+        _multiRun: { allRuns: [{ id: 'no-items', note: 'SENTINEL_RUN' }, 'SENTINEL_STRING_RUN'] },
+      } as never,
+    });
+
+    const hist = await app.request('/api/evals/history');
+    expect(hist.status).toBe(200);
+    const body = await readJson(hist);
+    const served = body.data[0].data;
+    expect(served.items).toEqual([
+      '[redacted]',
+      '[redacted]',
+      expect.objectContaining({ input: '[redacted]' }),
+    ]);
+    expect(served._multiRun.allRuns).toEqual(['[redacted]', '[redacted]']);
+    expect(JSON.stringify(body)).not.toContain('SENTINEL');
   });
 
   // --- Compare endpoint (ID-based) ---
@@ -873,6 +950,9 @@ describe('Studio API: Evals', () => {
       // "never had one".
       expect(entry.summary.itemErrorRate).toBeUndefined();
       expect(entry.metadata.importedItemErrorRate).toBe('invalid');
+      // A refused verdict is not refused accounting: the cost certification
+      // must not be downgraded alongside it.
+      expect(entry.metadata.importedAccounting).toBeUndefined();
     });
   });
 

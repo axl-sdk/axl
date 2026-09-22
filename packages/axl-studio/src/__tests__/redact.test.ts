@@ -882,6 +882,89 @@ describe('redactEvalResult', () => {
     expect(JSON.stringify(out)).not.toContain('SENTINEL');
   });
 
+  describe('malformed stored shapes (never throw, never forward)', () => {
+    // History rows are whatever import or an older writer stored. The redacted
+    // read must neither fail the whole list nor pass an unreadable part through:
+    // like `redactRecordLine`, anything it cannot walk is replaced.
+    const withMultiRun = (multiRun: unknown) =>
+      ({ ...makeResult(), _multiRun: multiRun }) as unknown as EvalResult;
+    const served = (result: EvalResult) => {
+      let out: EvalResult | undefined;
+      expect(() => {
+        out = redactEvalResult(result, true);
+      }).not.toThrow();
+      expect(JSON.stringify(out)).not.toContain('SENTINEL');
+      return out as unknown as { items: unknown[]; _multiRun?: { allRuns?: unknown } };
+    };
+
+    it('replaces a nested run that has no items array', () => {
+      const out = served(
+        withMultiRun({
+          allRuns: [
+            { id: 'x', note: 'SENTINEL_NO_ITEMS' },
+            'SENTINEL_STRING_RUN',
+            null,
+            { items: { 0: 'SENTINEL_ITEMS_OBJECT' } },
+          ],
+        }),
+      );
+      expect(out._multiRun?.allRuns).toEqual([
+        '[redacted]',
+        '[redacted]',
+        '[redacted]',
+        '[redacted]',
+      ]);
+    });
+
+    it('replaces allRuns that is not an array, and a _multiRun that is not an object', () => {
+      expect(served(withMultiRun({ allRuns: 'SENTINEL_ALLRUNS' }))._multiRun?.allRuns).toBe(
+        '[redacted]',
+      );
+      expect(served(withMultiRun('SENTINEL_MULTIRUN'))._multiRun).toBe('[redacted]');
+    });
+
+    it('replaces an item that is not an object, at top level and nested', () => {
+      const out = served(
+        withMultiRun({
+          allRuns: [{ ...makeResult(), items: [null, 'SENTINEL_NESTED_ITEM', makeItem()] }],
+        }),
+      );
+      const nested = (out._multiRun?.allRuns as Array<{ items: unknown[] }>)[0].items;
+      expect(nested.slice(0, 2)).toEqual(['[redacted]', '[redacted]']);
+      expect((nested[2] as { input: unknown }).input).toBe('[redacted]');
+
+      const top = served(makeResult([null, 'SENTINEL_TOP_ITEM', 42]));
+      expect(top.items).toEqual(['[redacted]', '[redacted]', '[redacted]']);
+    });
+
+    it('replaces a top-level items value that is not an array', () => {
+      const result = { ...makeResult(), items: 'SENTINEL_ITEMS' } as unknown as EvalResult;
+      expect(served(result).items).toBe('[redacted]');
+    });
+
+    it('replaces malformed per-item scorerErrors, callerReport and scoreDetails entries', () => {
+      const out = served(
+        makeResult([
+          makeItem({
+            scorerErrors: 'SENTINEL_SCORER_ERRORS',
+            callerReport: null,
+            scoreDetails: {
+              a: null,
+              b: 'SENTINEL_DETAIL',
+              c: { score: 0.5, metadata: 'SENTINEL_META' },
+            },
+          }),
+          makeItem({ scoreDetails: 'SENTINEL_DETAILS' }),
+        ]),
+      );
+      const [first, second] = out.items as Array<Record<string, unknown>>;
+      expect(first.scorerErrors).toBe('[redacted]');
+      expect(first.callerReport).toBe('[redacted]');
+      expect(first.scoreDetails).toEqual({ a: '[redacted]', b: '[redacted]', c: { score: 0.5 } });
+      expect(second.scoreDetails).toBe('[redacted]');
+    });
+  });
+
   it('scrubs scoreDetails[*].metadata but keeps score/duration/cost', () => {
     const result = makeResult([
       makeItem({

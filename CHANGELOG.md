@@ -506,7 +506,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   run's inputs, outputs and error messages raw. Each run is now scrubbed the
   same way as the top-level result, and so is `_multiRun.batchFailure`. The
   history read applies the same rule to an imported artifact that carries
-  `_multiRun`.
+  `_multiRun`. Import drops a `_multiRun` the read cannot walk and marks it
+  `metadata.importedMultiRun: 'invalid'`. Under redaction, a stored item or
+  run with an unexpected shape is replaced with `[redacted]` instead of
+  failing the whole history list.
 
 ## [0.23.3] - 2026-09-09
 

@@ -349,8 +349,48 @@ function projectItemFailure(failure: unknown): EvalItemFailure | undefined {
   };
 }
 
-function redactEvalItem(item: EvalItem): EvalItem {
-  const { failure, ...rest } = item;
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Redact one scorer detail, or replace it when it is not an object. Only the
+ * structural keys survive; `metadata` (LLM scorer reasoning) never does.
+ */
+function redactScorerDetail(detail: unknown): ScorerDetail {
+  if (!isPlainObject(detail)) return REDACTED as unknown as ScorerDetail;
+  const d = detail as ScorerDetail;
+  return {
+    score: d.score,
+    ...(d.duration !== undefined ? { duration: d.duration } : {}),
+    ...(d.cost !== undefined ? { cost: d.cost } : {}),
+    // `skipped` is a structural boolean (the `applies` predicate verdict),
+    // not user/LLM content — preserve it so the client's N/A chip renders.
+    ...(d.skipped !== undefined ? { skipped: d.skipped } : {}),
+    // `outcome` and `accounting` are structural (a classification and a set
+    // of counts), so they survive redaction the way `skipped` does — without
+    // them a compliance-mode reader cannot tell a judge that was stopped on
+    // budget from one that scored 0.
+    ...(d.outcome !== undefined ? { outcome: d.outcome } : {}),
+    ...(d.accounting !== undefined ? { accounting: d.accounting } : {}),
+    // `diagnostics` survives for the same reason `accounting` does: it is a
+    // list of operation ids and statuses, not content.
+    ...(d.diagnostics !== undefined ? { diagnostics: d.diagnostics } : {}),
+    // metadata deliberately omitted — may contain LLM scorer reasoning
+  };
+}
+
+/**
+ * Redact one item. Total by design: a history row is whatever import or an
+ * older writer stored, so a part that does not have the expected shape is
+ * replaced with the sentinel — never forwarded (a leak) and never allowed to
+ * throw (which would fail the whole redacted history list). Same stance as
+ * `redactRecordLine` on an unparseable line.
+ */
+function redactEvalItem(item: unknown): EvalItem {
+  if (!isPlainObject(item)) return REDACTED as unknown as EvalItem;
+  const { failure, ...rest } = item as EvalItem;
+  const typed = item as EvalItem;
   const projectedFailure = failure !== undefined ? projectItemFailure(failure) : undefined;
   const scrubbed: EvalItem = {
     ...rest,
@@ -361,48 +401,47 @@ function redactEvalItem(item: EvalItem): EvalItem {
     // IDs, kinds, turn/attempt indexes and a status — pointers into an artifact,
     // never content. The records themselves are redacted by the core rule at
     // both write time and delivery time (`redactRecordLine`).
-    ...(item.metadata !== undefined ? { metadata: redactItemMetadata(item.metadata) } : {}),
-    ...(item.annotations !== undefined ? { annotations: REDACTED } : {}),
-    ...(item.error !== undefined ? { error: REDACTED } : {}),
-    ...(item.scorerErrors !== undefined
-      ? { scorerErrors: item.scorerErrors.map(() => REDACTED) }
+    ...(typed.metadata !== undefined
+      ? {
+          metadata: isPlainObject(typed.metadata)
+            ? redactItemMetadata(typed.metadata)
+            : (REDACTED as unknown as Record<string, unknown>),
+        }
+      : {}),
+    ...(typed.annotations !== undefined ? { annotations: REDACTED } : {}),
+    ...(typed.error !== undefined ? { error: REDACTED } : {}),
+    ...(typed.scorerErrors !== undefined
+      ? {
+          scorerErrors: Array.isArray(typed.scorerErrors)
+            ? typed.scorerErrors.map(() => REDACTED)
+            : (REDACTED as unknown as string[]),
+        }
       : {}),
     // `callerReport.metadata` is whatever the workflow callback returned — free-
     // form user content, exactly like `output`, so it is dropped rather than
     // masked (same treatment as scorer metadata below). Its sibling `cost` is a
     // plain number and stays. (`outcome` and `accounting` are spread through
     // untouched: both are structural counts and classifications, no content.)
-    ...(item.callerReport !== undefined
+    ...(typed.callerReport !== undefined
       ? {
-          callerReport: {
-            ...(item.callerReport.cost !== undefined ? { cost: item.callerReport.cost } : {}),
-          },
+          callerReport: isPlainObject(typed.callerReport)
+            ? typeof typed.callerReport.cost === 'number'
+              ? { cost: typed.callerReport.cost }
+              : {}
+            : (REDACTED as unknown as EvalItem['callerReport']),
         }
       : {}),
   };
-  if (item.scoreDetails) {
-    const detailsOut: Record<string, ScorerDetail> = {};
-    for (const [name, detail] of Object.entries(item.scoreDetails)) {
-      detailsOut[name] = {
-        score: detail.score,
-        ...(detail.duration !== undefined ? { duration: detail.duration } : {}),
-        ...(detail.cost !== undefined ? { cost: detail.cost } : {}),
-        // `skipped` is a structural boolean (the `applies` predicate verdict),
-        // not user/LLM content — preserve it so the client's N/A chip renders.
-        ...(detail.skipped !== undefined ? { skipped: detail.skipped } : {}),
-        // `outcome` and `accounting` are structural (a classification and a set
-        // of counts), so they survive redaction the way `skipped` does — without
-        // them a compliance-mode reader cannot tell a judge that was stopped on
-        // budget from one that scored 0.
-        ...(detail.outcome !== undefined ? { outcome: detail.outcome } : {}),
-        ...(detail.accounting !== undefined ? { accounting: detail.accounting } : {}),
-        // `diagnostics` survives for the same reason `accounting` does: it is a
-        // list of operation ids and statuses, not content.
-        ...(detail.diagnostics !== undefined ? { diagnostics: detail.diagnostics } : {}),
-        // metadata deliberately omitted — may contain LLM scorer reasoning
-      };
+  if (typed.scoreDetails !== undefined) {
+    if (isPlainObject(typed.scoreDetails)) {
+      const detailsOut: Record<string, ScorerDetail> = {};
+      for (const [name, detail] of Object.entries(typed.scoreDetails)) {
+        detailsOut[name] = redactScorerDetail(detail);
+      }
+      scrubbed.scoreDetails = detailsOut;
+    } else {
+      scrubbed.scoreDetails = REDACTED as unknown as Record<string, ScorerDetail>;
     }
-    scrubbed.scoreDetails = detailsOut;
   }
   return scrubbed;
 }
@@ -428,28 +467,49 @@ function redactEvalItem(item: EvalItem): EvalItem {
  */
 export function redactEvalResult(result: EvalResult, redact: boolean): EvalResult {
   if (!redact) return result;
+  return redactResultShape(result);
+}
+
+/**
+ * The redacting walk behind `redactEvalResult`, total over whatever was stored:
+ * `items` that is not an array, and `_multiRun` / `allRuns` / a nested run that
+ * does not have the expected shape, are replaced with the sentinel.
+ */
+function redactResultShape(result: EvalResult): EvalResult {
   const meta = result.metadata as Record<string, unknown> | undefined;
   const scrubbedMetadata =
-    meta && typeof meta.batchFailure === 'string'
+    isPlainObject(meta) && typeof meta.batchFailure === 'string'
       ? { ...meta, batchFailure: REDACTED }
       : result.metadata;
+  const hasMultiRun = '_multiRun' in result;
   const multiRun = (result as { _multiRun?: unknown })._multiRun;
   return {
     ...result,
     metadata: scrubbedMetadata,
-    items: result.items.map(redactEvalItem),
-    ...(multiRun && typeof multiRun === 'object'
-      ? { _multiRun: redactMultiRun(multiRun as Record<string, unknown>) }
+    items: Array.isArray(result.items)
+      ? result.items.map(redactEvalItem)
+      : (REDACTED as unknown as EvalItem[]),
+    ...(hasMultiRun && multiRun !== undefined
+      ? {
+          _multiRun: isPlainObject(multiRun) ? redactMultiRun(multiRun) : REDACTED,
+        }
       : {}),
   };
 }
 
 function redactMultiRun(multiRun: Record<string, unknown>): Record<string, unknown> {
+  const { allRuns } = multiRun;
   return {
     ...multiRun,
-    ...(Array.isArray(multiRun.allRuns)
+    ...(allRuns !== undefined
       ? {
-          allRuns: (multiRun.allRuns as EvalResult[]).map((run) => redactEvalResult(run, true)),
+          allRuns: Array.isArray(allRuns)
+            ? allRuns.map((run) =>
+                isPlainObject(run) && Array.isArray(run.items)
+                  ? redactResultShape(run as unknown as EvalResult)
+                  : REDACTED,
+              )
+            : REDACTED,
         }
       : {}),
     ...(typeof multiRun.batchFailure === 'string' ? { batchFailure: REDACTED } : {}),

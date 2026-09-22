@@ -601,6 +601,14 @@ in [0, 1]. A record that fails is dropped and marked
 untouched. The multi-run view promotes the worst run's record and counts
 exceeded runs, so a forged record would otherwise pose as the worst run.
 
+A `_multiRun` block (a saved sync multi-run response) must be a walkable shape:
+if `allRuns` is present, it must be an array of objects, each with an `items`
+array of objects. A block that fails is dropped and marked
+`metadata.importedMultiRun: 'invalid'`; the top-level result still imports.
+Separately, the redacted history read handles any stored shape without
+failing: a part it cannot walk (a non-object item, a run without `items`) is
+replaced with `[redacted]` rather than served or allowed to fail the list.
+
 ## Observability-boundary redaction
 
 When the runtime is constructed with `config.trace.redact: true`, Studio scrubs user/LLM content at three layers — trace events at emission, REST route responses at serialization, and WebSocket broadcasts at send time — while preserving structural metadata (IDs, keys, agent/tool/workflow names, roles, cost/token/duration metrics, timestamps).

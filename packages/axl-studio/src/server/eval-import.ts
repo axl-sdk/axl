@@ -148,6 +148,30 @@ export function isValidImportedItemErrorRate(value: unknown): boolean {
   return exceeded === (attempted > 0 && rate > limit);
 }
 
+/**
+ * Is this `_multiRun` (a saved sync multi-run response) walkable?
+ *
+ * Studio never writes `_multiRun` to history; only an imported artifact
+ * carries it, and the redacted history read walks every run in `allRuns`.
+ * This checks exactly that walk: a plain object whose `allRuns`, when
+ * present, is an array of plain objects each holding an `items` array of
+ * plain objects. `aggregate` and the partial-batch markers are not checked —
+ * nothing reads them as content.
+ */
+export function isValidImportedMultiRun(value: unknown): boolean {
+  if (!isPlainRecord(value)) return false;
+  const { allRuns } = value;
+  if (allRuns === undefined) return true;
+  if (!Array.isArray(allRuns)) return false;
+  return allRuns.every(
+    (run) => isPlainRecord(run) && Array.isArray(run.items) && run.items.every(isPlainRecord),
+  );
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 function sumOf(record: unknown): number | undefined {
   if (record === undefined) return 0;
   if (record === null || typeof record !== 'object' || Array.isArray(record)) return undefined;

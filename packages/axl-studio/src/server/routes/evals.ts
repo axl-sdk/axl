@@ -14,6 +14,7 @@ import {
   importedAccountingIsTrustworthy,
   isValidImportedCoverage,
   isValidImportedItemErrorRate,
+  isValidImportedMultiRun,
   stripAccounting,
 } from '../eval-import.js';
 
@@ -938,6 +939,16 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
       ) {
         delete entry.summary.itemErrorRate;
         entry.metadata.importedItemErrorRate = 'invalid';
+      }
+
+      // `_multiRun` (a saved sync multi-run response) is walked run by run on
+      // every redacted history read. A shape that walk cannot follow is dropped
+      // and marked on its own key, like `itemErrorRate`. The top-level result
+      // still imports; only the nested block it cannot vouch for is refused.
+      const multiRun = (entry as { _multiRun?: unknown })._multiRun;
+      if (multiRun !== undefined && !isValidImportedMultiRun(multiRun)) {
+        delete (entry as { _multiRun?: unknown })._multiRun;
+        entry.metadata.importedMultiRun = 'invalid';
       }
 
       // Re-stage the sidecar under the NEW history id and rewrite the result's

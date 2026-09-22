@@ -806,6 +806,76 @@ describe('Studio API: Evals', () => {
 
   // --- Import endpoint ---
 
+  describe('POST /api/evals/import — summary.itemErrorRate', () => {
+    async function importWithRate(itemErrorRate: unknown) {
+      const { app } = createTestServer();
+      const result = {
+        workflow: 'wf',
+        dataset: 'ds',
+        metadata: {},
+        timestamp: new Date().toISOString(),
+        totalCost: 0,
+        duration: 1,
+        items: [{ input: 'in', output: 'out', scores: {} }],
+        summary: { count: 4, failures: 1, scorers: {}, itemErrorRate },
+      };
+      const res = await app.request('/api/evals/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ result }),
+      });
+      expect(res.status).toBe(200);
+      const hist = await readJson(await app.request('/api/evals/history'));
+      return hist.data[0].data;
+    }
+
+    it('keeps a consistent record unmarked', async () => {
+      const rate = { failed: 1, attempted: 4, rate: 0.25, limit: 0.05, exceeded: true };
+      const entry = await importWithRate(rate);
+      expect(entry.summary.itemErrorRate).toEqual(rate);
+      expect(entry.metadata.importedItemErrorRate).toBeUndefined();
+    });
+
+    it('keeps a zero-attempt record, which is never exceeded', async () => {
+      const rate = { failed: 0, attempted: 0, rate: 0, limit: 0, exceeded: false };
+      const entry = await importWithRate(rate);
+      expect(entry.summary.itemErrorRate).toEqual(rate);
+    });
+
+    it.each([
+      ['a non-numeric rate', { failed: 1, attempted: 4, rate: 'x', limit: 0.05, exceeded: true }],
+      [
+        'a fractional count',
+        { failed: 1.5, attempted: 4, rate: 0.375, limit: 0.05, exceeded: true },
+      ],
+      [
+        'more failures than attempts',
+        { failed: 5, attempted: 4, rate: 1.25, limit: 0.05, exceeded: true },
+      ],
+      [
+        'a limit outside [0, 1]',
+        { failed: 1, attempted: 4, rate: 0.25, limit: 2, exceeded: false },
+      ],
+      [
+        'a rate that disagrees with its counts',
+        { failed: 1, attempted: 4, rate: 0, limit: 0.05, exceeded: false },
+      ],
+      [
+        'an exceeded flag that disagrees with the rate',
+        { failed: 0, attempted: 4, rate: 0, limit: 0.05, exceeded: true },
+      ],
+      ['a missing exceeded flag', { failed: 1, attempted: 4, rate: 0.25, limit: 0.05 }],
+      ['a non-object', 'SENTINEL'],
+    ])('drops and marks %s', async (_label, rate) => {
+      const entry = await importWithRate(rate);
+      // Dropped so a forged verdict cannot inflate the multi-run runsExceeded
+      // or pose as the worst run; marked so a reader can tell "refused" from
+      // "never had one".
+      expect(entry.summary.itemErrorRate).toBeUndefined();
+      expect(entry.metadata.importedItemErrorRate).toBe('invalid');
+    });
+  });
+
   it('POST /api/evals/import stores a CLI artifact in history', async () => {
     const { app } = createTestServer();
 

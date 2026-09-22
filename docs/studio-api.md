@@ -592,6 +592,15 @@ survive. Import **never rejects** a result over its accounting; the outcome is
 recorded on `metadata.importedAccounting` as `'declared'` or `'invalid'` so it
 is visible rather than inferred.
 
+`summary.itemErrorRate` is checked separately, because it is a verdict rather
+than accounting. The record must satisfy the identities `@axlsdk/eval` writes:
+`rate = failed / attempted` (0 when nothing was attempted),
+`exceeded = attempted > 0 && rate > limit`, `failed <= attempted`, and `limit`
+in [0, 1]. A record that fails is dropped and marked
+`metadata.importedItemErrorRate: 'invalid'`, leaving `importedAccounting`
+untouched. The multi-run view promotes the worst run's record and counts
+exceeded runs, so a forged record would otherwise pose as the worst run.
+
 ## Observability-boundary redaction
 
 When the runtime is constructed with `config.trace.redact: true`, Studio scrubs user/LLM content at three layers — trace events at emission, REST route responses at serialization, and WebSocket broadcasts at send time — while preserving structural metadata (IDs, keys, agent/tool/workflow names, roles, cost/token/duration metrics, timestamps).

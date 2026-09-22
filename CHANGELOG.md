@@ -245,10 +245,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged. `rescore` carries it through, and the type is exported as
   `EvalItemFailure`. Studio's Eval Runner item detail shows the cause beside
   the message (provider, `HTTP <status>` or `network`, retryable, request id;
-  the name alone for a non-provider error), and `failure` survives
-  `trace.redact` because it carries no content. A multi-run Studio result's
-  `summary.itemErrorRate` is the **worst** run's record (not run 1's) plus
-  `runsExceeded`, the number of runs over their limit.
+  the name alone for a non-provider error). Under `trace.redact`, `failure` is
+  projected to those five keys and any other key is dropped. A multi-run
+  Studio result's `summary.itemErrorRate` is the **worst** run's record (not
+  run 1's) plus `runsExceeded`, the number of runs over their limit.
+  `POST /api/evals/import` drops a `summary.itemErrorRate` that is
+  inconsistent with its own counts and marks it
+  `metadata.importedItemErrorRate: 'invalid'`.
 
 ### Changed
 

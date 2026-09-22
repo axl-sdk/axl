@@ -13,6 +13,7 @@ import {
 import {
   importedAccountingIsTrustworthy,
   isValidImportedCoverage,
+  isValidImportedItemErrorRate,
   stripAccounting,
 } from '../eval-import.js';
 
@@ -925,6 +926,18 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
         // strength of a record that just failed validation.
         entry.summary = stripped.summary;
         entry.metadata.importedAccounting = 'invalid';
+      }
+
+      // `summary.itemErrorRate` is a verdict the multi-run view promotes (worst
+      // run, runs exceeded), and unlike coverage it is not accounting, so a
+      // malformed one is dropped and marked on its own key rather than
+      // downgrading `importedAccounting`.
+      if (
+        entry.summary?.itemErrorRate !== undefined &&
+        !isValidImportedItemErrorRate(entry.summary.itemErrorRate)
+      ) {
+        delete entry.summary.itemErrorRate;
+        entry.metadata.importedItemErrorRate = 'invalid';
       }
 
       // Re-stage the sidecar under the NEW history id and rewrite the result's

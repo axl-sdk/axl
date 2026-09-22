@@ -125,6 +125,29 @@ export function isValidImportedCoverage(value: unknown): boolean {
   return true;
 }
 
+/**
+ * Is this a structurally consistent `ItemErrorRate` (`summary.itemErrorRate`)?
+ *
+ * The record is a verdict, and Studio's multi-run view promotes the worst run's
+ * record and counts the runs that `exceeded`, so a forged one would pose as the
+ * worst run or inflate that count. It is re-derivable from its own counts, so
+ * this checks the identities `@axlsdk/eval`'s `evaluateItemErrorRate` writes:
+ * `rate = failed / attempted` (0 when nothing was attempted) and
+ * `exceeded = attempted > 0 && rate > limit`, with `failed <= attempted` and
+ * `limit` in [0, 1]. Extra keys (the client-only `runsExceeded`) are ignored.
+ */
+export function isValidImportedItemErrorRate(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const r = value as Record<string, unknown>;
+  const { failed, attempted, rate, limit, exceeded } = r;
+  if (!isCount(failed) || !isCount(attempted) || failed > attempted) return false;
+  if (!isFiniteNonNegative(limit) || limit > 1) return false;
+  if (typeof rate !== 'number' || typeof exceeded !== 'boolean') return false;
+  const expectedRate = attempted > 0 ? failed / attempted : 0;
+  if (Math.abs(rate - expectedRate) > EPSILON) return false;
+  return exceeded === (attempted > 0 && rate > limit);
+}
+
 function sumOf(record: unknown): number | undefined {
   if (record === undefined) return 0;
   if (record === null || typeof record !== 'object' || Array.isArray(record)) return undefined;

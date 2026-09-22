@@ -8,6 +8,7 @@ import type { Accounting } from '@axlsdk/axl';
 
 import type { EvalAccounting, EvalResult, ModelTimingStats } from './types.js';
 import { isBudgetStopped, readAccounting } from './accounting.js';
+import { formatPercent } from './utils.js';
 
 /**
  * Render known spend and say so when it is only a lower bound.
@@ -54,7 +55,30 @@ export function formatCoverageLine(result: EvalResult): string | undefined {
     .filter(([, n]) => n > 0)
     .map(([label, n]) => `${n} ${label}`);
   if (parts.length === 0) return undefined;
-  return `  Items: ${items.completed} completed, ${parts.join(', ')}`;
+  const rate = result.summary.itemErrorRate;
+  // The rate is informational even when the gate is off (limit 1) or not
+  // tripped, so a reader sees how thin the run was without re-deriving it.
+  const rateSuffix = rate
+    ? ` — item error rate ${formatPercent(rate.rate)} (limit ${formatPercent(rate.limit)})`
+    : '';
+  return `  Items: ${items.completed} completed, ${parts.join(', ')}${rateSuffix}`;
+}
+
+/**
+ * The item-coverage gate's failure line, or `null` when it did not trip.
+ *
+ * Distinct from a budget stop and from a total wipeout: this run DID produce
+ * scores, but over too few of its items to be trusted as a baseline.
+ */
+export function itemErrorRateMessage(result: EvalResult, label: string): string | null {
+  const rate = result.summary.itemErrorRate;
+  if (!rate?.exceeded) return null;
+  return (
+    `[axl-eval] ITEM ERROR RATE EXCEEDED: ${label} — ${rate.failed} of ${rate.attempted} attempted ` +
+    `item(s) failed in the workflow (item error rate ${formatPercent(rate.rate)}), over the ` +
+    `${formatPercent(rate.limit)} limit; the scores cover only the surviving items. ` +
+    `Raise failOnItemErrorRate or pass --max-item-error-rate <0..1> to accept it (1 disables the gate).`
+  );
 }
 
 /**

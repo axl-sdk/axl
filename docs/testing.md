@@ -480,6 +480,26 @@ Cases that never started are `budget_skipped` and cases stopped mid-flight are
 `budget_interrupted` — neither is a workflow failure, and `summary.coverage` is the field
 to gate CI on (`summary.failures` keeps its older, broader "produced no output" meaning).
 
+### A thinned run does not pass
+
+Items whose **workflow** threw are `failed`. By default a run fails when more than 5% of its
+attempted items failed — `failed / (count − cancelled − budget_skipped − budget_interrupted)`,
+strictly greater than the limit — because its scores cover only the survivors. `runEval`
+records the verdict and returns normally; the CLI exits non-zero, and `axl-eval compare`
+refuses to certify a thinned side (legacy artifacts included).
+
+```ts
+const result = await runEval({ ...config, failOnItemErrorRate: 0.1 }, executeWorkflow, runtime);
+
+result.summary.itemErrorRate;
+// { failed: 12, attempted: 100, rate: 0.12, limit: 0.1, exceeded: true }
+// absent when no item failed; `1` disables the gate; an invalid value throws
+```
+
+To test the gate, have the workflow throw for chosen items — a `ProviderError` with
+`status: 429` reproduces a rate-limit storm without a provider. From the CLI,
+`--max-item-error-rate <0..1>` overrides the config for one invocation.
+
 ### Seeing the request behind a score
 
 When a score is wrong, the question is what the model was actually asked. Traces

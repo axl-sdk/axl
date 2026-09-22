@@ -16,6 +16,7 @@ export const KNOWN_FLAGS = new Set([
   '--concurrency',
   '--scorers',
   '--budget',
+  '--max-item-error-rate',
 ]);
 
 /**
@@ -34,6 +35,7 @@ export const VALUE_FLAGS = new Set([
   '--concurrency',
   '--scorers',
   '--budget',
+  '--max-item-error-rate',
 ]);
 
 export type ParsedEvalArgs = {
@@ -58,6 +60,11 @@ export type ParsedEvalArgs = {
    * work — duplicating the parse here would let the two disagree.
    */
   budget?: string;
+  /**
+   * `--max-item-error-rate <0..1>`: overrides the eval file's
+   * `failOnItemErrorRate` (default `0.05`); `1` disables the gate.
+   */
+  maxItemErrorRate?: number;
   paths: string[];
 };
 
@@ -74,6 +81,21 @@ export function envInt(name: string): number | undefined {
   return n;
 }
 
+/**
+ * Parse an error-rate flag value strictly, exiting non-zero on anything that is
+ * not a clean decimal in `[0, 1]`. `parseFloat('0.5abc')` is `0.5` and
+ * `parseFloat('5')` is a 500% limit — either would silently change what a gate
+ * enforces, so neither is accepted.
+ */
+export function parseErrorRateFlag(flag: string, raw: string): number {
+  const n = /^\d*\.?\d+$/.test(raw.trim()) ? Number(raw) : NaN;
+  if (!Number.isFinite(n) || n < 0 || n > 1) {
+    console.error(`Error: ${flag} must be a number in [0, 1], got "${raw}"`);
+    process.exit(1);
+  }
+  return n;
+}
+
 export function parseEvalArgs(args: string[]): ParsedEvalArgs {
   let outputPath: string | undefined;
   let configArg: string | undefined;
@@ -84,6 +106,7 @@ export function parseEvalArgs(args: string[]): ParsedEvalArgs {
   let concurrency: number | undefined;
   let scorerNames: string[] | undefined;
   let budget: string | undefined;
+  let maxItemErrorRate: number | undefined;
   const paths: string[] = [];
 
   for (let i = 0; i < args.length; i++) {
@@ -112,6 +135,8 @@ export function parseEvalArgs(args: string[]): ParsedEvalArgs {
         }
       } else if (arg === '--budget') {
         budget = value;
+      } else if (arg === '--max-item-error-rate') {
+        maxItemErrorRate = parseErrorRateFlag(arg, value);
       } else if (arg === '--scorers') {
         scorerNames = [
           ...new Set(
@@ -155,6 +180,7 @@ export function parseEvalArgs(args: string[]): ParsedEvalArgs {
     concurrency,
     scorerNames,
     budget,
+    maxItemErrorRate,
     paths,
   };
 }

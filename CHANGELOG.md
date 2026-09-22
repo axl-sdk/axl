@@ -234,6 +234,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking (exit codes): `axl-eval` now fails a run that lost more than 5% of
+  its items.** `EvalConfig.failOnItemErrorRate` defaults to `0.05`. A run whose
+  `failed / (count − cancelled − budget_skipped − budget_interrupted)` is
+  strictly above the limit exits non-zero with `ITEM ERROR RATE EXCEEDED`.
+  Previously a run that lost 250 of 339 items exited 0 and was scored over the
+  survivors. **To opt out**, set `failOnItemErrorRate: 1` in the eval file or pass
+  `--max-item-error-rate 1`. Any other value in `[0, 1]` sets the limit, and the
+  flag overrides the config. `runEval` records the verdict on the new
+  `summary.itemErrorRate` (present only when an item failed, so clean artifacts
+  are unchanged) and never throws on it. An invalid limit **throws**
+  `AxlError('INVALID_ITEM_ERROR_RATE')` before the dataset loads. Under `--runs N`
+  each run is gated individually, the failing run is named, and the result
+  artifact is still written. `rescore` does not apply the gate and rejects the
+  flag.
+- **Breaking (exit codes): `axl-eval compare` refuses to certify a thinned
+  side by default.** Each compared run's item error rate is checked against
+  `0.05`, and the refusal names coverage, the side, and the run. This includes
+  pre-0.24 artifacts, whose rate is derived from their items, and rescored
+  artifacts. `--max-item-error-rate <0..1>` overrides the limit (`1` disables
+  it). A side that lost items within the limit still gets a warning. The pure
+  decision is exported as `evaluateItemErrorRateGate(baseline, candidate,
+  limit?)` beside `evaluateScorerErrorRateGate`.
 - **A 429 from OpenAI or Anthropic now waits and retries instead of failing
   fast, and a spend cap fails immediately.** On first-party OpenAI (`openai:`,
   `openai-responses:`) and Anthropic (`anthropic:`), the transport reads the

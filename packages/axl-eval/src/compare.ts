@@ -4,10 +4,20 @@ import type {
   EvalCompareOptions,
   EvalRegression,
   EvalImprovement,
+  ItemErrorRate,
 } from './types.js';
 import { pairedBootstrapCI } from './bootstrap.js';
-import { scorerCounts, evaluateScorerTolerance, round } from './utils.js';
+import {
+  scorerCounts,
+  evaluateScorerTolerance,
+  evaluateItemErrorRate,
+  isErrorRateLimit,
+  round,
+  formatPercent,
+  DEFAULT_ITEM_ERROR_RATE_LIMIT,
+} from './utils.js';
 import { readAccounting } from './accounting.js';
+import { buildCoverage } from './runner.js';
 
 /**
  * Decide whether two sides' costs are comparable AS SPEND. Returns `null` to
@@ -542,4 +552,99 @@ export function evaluateScorerErrorRateGate(
     }
   }
   return null;
+}
+
+/** One compared run's item error rate — see {@link compareItemErrorRates}. */
+export type SideItemErrorRate = {
+  side: 'baseline' | 'candidate';
+  /** 0-based position within the side's truncated pool. */
+  runIndex: number;
+  runId: string;
+  /** `true` when the rate was derived from the items of a pre-0.24 artifact. */
+  legacy: boolean;
+} & ItemErrorRate;
+
+/**
+ * Every compared run's item error rate against `maxItemErrorRate`, over the
+ * same truncated pool `evalCompare` compares (the first `min(baseline,
+ * candidate)` runs of each side). Each run is evaluated INDIVIDUALLY: pooling
+ * would let clean runs dilute one thinned run below the limit.
+ *
+ * Uses the same rule as `runEval`'s produce-time gate
+ * ({@link evaluateItemErrorRate}). A pre-0.24 artifact without
+ * `summary.coverage` is evaluated on a rate derived from its items with the
+ * legacy rule (`outcome ?? (error ? 'failed' : 'completed')`) — never skipped,
+ * which would certify exactly the thinned legacy runs this floor exists to
+ * catch. A rescore artifact carries its source's item outcomes, so it is
+ * evaluated on them.
+ */
+export function compareItemErrorRates(
+  baseline: EvalResult | EvalResult[],
+  candidate: EvalResult | EvalResult[],
+  maxItemErrorRate: number = DEFAULT_ITEM_ERROR_RATE_LIMIT,
+): SideItemErrorRate[] {
+  if (!isErrorRateLimit(maxItemErrorRate)) {
+    throw new Error(
+      `Invalid maxItemErrorRate (${String(maxItemErrorRate)}): expected a number in [0, 1].`,
+    );
+  }
+  const baselineRuns = Array.isArray(baseline) ? baseline : [baseline];
+  const candidateRuns = Array.isArray(candidate) ? candidate : [candidate];
+  const runCount = Math.min(baselineRuns.length, candidateRuns.length);
+  const rates: SideItemErrorRate[] = [];
+  for (const [side, runs] of [
+    ['baseline', baselineRuns],
+    ['candidate', candidateRuns],
+  ] as const) {
+    for (let r = 0; r < runCount; r++) {
+      const run = runs[r];
+      const coverage = run.summary.coverage?.items;
+      const legacy = coverage === undefined;
+      const verdict = legacy
+        ? evaluateItemErrorRate(
+            buildCoverage(run.items, []).items,
+            run.items.length,
+            maxItemErrorRate,
+          )
+        : evaluateItemErrorRate(coverage, run.summary.count, maxItemErrorRate);
+      rates.push({ side, runIndex: r, runId: run.id, legacy, ...verdict });
+    }
+  }
+  return rates;
+}
+
+/** Human-readable description of one run's item error rate, for CLI lines. */
+export function describeItemErrorRate(rate: SideItemErrorRate, multiRun: boolean): string {
+  const which = multiRun ? ` run ${rate.runIndex + 1} (${rate.runId})` : ` (${rate.runId})`;
+  const legacy = rate.legacy ? ', derived from the items of a pre-0.24 artifact' : '';
+  return (
+    `${rate.side}${which} item error rate ${formatPercent(rate.rate)} ` +
+    `(${rate.failed}/${rate.attempted} attempted items failed${legacy})`
+  );
+}
+
+/**
+ * Decide whether a comparison must be REFUSED because a side lost too many
+ * items (`axl-eval compare`, default-on at `0.05`, overridden by
+ * `--max-item-error-rate`; `1` disables it). Pure and testable — returns a
+ * human-readable refusal reason naming coverage and the side, or `null` to
+ * allow. See {@link compareItemErrorRates} for the per-run rule.
+ *
+ * Throws on an invalid limit: the gate is default-on, so a bad value must not
+ * quietly disable it.
+ */
+export function evaluateItemErrorRateGate(
+  baseline: EvalResult | EvalResult[],
+  candidate: EvalResult | EvalResult[],
+  maxItemErrorRate: number = DEFAULT_ITEM_ERROR_RATE_LIMIT,
+): string | null {
+  const rates = compareItemErrorRates(baseline, candidate, maxItemErrorRate);
+  const multiRun = rates.some((r) => r.runIndex > 0);
+  const over = rates.find((r) => r.exceeded);
+  if (!over) return null;
+  return (
+    `coverage: ${describeItemErrorRate(over, multiRun)} exceeds the ` +
+    `${formatPercent(maxItemErrorRate)} limit — its scores cover only the surviving items. ` +
+    `Pass --max-item-error-rate <0..1> to accept a thinned side (1 disables the check).`
+  );
 }

@@ -128,7 +128,45 @@ export type EvalConfig = {
    * other at consume/gate time (refuse to certify a thinned baseline/candidate).
    */
   failOnScorerErrorRate?: number;
+  /**
+   * Source-side coverage gate, **on by default** at `0.05`. `runEval` records
+   * `summary.itemErrorRate` whenever an item failed, and marks it `exceeded`
+   * when more than this fraction of the attempted items failed; the CLI then
+   * exits non-zero. It exists because a run that lost most of its items to
+   * throttling or an incident otherwise exits clean and is scored over the
+   * survivors.
+   *
+   * Rate = `coverage.items.failed / (count − cancelled − budget_skipped −
+   * budget_interrupted)`: cancelled and budget-stopped items are reported by
+   * their own gates and never count twice. Fires on strictly `>`, so `1`
+   * disables it (the CLI flag `--max-item-error-rate` overrides this value).
+   * A run with nothing attempted never fires.
+   *
+   * Unlike `failOnScorerErrorRate`, an invalid value (non-number, non-finite,
+   * `< 0` or `> 1`) makes `runEval` THROW `AxlError('INVALID_ITEM_ERROR_RATE')`
+   * before the dataset loads: warning and skipping would silently switch off a
+   * default-on gate.
+   */
+  failOnItemErrorRate?: number;
   metadata?: Record<string, unknown>;
+};
+
+/**
+ * A run's item error rate against its `failOnItemErrorRate` limit, on
+ * `EvalSummary.itemErrorRate`. See {@link EvalConfig.failOnItemErrorRate} for
+ * the definition.
+ */
+export type ItemErrorRate = {
+  /** Items whose workflow threw — `coverage.items.failed`. */
+  failed: number;
+  /** `count − cancelled − budget_skipped − budget_interrupted`. */
+  attempted: number;
+  /** `failed / attempted`; `0` when nothing was attempted. */
+  rate: number;
+  /** The limit in force for this run (config or CLI flag, default `0.05`). */
+  limit: number;
+  /** `rate > limit` with at least one attempted item. */
+  exceeded: boolean;
 };
 
 /**
@@ -451,6 +489,15 @@ export type EvalSummary = {
    * tripped (either not configured or all scorers within tolerance).
    */
   degraded?: DegradedScorer[];
+  /**
+   * The item error rate against the run's `failOnItemErrorRate` limit.
+   * Present exactly when at least one item `failed` (so a clean run's summary
+   * is unchanged); `exceeded` says whether the gate tripped. Like `degraded`,
+   * `runEval` never throws on it — the CLI and consumers decide the exit code.
+   * Absent on rescores (the source run owns item failures) and on pre-0.24
+   * artifacts.
+   */
+  itemErrorRate?: ItemErrorRate;
 };
 
 /**

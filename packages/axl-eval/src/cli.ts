@@ -4,7 +4,13 @@ import { readdirSync, statSync } from 'node:fs';
 import { readFile as readFileAsync, writeFile as writeFileAsync, mkdir } from 'node:fs/promises';
 import * as path from 'node:path';
 import type { AxlRuntime, EvalExecuteWorkflow } from '@axlsdk/axl';
-import { evalCompare, evaluateScorerErrorRateGate } from './compare.js';
+import {
+  compareItemErrorRates,
+  describeItemErrorRate,
+  evalCompare,
+  evaluateItemErrorRateGate,
+  evaluateScorerErrorRateGate,
+} from './compare.js';
 import { runEval } from './runner.js';
 import { rescore } from './rescore.js';
 import { aggregateRuns } from './multi-run.js';
@@ -23,7 +29,7 @@ import {
   CONFIG_CANDIDATES,
 } from './cli-utils.js';
 import { validateEvalConfig } from './cli-validate.js';
-import { parseEvalArgs, envInt } from './cli-args.js';
+import { parseEvalArgs, parseErrorRateFlag, envInt } from './cli-args.js';
 import {
   budgetStopMessage,
   formatBudgetLine,
@@ -31,8 +37,9 @@ import {
   formatKnownSpend,
   formatModelTimingLines,
   isTotalWipeout,
+  itemErrorRateMessage,
 } from './cli-format.js';
-import { scorerCounts } from './utils.js';
+import { formatPercent, scorerCounts } from './utils.js';
 
 /**
  * Refuse to certify a comparison and exit non-zero, with one consistent
@@ -216,20 +223,36 @@ function scorerFilteredScorers(r: EvalResult | EvalResult[]): string[] | undefin
   return Array.isArray(meta.scorersRun) ? (meta.scorersRun as string[]) : [];
 }
 
+/**
+ * Parse compare's `--max-item-error-rate <0..1>`. Unlike the scorer flag this
+ * gate is ON by default (`0.05`), so an absent flag means the default, never
+ * "off"; `1` disables it.
+ */
+function parseMaxItemErrorRate(args: string[]): number | undefined {
+  const idx = args.indexOf('--max-item-error-rate');
+  if (idx === -1) return undefined;
+  if (idx + 1 >= args.length) {
+    console.error('Error: --max-item-error-rate requires a value in [0, 1]');
+    process.exit(1);
+  }
+  return parseErrorRateFlag('--max-item-error-rate', args[idx + 1]);
+}
+
 async function runCompare(args: string[]) {
   const failOnRegression = args.includes('--fail-on-regression');
   const thresholds = parseThresholdArg(args);
   const maxScorerErrorRate = parseMaxScorerErrorRate(args);
+  const maxItemErrorRate = parseMaxItemErrorRate(args);
   // Exclude flags and the values consumed by value-taking flags so neither a
   // threshold nor an error-rate value is mistaken for a result file path.
-  const valueFlags = new Set(['--threshold', '--max-scorer-error-rate']);
+  const valueFlags = new Set(['--threshold', '--max-scorer-error-rate', '--max-item-error-rate']);
   const files = args.filter(
     (a, i) => !a.startsWith('--') && !(i > 0 && valueFlags.has(args[i - 1])),
   );
 
   if (files.length !== 2) {
     console.error(
-      'Usage: axl-eval compare <baseline.json> <candidate.json> [--threshold <value>] [--fail-on-regression] [--max-scorer-error-rate <0..1>]',
+      'Usage: axl-eval compare <baseline.json> <candidate.json> [--threshold <value>] [--fail-on-regression] [--max-scorer-error-rate <0..1>] [--max-item-error-rate <0..1>]',
     );
     process.exit(1);
   }
@@ -392,6 +415,23 @@ async function runCompare(args: string[]) {
     if (reason) refuseToGate(reason);
   }
 
+  // Coverage floor (default-on, F2). A side that lost more than the limit of
+  // its attempted items is scored over survivors, so its means are not a
+  // trustworthy baseline or candidate. Any side that lost items at all is
+  // named, so accepting a thinned side with the flag is never silent.
+  const itemRates = compareItemErrorRates(baseline, candidate, maxItemErrorRate);
+  const multiRunCompare = itemRates.some((r) => r.runIndex > 0);
+  for (const rate of itemRates) {
+    if (rate.failed > 0 && !rate.exceeded) {
+      console.error(
+        `[axl-eval] WARNING: ${describeItemErrorRate(rate, multiRunCompare)}, within the ` +
+          `${formatPercent(rate.limit)} limit; its scores cover only the surviving items.`,
+      );
+    }
+  }
+  const coverageReason = evaluateItemErrorRateGate(baseline, candidate, maxItemErrorRate);
+  if (coverageReason) refuseToGate(coverageReason);
+
   if (failOnRegression && comparison.regressions.length > 0) {
     // When CI is available, only fail on significant regressions
     const hasSignificance = scorerNames.some((n) => comparison.scorers[n].significant != null);
@@ -407,8 +447,16 @@ async function runCompare(args: string[]) {
 }
 
 async function runRescore(args: string[], signal: AbortSignal) {
-  const { outputPath, configArg, conditions, concurrency, scorerNames, budget, paths } =
-    parseEvalArgs(args);
+  const {
+    outputPath,
+    configArg,
+    conditions,
+    concurrency,
+    scorerNames,
+    budget,
+    maxItemErrorRate,
+    paths,
+  } = parseEvalArgs(args);
 
   if (paths.length < 2) {
     console.error('Usage: axl-eval rescore <results.json> <eval-file> [--output <file>]');
@@ -421,6 +469,16 @@ async function runRescore(args: string[], signal: AbortSignal) {
   if (scorerNames?.length) {
     console.error(
       'Error: --scorers is not supported with rescore; pass a scorer subset in the eval file instead.',
+    );
+    process.exit(1);
+  }
+  // Rescore does not re-run the workflow: its failed items are the SOURCE
+  // run's, carried through with their outcomes, so an item gate here would
+  // re-litigate that run. The source run was gated when it was produced, and
+  // `compare` re-applies the floor to the rescored artifact at consume time.
+  if (maxItemErrorRate != null) {
+    console.error(
+      'Error: --max-item-error-rate is not supported with rescore; item failures belong to the source run — gate them with `axl-eval compare`.',
     );
     process.exit(1);
   }
@@ -720,19 +778,6 @@ function reportFullySkippedScorers(result: EvalResult, label: string): void {
 }
 
 /**
- * A run where EVERY item errored in the workflow (0 succeeded) produced no valid
- * output to score — the eval is meaningless and must never pass CI green. This
- * is distinct from (and complementary to) the scorer failure-rate gate: that one
- * is about a flaky/failing *scorer*, this is about a broken *workflow*. The
- * scorer gate deliberately ignores a zero-sample scorer (nothing ran), so without
- * this guard a 100%-workflow-error run exits 0 — a silent-green trap.
- *
- * Non-configurable on purpose: a 0%-success eval is unambiguously broken, so this
- * always fails. (A configurable `failOnItemErrorRate` for PARTIAL workflow-failure
- * gating is a reasonable future opt-in; the per-item failure count is already shown
- * loudly in the table either way.) Returns whether the run was a total wipeout.
- */
-/**
  * Print the budget-stop reason, first and distinctly, and report whether the run
  * was budget-stopped so the caller can exit non-zero for incomplete execution
  * without counting it as a model failure.
@@ -744,7 +789,32 @@ function reportBudgetStop(result: EvalResult, label: string): boolean {
   return true;
 }
 
-/** Print the total-wipeout diagnostic when every item failed in the workflow. */
+/**
+ * Print the item-coverage gate's failure (default-on `failOnItemErrorRate`) and
+ * report whether it tripped. Skipped when the run was a total wipeout: that
+ * diagnostic already names the stronger fact, and one cause gets one line.
+ */
+function reportItemErrorRate(result: EvalResult, label: string, wipeout: boolean): boolean {
+  const message = itemErrorRateMessage(result, label);
+  if (!message) return false;
+  if (!wipeout) console.error(message);
+  return true;
+}
+
+/**
+ * A run where EVERY item errored in the workflow (0 succeeded) produced no valid
+ * output to score — the eval is meaningless and must never pass CI green. This
+ * is distinct from (and complementary to) the scorer failure-rate gate: that one
+ * is about a flaky/failing *scorer*, this is about a broken *workflow*. The
+ * scorer gate deliberately ignores a zero-sample scorer (nothing ran), so without
+ * this guard a 100%-workflow-error run exits 0 — a silent-green trap.
+ *
+ * Non-configurable on purpose: a 0%-success eval is unambiguously broken, so this
+ * always fails, even with the item gate disabled (`--max-item-error-rate 1`).
+ * PARTIAL workflow failure is the default-on `failOnItemErrorRate` gate's job —
+ * see `reportItemErrorRate`. Prints the diagnostic and returns whether the run
+ * was a total wipeout.
+ */
 function reportTotalWipeout(result: EvalResult, label: string): boolean {
   if (!isTotalWipeout(result)) return false;
   console.error(
@@ -892,6 +962,7 @@ async function runEvalCommand(args: string[], signal: AbortSignal) {
     concurrency,
     scorerNames,
     budget,
+    maxItemErrorRate,
     paths,
   } = parseEvalArgs(args);
 
@@ -950,6 +1021,9 @@ async function runEvalCommand(args: string[], signal: AbortSignal) {
         // limit is PER RUN — never divided across the batch and never shared,
         // which would make run 2's items depend on run 1's spend.
         if (budget != null) evalConfig.budget = budget;
+        // `--max-item-error-rate` overrides the file's `failOnItemErrorRate`
+        // the same way, per run, so the summary records the limit that applied.
+        if (maxItemErrorRate != null) evalConfig.failOnItemErrorRate = maxItemErrorRate;
 
         // --scorers: run a subset of scorers for a focused iteration loop.
         // (The single-file guard already ran before the loop.) Validate-then-
@@ -1154,18 +1228,21 @@ async function runEvalCommand(args: string[], signal: AbortSignal) {
           console.log('\n' + formatMultiRunTable(summary) + '\n');
           for (const r of runResults) results.push(r);
 
-          // Failure-rate gate (opt-in via failOnScorerErrorRate) + total-wipeout
-          // guard (always). Report every run; count the file as failed unless it
-          // was already counted as a partial batch above (avoids double-count).
+          // Failure-rate gates (scorer: opt-in; item: default-on) + total-wipeout
+          // guard (always). Every run is gated INDIVIDUALLY — a pooled rate would
+          // let clean runs hide a thinned one. Report every run; count the file
+          // as failed unless it was already counted as a partial batch above
+          // (avoids double-count).
           let anyFailing = false;
-          for (const r of runResults) {
+          for (const [i, r] of runResults.entries()) {
             // Call each (no short-circuit) so every one prints its diagnostic,
             // budget stop first.
             const budgetStopped = reportBudgetStop(r, filePath);
             const wipeout = reportTotalWipeout(r, filePath);
+            const thinned = reportItemErrorRate(r, `${filePath} run ${i + 1}/${runs}`, wipeout);
             const degraded = reportDegraded(r, filePath);
             reportFullySkippedScorers(r, filePath); // advisory only
-            if (budgetStopped || wipeout || degraded) anyFailing = true;
+            if (budgetStopped || wipeout || thinned || degraded) anyFailing = true;
           }
           if (anyFailing && !partial) failedFiles++;
         } else {
@@ -1175,13 +1252,16 @@ async function runEvalCommand(args: string[], signal: AbortSignal) {
 
           console.log('\n' + formatTable(result) + '\n');
           // Budget stop first and distinctly (contracts §11 Q10), then the
-          // total-wipeout guard (always) + scorer failure-rate gate (opt-in).
-          // Every failing reason is printed; any one of them exits non-zero.
+          // total-wipeout guard (always), the item gate (default-on) and the
+          // scorer failure-rate gate (opt-in). Every failing reason is printed;
+          // any one of them exits non-zero. The artifact is written below
+          // regardless: gates govern the exit code, not persistence.
           const budgetStopped = reportBudgetStop(result, filePath);
           const wipeout = reportTotalWipeout(result, filePath);
+          const thinned = reportItemErrorRate(result, filePath, wipeout);
           const degraded = reportDegraded(result, filePath);
           reportFullySkippedScorers(result, filePath); // advisory only
-          if (budgetStopped || wipeout || degraded) failedFiles++;
+          if (budgetStopped || wipeout || thinned || degraded) failedFiles++;
         }
       } catch (err) {
         console.error(

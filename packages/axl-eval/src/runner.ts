@@ -1,5 +1,5 @@
 import type { ArtifactManifest, AxlRuntime, CallTiming, ModelTimingRollup } from '@axlsdk/axl';
-import { AdmissionController, RequestCaptureChannel } from '@axlsdk/axl';
+import { AdmissionController, AxlError, RequestCaptureChannel } from '@axlsdk/axl';
 import type {
   EvalAccounting,
   EvalConfig,
@@ -19,6 +19,9 @@ import {
   mapWithConcurrency,
   scorerCounts,
   evaluateScorerTolerance,
+  evaluateItemErrorRate,
+  isErrorRateLimit,
+  DEFAULT_ITEM_ERROR_RATE_LIMIT,
 } from './utils.js';
 import { scoreItem } from './score-item.js';
 import { emptyAccounting, isAdmissionDenied, parseBudget, trackScope } from './accounting.js';
@@ -291,6 +294,17 @@ export async function runEval(
 ): Promise<EvalResult> {
   const startTime = Date.now();
   const id = randomUUID();
+
+  // The item gate is default-on, so an unusable limit must fail loudly and
+  // before any work: warn-and-skip (the scorer gate's policy) would silently
+  // switch the gate off for the whole run.
+  const itemErrorRateLimit = config.failOnItemErrorRate ?? DEFAULT_ITEM_ERROR_RATE_LIMIT;
+  if (!isErrorRateLimit(itemErrorRateLimit)) {
+    throw new AxlError(
+      'INVALID_ITEM_ERROR_RATE',
+      `Invalid failOnItemErrorRate (${String(itemErrorRateLimit)}): expected a number in [0, 1]; 1 disables the gate.`,
+    );
+  }
 
   // Budget FIRST (contracts §11 Q5): a malformed limit must not cost a dataset
   // load, let alone a provider call. `AdmissionController` re-validates the
@@ -645,6 +659,10 @@ export async function runEval(
     }
   }
 
+  // Item coverage gate (default-on). Recorded only when something failed, so a
+  // clean run's summary and artifact are byte-identical to before the gate.
+  const itemErrorRate = evaluateItemErrorRate(coverage.items, items.length, itemErrorRateLimit);
+
   const durations = evalItems.filter((i) => !i.error && i.duration != null).map((i) => i.duration!);
   const timing = durations.length > 0 ? computeStats(durations) : undefined;
 
@@ -754,6 +772,7 @@ export async function runEval(
       timing,
       ...(modelTiming ? { modelTiming } : {}),
       ...(degraded ? { degraded } : {}),
+      ...(itemErrorRate.failed > 0 ? { itemErrorRate } : {}),
     },
   };
 }

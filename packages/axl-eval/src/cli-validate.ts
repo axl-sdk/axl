@@ -1,4 +1,5 @@
 import type { EvalConfig } from './types.js';
+import { isErrorRateLimit } from './utils.js';
 
 /**
  * Validate an eval config's required fields and produce a diagnostic string
@@ -72,6 +73,15 @@ export function validateEvalConfig(cfg: unknown): string | undefined {
     const v = (c as Record<string, unknown>).failOnScorerErrorRate;
     if (v !== undefined && (typeof v !== 'number' || !Number.isFinite(v) || v < 0 || v > 1)) {
       return `exports an invalid failOnScorerErrorRate (${typeof v === 'number' ? v : typeof v}) — must be a number between 0 and 1.`;
+    }
+  }
+  // Same rule for the default-on item gate; `runEval` also throws on it, but
+  // rejecting at load keeps the message on the file's own line. `null` means
+  // "use the default", as it does for `budget` — never "off".
+  {
+    const v = (c as Record<string, unknown>).failOnItemErrorRate;
+    if (v != null && !isErrorRateLimit(v)) {
+      return `exports an invalid failOnItemErrorRate (${typeof v === 'number' ? v : typeof v}) — must be a number between 0 and 1 (1 disables the gate).`;
     }
   }
   return undefined;

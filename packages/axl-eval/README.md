@@ -273,6 +273,7 @@ npx axl-eval ./evals/qa.eval.ts --concurrency 10    # override item concurrency 
 npx axl-eval ./evals/qa.eval.ts --scorers accuracy  # run only named scorer(s) (single file)
 npx axl-eval ./evals/qa.eval.ts --capture-requests  # also record the requests Axl submitted
 npx axl-eval ./evals/qa.eval.ts --budget 2.50       # stop admitting paid work once known spend reaches $2.50
+npx axl-eval ./evals/qa.eval.ts --max-item-error-rate 0.1  # allow up to 10% of items to fail (default 5%; 1 disables)
 ```
 
 The CLI resolves a runtime automatically: `--config <path>` > auto-detect `axl.config.*` > bare `new AxlRuntime()` (providers from env vars). Use `--conditions` when your eval file imports from monorepo packages that use conditional exports (e.g., `"development"` condition for source TypeScript instead of compiled dist).
@@ -310,9 +311,28 @@ npx axl-eval compare base.json cand.json --fail-on-regression --max-scorer-error
 
 Building a custom CI gate? Both decisions are exported as pure functions — `evaluateScorerErrorRateGate` and `evaluateScorerTolerance` (see the [API reference](../../docs/api-reference.md)).
 
+#### Item error rate — on by default
+
+A run that loses items in the *workflow* (a rate-limit storm, an incident, a tool bug) is scored over the survivors, so its means can look healthy while most of the dataset never ran. `axl-eval` therefore fails a run by default when **more than 5%** of its attempted items failed:
+
+```
+  Items: 89 completed, 250 failed — item error rate 73.7% (limit 5%)
+[axl-eval] ITEM ERROR RATE EXCEEDED: qa.eval.ts — 250 of 339 attempted item(s) failed in the workflow (item error rate 73.7%), over the 5% limit; …
+```
+
+The rate is `failed / (count − cancelled − budget_skipped − budget_interrupted)`: a cancelled or budget-stopped item is reported by its own gate and never counts here, and the gate fires on strictly `>`. Under `--runs N` every run is gated on its own, and the failing run is named. The artifact is still written.
+
+| Knob | Where | Effect |
+|------|-------|--------|
+| `failOnItemErrorRate` (config field, default `0.05`) | **Source-side** — `runEval` | Sets the limit; `runEval` records `summary.itemErrorRate` whenever an item failed. An invalid value throws before the dataset loads. |
+| `--max-item-error-rate <0..1>` (run flag) | CLI | Overrides the config for this invocation. `1` disables the gate (the rate is still printed). |
+| `--max-item-error-rate <0..1>` (compare flag, default `0.05`) | **Gate-side** — `axl-eval compare` | Refuses to certify a side (any compared run) whose item error rate is over the limit, including legacy artifacts (rate derived from their items). Warns about a side that lost items within the limit. |
+
+`rescore` does not apply the gate — its failed items belong to the source run — and rejects the flag; `compare` re-applies the floor to a rescored artifact. Building your own gate? `evaluateItemErrorRateGate(baseline, candidate, limit?)` is exported.
+
 #### Total-workflow-wipeout guard
 
-Separate from the scorer signal above: if **every** item errored in the *workflow* (0 succeeded), the eval produced no scorable output, so `axl-eval` always exits non-zero with `FAILED: … all N item(s) errored in the workflow` — a fully-broken eval (bad provider URI, an exception in every run) can never go green in CI. This is non-configurable (a 0%-success eval is unambiguously broken) and distinct from `failOnScorerErrorRate` (which is about a flaky *scorer* and deliberately ignores a run with no scored items). Partial workflow-failure rates stay visible (`Failures: N/M` in the table) but non-gating.
+Separate from the gates above: if **every** item errored in the *workflow* (0 succeeded), the eval produced no scorable output, so `axl-eval` always exits non-zero with `FAILED: … all N item(s) errored in the workflow` — a fully-broken eval (bad provider URI, an exception in every run) can never go green in CI. This is non-configurable (a 0%-success eval is unambiguously broken) and still applies with the item gate disabled (`--max-item-error-rate 1`). It is distinct from `failOnScorerErrorRate` (which is about a flaky *scorer* and deliberately ignores a run with no scored items).
 
 ### Programmatic
 
@@ -557,6 +577,7 @@ Compare two runs to detect regressions and improvements. Runs must use the same 
 npx axl-eval compare ./results/v1.json ./results/v2.json
 npx axl-eval compare v1.json v2.json --fail-on-regression  # exit 1 if significant regressions
 npx axl-eval compare v1.json v2.json --max-scorer-error-rate 0.05  # exit 1 if a scorer failed on >5% of the items it ran against (deterministic scorers: zero tolerance)
+npx axl-eval compare v1.json v2.json --max-item-error-rate 0.2     # accept a side that lost up to 20% of its items (default 5%, always on; 1 disables)
 ```
 
 ```

@@ -1,3 +1,5 @@
+import type { EvalItemOutcome, ItemErrorRate } from './types.js';
+
 export function computeStats(scores: number[]): {
   mean: number;
   min: number;
@@ -17,6 +19,39 @@ export function computeStats(scores: number[]): {
 
 export function round(n: number): number {
   return Math.round(n * 1000) / 1000;
+}
+
+/** `0.737 → '73.7%'`, `0.05 → '5%'` — one decimal, no trailing zero. */
+export function formatPercent(rate: number): string {
+  return `${Number((rate * 100).toFixed(1))}%`;
+}
+
+/** Default `failOnItemErrorRate`, shared by `runEval` and the compare floor. */
+export const DEFAULT_ITEM_ERROR_RATE_LIMIT = 0.05;
+
+/** `true` for a usable error-rate limit: a finite number in `[0, 1]`. */
+export function isErrorRateLimit(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1;
+}
+
+/**
+ * The single item-error-rate rule, shared by `runEval` (produce time) and
+ * `evaluateItemErrorRateGate` (compare time), so the two can never disagree.
+ *
+ * Cancelled and budget-stopped items leave the denominator: those runs are
+ * reported by their own gates, and counting them here would fail a run twice
+ * for one cause. Fires on strictly `>`, so a limit of `1` never fires, and a
+ * run with nothing attempted never fires (and reports a rate of `0`, not NaN).
+ */
+export function evaluateItemErrorRate(
+  items: Readonly<Record<EvalItemOutcome, number>>,
+  count: number,
+  limit: number,
+): ItemErrorRate {
+  const failed = items.failed;
+  const attempted = count - items.cancelled - items.budget_skipped - items.budget_interrupted;
+  const rate = attempted > 0 ? failed / attempted : 0;
+  return { failed, attempted, rate, limit, exceeded: attempted > 0 && rate > limit };
 }
 
 /**

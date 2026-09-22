@@ -226,8 +226,12 @@ export class RateLimiter {
     // intentionally empty
   }
 
-  /** Drain the queue: grant head waiters while a permit is free and spacing allows. */
-  private pump(): void {
+  /**
+   * Drain the queue: grant head waiters while a permit is free and spacing allows.
+   * Protected so the internal per-scope governor can gate grants on its own
+   * state (for example a brake) by overriding it.
+   */
+  protected pump(): void {
     while (this.queue.length > 0 && this.active < this.maxConcurrent) {
       if (this.minIntervalMs > 0) {
         const waitMs = this.minIntervalMs - (Date.now() - this.lastGrantAt);

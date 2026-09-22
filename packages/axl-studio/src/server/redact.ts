@@ -37,7 +37,7 @@ import type {
 } from '@axlsdk/axl';
 import { redactCapturedRequest, redactHistoricalEvent } from '@axlsdk/axl';
 import type { CapturedRequestRecord } from '@axlsdk/axl';
-import type { EvalResult, EvalItem, ScorerDetail } from '@axlsdk/eval';
+import type { EvalResult, EvalItem, EvalItemFailure, ScorerDetail } from '@axlsdk/eval';
 
 // Stream events on the wire are `AxlEvent` — the translation layer was
 // deleted in PR 1 commit 4. The legacy `StreamEvent` shapes are gone;
@@ -294,7 +294,8 @@ export function sanitizeRichInputFailure(event: HistoricalAxlEvent): HistoricalA
  *
  * Preserved fields (structural / metrics):
  *   scores (numeric), duration, cost, scorerCost
- *   failure (name/provider/status/retryable/requestId — never a body or message)
+ *   failure (projected to name/provider/status/retryable/requestId — see
+ *            projectItemFailure; any other key is dropped)
  *   scoreDetails[*].{score, duration, cost, skipped} (but not metadata)
  *   metadata (execution metadata: models, tokens, agentCalls, workflows)
  *   traces (trace events — already redacted at emission time)
@@ -328,9 +329,32 @@ function redactItemMetadata(
   return out;
 }
 
+/**
+ * Project `EvalItem.failure` onto its five known keys, each only when present
+ * with the type `@axlsdk/eval` writes. The runner never records a body or
+ * message there, but an imported artifact is stored verbatim and a newer writer
+ * could add a key — an allowlist keeps either from becoming a leak. Without a
+ * string `name` there is no cause to show, so the record is dropped.
+ */
+function projectItemFailure(failure: unknown): EvalItemFailure | undefined {
+  if (!failure || typeof failure !== 'object') return undefined;
+  const f = failure as Record<string, unknown>;
+  if (typeof f.name !== 'string') return undefined;
+  return {
+    name: f.name,
+    ...(typeof f.provider === 'string' ? { provider: f.provider } : {}),
+    ...(typeof f.status === 'number' && Number.isFinite(f.status) ? { status: f.status } : {}),
+    ...(typeof f.retryable === 'boolean' ? { retryable: f.retryable } : {}),
+    ...(typeof f.requestId === 'string' ? { requestId: f.requestId } : {}),
+  };
+}
+
 function redactEvalItem(item: EvalItem): EvalItem {
+  const { failure, ...rest } = item;
+  const projectedFailure = failure !== undefined ? projectItemFailure(failure) : undefined;
   const scrubbed: EvalItem = {
-    ...item,
+    ...rest,
+    ...(projectedFailure ? { failure: projectedFailure } : {}),
     input: REDACTED,
     output: REDACTED,
     // `diagnostics` is spread through untouched on purpose: it holds operation

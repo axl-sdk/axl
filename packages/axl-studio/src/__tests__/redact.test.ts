@@ -833,6 +833,55 @@ describe('redactEvalResult', () => {
     expect(out.items[0].failure).toEqual(failure);
   });
 
+  it('projects failure to its five known keys, dropping anything else an import carried', () => {
+    // Import stores items verbatim, so `failure` can hold keys no Axl writer
+    // produces — a response body, a message — that must not ride through.
+    const result = makeResult([
+      makeItem({
+        error: 'boom',
+        failure: {
+          name: 'ProviderError',
+          provider: 'openai',
+          status: 429,
+          retryable: true,
+          requestId: 'req_1',
+          body: 'SENTINEL_BODY echo of john@acme.com',
+          message: 'SENTINEL_MESSAGE',
+        },
+      }),
+    ]);
+    const out = redactEvalResult(result, true);
+    expect(out.items[0].failure).toEqual({
+      name: 'ProviderError',
+      provider: 'openai',
+      status: 429,
+      retryable: true,
+      requestId: 'req_1',
+    });
+    expect(JSON.stringify(out)).not.toContain('SENTINEL');
+  });
+
+  it('drops failure fields of the wrong type, and a failure with no string name', () => {
+    const result = makeResult([
+      makeItem({
+        failure: {
+          name: 'ProviderError',
+          provider: { leaked: 'SENTINEL_PROVIDER' },
+          status: 'SENTINEL_STATUS',
+          retryable: 'yes',
+          requestId: 42,
+        },
+      }),
+      makeItem({ failure: { name: { leaked: 'SENTINEL_NAME' }, status: 429 } }),
+      makeItem({ failure: 'SENTINEL_STRING_FAILURE' }),
+    ]);
+    const out = redactEvalResult(result, true);
+    expect(out.items[0].failure).toEqual({ name: 'ProviderError' });
+    expect('failure' in out.items[1]).toBe(false);
+    expect('failure' in out.items[2]).toBe(false);
+    expect(JSON.stringify(out)).not.toContain('SENTINEL');
+  });
+
   it('scrubs scoreDetails[*].metadata but keeps score/duration/cost', () => {
     const result = makeResult([
       makeItem({

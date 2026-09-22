@@ -4,45 +4,24 @@ description: Black-box behavioral review — derive the user scenarios the work 
 disable-model-invocation: true
 ---
 
-Review what the SDK should do before looking at how the session implemented it.
-The root lead owns product-scope decisions and gap triage.
+Derive and verify the scenarios for this session's work by following
+`.claude/skills/scenario-review/references/procedure.md` (read it now). Honor
+any scope note in the user's request; otherwise default to the session's
+work. This file binds the procedure's lanes to Claude Code.
 
-## Derive scenarios blind
+## Lane bindings
 
-Pin product scope, then use `behavioral-test-analyst` (Opus/high). Give it
-requirements, acceptance criteria, and durable public context only—no diff,
-changed-file list, implementation summary, suspected gaps, or intended answer.
-Have it derive developer journeys, integration paths, edge cases, failures,
-recovery, compatibility boundaries, and a discriminating test matrix. Freeze
-both matrices before mapping anything to code.
+| Lane                      | Agent                                                                                  |
+| ------------------------- | -------------------------------------------------------------------------------------- |
+| Blind analyst             | `senior-reviewer` with the blind-analyst charter; never a `fork`, never given the diff |
+| Discovery                 | `Explore`                                                                              |
+| Implementation            | `implementer` for established contracts; `senior-implementer` for consequential seams  |
+| Hard problems             | `senior-implementer`                                                                   |
+| Verification / fix review | `reviewer` with the frozen-scenario verification or diff-review charter                |
+| Review, seam              | `senior-reviewer` with the focused seam charter                                        |
+| Live-API pass             | the lead, via `/live-api-verification` with the checklist path                         |
 
-This independent reasoning boundary is load-bearing. Do not use a low-effort
-implementation agent for scenario completeness.
+## Platform mechanics
 
-## Verify after freezing
-
-For every scenario, establish expected behavior and verify it by the strongest
-cheap method. Prefer discriminating Vitest, type-level, e2e, Studio, or
-integration tests over code reading. Use `repo-explorer` for bounded source
-mapping, `routine-implementer` for mechanical test additions or clear fixes, and
-`implementer` when the harness or fix needs judgment. Keep new product
-scope and architecture with the lead. Route unclear, intermittent,
-provider-specific, concurrency, or stagnant diagnosis of bugs to `deep-debugger`.
-
-Emit `scenario | expected behavior | status | evidence | gap`.
-
-Do not mark real-provider behavior satisfied from `MockProvider` or static
-inspection.
-
-## Close gaps
-
-- Incorrect implemented behavior is a bug: write a failing test when practical,
-  fix it, and verify.
-- Entirely unhandled behavior may be new scope: recommend a decision instead of
-  silently building it.
-- Commit verified fixes in logical chunks and keep unrelated fixes separate.
-- Put provider-gated scenarios into the plan's one live-API checklist, or one
-  review-local checklist, and close it with `/live-api-verification`.
-
-Maintain healthy skepticism without inventing scope. Verify before declaring a
-gap.
+- Worktree isolation only when concurrent fixers mutate files.
+- Resume with `SendMessage`; named agents deliver their report to `team-lead` with `SendMessage`.

@@ -22,9 +22,12 @@ export type ProviderConfig = {
    * Opt-in client-side rate governor for this provider's HTTP calls (see
    * {@link RateLimitConfig}). Bounds in-flight request concurrency (and,
    * optionally, request spacing) through the shared `fetchWithRetry` chokepoint.
-   * Omitted ⇒ no governor (behavior unchanged). Caveat: governs **chat** calls
-   * through this provider instance only — NOT memory-embedder calls (constructed
-   * outside the registry) and NOT other processes sharing the same API key.
+   * Omitted ⇒ no governor (behavior unchanged). Governors are pooled per
+   * runtime, one per scope: provider family (`openai` covers `openai-responses`)
+   * + base-URL origin + credential source + model. Two blocks reaching one
+   * scope use the strictest value per field. Caveat: governs **chat** calls
+   * only — NOT memory-embedder calls (constructed outside the registry) and NOT
+   * other runtimes (unless they share a provider instance) or processes.
    */
   rateLimit?: RateLimitConfig;
 };

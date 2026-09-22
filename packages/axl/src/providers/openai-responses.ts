@@ -22,7 +22,8 @@ import { resolveThinkingOptions, resolveApiKey, type ApiKeySource } from './type
 import { fetchWithRetry } from './retry.js';
 import { CallTimingRecorder, withCallTiming, withChatTiming } from './call-timing.js';
 import { buildProviderError, ProviderError } from './errors.js';
-import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
+import type { RateLimitConfig } from './rate-limiter.js';
+import { AdapterGovernors, type ScopeGovernor } from './governor-pool.js';
 import { assertSafeProviderBaseUrl } from '../http-transport.js';
 import type { InputContentPart, InputMediaSource } from '../input.js';
 import { UnsupportedModelInputError } from '../errors.js';
@@ -218,7 +219,7 @@ export class OpenAIResponsesProvider implements Provider {
 
   private baseUrl: string;
   private apiKeySource: ApiKeySource;
-  private governor?: RateLimiter;
+  private readonly governors: AdapterGovernors;
 
   constructor(
     options: {
@@ -239,13 +240,29 @@ export class OpenAIResponsesProvider implements Provider {
       'OpenAI Responses provider',
       options.dangerouslyAllowInsecureHttp,
     );
-    this.governor = options.rateLimit ? new RateLimiter(options.rateLimit) : undefined;
+    // Family `openai`: Chat Completions and Responses on one key and origin
+    // share the account's rate limits, so they share one governor per model.
+    this.governors = new AdapterGovernors(
+      this,
+      {
+        family: 'openai',
+        baseUrl: this.baseUrl,
+        apiKeySource: this.apiKeySource,
+        adapterName: this.name,
+      },
+      options.rateLimit,
+    );
 
     // Eager validation for the string case; a function source is validated per
     // request in resolveKey().
     if (typeof this.apiKeySource === 'string' && !this.apiKeySource) {
       throw new Error('OpenAI API key is required. Set OPENAI_API_KEY or pass apiKey in options.');
     }
+  }
+
+  /** The rate governor for one call to `model`, from the runtime's per-scope pool. */
+  protected governorFor(model: string): ScopeGovernor | undefined {
+    return this.governors.governorFor(model);
   }
 
   /** Resolve the API key for one request (supports an expiring-token callback). */
@@ -271,6 +288,7 @@ export class OpenAIResponsesProvider implements Provider {
     const body = this.buildRequestBody(messages, options, false);
 
     const recorder = new CallTimingRecorder(options.requestLifecycle);
+    const governor = this.governorFor(this.requestModel(body, options.model));
     const res = await fetchWithRetry(
       `${this.baseUrl}/responses`,
       {
@@ -280,7 +298,7 @@ export class OpenAIResponsesProvider implements Provider {
         signal: options.signal,
       },
       {
-        governor: this.governor,
+        governor,
         provider: this.name,
         timing: recorder.observer,
         admission: options.dispatchAdmission,
@@ -316,6 +334,7 @@ export class OpenAIResponsesProvider implements Provider {
     const body = this.buildRequestBody(messages, options, true);
 
     const recorder = new CallTimingRecorder(options.requestLifecycle);
+    const governor = this.governorFor(this.requestModel(body, options.model));
     const res = await fetchWithRetry(
       `${this.baseUrl}/responses`,
       {
@@ -325,7 +344,7 @@ export class OpenAIResponsesProvider implements Provider {
         signal: options.signal,
       },
       {
-        governor: this.governor,
+        governor,
         provider: this.name,
         timing: recorder.observer,
         admission: options.dispatchAdmission,

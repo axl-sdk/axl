@@ -562,21 +562,58 @@ export default defineConfig({
   **embedder** calls (e.g. `ctx.remember({ embed: true })`) are constructed outside
   the provider registry and are **not** governed in this version — they can still
   count against a shared key's limit.
-- **Per provider instance / process.** Providers are singletons per (runtime,
-  provider type), so one governor covers all chat calls through that adapter — but
-  not other processes or runtimes sharing the same key.
-- **`openai-responses` inherits `openai`'s `rateLimit`** when it has no config of its
-  own (same fallback as `apiKey`/`baseUrl`). Note this builds a **separate governor
-  instance** per adapter, not a shared counter — if you configure `providers.openai`
-  and use *both* `openai:` and `openai-responses:` models, you get two independent
-  caps against the same key (effective concurrency = the sum). Set `maxConcurrent`
-  with that in mind, or give each adapter its own block.
+- **One governor per scope, per runtime.** A scope is provider family + base-URL
+  origin + credential source + model:
+  - **Family:** `openai:` and `openai-responses:` are one family, because they
+    draw on one account's limits. Every other adapter or preset is its own family.
+  - **Origin:** the scheme, host and port of `baseUrl`, so a proxy or a
+    self-hosted endpoint is a separate account.
+  - **Credential:** a string `apiKey` by value (two tenants' keys never share), a
+    callback by identity (a rotating token callback is one scope). The key is
+    never logged or shown in a warning.
+  - **Model:** each model gets its own governor, so `maxConcurrent: 8` allows 8 in
+    flight **per model**. There is no model-family table.
+
+  So with one `providers.openai` block, `openai:gpt-4o` and
+  `openai-responses:gpt-4o` share **one** cap. **This changed in 0.24:** before,
+  each adapter had its own governor and using both added the caps together. If
+  you sized `maxConcurrent` for that sum, halve your expectation or raise it.
+- **`openai-responses` inherits `openai`'s `rateLimit`** when it has no block of its
+  own (same fallback as `apiKey`/`baseUrl`). If both blocks exist with the same key
+  and origin, they are still one scope: each field takes the **strictest** value
+  either block sets (smaller `maxConcurrent` and `acquireTimeoutMs`, larger
+  `minIntervalMs`), and Axl warns once. A block without `rateLimit` on that scope
+  is governed by the other block's settings.
+- **Across runtimes, sharing is explicit.** Two `AxlRuntime`s never share a
+  governor by inference, even on the same key (that would merge tenants). To pace
+  two runtimes (say, a judge and a drafter) against one budget, construct the
+  adapters once and register the **same instances** in both:
+
+  ```typescript
+  const openai = new OpenAIProvider({ rateLimit: { maxConcurrent: 8 } });
+  const responses = new OpenAIResponsesProvider({ rateLimit: { maxConcurrent: 8 } });
+  for (const runtime of [judgeRuntime, drafterRuntime]) {
+    runtime.registerProvider('openai', openai);
+    runtime.registerProvider('openai-responses', responses);
+  }
+  ```
+
+  Known limits of this recipe:
+  - Register an instance for **every** adapter you share. A registered `openai`
+    instance does not pool with a factory-built `openai-responses`, so the two
+    would be separate governors again.
+  - Two separately constructed instances (like `openai` and `responses` above)
+    have separate pools even on one key; only a shared instance shares.
+  - A standalone `agent.ask()` (no runtime) builds a fresh registry per call, so
+    its governors do not persist across asks.
 - **No deadlock on nesting.** A permit is held only across a single HTTP call, never
   across a nested `ctx.ask()` (tool handlers run between provider calls, not during),
   so an agent-as-tool chain on the same provider under `maxConcurrent: 1` still
   completes — permits don't stack.
 - **Custom providers** registered via `registerInstance` are not governed unless they
-  wrap `fetchWithRetry({ governor })` themselves.
+  wrap `fetchWithRetry({ governor })` themselves. A subclass of
+  `OpenAICompatibleProvider` that issues its own request passes
+  `this.governorFor(model)` as `governor`.
 
 **Using it with `axl-eval`:** the eval CLI builds its runtime from your config
 (`--config` or an auto-detected `axl.config.*`), so `providers.<name>.rateLimit` is

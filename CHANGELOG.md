@@ -234,6 +234,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Rate governors are pooled per runtime, one per scope.** A scope is provider
+  family + base-URL origin + credential source + model. `openai` and
+  `openai-responses` are one family, a string `apiKey` is compared by value and
+  a callback by identity (a rotating token callback is one scope), and the key
+  is never logged. Consequences for existing `rateLimit` configs:
+  - **Behavior change: `openai:` + `openai-responses:` no longer add up.** With
+    one `providers.openai` block, calls through both adapters on one model now
+    share one `maxConcurrent` cap instead of each getting its own, so a config
+    sized for the sum sees half the concurrency.
+  - **Behavior change: caps are per model.** `maxConcurrent` bounds each model
+    separately, where one adapter-wide cap used to cover all of its models.
+  - Two provider blocks reaching one scope (for example `openai` and
+    `openai-responses` with the same key) use the strictest value per field and
+    warn once. A block with no `rateLimit` on such a scope is governed by the
+    other block.
+  - Runtimes never share governors by inference, even on one key. Register one
+    provider instance in both runtimes to share; `docs/providers.md` has the
+    recipe and its limits.
+  - `ProviderRegistry.register(name, factory)` is unchanged; user factories
+    still take `(config)`. `registry.clearCache()` now also discards the pooled
+    governors.
+  - **Breaking for `OpenAICompatibleProvider` subclasses:** the protected
+    `governor` field is replaced by `protected governorFor(model)`. A subclass
+    that issued its own `fetchWithRetry({ governor: this.governor })` must pass
+    `this.governorFor(model)` instead.
+  - Transcription adapters and the memory embedder keep their per-instance
+    behavior.
 - **Breaking: `runtime.resolveProvider(uri)` returns a scoped facade**, so
   `resolveProvider(uri).provider === registeredInstance` is now `false`. The
   facade routes `chat`/`stream` through accounting and admission and forwards

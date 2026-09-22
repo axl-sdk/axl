@@ -17,7 +17,8 @@ import { resolveThinkingOptions, resolveApiKey, type ApiKeySource } from './type
 import { fetchWithRetry } from './retry.js';
 import { CallTimingRecorder, withCallTiming, withChatTiming } from './call-timing.js';
 import { buildProviderError, ProviderError } from './errors.js';
-import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
+import type { RateLimitConfig } from './rate-limiter.js';
+import { AdapterGovernors, type ScopeGovernor } from './governor-pool.js';
 import { assertSafeProviderBaseUrl } from '../http-transport.js';
 import type { InputContentPart, InputMediaSource } from '../input.js';
 import type { RecordedAudioSource } from '../transcription.js';
@@ -897,7 +898,7 @@ export class GeminiProvider implements Provider {
   private baseUrl: string;
   private apiKeySource: ApiKeySource;
   private callCounter = 0;
-  private governor?: RateLimiter;
+  private readonly governors: AdapterGovernors;
 
   constructor(
     options: {
@@ -918,13 +919,27 @@ export class GeminiProvider implements Provider {
       'Google provider',
       options.dangerouslyAllowInsecureHttp,
     );
-    this.governor = options.rateLimit ? new RateLimiter(options.rateLimit) : undefined;
+    this.governors = new AdapterGovernors(
+      this,
+      {
+        family: this.name,
+        baseUrl: this.baseUrl,
+        apiKeySource: this.apiKeySource,
+        adapterName: this.name,
+      },
+      options.rateLimit,
+    );
 
     // Eager validation for the string case; a function source is validated per
     // request in resolveKey().
     if (typeof this.apiKeySource === 'string' && !this.apiKeySource) {
       throw new Error('Google API key is required. Set GOOGLE_API_KEY or pass apiKey in options.');
     }
+  }
+
+  /** The rate governor for one call to `model`, from the runtime's per-scope pool. */
+  protected governorFor(model: string): ScopeGovernor | undefined {
+    return this.governors.governorFor(model);
   }
 
   /** Resolve the API key for one request (supports an expiring-token callback). */
@@ -957,7 +972,7 @@ export class GeminiProvider implements Provider {
         signal: options.signal,
       },
       {
-        governor: this.governor,
+        governor: this.governorFor(pricingContext.model),
         provider: this.name,
         timing: recorder.observer,
         admission: options.dispatchAdmission,
@@ -1005,7 +1020,7 @@ export class GeminiProvider implements Provider {
         signal: options.signal,
       },
       {
-        governor: this.governor,
+        governor: this.governorFor(pricingContext.model),
         provider: this.name,
         timing: recorder.observer,
         admission: options.dispatchAdmission,
@@ -1051,7 +1066,7 @@ export class GeminiProvider implements Provider {
       `${this.baseUrl}/interactions`,
       { method: 'POST', headers, body: JSON.stringify(body), signal: options.signal },
       {
-        governor: this.governor,
+        governor: this.governorFor(pricingContext.model),
         provider: this.name,
         timing: recorder.observer,
         admission: options.dispatchAdmission,
@@ -1091,7 +1106,7 @@ export class GeminiProvider implements Provider {
       `${this.baseUrl}/interactions?alt=sse`,
       { method: 'POST', headers, body: JSON.stringify(body), signal: options.signal },
       {
-        governor: this.governor,
+        governor: this.governorFor(pricingContext.model),
         provider: this.name,
         timing: recorder.observer,
         admission: options.dispatchAdmission,

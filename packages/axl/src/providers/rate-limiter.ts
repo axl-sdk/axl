@@ -18,10 +18,13 @@
  *   its whole lifetime. Non-streaming calls still hold it across generation in
  *   practice, because a provider sends no headers until the completion is
  *   finished. Neither bounds tokens/min.
- * - **Per provider instance.** Providers are singletons per (runtime, provider
- *   type), so one governor governs all calls through that adapter — but NOT
- *   embedder calls (the embedder is constructed outside the registry) and NOT
- *   other processes/runtimes sharing the same API key.
+ * - **One governor per scope, per runtime.** The built-in chat adapters don't
+ *   construct this class directly: they resolve a governor per call from the
+ *   runtime's `GovernorPool` (`governor-pool.ts`), one per provider family +
+ *   base-URL origin + credential source + model. A directly constructed
+ *   `RateLimiter` (custom adapters) governs exactly the calls it is passed to.
+ *   Neither covers embedder calls (constructed outside the registry) nor other
+ *   processes.
  * - **`minIntervalMs` is global spacing, not a burst bucket.** A single
  *   last-grant timestamp gates every grant: a permit may be free yet a grant
  *   still waits out the interval. There is no accumulated burst allowance.
@@ -70,13 +73,62 @@ type Waiter = {
 };
 
 /**
+ * Validate a {@link RateLimitConfig}, emitting the same warnings the
+ * {@link RateLimiter} constructor always has, and return only the fields that
+ * take effect: an invalid or non-positive value is dropped (absent), and
+ * `maxConcurrent` is floored. The result is what the constructor applies, and
+ * what the per-runtime governor pool merges across provider blocks, so a
+ * typo'd `0` in one block never reads as the "strictest" value.
+ *
+ * Internal (not barrel-exported).
+ */
+export function sanitizeRateLimitConfig(config: RateLimitConfig): RateLimitConfig {
+  const limits: RateLimitConfig = {};
+  const mc = config.maxConcurrent;
+  if (mc != null) {
+    if (!Number.isFinite(mc) || mc < 1) {
+      // A typo'd 0 / negative / NaN must not deadlock the provider — ignore the
+      // cap (no limit) and say so loudly.
+      console.warn(
+        `[axl] RateLimiter: ignoring invalid maxConcurrent (${mc}); expected an integer >= 1. No concurrency cap applied.`,
+      );
+    } else {
+      limits.maxConcurrent = Math.floor(mc);
+      if (limits.maxConcurrent < 2) {
+        console.warn(
+          `[axl] RateLimiter: maxConcurrent=${limits.maxConcurrent} serializes every request to this provider. ` +
+            `Nested same-provider calls still complete (permits aren't held across a nested ask), but throughput is a floor, not a guarantee.`,
+        );
+      }
+    }
+  }
+  if (
+    config.minIntervalMs != null &&
+    Number.isFinite(config.minIntervalMs) &&
+    config.minIntervalMs > 0
+  ) {
+    limits.minIntervalMs = config.minIntervalMs;
+  }
+  if (
+    config.acquireTimeoutMs != null &&
+    Number.isFinite(config.acquireTimeoutMs) &&
+    config.acquireTimeoutMs > 0
+  ) {
+    limits.acquireTimeoutMs = config.acquireTimeoutMs;
+  }
+  return limits;
+}
+
+/**
  * Counting semaphore + FIFO waiter queue. Dependency-free. Not shared across
  * processes — purely an in-process pacing aid.
  */
 export class RateLimiter {
-  private readonly maxConcurrent: number;
-  private readonly minIntervalMs: number;
-  private readonly acquireTimeoutMs?: number;
+  // Mutable and protected so the internal per-scope governor can tighten a live
+  // governor when a second provider block reaches the same scope.
+  protected maxConcurrent = Infinity;
+  protected minIntervalMs = 0;
+  protected acquireTimeoutMs?: number;
 
   private active = 0;
   // `-Infinity` (not 0) so the FIRST grant is always immediate regardless of the
@@ -90,38 +142,19 @@ export class RateLimiter {
   private warnedQueued = false;
 
   constructor(config: RateLimitConfig = {}) {
-    const mc = config.maxConcurrent;
-    if (mc == null) {
-      this.maxConcurrent = Infinity;
-    } else if (!Number.isFinite(mc) || mc < 1) {
-      // A typo'd 0 / negative / NaN must not deadlock the provider — ignore the
-      // cap (no limit) and say so loudly.
-      console.warn(
-        `[axl] RateLimiter: ignoring invalid maxConcurrent (${mc}); expected an integer >= 1. No concurrency cap applied.`,
-      );
-      this.maxConcurrent = Infinity;
-    } else {
-      this.maxConcurrent = Math.floor(mc);
-      if (this.maxConcurrent < 2) {
-        console.warn(
-          `[axl] RateLimiter: maxConcurrent=${this.maxConcurrent} serializes every request to this provider. ` +
-            `Nested same-provider calls still complete (permits aren't held across a nested ask), but throughput is a floor, not a guarantee.`,
-        );
-      }
-    }
+    this.applyLimits(sanitizeRateLimitConfig(config));
+  }
 
-    this.minIntervalMs =
-      config.minIntervalMs != null &&
-      Number.isFinite(config.minIntervalMs) &&
-      config.minIntervalMs > 0
-        ? config.minIntervalMs
-        : 0;
-    this.acquireTimeoutMs =
-      config.acquireTimeoutMs != null &&
-      Number.isFinite(config.acquireTimeoutMs) &&
-      config.acquireTimeoutMs > 0
-        ? config.acquireTimeoutMs
-        : undefined;
+  /**
+   * Apply already-sanitized limits (see {@link sanitizeRateLimitConfig}). An
+   * absent field means "no limit". Takes effect for the next grant; a waiter
+   * already queued keeps the `acquireTimeoutMs` timer it was armed with.
+   */
+  protected applyLimits(limits: RateLimitConfig): void {
+    this.maxConcurrent = limits.maxConcurrent ?? Infinity;
+    this.minIntervalMs = limits.minIntervalMs ?? 0;
+    this.acquireTimeoutMs = limits.acquireTimeoutMs;
+    this.pump();
   }
 
   /**

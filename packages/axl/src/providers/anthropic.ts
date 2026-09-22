@@ -16,7 +16,8 @@ import { resolveThinkingOptions, resolveApiKey, type ApiKeySource } from './type
 import { fetchWithRetry } from './retry.js';
 import { CallTimingRecorder, withCallTiming, withChatTiming } from './call-timing.js';
 import { buildProviderError } from './errors.js';
-import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
+import type { RateLimitConfig } from './rate-limiter.js';
+import { AdapterGovernors, type ScopeGovernor } from './governor-pool.js';
 import { assertSafeProviderBaseUrl } from '../http-transport.js';
 import type { InputContentPart, InputMediaSource } from '../input.js';
 import { UnsupportedModelInputError } from '../errors.js';
@@ -875,7 +876,7 @@ export class AnthropicProvider implements Provider {
 
   private baseUrl: string;
   private apiKeySource: ApiKeySource;
-  private governor?: RateLimiter;
+  private readonly governors: AdapterGovernors;
 
   constructor(
     options: {
@@ -892,7 +893,16 @@ export class AnthropicProvider implements Provider {
       'Anthropic provider',
       options.dangerouslyAllowInsecureHttp,
     );
-    this.governor = options.rateLimit ? new RateLimiter(options.rateLimit) : undefined;
+    this.governors = new AdapterGovernors(
+      this,
+      {
+        family: this.name,
+        baseUrl: this.baseUrl,
+        apiKeySource: this.apiKeySource,
+        adapterName: this.name,
+      },
+      options.rateLimit,
+    );
 
     // Eager validation for the string case; a function source is validated per
     // request in resolveKey().
@@ -901,6 +911,11 @@ export class AnthropicProvider implements Provider {
         'Anthropic API key is required. Set ANTHROPIC_API_KEY or pass apiKey in options.',
       );
     }
+  }
+
+  /** The rate governor for one call to `model`, from the runtime's per-scope pool. */
+  protected governorFor(model: string): ScopeGovernor | undefined {
+    return this.governors.governorFor(model);
   }
 
   /** Resolve the API key for one request (supports an expiring-token callback). */
@@ -927,6 +942,7 @@ export class AnthropicProvider implements Provider {
     const pricingContext = pricingContextFromBody(body);
 
     const recorder = new CallTimingRecorder(options.requestLifecycle);
+    const governor = this.governorFor(pricingContext.model ?? options.model);
     const res = await fetchWithRetry(
       `${this.baseUrl}/messages`,
       {
@@ -936,7 +952,7 @@ export class AnthropicProvider implements Provider {
         signal: options.signal,
       },
       {
-        governor: this.governor,
+        governor,
         provider: this.name,
         timing: recorder.observer,
         admission: options.dispatchAdmission,
@@ -973,6 +989,7 @@ export class AnthropicProvider implements Provider {
     const pricingContext = pricingContextFromBody(body);
 
     const recorder = new CallTimingRecorder(options.requestLifecycle);
+    const governor = this.governorFor(pricingContext.model ?? options.model);
     const res = await fetchWithRetry(
       `${this.baseUrl}/messages`,
       {
@@ -982,7 +999,7 @@ export class AnthropicProvider implements Provider {
         signal: options.signal,
       },
       {
-        governor: this.governor,
+        governor,
         provider: this.name,
         timing: recorder.observer,
         admission: options.dispatchAdmission,

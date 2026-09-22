@@ -2,9 +2,16 @@ import { randomUUID } from 'node:crypto';
 import { Hono } from 'hono';
 import type { StudioEnv } from '../types.js';
 import type { ConnectionManager } from '../ws/connection-manager.js';
-import type { DegradedScorer, EvalResult, ItemErrorRate, Scorer } from '@axlsdk/eval';
+import type {
+  DegradedScorer,
+  EvalComparison,
+  EvalResult,
+  ItemErrorRate,
+  Scorer,
+} from '@axlsdk/eval';
 import type { CapturedRequestRecord } from '@axlsdk/axl';
 import {
+  redactEvalComparison,
   redactEvalHistoryList,
   redactEvalResult,
   redactErrorMessage,
@@ -718,7 +725,10 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
     try {
       // `missing.length === 0` guarantees both are defined here.
       const result = await runtime.evalCompare(baseline!, candidate!, body.options);
-      return c.json({ ok: true, data: result });
+      return c.json({
+        ok: true,
+        data: redactEvalComparison(result as EvalComparison, redactOn),
+      });
     } catch (err) {
       return c.json(
         {

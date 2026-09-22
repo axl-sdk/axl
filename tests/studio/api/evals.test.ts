@@ -701,6 +701,76 @@ describe('Studio API: Evals', () => {
   // wire payload tiny so host body-parser limits don't fire when Studio is
   // mounted as middleware behind Express/NestJS/Fastify.
 
+  describe('POST /api/evals/compare under trace.redact', () => {
+    // Compare returns the baseline item's `input` on every regression and
+    // improvement, and each side's result metadata. Both must meet the same
+    // scrub as GET /api/evals/history, or comparing two ids bypasses it.
+    async function compareImported(redact: boolean) {
+      const { app } = createTestServer(undefined, { redact });
+      const side = (scores: [number, number], metadata: Record<string, unknown>) => ({
+        workflow: 'wf',
+        dataset: 'ds',
+        metadata: { scorerTypes: { s: 'deterministic' }, ...metadata },
+        timestamp: new Date().toISOString(),
+        totalCost: 0,
+        duration: 1,
+        items: [
+          { input: 'SENTINEL_INPUT_0', output: 'o', scores: { s: scores[0] } },
+          { input: { q: 'SENTINEL_INPUT_1' }, output: 'o', scores: { s: scores[1] } },
+        ],
+        summary: {
+          count: 2,
+          failures: 0,
+          scorers: { s: { mean: 0.5, min: 0, max: 1, p50: 0.5, p95: 1 } },
+        },
+      });
+      const importOne = async (result: unknown) =>
+        (
+          await readJson(
+            await app.request('/api/evals/import', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ result }),
+            }),
+          )
+        ).data.id as string;
+      const baselineId = await importOne(side([1, 0], { batchFailure: 'SENTINEL_BATCH' }));
+      const candidateId = await importOne(side([0, 1], {}));
+      const res = await app.request('/api/evals/compare', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ baselineId, candidateId, options: { thresholds: 0 } }),
+      });
+      expect(res.status).toBe(200);
+      return readJson(res);
+    }
+
+    it('masks regression and improvement inputs and the side metadata batchFailure', async () => {
+      const body = await compareImported(true);
+      const { regressions, improvements, baseline, scorers } = body.data;
+      expect(regressions.length).toBeGreaterThan(0);
+      expect(improvements.length).toBeGreaterThan(0);
+      for (const r of [...regressions, ...improvements]) {
+        expect(r.input).toBe('[redacted]');
+        expect(typeof r.itemIndex).toBe('number');
+      }
+      expect(baseline.metadata.batchFailure).toBe('[redacted]');
+      // Structural results are untouched.
+      expect(baseline.metadata.scorerTypes).toEqual({ s: 'deterministic' });
+      expect(scorers.s.delta).toBe(0);
+      expect(JSON.stringify(body)).not.toContain('SENTINEL');
+    });
+
+    it('serves the inputs unchanged when redact is off', async () => {
+      const body = await compareImported(false);
+      const inputs = [...body.data.regressions, ...body.data.improvements].map(
+        (r: { input: unknown }) => r.input,
+      );
+      expect(inputs).toContainEqual('SENTINEL_INPUT_0');
+      expect(inputs).toContainEqual({ q: 'SENTINEL_INPUT_1' });
+    });
+  });
+
   it('POST /api/evals/compare compares two eval results by ID', async () => {
     const provider = MockProvider.sequence([
       { content: 'baseline output' },

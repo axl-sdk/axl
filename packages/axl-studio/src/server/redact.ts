@@ -37,7 +37,14 @@ import type {
 } from '@axlsdk/axl';
 import { redactCapturedRequest, redactHistoricalEvent } from '@axlsdk/axl';
 import type { CapturedRequestRecord } from '@axlsdk/axl';
-import type { EvalResult, EvalItem, EvalItemFailure, ScorerDetail } from '@axlsdk/eval';
+import type {
+  EvalComparison,
+  EvalItem,
+  EvalItemFailure,
+  EvalRegression,
+  EvalResult,
+  ScorerDetail,
+} from '@axlsdk/eval';
 
 // Stream events on the wire are `AxlEvent` — the translation layer was
 // deleted in PR 1 commit 4. The legacy `StreamEvent` shapes are gone;
@@ -476,11 +483,7 @@ export function redactEvalResult(result: EvalResult, redact: boolean): EvalResul
  * does not have the expected shape, are replaced with the sentinel.
  */
 function redactResultShape(result: EvalResult): EvalResult {
-  const meta = result.metadata as Record<string, unknown> | undefined;
-  const scrubbedMetadata =
-    isPlainObject(meta) && typeof meta.batchFailure === 'string'
-      ? { ...meta, batchFailure: REDACTED }
-      : result.metadata;
+  const scrubbedMetadata = redactResultMetadata(result.metadata);
   const hasMultiRun = '_multiRun' in result;
   const multiRun = (result as { _multiRun?: unknown })._multiRun;
   return {
@@ -495,6 +498,14 @@ function redactResultShape(result: EvalResult): EvalResult {
         }
       : {}),
   };
+}
+
+/** Result-level metadata is structural except `batchFailure`, a raw error message. */
+function redactResultMetadata<M>(metadata: M): M {
+  const meta = metadata as unknown;
+  return isPlainObject(meta) && typeof meta.batchFailure === 'string'
+    ? ({ ...meta, batchFailure: REDACTED } as M)
+    : metadata;
 }
 
 function redactMultiRun(multiRun: Record<string, unknown>): Record<string, unknown> {
@@ -513,6 +524,33 @@ function redactMultiRun(multiRun: Record<string, unknown>): Record<string, unkno
         }
       : {}),
     ...(typeof multiRun.batchFailure === 'string' ? { batchFailure: REDACTED } : {}),
+  };
+}
+
+/**
+ * Scrub an `EvalComparison` for `POST /api/evals/compare`.
+ *
+ * Compare copies the baseline item's `input` onto every regression and
+ * improvement, and each side's result `metadata` onto `baseline` / `candidate`.
+ * Those are the same fields `redactEvalResult` scrubs on history, so they get
+ * the same rule here — otherwise comparing two history ids bypasses the scrub.
+ * `input` is masked rather than dropped (it is a required key); `itemIndex`,
+ * scores and every statistic stay. `summary` is built from scorer names and
+ * numbers only, so it passes through.
+ */
+export function redactEvalComparison(comparison: EvalComparison, redact: boolean): EvalComparison {
+  if (!redact) return comparison;
+  const maskInput = (r: EvalRegression): EvalRegression => ({ ...r, input: REDACTED });
+  const side = <S extends { metadata: Record<string, unknown> }>(s: S): S => ({
+    ...s,
+    metadata: redactResultMetadata(s.metadata),
+  });
+  return {
+    ...comparison,
+    baseline: side(comparison.baseline),
+    candidate: side(comparison.candidate),
+    regressions: comparison.regressions.map(maskInput),
+    improvements: comparison.improvements.map(maskInput),
   };
 }
 

@@ -510,6 +510,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `metadata.importedMultiRun: 'invalid'`. Under redaction, a stored item or
   run with an unexpected shape is replaced with `[redacted]` instead of
   failing the whole history list.
+- **Studio: eval compare responses are redacted.** Under `trace.redact`,
+  `POST /api/evals/compare` returned each regression's and improvement's
+  `input` (the baseline item's raw input) and each side's
+  `metadata.batchFailure` unmasked, so comparing two history ids bypassed
+  the history scrub. `readOnly` deployments allow compare, so this was
+  reachable by the least-privileged Studio role. Those fields are now masked;
+  `itemIndex`, scores and every statistic are unchanged.
 
 ## [0.23.3] - 2026-09-09
 

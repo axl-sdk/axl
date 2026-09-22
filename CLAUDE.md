@@ -88,73 +88,61 @@ Run from the repo root. Per-area detail: `.claude/rules/testing.md` and the pack
 
 ## Agent routing
 
-Route by uncertainty, consequence, and critical-path latency. Codex defaults:
+**This section addresses the orchestrating root.** Subagents receive this file
+verbatim: if you are one, it explains how you were selected, not licence to
+invoke a workflow or spawn agents beyond what your agent definition allows.
 
-| Role | Model / effort | Assignment |
-| --- | --- | --- |
-| Root lead | Sol / medium | Settled execution, including long plans |
-| Root lead, primary reasoner | Astra / medium | Unresolved architecture, contracts, conflicting evidence, or consequential interactions |
-| `repo-explorer` | Luna / medium | Bounded read-only discovery |
-| `routine-implementer` | Luna / high | Highly specified patterned work |
-| `budget-implementer` | Luna / max | Optional settled moderate work with executable checks and scheduling slack |
-| `balanced-implementer` | Sol / medium | Settled moderate work, especially on the critical path |
-| `boundary-implementer` | Sol / high | Settled consequential seams under a five-part grant |
-| `behavioral-test-analyst` | Sol / high | Blind behavioral scenarios and discriminating test design |
-| `pragmatic-code-reviewer` | Sol / high | Ordinary substantive review |
-| `adversarial-code-reviewer` | Astra / high | Focused consequential-risk review |
-| `deep-debugger` | Astra / medium | Uncertain root causes and stalled diagnosis |
+Both platforms run the same five lanes. Model and effort live only in the agent
+definitions (`.claude/agents/*.md` frontmatter, `.codex/agents/*.toml`); retune
+there, never in this table.
 
-Role TOML files under `.codex/agents/` configure workers; this table records routing
-intent. Root model selection belongs to the host, not the skill. Preserve explicit
-user choices, verify resolved settings when exposed, and report unknown settings
-honestly. A running session may retain older role definitions. Check available
-roles before dispatch: skip the optional budget lane if unavailable; keep uncertain
-diagnosis with the lead if the debugger is unavailable. Use a fresh session to
-load updated role definitions; do not claim file edits reconfigured live agents.
-Raise root or debugger effort only for a concrete unresolved reasoning
-problem. Plan length alone does not warrant a stronger lead. Terra remains a
-candidate for measured recurring workloads, not an automatic escalation rung.
-Benchmark rankings motivate these defaults; accepted repo results must validate them.
+| Agent | Use for |
+| --- | --- |
+| `Explore` | Read-only discovery; file-backed evidence, not judgment |
+| `implementer` | Bounded, settled implementation using established contracts and patterns |
+| `senior-implementer` | Ambiguous diagnosis and consequential implementation, including settled seam changes under a brief |
+| `reviewer` | Full correctness review against established contracts; plan review applying established architecture |
+| `senior-reviewer` | Consequential contracts, interacting failure modes, architectural changes, and blind scenario/test analysis |
 
-Claude uses Sonnet/low for exploration and routine patterned work. Opus/medium
-handles settled implementation and pragmatic review; Opus/high handles blind
-behavioral analysis, hard debugging, and premium adversarial review. Claude's
-single `implementer` covers moderate work and consequential seams; Codex separates
-balanced and boundary roles. Claude uses Fable for demanding orchestration and
-Opus as the economical alternative, at medium effort unless consequential
-synthesis warrants more. Preserve Claude model choices independently of Codex
-benchmark results. On both platforms, `deep-debugger` owns uncertain diagnosis;
-unresolved architecture and product policy remain with the lead.
+Route by uncertainty, consequence, and the evidence needed to establish
+correctness, not diff size. A substantial feature on established contracts can
+be routine; a small change to public types/Zod, provider wire or `effort`
+mapping, streaming/redaction, state durability, usage/cost, or concurrency is
+consequential even with a settled design. Consequential implementation gets a
+seam brief (invariants plus a verification plan) and one consolidated
+`senior-reviewer` pass on the quiescent seam diff. Review classes share one
+evidence standard and are selected by charter, not run as a sequential approval
+chain. Unresolved architecture, product, and policy decisions stay with the lead.
 
-Do not delegate merely because a slot exists. Give workers whole owned chunks
-and local engineering discretion within settled behavior and invariants. A
-consequential implementation grant must include design, invariants, acceptance
-criteria, owned files, and verification; require one focused premium review of
-the consolidated quiescent seam diff. Start ordinary milestone review with one
-composite reviewer and add independent charters for distinct meaningful failure
-surfaces. Explicit comprehensive session review retains at least two perspectives.
-Resume relevant agents for related work without crossing implementation/review or
-blind behavioral-analysis independence boundaries. Escalate stagnant diagnosis
-(two repetitions of the same ineffective approach without new evidence), not
-productive test failures. Return unresolved policy or contracts outside a grant
-promptly. The `tackle-plan` lead records orchestration outcomes and adjusts routing
-within authorized scope using its shared accountability reference.
+Both fleets' agent bodies point to shared procedures under
+`.claude/references/agents/`. Keep behavior there; keep discovery descriptions,
+model/effort, tool or sandbox controls, and report delivery in the platform
+entrypoints. Workflow routing policy belongs in the shared skill procedures;
+`.claude/references/workflow-handoffs.md` owns sequencing and evidence reuse.
+
+The host selects the root lead; skills cannot switch it. Preserve explicit user
+choices and report unknown resolved settings honestly. Raise root effort only
+for a concrete unresolved reasoning problem; plan length alone does not warrant
+a stronger lead. Fresh sessions load agent definitions; file edits do not
+reconfigure live agents, so check the available roles before dispatch.
 
 Read-only role configuration is defense in depth, not a portable hard boundary:
-the host's permission profile may override a role's `sandbox_mode`. Discovery,
-behavioral-analysis, and review agents must still be explicitly instructed not
-to edit or run artifact-writing commands, and the lead must confirm a review
-wave did not mutate the working tree before accepting its findings or committing.
+the host's permission profile may override `disallowedTools` or `sandbox_mode`.
+Discovery and review agents must still be explicitly instructed not to edit or
+run artifact-writing commands, and the lead must confirm a review wave did not
+mutate the working tree before accepting its findings or committing.
 
 ## Workflow skills
 
 Claude skills live in `.claude/skills/`. Codex discovers repository skills
 through `.agents/skills`, which points to `.codex/skills`. The Codex directory
-links `live-api-verification` and `prompt-iteration` back here individually, so
-their Axl knowledge still has one source. The four orchestration workflows are
-native Codex
-variants because they name Codex agents and choose Codex model tiers; keep the two
-platform variants aligned on outcomes, not implementation details.
+links `live-api-verification` and `prompt-iteration` back here individually. The
+four orchestration workflows (`plan-doc`, `tackle-plan`, `session-review`,
+`scenario-review`) keep one platform-neutral procedure each in
+`.claude/skills/<skill>/references/procedure.md`, written in lane language; each
+platform's `SKILL.md` only binds those lanes to its agents and platform
+mechanics, and `.codex/skills/<skill>/references` links to the shared directory.
+Edit the procedure for a workflow change and the bindings for a roster change.
 
 The five orchestration and live-verification workflows are explicit-invoke
 (`disable-model-invocation: true` in Claude;

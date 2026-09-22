@@ -55,6 +55,7 @@ export type {
   EvalConfig,
   EvalResult,
   EvalItem,
+  EvalItemFailure,
   EvalSummary,
   EvalComparison,
   EvalComparisonPartial,

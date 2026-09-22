@@ -364,6 +364,8 @@ export async function rescore(
         output: original.output,
         error: original.error,
         ...(original.outcome ? { outcome: original.outcome } : {}),
+        // The failure cause is a fact about the source run too.
+        ...(original.failure ? { failure: original.failure } : {}),
         accounting,
         // Same rule as a scored item: an item carrying `accounting` always
         // carries both compat views, so no reader falls through to the legacy

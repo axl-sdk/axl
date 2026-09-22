@@ -496,6 +496,15 @@ result.summary.itemErrorRate;
 // absent when no item failed; `1` disables the gate; an invalid value throws
 ```
 
+Each failed item says why on `item.failure`, taken from the first `ProviderError` on the
+thrown value or its `cause` chain (the provider's raw `body` is never stored), and the CLI
+groups the failed items by it (`Failure causes: 5 × 429 (openai), 1 × other`):
+
+```ts
+result.items[0].failure;
+// { name: 'ProviderError', provider: 'openai', status: 429, retryable: true, requestId: 'req_…' }
+```
+
 To test the gate, have the workflow throw for chosen items — a `ProviderError` with
 `status: 429` reproduces a rate-limit storm without a provider. From the CLI,
 `--max-item-error-rate <0..1>` overrides the config for one invocation.

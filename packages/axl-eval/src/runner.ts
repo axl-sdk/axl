@@ -1,10 +1,11 @@
 import type { ArtifactManifest, AxlRuntime, CallTiming, ModelTimingRollup } from '@axlsdk/axl';
-import { AdmissionController, AxlError, RequestCaptureChannel } from '@axlsdk/axl';
+import { AdmissionController, AxlError, ProviderError, RequestCaptureChannel } from '@axlsdk/axl';
 import type {
   EvalAccounting,
   EvalConfig,
   EvalCoverage,
   EvalItem,
+  EvalItemFailure,
   EvalItemOutcome,
   EvalResult,
   EvalSummary,
@@ -283,6 +284,59 @@ export function attachOperationRefs(
   }
 }
 
+/** How far down a `cause` chain the failure walk looks before giving up. */
+const MAX_CAUSE_DEPTH = 8;
+
+/**
+ * Is this a `ProviderError`? Structural, like `isAdmissionDenied`: core ships
+ * dual ESM+CJS and `runtime.eval()` reaches this runner through a dynamic
+ * import, so an error thrown by the other copy of the class fails `instanceof`.
+ * The `code`/`name` pair is stable public surface on both copies.
+ */
+function isProviderErrorLike(value: unknown): value is ProviderError {
+  if (value instanceof ProviderError) return true;
+  if (typeof value !== 'object' || value === null) return false;
+  const candidate = value as { code?: unknown; name?: unknown };
+  return candidate.code === 'PROVIDER_ERROR' && candidate.name === 'ProviderError';
+}
+
+/**
+ * The structured cause of an item failure, read from the thrown value before
+ * it is flattened to a message.
+ *
+ * Walks the thrown value and its `cause` chain — bounded in depth, because a
+ * cause chain is caller-built data and may be cyclic — and takes EVERY
+ * field from the first `ProviderError` it meets. With none, only the thrown
+ * value's `name` is kept. Each field is copied by name with a type check, never
+ * by spreading the error, so `body` (which can echo prompt text) and any other
+ * property cannot reach the artifact.
+ */
+export function describeItemFailure(thrown: unknown): EvalItemFailure | undefined {
+  let current: unknown = thrown;
+  // The depth bound is also the cycle guard: a chain that loops back on
+  // itself is simply walked until the bound.
+  for (let depth = 0; depth <= MAX_CAUSE_DEPTH; depth++) {
+    if (typeof current !== 'object' || current === null) break;
+    if (isProviderErrorLike(current)) {
+      const { name, provider, status, retryable, requestId } = current as Partial<
+        Record<'name' | 'provider' | 'status' | 'retryable' | 'requestId', unknown>
+      >;
+      return {
+        name: typeof name === 'string' ? name : 'ProviderError',
+        ...(typeof provider === 'string' ? { provider } : {}),
+        ...(typeof status === 'number' && Number.isFinite(status) ? { status } : {}),
+        ...(typeof retryable === 'boolean' ? { retryable } : {}),
+        ...(typeof requestId === 'string' ? { requestId } : {}),
+      };
+    }
+    current = (current as { cause?: unknown }).cause;
+  }
+  const name = (thrown as { name?: unknown } | null | undefined)?.name;
+  return typeof thrown === 'object' && thrown !== null && typeof name === 'string' && name
+    ? { name }
+    : undefined;
+}
+
 export async function runEval(
   config: EvalConfig,
   executeWorkflow: (
@@ -492,6 +546,8 @@ export async function runEval(
             // Everything else is the workflow's own failure, INCLUDING a nested
             // `ctx.budget` block: that is user logic, not a run-budget stop.
             evalItem.outcome = 'failed';
+            const failure = describeItemFailure(err);
+            if (failure) evalItem.failure = failure;
             evalItem.error = err instanceof Error ? err.message : String(err);
             if (admission?.closed) noteClosure('case');
           }

@@ -364,11 +364,39 @@ export type ModelTimingStats = {
   firstTokenCalls?: number;
 };
 
+/**
+ * Why an item's workflow failed, captured from the thrown value before it is
+ * flattened to `EvalItem.error`. Populated on `failed` items only.
+ *
+ * When a `ProviderError` is found — the thrown value itself or the first one
+ * down its `cause` chain — every field comes from it. Otherwise only the thrown
+ * value's `name` is recorded. `ProviderError.body` is NEVER recorded: it can
+ * echo prompt text and is redaction-eligible.
+ */
+export type EvalItemFailure = {
+  /** `'ProviderError'` when one was found, else the thrown value's own `name`. */
+  name: string;
+  /** Adapter/profile name, e.g. `'openai'`. */
+  provider?: string;
+  /** HTTP status; `0` for a network-level failure. */
+  status?: number;
+  /** `ProviderError.retryable` — the semantic failover hint. */
+  retryable?: boolean;
+  /** Provider request id, when the response carried one. */
+  requestId?: string;
+};
+
 export type EvalItem = {
   input: unknown;
   annotations?: unknown;
   output: unknown;
   error?: string;
+  /**
+   * Structured cause of a `failed` item — see {@link EvalItemFailure}. Absent
+   * on every other outcome, on pre-0.24 artifacts, and when the thrown value
+   * carried no `name` (a thrown string, say).
+   */
+  failure?: EvalItemFailure;
   scorerErrors?: string[];
   scores: Record<string, number | null>;
   duration?: number;

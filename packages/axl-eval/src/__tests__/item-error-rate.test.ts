@@ -145,7 +145,7 @@ describe('runEval: item error rate at produce time', () => {
 
     expect(result.summary.itemErrorRate).toMatchObject({ limit: 0.1, exceeded: false });
     // The rate is still shown, informationally, on the coverage line.
-    expect(formatCoverageLine(result)).toBe(
+    expect(formatCoverageLine(result)!.split('\n')[0]).toBe(
       '  Items: 94 completed, 6 failed — item error rate 6% (limit 10%)',
     );
   });

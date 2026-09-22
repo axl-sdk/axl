@@ -231,6 +231,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the reason and disables both actions instead of repeating counters for
   evidence that is gone; a run that captured nothing, and a multi-run aggregate
   view (whose result carries run 1's manifest), render nothing.
+- **Eval items record why they failed.** A `failed` item now carries
+  `item.failure = { name, provider?, status?, retryable?, requestId? }`,
+  captured before the thrown value is flattened to `error`. Every field comes
+  from the first `ProviderError` on the thrown value or its `cause` chain
+  (bounded walk). With none, only the thrown `name` is recorded.
+  `ProviderError.body` is never recorded. The CLI summary adds a
+  `Failure causes:` line that groups failed items by status and provider (for
+  example `5 × 429 (openai), 2 × other`), so throttling reads differently from a
+  bug. The field is additive: `EvalItemOutcome` and the coverage counters are
+  unchanged. `rescore` carries it through, and the type is exported as
+  `EvalItemFailure`.
 
 ### Changed
 

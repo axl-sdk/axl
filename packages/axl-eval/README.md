@@ -317,6 +317,7 @@ A run that loses items in the *workflow* (a rate-limit storm, an incident, a too
 
 ```
   Items: 89 completed, 250 failed — item error rate 73.7% (limit 5%)
+  Failure causes: 250 × 429 (openai)
 [axl-eval] ITEM ERROR RATE EXCEEDED: qa.eval.ts — 250 of 339 attempted item(s) failed in the workflow (item error rate 73.7%), over the 5% limit; …
 ```
 
@@ -327,6 +328,8 @@ The rate is `failed / (count − cancelled − budget_skipped − budget_interru
 | `failOnItemErrorRate` (config field, default `0.05`) | **Source-side** — `runEval` | Sets the limit; `runEval` records `summary.itemErrorRate` whenever an item failed. An invalid value throws before the dataset loads. |
 | `--max-item-error-rate <0..1>` (run flag) | CLI | Overrides the config for this invocation. `1` disables the gate (the rate is still printed). |
 | `--max-item-error-rate <0..1>` (compare flag, default `0.05`) | **Gate-side** — `axl-eval compare` | Refuses to certify a side (any compared run) whose item error rate is over the limit, including legacy artifacts (rate derived from their items). Warns about a side that lost items within the limit. |
+
+Each failed item records **why** on `item.failure` — `{ name, provider, status, retryable, requestId }` taken from the first `ProviderError` on the thrown value or its `cause` chain, or just the thrown `name` otherwise (the provider's raw error body is never stored) — and the table groups them on the `Failure causes:` line (`network` is status `0`, `other` is a non-provider failure), so a rate-limit storm reads differently from a bug.
 
 `rescore` does not apply the gate — its failed items belong to the source run — and rejects the flag; `compare` re-applies the floor to a rescored artifact. Building your own gate? `evaluateItemErrorRateGate(baseline, candidate, limit?)` is exported.
 

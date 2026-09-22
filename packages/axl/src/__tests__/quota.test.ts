@@ -128,6 +128,28 @@ describe('hint', () => {
     }
   });
 
+  it('OpenAI: the project-tokens lane can be the binding one', () => {
+    const h = openaiHeaders({ limitTokens: '1000', remainingTokens: '900' });
+    h.set('x-ratelimit-limit-project-tokens', '500');
+    h.set('x-ratelimit-remaining-project-tokens', '50');
+    expect(openai.hint(h)).toBe(0.1);
+  });
+
+  it('Anthropic: Priority Tier input and output lanes can be the binding one', () => {
+    const base = {
+      'anthropic-ratelimit-requests-limit': '1000',
+      'anthropic-ratelimit-requests-remaining': '900',
+    };
+    for (const lane of ['input', 'output']) {
+      const h = new Headers({
+        ...base,
+        [`anthropic-priority-${lane}-tokens-limit`]: '10000',
+        [`anthropic-priority-${lane}-tokens-remaining`]: '1000',
+      });
+      expect(anthropic.hint(h), lane).toBe(0.1);
+    }
+  });
+
   it('reports exhaustion as 0 and ignores the reset headers entirely', () => {
     const h = openaiHeaders({ limitTokens: '1000', remainingTokens: '0' });
     h.set('x-ratelimit-reset-tokens', 'garbage-that-would-throw-if-parsed');

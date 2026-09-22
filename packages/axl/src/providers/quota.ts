@@ -168,11 +168,19 @@ const OPENAI_SPEND_CAP_CODES: ReadonlySet<unknown> = new Set([
   'organization_usage_limit_exceeded',
 ]);
 
-/** Lanes from developers.openai.com/api/docs/guides/rate-limits. */
+/**
+ * Lanes from developers.openai.com/api/docs/guides/rate-limits, including the
+ * project-scoped token lane. More lanes only lower the minimum, which keeps the
+ * hint conservative.
+ */
 export const openaiQuotaDialect: QuotaDialect = makeDialect(
   [
     { limit: 'x-ratelimit-limit-requests', remaining: 'x-ratelimit-remaining-requests' },
     { limit: 'x-ratelimit-limit-tokens', remaining: 'x-ratelimit-remaining-tokens' },
+    {
+      limit: 'x-ratelimit-limit-project-tokens',
+      remaining: 'x-ratelimit-remaining-project-tokens',
+    },
   ],
   (error) => {
     if (error.type === 'insufficient_quota' || OPENAI_SPEND_CAP_CODES.has(error.code)) {
@@ -208,6 +216,15 @@ export const anthropicQuotaDialect: QuotaDialect = makeDialect(
     {
       limit: 'anthropic-ratelimit-output-tokens-limit',
       remaining: 'anthropic-ratelimit-output-tokens-remaining',
+    },
+    // Priority Tier only; absent otherwise.
+    {
+      limit: 'anthropic-priority-input-tokens-limit',
+      remaining: 'anthropic-priority-input-tokens-remaining',
+    },
+    {
+      limit: 'anthropic-priority-output-tokens-limit',
+      remaining: 'anthropic-priority-output-tokens-remaining',
     },
   ],
   (error) => {

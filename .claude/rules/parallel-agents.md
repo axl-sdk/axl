@@ -18,8 +18,10 @@ another agent's in-flight edit.
 - If a sibling agent's half-finished edit is breaking your build/typecheck, that's **expected
   mid-flight noise** — report it and proceed; do not try to make it disappear. The orchestrator
   reconciles at the end.
-- Need an isolated tree? Ask the orchestrator for a **git worktree** (`isolation: "worktree"` on
-  the Agent tool) instead. That's the supported isolation primitive; stash is not.
+- Need an isolated tree? Ask the orchestrator for a **git worktree**. Use the platform's native
+  worktree-isolation option when available (`isolation: "worktree"` in Claude Code); otherwise
+  the lead provisions one with `git worktree add`. That's the supported isolation primitive;
+  stash is not.
 
 ## The pre-commit hook stashes — so isolate concurrent file-mutating work
 
@@ -46,6 +48,18 @@ before any agent works in it:
    `.env` in by hand first.
 
 Once provisioned, worktrees are the right tool when agents mutate files concurrently.
+
+## Committing on a shared tree
+
+`git commit` commits the INDEX, not the paths you added — a sibling's staged files ride along
+under your message. Commit with explicit paths (`git commit -- <your paths>`) and check
+`git diff --cached --name-only` immediately before. Never repair a mislabeled commit with
+reset/revert/checkout on the shared tree; report it and let the lead reconcile.
+
+- **One ignored path in `git add a b c` aborts the whole add** — nothing is staged, a chained
+  commit silently skips (or commits someone else's staged files). Check the add's exit status.
+- **Never chain `|| git commit --amend` after a fallible commit.** If the first commit failed,
+  the amend rewrites the previous commit — possibly a sibling's.
 
 ## Scope discipline
 

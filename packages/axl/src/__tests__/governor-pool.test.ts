@@ -439,6 +439,58 @@ describe('AC12: credentials, origins and runtimes separate scopes', () => {
     net.releaseAll();
     await Promise.all(calls);
   });
+
+  it('the origin is normalized: default port and trailing slash do not split a scope', async () => {
+    const net = stubFetch();
+    const runtime = new AxlRuntime({
+      providers: {
+        openai: {
+          apiKey: 'k',
+          baseUrl: 'https://api.openai.com:443/v1/',
+          rateLimit: { maxConcurrent: 1 },
+        },
+        'openai-responses': {
+          apiKey: 'k',
+          baseUrl: 'https://API.openai.com/v1',
+          rateLimit: { maxConcurrent: 1 },
+        },
+      },
+    });
+    const calls = [
+      chat(resolveVia(runtime, 'openai:gpt-4o').provider, 'gpt-4o'),
+      chat(resolveVia(runtime, 'openai-responses:gpt-4o').provider, 'gpt-4o'),
+    ];
+    await settle();
+    // One scope: the explicit :443 and the host's case are the same origin.
+    expect(net.inFlight).toBe(1);
+    net.releaseAll();
+    await settle();
+    expect(net.inFlight).toBe(1);
+    net.releaseAll();
+    await Promise.all(calls);
+    expect(net.peak).toBe(1);
+    expect(mergeWarnings()).toEqual([]);
+  });
+
+  it('the family is part of the scope: openai and a preset on one key and origin stay separate', async () => {
+    const net = stubFetch();
+    const proxy = 'https://proxy.example.com/v1';
+    const runtime = new AxlRuntime({
+      providers: {
+        openai: { apiKey: 'k', baseUrl: proxy, rateLimit: { maxConcurrent: 1 } },
+        groq: { apiKey: 'k', baseUrl: proxy, rateLimit: { maxConcurrent: 1 } },
+      },
+    });
+    const calls = [
+      chat(resolveVia(runtime, 'openai:shared-model').provider, 'shared-model'),
+      chat(resolveVia(runtime, 'groq:shared-model').provider, 'shared-model'),
+    ];
+    await settle();
+    expect(net.inFlight).toBe(2);
+    expect(net.dispatches.every((d) => d.url.startsWith(proxy))).toBe(true);
+    net.releaseAll();
+    await Promise.all(calls);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -667,6 +719,39 @@ describe('AC15: two rateLimit blocks on one scope merge strictest', () => {
     await Promise.all(calls);
     expect(net.peak).toBe(1);
     expect(mergeWarnings()).toEqual([]);
+  });
+
+  it('a waiter armed before a merge reports the timeout it was armed with', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    const net = stubFetch();
+    const config: AxlConfig = {
+      providers: {
+        openai: { apiKey: 'k', rateLimit: { maxConcurrent: 1, acquireTimeoutMs: 200 } },
+        'openai-responses': { apiKey: 'k', rateLimit: { acquireTimeoutMs: 50 } },
+      },
+    };
+    const registry = new ProviderRegistry();
+    const completions = registry.resolve('openai:gpt-4o', config).provider;
+    const holder = chat(completions, 'gpt-4o');
+    const waiter = chat(completions, 'gpt-4o').then(
+      () => 'resolved',
+      (err: unknown) => err,
+    );
+    await settle();
+    expect(net.inFlight).toBe(1);
+
+    // The Responses block joins and tightens the scope's timeout to 50 ms. The
+    // queued waiter keeps its 200 ms timer, and its error must say so.
+    registry.resolve('openai-responses:gpt-4o', config);
+    await vi.advanceTimersByTimeAsync(199);
+    await settle();
+    expect(net.dispatches).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    const err = await waiter;
+    expect((err as Error).message).toBe('RateLimiter.acquire timed out after 200ms');
+
+    net.releaseAll();
+    await holder;
   });
 
   it('an invalid value in one block is not taken as the strictest', async () => {

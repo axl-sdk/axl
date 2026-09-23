@@ -177,9 +177,15 @@ const MODEL: Record<Family, string> = {
   groq: 'llama-3.3-70b',
 };
 
-function providerFor(family: Family, rateLimit?: RateLimitConfig): Provider {
+function providerFor(family: Family, rateLimit?: RateLimitConfig, baseUrl?: string): Provider {
   const runtime = new AxlRuntime({
-    providers: { [family]: { apiKey: 'k', ...(rateLimit ? { rateLimit } : {}) } },
+    providers: {
+      [family]: {
+        apiKey: 'k',
+        ...(rateLimit ? { rateLimit } : {}),
+        ...(baseUrl ? { baseUrl } : {}),
+      },
+    },
   });
   return runtime.resolveProvider(`${family}:${MODEL[family]}`).provider;
 }
@@ -647,6 +653,117 @@ describe('AC21 (guard): dialect-less scopes are unchanged', () => {
     await vi.runAllTimersAsync();
     expect((await p).status).toBe(429);
     expect(net.log.map((d) => d.at - T0)).toEqual([0, 1000, 2000]);
+  });
+});
+
+describe('AC21 (guard): a first-party family behind a proxy is dialect-less', () => {
+  const PROXY = 'https://llm-gateway.example.com/v1';
+  const families: [Family][] = [['openai'], ['openai-responses'], ['anthropic']];
+
+  it.each(families)('%s at a proxy origin: a 200 goes out with no governor', async (family) => {
+    const model = MODEL[family];
+    const net = stubFetch(() => ({ status: 200 }));
+    const provider = providerFor(family, undefined, PROXY);
+    const r = await outcome(ask(provider, 'call-a', {}, model));
+    expect(r.ok).toBe(true);
+    expect(
+      net.log.map((d) => [d.tag, d.url.startsWith('https://llm-gateway.example.com/')]),
+    ).toEqual([['call-a', true]]);
+    expect(governorOf(provider, model)).toBeUndefined();
+  });
+
+  it.each(families)(
+    '%s at a proxy origin: a 429 holds no sibling and shares the transient budget',
+    async (family) => {
+      const model = MODEL[family];
+      const net = stubFetch((d) =>
+        d.tag === 'call-a' ? { status: 429, headers: { 'retry-after': '1' } } : { status: 200 },
+      );
+      const provider = providerFor(family, undefined, PROXY);
+      const a = outcome(ask(provider, 'call-a', {}, model));
+      await at(1);
+      const b = outcome(ask(provider, 'call-b', {}, model));
+      await vi.runAllTimersAsync();
+      const ra = await a;
+      expect((ra as { error: ProviderError }).error.status).toBe(429);
+      expect((await b).ok).toBe(true);
+      expect(net.log.map((d) => [d.tag, d.at - T0])).toEqual([
+        ['call-a', 0],
+        ['call-b', 1],
+        ['call-a', 1000],
+        ['call-a', 2000],
+      ]);
+      expect(warn).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(families)(
+    '%s at a proxy origin: a 503 retries on the shared budget and holds no sibling',
+    async (family) => {
+      const model = MODEL[family];
+      const net = stubFetch((d) => (d.tag === 'call-a' ? { status: 503 } : { status: 200 }));
+      const provider = providerFor(family, undefined, PROXY);
+      const a = outcome(ask(provider, 'call-a', {}, model));
+      await at(1);
+      const b = outcome(ask(provider, 'call-b', {}, model));
+      await vi.runAllTimersAsync();
+      expect(((await a) as { error: ProviderError }).error.status).toBe(503);
+      expect((await b).ok).toBe(true);
+      expect(net.log.map((d) => [d.tag, d.at - T0])).toEqual([
+        ['call-a', 0],
+        ['call-b', 1],
+        ['call-a', 1000],
+        ['call-a', 3000],
+      ]);
+    },
+  );
+
+  it.each(families)(
+    '%s at a proxy origin with rateLimit: the governor paces but never brakes',
+    async (family) => {
+      const model = MODEL[family];
+      const net = stubFetch((d) =>
+        d.tag === 'call-a' ? { status: 429, headers: { 'retry-after': '1' } } : { status: 200 },
+      );
+      const provider = providerFor(family, { maxConcurrent: 2 }, PROXY);
+      const a = outcome(ask(provider, 'call-a', {}, model));
+      await at(1);
+      const b = outcome(ask(provider, 'call-b', {}, model));
+      await vi.runAllTimersAsync();
+      expect(((await a) as { error: ProviderError }).error.status).toBe(429);
+      expect((await b).ok).toBe(true);
+      expect(net.log.map((d) => [d.tag, d.at - T0])).toEqual([
+        ['call-a', 0],
+        ['call-b', 1],
+        ['call-a', 1000],
+        ['call-a', 2000],
+      ]);
+      expect(governorOf(provider, model).adapts).toBe(false);
+    },
+  );
+
+  it.each<[Family, string]>([
+    ['openai', 'https://api.openai.com/v1'],
+    ['openai-responses', 'https://API.openai.com:443/v1/'],
+    ['anthropic', 'https://api.anthropic.com/v1'],
+  ])('%s with baseUrl %s (the default origin) still brakes', async (family, baseUrl) => {
+    const model = MODEL[family];
+    const net = stubFetch((d) =>
+      d.tag === 'call-a' && d.attempt === 1
+        ? { status: 429, headers: { 'retry-after': '1' } }
+        : { status: 200 },
+    );
+    const provider = providerFor(family, undefined, baseUrl);
+    const a = outcome(ask(provider, 'call-a', {}, model));
+    await at(1);
+    const b = outcome(ask(provider, 'call-b', {}, model));
+    await vi.runAllTimersAsync();
+    await Promise.all([a, b]);
+    expect(net.log.map((d) => [d.tag, d.at - T0])).toEqual([
+      ['call-a', 0],
+      ['call-a', 1000],
+      ['call-b', 1000],
+    ]);
   });
 });
 

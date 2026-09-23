@@ -237,7 +237,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A 429 from OpenAI or Anthropic now waits and retries instead of failing
   fast, and a spend cap fails immediately.** On first-party OpenAI (`openai:`,
   `openai-responses:`) and Anthropic (`anthropic:`), the transport reads the
-  429 body before deciding what to do. This is on by default and needs no
+  429 body before deciding what to do. First-party means the vendor's own
+  endpoint (`api.openai.com`, `api.anthropic.com`); the same blocks pointed at
+  a proxy, gateway or self-hosted `baseUrl` are unchanged. This is on by default and needs no
   configuration:
   - **Spend caps fail fast.** Anthropic `enforced_spend_limit_reached`, and
     OpenAI `insufficient_quota` and its billing codes, return at once as

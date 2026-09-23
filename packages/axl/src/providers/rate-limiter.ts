@@ -67,7 +67,8 @@ export type RateLimitConfig = {
   acquireTimeoutMs?: number;
   /**
    * Feedback-driven pacing on scopes with a quota dialect: first-party OpenAI
-   * (`openai:` and `openai-responses:`) and Anthropic. Default `true` there;
+   * (`openai:` and `openai-responses:`) and Anthropic at the vendor's default
+   * endpoint origin (not a proxy or gateway `baseUrl`). Default `true` there;
    * it has no effect anywhere else. When on, a rate-limit 429 brakes every
    * call on the scope for its `Retry-After` (clamped at 60 s) and the call
    * retries on its own budget (`maxRateLimitRetries`); a spend-cap 429 fails

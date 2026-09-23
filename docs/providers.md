@@ -4,7 +4,7 @@ Agents reference models using the `provider:model` URI scheme. Axl ships four na
 adapters plus OpenAI-compatible presets, all built on raw `fetch` with no provider SDKs.
 
 All providers retry `429` (rate limit), `503` (unavailable), and `529` (overloaded)
-responses with exponential backoff. On first-party OpenAI and Anthropic a rate-limit
+responses with exponential backoff. On OpenAI's and Anthropic's own endpoints a rate-limit
 `429` also pauses every call on the same account and model until the provider's
 `Retry-After`, and a spend-cap `429` fails fast; see
 [Rate limiting](#rate-limiting).
@@ -533,7 +533,9 @@ part of the application's trust boundary. See
 
 First-party OpenAI (`openai:` and `openai-responses:`) and Anthropic (`anthropic:`)
 are the only providers with a **quota dialect**: Axl can tell a rate-limit `429` from
-a spend-cap `429` in their error bodies. On those scopes (see "one governor per
+a spend-cap `429` in their error bodies. "First-party" means the vendor's own default
+endpoint: the origin of `https://api.openai.com/v1` or `https://api.anthropic.com/v1`
+(an explicit `baseUrl` with that origin counts). On those scopes (see "one governor per
 scope" below) a `429` is handled differently from other providers, with no
 configuration:
 
@@ -546,7 +548,7 @@ configuration:
 - **A rate limit brakes the whole scope.** Any other `429` (including one whose body
   can't be read) pauses **every** call on that scope until its `Retry-After`, clamped
   at 60 s. Without `Retry-After` the pause is the usual backoff: 1 s, then 2 s, doubling
-  for each further consecutive 429. During the pause nothing on the scope is sent: not
+  for each further 429 the same call receives. During the pause nothing on the scope is sent: not
   calls queued for a permit, and not calls waking from a `503` backoff. The call that
   hit the 429 gives its permit back while it waits and retries first once the pause
   ends, ahead of calls that have not been sent yet.
@@ -563,6 +565,12 @@ Set `rateLimit: { adaptive: false }` to turn this off for a provider: a `429` th
 the transient budget and holds up no other call, as on every other provider. Other
 providers (Gemini, OpenAI-compatible presets such as Azure or OpenRouter, custom
 adapters) are unchanged.
+
+An `openai`, `openai-responses` or `anthropic` block whose `baseUrl` points anywhere
+else (a proxy, an LLM gateway, a self-hosted compatible server) has **no** dialect: its
+429s and quota headers are that server's, not the vendor's. It behaves exactly as
+before: no governor unless you set `rateLimit`, no pause, and `429`s on the shared
+transient budget. Opting such an endpoint in is not supported yet.
 
 The spend-cap body shapes come from the providers' documentation and have not yet been
 checked against live spend-cap responses. A spend-cap 429 whose body Axl does not

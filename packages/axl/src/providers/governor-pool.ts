@@ -281,7 +281,7 @@ export class AccountScope {
     private readonly family: string,
     private readonly origin: string,
   ) {
-    this.dialect = quotaDialectFor(family);
+    this.dialect = quotaDialectFor(family, origin);
   }
 
   /** Record one provider block's (sanitized) `rateLimit`, merging strictest. */

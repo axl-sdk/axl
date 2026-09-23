@@ -241,15 +241,28 @@ export const anthropicQuotaDialect: QuotaDialect = makeDialect(
   },
 );
 
-/** Keyed by governor-scope family (`governor-pool.ts`); a Map so no prototype key resolves. */
-const DIALECTS: ReadonlyMap<string, QuotaDialect> = new Map([
-  ['openai', openaiQuotaDialect],
-  ['anthropic', anthropicQuotaDialect],
+/**
+ * Keyed by governor-scope family (`governor-pool.ts`); a Map so no prototype key
+ * resolves. Each dialect describes its vendor's own endpoint only, so it is paired
+ * with that endpoint's origin: the adapters' default base URLs
+ * (`https://api.openai.com/v1`, `https://api.anthropic.com/v1`).
+ */
+const DIALECTS: ReadonlyMap<string, { origin: string; dialect: QuotaDialect }> = new Map([
+  ['openai', { origin: 'https://api.openai.com', dialect: openaiQuotaDialect }],
+  ['anthropic', { origin: 'https://api.anthropic.com', dialect: anthropicQuotaDialect }],
 ]);
 
-/** The dialect for a governor-scope family, or `undefined` for a dialect-less scope. */
-export function quotaDialectFor(family: string): QuotaDialect | undefined {
-  return DIALECTS.get(family);
+/**
+ * The dialect for a governor scope, or `undefined` for a dialect-less scope.
+ *
+ * A dialect applies only at its vendor's own endpoint. `origin` is the scope's
+ * normalized origin (`new URL(baseUrl).origin`); an `openai` or `anthropic`
+ * block pointed at a proxy, gateway or self-hosted server gets no dialect,
+ * because that server's 429s and headers are not the vendor's.
+ */
+export function quotaDialectFor(family: string, origin: string): QuotaDialect | undefined {
+  const entry = DIALECTS.get(family);
+  return entry !== undefined && entry.origin === origin ? entry.dialect : undefined;
 }
 
 /**

@@ -68,9 +68,38 @@ const OPENAI_SLOW_DOWN = {
 };
 
 describe('quotaDialectFor', () => {
-  it('returns a dialect only for the first-party OpenAI and Anthropic families', () => {
-    expect(quotaDialectFor('openai')).toBe(openaiQuotaDialect);
-    expect(quotaDialectFor('anthropic')).toBe(anthropicQuotaDialect);
+  const OPENAI = 'https://api.openai.com';
+  const ANTHROPIC = 'https://api.anthropic.com';
+
+  it('returns a dialect for OpenAI and Anthropic at their own default origins', () => {
+    expect(quotaDialectFor('openai', OPENAI)).toBe(openaiQuotaDialect);
+    expect(quotaDialectFor('anthropic', ANTHROPIC)).toBe(anthropicQuotaDialect);
+    // The origins the adapters derive from their default base URLs.
+    expect(quotaDialectFor('openai', new URL('https://api.openai.com/v1').origin)).toBe(
+      openaiQuotaDialect,
+    );
+    expect(quotaDialectFor('anthropic', new URL('https://API.anthropic.com:443/v1').origin)).toBe(
+      anthropicQuotaDialect,
+    );
+  });
+
+  it('a first-party family at any other origin is dialect-less', () => {
+    for (const origin of [
+      'https://proxy.example.com',
+      'http://api.openai.com',
+      'https://api.openai.com:8443',
+      'https://eu.api.openai.com',
+      'http://localhost:4000',
+      ANTHROPIC,
+    ]) {
+      expect(quotaDialectFor('openai', origin)).toBeUndefined();
+    }
+    for (const origin of ['https://gateway.example.com', OPENAI]) {
+      expect(quotaDialectFor('anthropic', origin)).toBeUndefined();
+    }
+  });
+
+  it('other families have no dialect, even at a vendor origin', () => {
     for (const family of [
       'google',
       'azure',
@@ -81,7 +110,8 @@ describe('quotaDialectFor', () => {
       '__proto__',
       'constructor',
     ]) {
-      expect(quotaDialectFor(family)).toBeUndefined();
+      expect(quotaDialectFor(family, OPENAI)).toBeUndefined();
+      expect(quotaDialectFor(family, ANTHROPIC)).toBeUndefined();
     }
   });
 });

@@ -133,19 +133,6 @@ export type FetchWithRetryOptions = {
    */
   provider?: string;
   /**
-   * Optional out-of-band latency observer. Observing changes nothing: omitting
-   * this leaves behavior byte-identical, and neither callback's return value is
-   * read.
-   *
-   * A CALLBACK MUST NOT THROW. Both are invoked inside the fetch loop and
-   * neither is wrapped, so a throw propagates to the caller exactly as a
-   * throwing `governor.observe()` does — the permit is still released by the
-   * `finally`, but a throw from `onComplete` turns a returned `Response` into a
-   * thrown error whose body is never consumed or cancelled. Propagating rather
-   * than swallowing is deliberate and matches this seam's existing stance;
-   * observers own their own error handling.
-   */
-  /**
    * Optional budget admission gate. `beforeDispatch` is called AFTER the
    * governor permit is acquired and immediately before EVERY `fetch` attempt —
    * so a request that queued behind the governor, or slept through retry
@@ -160,6 +147,18 @@ export type FetchWithRetryOptions = {
    * throw and must not change behavior.
    */
   admission?: DispatchAdmission;
+  /**
+   * Optional out-of-band latency observer. Observing changes nothing: omitting
+   * this leaves behavior byte-identical, and no callback's return value is read.
+   *
+   * A CALLBACK MUST NOT THROW. Each is invoked inside the fetch loop and none
+   * is wrapped, so a throw propagates to the caller exactly as a
+   * throwing `governor.observe()` does — the permit is still released by the
+   * `finally`, but a throw from `onComplete` turns a returned `Response` into a
+   * thrown error whose body is never consumed or cancelled. Propagating rather
+   * than swallowing is deliberate and matches this seam's existing stance;
+   * observers own their own error handling.
+   */
   timing?: {
     /**
      * Fired at each attempt's `fetch` start, `attempt` 1-indexed. A stall clock

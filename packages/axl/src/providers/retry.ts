@@ -293,16 +293,22 @@ export async function fetchWithRetry(
           // other wait on this path. (A brake that began during the sleep is
           // handled by the check below, with no await in between.)
           if (signal?.aborted) throw signal.reason;
-        } else if (dispatches === 0) {
-          // A first-time caller waits out any brake BEFORE queueing, so its
-          // `acquireTimeoutMs` clock does not run during the brake.
-          await waitSelfImposed(() => scope.awaitClear(signal));
-          await waitSelfImposed(() => scope.acquire(signal));
-          acquired = true;
         } else {
-          // A retry re-acquires at the head of the queue, no queue timeout;
-          // the governor grants nothing until the brake ends.
-          await waitSelfImposed(() => scope.reacquire(signal));
+          // A first-time caller waits out any brake BEFORE queueing, so its
+          // `acquireTimeoutMs` clock does not run during the brake. A retry
+          // re-acquires at the head of the queue with no queue timeout; the
+          // governor grants nothing until the brake ends. A wait that never
+          // happens (not braked, permit free) is not timed at all, so it adds
+          // exactly 0 to `queuedMs` rather than a clock tick.
+          if (dispatches === 0 && scope.braked()) {
+            await waitSelfImposed(() => scope.awaitClear(signal));
+          }
+          if (signal?.aborted) throw signal.reason;
+          if (!scope.tryAcquire()) {
+            await waitSelfImposed(() =>
+              dispatches === 0 ? scope.acquire(signal) : scope.reacquire(signal),
+            );
+          }
           acquired = true;
         }
         // Last check, and the only place a held permit meets a brake: a

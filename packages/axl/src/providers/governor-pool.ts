@@ -145,6 +145,15 @@ export class ScopeGovernor extends RateLimiter {
     return this.enqueue(signal, { priority: true, timeoutMs: undefined });
   }
 
+  /**
+   * Take a permit without waiting, if `acquire()` / `reacquire()` would grant
+   * one at once: not braked and a permit free. Lets the transport skip timing a
+   * wait that never happened, so an unqueued call reports `queuedMs` exactly 0.
+   */
+  tryAcquire(): boolean {
+    return !this.braked() && this.tryGrant();
+  }
+
   /** Read the quota hint on a 2xx. Total: a throwing dialect warns once and is ignored. */
   override observe(res: Response): void {
     if (!this.adapts || !res.ok) return;

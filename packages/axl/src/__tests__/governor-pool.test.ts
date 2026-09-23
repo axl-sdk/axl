@@ -3,6 +3,7 @@ import { AxlRuntime } from '../runtime.js';
 import { ProviderRegistry } from '../providers/registry.js';
 import { OpenAIProvider } from '../providers/openai.js';
 import { RateLimiter } from '../providers/rate-limiter.js';
+import { ScopeGovernor } from '../providers/governor-pool.js';
 import type { AxlConfig } from '../config.js';
 import type { ChatMessage, Provider, ProviderResponse } from '../providers/types.js';
 
@@ -797,6 +798,7 @@ describe('no rateLimit anywhere', () => {
     async (name, model) => {
       vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
       const acquire = vi.spyOn(RateLimiter.prototype, 'acquire');
+      const tryAcquire = vi.spyOn(ScopeGovernor.prototype, 'tryAcquire');
       const net = stubFetch();
       const runtime = new AxlRuntime({ providers: { [name]: { apiKey: 'k' } } });
       const { provider } = resolveVia(runtime, `${name}:${model}`);
@@ -805,7 +807,9 @@ describe('no rateLimit anywhere', () => {
       expect(net.inFlight).toBe(3);
       net.releaseAll();
       const results = await Promise.all(calls);
-      expect(acquire).toHaveBeenCalledTimes(3);
+      // Each call took a permit from the scope's governor at once; none queued.
+      expect(tryAcquire.mock.results.map((r) => r.value)).toEqual([true, true, true]);
+      expect(acquire).not.toHaveBeenCalled();
       for (const r of results) expect(r.timing?.queuedMs).toBe(0);
       expect(warn).not.toHaveBeenCalled();
     },

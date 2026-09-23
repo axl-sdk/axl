@@ -280,6 +280,24 @@ export class RateLimiter {
     });
   }
 
+  /**
+   * Take a permit synchronously if one is free right now — nobody queued,
+   * capacity available and spacing satisfied — exactly when `acquire()` would
+   * grant without waiting. Returns whether it took one; the caller pairs a
+   * `true` with one {@link release}.
+   *
+   * @internal Extension point for Axl's own per-scope governor.
+   */
+  protected tryGrant(): boolean {
+    if (this.queue.length > 0 || this.active >= this.maxConcurrent) return false;
+    if (this.minIntervalMs > 0 && this.minIntervalMs - (Date.now() - this.lastGrantAt) > 0) {
+      return false;
+    }
+    this.active++;
+    this.lastGrantAt = Date.now();
+    return true;
+  }
+
   private hasStaticCap(): boolean {
     return this.maxConcurrent !== Infinity || this.minIntervalMs > 0;
   }

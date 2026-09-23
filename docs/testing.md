@@ -78,6 +78,8 @@ configured response delay is pending rejects with the signal's exact reason. Thi
 `stallTimeout` behavior testable without a real provider; it does not certify a vendor's
 network abort behavior. See the [API reference](./api-reference.md#ask-deadlines-cancellation-and-stalled-requests).
 
+> **Fake timers against a real adapter:** a suite that fakes `setTimeout` but not `Date` (for example `vi.useFakeTimers({ toFake: ['setTimeout'] })`) waits in real time on an OpenAI or Anthropic rate-limit pause, because the pause is measured with `Date.now()`; fake `Date` too, or set `rateLimit: { adaptive: false }`. See [Rate limiting](./providers.md#rate-limiting).
+
 ### Deterministic provider timing
 
 A mock response accepts an optional `timing` block ([`CallTiming`](./api-reference.md#calltiming)). `chat()` returns it on `ProviderResponse.timing` and `stream()` carries it on the terminal `done` chunk, so `agent_call_end.timing`, the `TimeoutError` breakdown, and the eval per-model rollup all become exact integers instead of measured deltas — no real clocks, no real transport.

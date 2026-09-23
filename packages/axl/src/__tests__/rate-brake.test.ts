@@ -452,14 +452,17 @@ describe('AC19: rate-limit and transient retries use separate budgets', () => {
     it('a brake that lands between the first grant and fetch sends the caller back to wait', async () => {
       const { net, p, timing } = governed(
         (gov) => {
-          const acquire = gov.acquire.bind(gov);
+          // The first grant is synchronous (a free permit), so the sibling's
+          // 429 lands right after it, before the caller reaches fetch.
+          const tryAcquire = gov.tryAcquire.bind(gov);
           let once = true;
-          gov.acquire = async (signal) => {
-            await acquire(signal);
-            if (once) {
+          gov.tryAcquire = () => {
+            const granted = tryAcquire();
+            if (granted && once) {
               once = false;
-              gov.brake(1000, Date.now()); // a sibling's 429, right after the grant
+              gov.brake(1000, Date.now());
             }
+            return granted;
           };
         },
         [{ status: 200 }],
@@ -1198,6 +1201,25 @@ describe('AC39: no permit is held through a brake once in-flight calls land', ()
 // ---------------------------------------------------------------------------
 
 describe('AC33: queuedMs and retryMs stay disjoint', () => {
+  it.each<[string, RateLimitConfig | undefined]>([
+    ['no rateLimit', undefined],
+    ['an unsaturated maxConcurrent', { maxConcurrent: 2 }],
+  ])(
+    'real timers: an unqueued dialect-scope call reports queuedMs exactly 0 (%s)',
+    async (_label, rateLimit) => {
+      vi.useRealTimers();
+      // Every clock read advances, so any bracket around a wait that never
+      // happened would show up as queue time.
+      let now = T0;
+      vi.spyOn(Date, 'now').mockImplementation(() => (now += 5));
+      stubFetch(() => ({ status: 200 }));
+      const provider = providerFor('openai', rateLimit);
+      const res = await ask(provider, 'call-a');
+      expect(res.timing?.attempts).toBe(1);
+      expect(res.timing?.queuedMs).toBe(0);
+    },
+  );
+
   it('429 → 30 s brake → 200: the brake is queue time, not retry time', async () => {
     stubFetch((d) =>
       d.attempt === 1

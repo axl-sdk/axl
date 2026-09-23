@@ -85,6 +85,8 @@ type Reply = {
   after?: number;
   /** Return a bare object fixture (no clone, no body) instead of a Response. */
   bare?: boolean;
+  /** Reject `fetch` with this error (after `after` ms) instead of responding. */
+  throws?: Error;
 };
 
 type Dispatch = {
@@ -138,6 +140,7 @@ function stubFetch(script: (d: Dispatch) => Reply) {
     } finally {
       inFlight--;
     }
+    if (reply.throws) throw reply.throws;
     if (reply.bare) {
       return { ok: false, status: reply.status, headers: new Headers(reply.headers) } as Response;
     }
@@ -1193,6 +1196,73 @@ describe('AC39: no permit is held through a brake once in-flight calls land', ()
       ['call-n2', 1, 61_010],
     ]);
     expect(net.peak).toBeLessThanOrEqual(2);
+  });
+});
+
+describe('AC39 (network error): a socket-error sleeper that wakes into a brake holds no permit', () => {
+  it('call-s1 fetch throws, then a sibling 429 with Retry-After: 60 lands before it wakes', async () => {
+    const net = stubFetch((d) => {
+      if (d.tag === 'call-s1' && d.attempt === 1) {
+        return { status: 0, throws: new TypeError('socket hang up'), after: 10 };
+      }
+      if (d.tag === 'call-s2' && d.attempt === 1) {
+        return { status: 429, headers: { 'retry-after': '60' }, after: 5 };
+      }
+      return { status: 200, after: 5 };
+    });
+    const provider = providerFor('openai', { maxConcurrent: 2 });
+    const gov = governorOf(provider);
+    const s1 = outcome(ask(provider, 'call-s1'));
+    const s2 = outcome(ask(provider, 'call-s2'));
+    await at(1009); // s1 is in its 1 s network backoff, still holding its permit
+    expect(activePermits(gov)).toBe(1);
+    await at(1011); // s1 woke at T0+1010 into s2's brake and gave its permit back
+    expect(activePermits(gov)).toBe(0);
+    await at(1100);
+    const n1 = outcome(ask(provider, 'call-n1'));
+    const n2 = outcome(ask(provider, 'call-n2'));
+    await at(60_004);
+    expect(net.log.map((d) => [d.tag, d.at - T0])).toEqual([
+      ['call-s1', 0],
+      ['call-s2', 0],
+    ]);
+    expect(activePermits(gov)).toBe(0);
+    await vi.runAllTimersAsync();
+    const results = await Promise.all([s1, s2, n1, n2]);
+    expect(results.every((r) => r.ok)).toBe(true);
+    expect(net.log.slice(2).map((d) => [d.tag, d.attempt, d.at - T0])).toEqual([
+      ['call-s2', 2, 60_005],
+      ['call-s1', 2, 60_005],
+      ['call-n1', 1, 60_010],
+      ['call-n2', 1, 60_010],
+    ]);
+    expect(net.peak).toBeLessThanOrEqual(2);
+  });
+});
+
+describe('brakes are per model', () => {
+  it('a braked gpt-4o does not hold gpt-4o-mini on the same account', async () => {
+    const net = stubFetch((d) =>
+      d.tag === 'call-a' && d.attempt === 1
+        ? { status: 429, headers: { 'retry-after': '5' } }
+        : { status: 200 },
+    );
+    const provider = providerFor('openai');
+    const a = outcome(ask(provider, 'call-a', {}, 'gpt-4o'));
+    await at(1);
+    const b = outcome(ask(provider, 'call-b', {}, 'gpt-4o'));
+    const mini = outcome(ask(provider, 'call-mini', {}, 'gpt-4o-mini'));
+    await tick();
+    expect(governorOf(provider, 'gpt-4o').braked()).toBe(true);
+    expect(governorOf(provider, 'gpt-4o-mini').braked()).toBe(false);
+    await vi.runAllTimersAsync();
+    expect((await Promise.all([a, b, mini])).every((r) => r.ok)).toBe(true);
+    expect(net.log.map((d) => [d.tag, d.at - T0])).toEqual([
+      ['call-a', 0],
+      ['call-mini', 1],
+      ['call-a', 5000],
+      ['call-b', 5000],
+    ]);
   });
 });
 

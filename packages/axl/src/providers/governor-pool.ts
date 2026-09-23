@@ -53,8 +53,18 @@ export const ADAPTIVE_RATE = Object.freeze({
   WINDOW_MS: 10_000,
   /** Multiplicative decrease: a cut sets `rate = BETA × min(rate, demand)`. */
   BETA: 0.5,
-  /** Additive increase regains one cut's rate (`rateAtLastCut`) in this much successful time. */
+  /**
+   * Additive increase: `alpha = max(rateAtLastCut, ALPHA_FLOOR_RATE) / R` per
+   * second of success, so one cut's rate comes back in this much successful time.
+   */
   RECOVERY_HORIZON_MS: 30_000,
+  /**
+   * The rate `alpha` is proportional to when the last cut left the scope slower
+   * than this (grants per second). Without it, a stray 429 on a quiet scope
+   * seeds a tiny rate that also climbs tinily, pinning a later fan-out for
+   * many minutes (review F1).
+   */
+  ALPHA_FLOOR_RATE: 5,
   /** The floor a cut never goes below, in grants per second. */
   MIN_RATE: 0.25,
   /** Demand is trusted only once the window holds this much unbraked time (after a brake). */
@@ -100,7 +110,7 @@ export class ScopeGovernor extends RateLimiter {
    * minimum gap of `1000 / rate` ms between grants, never below `minIntervalMs`.
    */
   private rate: number | undefined;
-  /** The rate the last cut set; recovery adds `rateAtLastCut / R` per second. */
+  /** The rate the last cut set; recovery adds `max(rateAtLastCut, ALPHA_FLOOR_RATE) / R` per second. */
   private rateAtLastCut = 0;
   /** When the last cut happened. A 429 cuts only if its request left after this. */
   private lastCutAt = Number.NEGATIVE_INFINITY;
@@ -217,9 +227,14 @@ export class ScopeGovernor extends RateLimiter {
   /** Advance recovery on a 2xx, then check whether the scope can reopen (plan §4.4, Q11). */
   private recover(now: number): void {
     if (this.rate === undefined) return;
-    const { RECOVERY_HORIZON_MS, HINT_THRESHOLD, REOPEN_PERIOD_MS } = ADAPTIVE_RATE;
-    // Success-gated time: at most 1 s per 2xx, never braked time, never idle time past 1 s.
-    const accruedMs = Math.min(Math.max(0, now - this.lastProgressAt), 1000);
+    const { RECOVERY_HORIZON_MS, ALPHA_FLOOR_RATE, HINT_THRESHOLD, REOPEN_PERIOD_MS } =
+      ADAPTIVE_RATE;
+    // Success-gated time (Q11): per 2xx, at most max(1 s, the current spacing
+    // interval). A gap Axl's own spacing imposed is not idle time; idle time
+    // beyond it never accrues, and braked time never does (`lastProgressAt` is
+    // pushed to the brake's end).
+    const capMs = Math.max(1000, 1000 / this.rate);
+    const accruedMs = Math.min(Math.max(0, now - this.lastProgressAt), capMs);
     this.lastProgressAt = Math.max(this.lastProgressAt, now);
     const hintLow = this.lastHint !== undefined && this.lastHint < HINT_THRESHOLD;
     // A low hint only holds growth; it never admits more.
@@ -227,7 +242,8 @@ export class ScopeGovernor extends RateLimiter {
       this.reopenSince = undefined;
       return;
     }
-    this.rate += (this.rateAtLastCut * accruedMs) / RECOVERY_HORIZON_MS;
+    const alphaBase = Math.max(this.rateAtLastCut, ALPHA_FLOOR_RATE);
+    this.rate += (alphaBase * accruedMs) / RECOVERY_HORIZON_MS;
     if (this.farAbovePeakDemand(now)) {
       this.reopenSince ??= now;
       if (now - this.reopenSince >= REOPEN_PERIOD_MS) {

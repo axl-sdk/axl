@@ -258,8 +258,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     at about 12.5/s). Grants, including the retries leaving the pause, are
     spaced accordingly, so the pause does not end in a burst. A wave of 429s
     from requests already in flight cuts the rate once. Recovery is linear on
-    successful responses and holds while quota headers show the account nearly
-    exhausted. Once traffic stays well under the rate, the scope drops pacing
+    successful responses, with a minimum pace so one stray 429 on a quiet scope
+    can't pin a later fan-out for minutes, and holds while quota headers show
+    the account nearly exhausted. Once traffic stays well under the rate, the scope drops pacing
     entirely. The first time a scope starts pacing, Axl logs one warning naming
     the provider family. The tuning is internal and not configurable, and
     `minIntervalMs` / `maxConcurrent` stay ceilings.

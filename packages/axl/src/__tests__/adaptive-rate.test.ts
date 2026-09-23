@@ -15,10 +15,18 @@ import type { ChatMessage, ChatOptions, Provider, ProviderResponse } from '../pr
 // spacing is derived from the internal constants (Q10), never restated.
 // ---------------------------------------------------------------------------
 
-const { BETA, RECOVERY_HORIZON_MS, WINDOW_MS, REOPEN_PERIOD_MS, HINT_THRESHOLD, MIN_RATE } =
-  ADAPTIVE_RATE;
+const {
+  BETA,
+  RECOVERY_HORIZON_MS,
+  WINDOW_MS,
+  REOPEN_PERIOD_MS,
+  HINT_THRESHOLD,
+  MIN_RATE,
+  ALPHA_FLOOR_RATE,
+} = ADAPTIVE_RATE;
 /** Additive increase per second of success after a cut to `rateAtCut`. */
-const alphaFor = (rateAtCut: number) => rateAtCut / (RECOVERY_HORIZON_MS / 1000);
+const alphaFor = (rateAtCut: number) =>
+  Math.max(rateAtCut, ALPHA_FLOOR_RATE) / (RECOVERY_HORIZON_MS / 1000);
 
 const T0 = Date.UTC(2026, 8, 22);
 const WAVE = 25;
@@ -459,6 +467,70 @@ describe('AC37: recovery is linear in rate and success-gated', () => {
     for (const gap of gaps(idleBurst)) {
       expect(gap).toBeGreaterThanOrEqual(Math.floor(1000 / (before + 2 * alphaFor(BETA * WAVE))));
     }
+  });
+});
+
+describe('J1: a stray 429 on a quiet scope does not pin a later fan-out (review F1)', () => {
+  /** One call on a quiet scope draws a 429: demand is one grant, so the cut is BETA × 1/s. */
+  async function strayCut(provider: Provider, gov: ScopeGovernor): Promise<number> {
+    const stray = ask(provider, 'call-stray');
+    await at(11); // its 429 landed at T0+10
+    const r0 = gov.currentRate!;
+    expect(r0).toBe(BETA * 1);
+    await vi.runAllTimersAsync(); // its retry succeeds after the 1 s brake
+    expect((await stray).ok).toBe(true);
+    return r0;
+  }
+
+  it('a 25-worker fan-out regains ALPHA_FLOOR_RATE within the floor-driven recovery time', async () => {
+    const latency = 500;
+    stubFetch((d) =>
+      d.tag === 'call-stray' && d.attempt === 1
+        ? { status: 429, headers: { 'retry-after': '1' } }
+        : { status: 200, headers: HEALTHY, after: latency },
+    );
+    const provider = providerFor();
+    const gov = governorOf(provider);
+    const r0 = await strayCut(provider, gov);
+    const alpha = alphaFor(r0);
+    expect(alpha).toBe(ALPHA_FLOOR_RATE / (RECOVERY_HORIZON_MS / 1000)); // the floor governs
+
+    const start = 5000;
+    await at(start);
+    let next = 0;
+    const worker = async () => {
+      while (next < 1000) await ask(provider, `call-f${next++}`);
+    };
+    const workers = Array.from({ length: WAVE }, worker);
+    // Linear recovery from r0 at alpha, lagging by at most one response latency
+    // plus one interval at r0 (the first 2xx of the fan-out).
+    const slackMs = latency + 1000 / r0;
+    const deadline = start + ((ALPHA_FLOOR_RATE - r0) / alpha) * 1000 + slackMs;
+    await at(Math.ceil(deadline));
+    expect(gov.currentRate).toBeGreaterThanOrEqual(ALPHA_FLOOR_RATE);
+    // …and no faster than linear: at most alpha per second since the cut's brake ended.
+    expect(gov.currentRate).toBeLessThanOrEqual(r0 + (alpha * (deadline - 1010)) / 1000);
+    next = 1000; // stop issuing
+    await vi.runAllTimersAsync();
+    await Promise.all(workers);
+  });
+
+  it('idle time still does not inflate a low rate: one 2xx accrues at most one spacing interval (Q11)', async () => {
+    stubFetch((d) =>
+      d.tag === 'call-stray' && d.attempt === 1
+        ? { status: 429, headers: { 'retry-after': '1' } }
+        : { status: 200, headers: HEALTHY },
+    );
+    const provider = providerFor();
+    const gov = governorOf(provider);
+    const r0 = await strayCut(provider, gov);
+    await at(60_000); // a minute idle
+    const before = gov.currentRate!;
+    const a = ask(provider, 'call-a');
+    await vi.runAllTimersAsync();
+    expect((await a).ok).toBe(true);
+    const capS = Math.max(1, 1 / before); // the scope's own spacing, not the idle minute
+    expect(gov.currentRate).toBeCloseTo(before + alphaFor(r0) * capS, 9);
   });
 });
 

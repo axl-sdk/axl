@@ -596,9 +596,12 @@ open to **paced**: it grants at most `rate` requests per second, spacing every g
   scope cut extend the pause but don't cut again. A 429 on a request sent after the cut
   halves `rate` again. Right after a long pause, too few requests have gone out to
   measure demand, so that cut halves the current `rate` instead.
-- **Recovery is linear and needs success.** Each successful response raises `rate` by a
-  small step that regains one halving in about 30 s of successful traffic. Paused time
-  and idle time don't count, so a quiet scope can't build up credit and then burst.
+- **Recovery is linear and needs success.** Successful responses raise `rate` steadily,
+  regaining one halving in about 30 s of successful traffic. A scope cut to a very low
+  rate (say one stray 429 while traffic was light) still climbs at a minimum pace of a
+  few requests per second per 30 s, so a fan-out that starts later isn't stuck crawling
+  for minutes. Paused time doesn't count, and neither does idle time beyond the scope's
+  own spacing, so a quiet scope can't build up credit and then burst.
   While the latest successful response's quota headers (`x-ratelimit-remaining-*` /
   `anthropic-ratelimit-*-remaining`) show the account nearly exhausted, `rate` holds.
   Quota headers only ever stop growth; they never admit more.

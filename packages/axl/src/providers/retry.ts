@@ -34,21 +34,26 @@ function jitter(ms: number): number {
   return ms * (0.75 + Math.random() * 0.5);
 }
 
+/**
+ * Sleep `ms`, cut short (resolving, not rejecting) by `signal`. The abort
+ * listener is removed when the sleep completes, so a long-lived signal shared
+ * by many calls does not collect one listener per backoff.
+ */
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
     if (signal?.aborted) {
       resolve();
       return;
     }
-    const timer = setTimeout(resolve, ms);
-    signal?.addEventListener(
-      'abort',
-      () => {
-        clearTimeout(timer);
-        resolve();
-      },
-      { once: true },
-    );
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
   });
 }
 

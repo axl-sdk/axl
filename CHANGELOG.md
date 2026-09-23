@@ -432,6 +432,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A response that is returned (success, a non-retryable error, or the last
   attempt after retries run out) keeps its body, so `ProviderError.body` is
   still the raw provider text.
+- **Retry backoffs no longer pile abort listeners onto a shared signal.** Each
+  completed backoff sleep now removes its listener from the call's
+  `AbortSignal`. Before, every retry on a long-lived signal (for example one
+  `AbortController` for a whole run) left a listener behind until that signal
+  was aborted or collected, which could trigger Node's
+  `MaxListenersExceededWarning`.
 
 ## [0.23.3] - 2026-09-09
 

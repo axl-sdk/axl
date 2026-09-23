@@ -1,3 +1,4 @@
+import { getEventListeners } from 'node:events';
 import { createServer } from 'node:http';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { fetchWithRetry, type FetchTiming } from '../providers/retry.js';
@@ -160,6 +161,27 @@ describe('fetchWithRetry', () => {
       }
     },
   );
+});
+
+describe('fetchWithRetry backoff sleep', () => {
+  it('leaves no abort listener on a long-lived signal after sleeps that ran to completion', async () => {
+    // One signal shared by many calls (a run-wide AbortController): each
+    // completed backoff must remove its listener, or they pile up per retry.
+    const ctrl = new AbortController();
+    const fail = { ok: false, status: 503, headers: new Headers() };
+    const ok = { ok: true, status: 200, headers: new Headers() };
+    for (let call = 0; call < 3; call++) {
+      globalThis.fetch = vi
+        .fn()
+        .mockResolvedValueOnce(fail)
+        .mockResolvedValueOnce(fail)
+        .mockResolvedValueOnce(ok) as any;
+      const p = fetchWithRetry('https://example.com', { signal: ctrl.signal });
+      await vi.runAllTimersAsync();
+      expect(await p).toBe(ok);
+    }
+    expect(getEventListeners(ctrl.signal, 'abort')).toHaveLength(0);
+  });
 });
 
 describe('fetchWithRetry + governor', () => {

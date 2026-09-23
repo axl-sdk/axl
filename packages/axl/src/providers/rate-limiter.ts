@@ -71,9 +71,12 @@ export type RateLimitConfig = {
    * endpoint origin (not a proxy or gateway `baseUrl`). Default `true` there;
    * it has no effect anywhere else. When on, a rate-limit 429 brakes every
    * call on the scope for its `Retry-After` (clamped at 60 s) and the call
-   * retries on its own budget (`maxRateLimitRetries`); a spend-cap 429 fails
-   * fast. `false` restores the plain behavior: a 429 shares the transient
-   * retry budget and holds up no other call. Ignored by a directly constructed
+   * retries on its own budget (`maxRateLimitRetries`), and the scope then
+   * paces its grants adaptively (a rate seeded from recent demand, recovered
+   * linearly on success, dropped once traffic stays well below it; tuning is
+   * internal) until it reopens; a spend-cap 429 fails fast. `false` restores
+   * the plain behavior: a 429 shares the transient retry budget, holds up no
+   * other call, and nothing is paced. Ignored by a directly constructed
    * `RateLimiter`, which is never adaptive.
    */
   adaptive?: boolean;
@@ -269,8 +272,9 @@ export class RateLimiter {
 
       // If pump() couldn't grant this waiter synchronously, it genuinely queued.
       // Warn only about the configured caps: a queue caused by something else
-      // (a rate-limit brake on a pooled governor) is not a cap to raise.
-      if (!waiter.granted && !options.priority && this.hasStaticCap() && !this.warnedQueued) {
+      // (a rate-limit brake or adaptive spacing on a pooled governor) is not a
+      // cap to raise.
+      if (!waiter.granted && !options.priority && this.staticCapBinding() && !this.warnedQueued) {
         this.warnedQueued = true;
         console.warn(
           `[axl] RateLimiter: request queued (maxConcurrent=${this.maxConcurrent}${this.minIntervalMs ? `, minIntervalMs=${this.minIntervalMs}` : ''}). ` +
@@ -290,16 +294,48 @@ export class RateLimiter {
    */
   protected tryGrant(): boolean {
     if (this.queue.length > 0 || this.active >= this.maxConcurrent) return false;
-    if (this.minIntervalMs > 0 && this.minIntervalMs - (Date.now() - this.lastGrantAt) > 0) {
-      return false;
-    }
+    if (this.spacingWaitMs() > 0) return false;
     this.active++;
     this.lastGrantAt = Date.now();
+    this.onGrant(this.lastGrantAt);
     return true;
   }
 
-  private hasStaticCap(): boolean {
-    return this.maxConcurrent !== Infinity || this.minIntervalMs > 0;
+  /**
+   * The minimum gap between two grants, in ms. Every grant path (the queue
+   * pump, priority waiters and {@link tryGrant}) spaces by it.
+   *
+   * @internal Extension point for Axl's own per-scope governor, which widens it
+   * while adaptively paced; not a supported public contract.
+   */
+  protected grantIntervalMs(): number {
+    return this.minIntervalMs;
+  }
+
+  /**
+   * Called on every grant, with its timestamp.
+   *
+   * @internal Extension point for Axl's own per-scope governor.
+   */
+  protected onGrant(_at: number): void {
+    // intentionally empty
+  }
+
+  /** How long the next grant must wait for spacing; `<= 0` means it may go now. */
+  private spacingWaitMs(): number {
+    const interval = this.grantIntervalMs();
+    return interval > 0 ? interval - (Date.now() - this.lastGrantAt) : 0;
+  }
+
+  /**
+   * Whether a CONFIGURED cap is what stops a grant right now: the concurrency
+   * cap is full, or the configured spacing has not elapsed. Queueing for any
+   * other reason (a brake, adaptive spacing) is not a cap the user can raise,
+   * so it never triggers the queued warning.
+   */
+  private staticCapBinding(): boolean {
+    if (this.active >= this.maxConcurrent) return true;
+    return this.minIntervalMs > 0 && this.minIntervalMs - (Date.now() - this.lastGrantAt) > 0;
   }
 
   /**
@@ -342,18 +378,16 @@ export class RateLimiter {
    */
   protected pump(): void {
     while (this.queue.length > 0 && this.active < this.maxConcurrent) {
-      if (this.minIntervalMs > 0) {
-        const waitMs = this.minIntervalMs - (Date.now() - this.lastGrantAt);
-        if (waitMs > 0) {
-          // Head-of-line waits out the spacing interval. One shared timer re-pumps.
-          if (!this.spacingTimer) {
-            this.spacingTimer = setTimeout(() => {
-              this.spacingTimer = undefined;
-              this.pump();
-            }, waitMs);
-          }
-          return;
+      const waitMs = this.spacingWaitMs();
+      if (waitMs > 0) {
+        // Head-of-line waits out the spacing interval. One shared timer re-pumps.
+        if (!this.spacingTimer) {
+          this.spacingTimer = setTimeout(() => {
+            this.spacingTimer = undefined;
+            this.pump();
+          }, waitMs);
         }
+        return;
       }
       const waiter = this.queue.shift()!;
       this.grant(waiter);
@@ -366,6 +400,7 @@ export class RateLimiter {
     this.active++;
     this.lastGrantAt = Date.now();
     this.clearWaiterTimers(waiter);
+    this.onGrant(this.lastGrantAt);
     waiter.resolve();
   }
 

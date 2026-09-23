@@ -558,11 +558,16 @@ configuration:
   holding a permit. Your ask `timeout`, signal and `AdmissionController` still stop it.
   When the budget runs out, the last `429` surfaces as a `ProviderError` with its raw
   body and raw `retryAfterMs`.
+- **After a rate-limit 429 the scope paces itself** (see "Adaptive pacing" below), and
+  returns to unpaced once the provider stops pushing back.
 - **Nothing changes before the first rate-limit 429.** With no `rateLimit` configured
-  there is no cap, no spacing and no warning; calls go out exactly as before.
+  there is no cap, no spacing and no warning; calls go out exactly as before. Request
+  size doesn't matter (a large base64 image or a cached prompt is not estimated or
+  charged), and quota headers alone never slow a scope that has not been throttled.
 
-Set `rateLimit: { adaptive: false }` to turn this off for a provider: a `429` then shares
-the transient budget and holds up no other call, as on every other provider. Other
+Set `rateLimit: { adaptive: false }` to turn all of this off for a provider (the pause,
+the separate budget and the adaptive pacing): a `429` then shares the transient budget
+and holds up no other call, as on every other provider. Other
 providers (Gemini, OpenAI-compatible presets such as Azure or OpenRouter, custom
 adapters) are unchanged.
 
@@ -576,6 +581,43 @@ The spend-cap body shapes come from the providers' documentation and have not ye
 checked against live spend-cap responses. A spend-cap 429 whose body Axl does not
 recognize is treated as a rate limit: it retries on the rate-limit budget and then fails
 with the same `ProviderError`.
+
+#### Adaptive pacing after a rate-limit 429
+
+The pause alone would let every waiting call leave at once when it ends and hit the
+same limit again. So the first rate-limit 429 on a scope also switches it from fully
+open to **paced**: it grants at most `rate` requests per second, spacing every grant
+(including the retries that go first after the pause) by `1000 / rate` ms.
+
+- **The first cut is measured, not guessed.** `rate` starts at half the scope's recent
+  demand: the requests granted over the last few seconds, not counting time spent
+  paused. A burst of 25 simultaneous calls that all draw 429s is paced at about 12.5/s.
+- **One cut per wave.** The 429s from requests that were already in flight when the
+  scope cut extend the pause but don't cut again. A 429 on a request sent after the cut
+  halves `rate` again. Right after a long pause, too few requests have gone out to
+  measure demand, so that cut halves the current `rate` instead.
+- **Recovery is linear and needs success.** Each successful response raises `rate` by a
+  small step that regains one halving in about 30 s of successful traffic. Paused time
+  and idle time don't count, so a quiet scope can't build up credit and then burst.
+  While the latest successful response's quota headers (`x-ratelimit-remaining-*` /
+  `anthropic-ratelimit-*-remaining`) show the account nearly exhausted, `rate` holds.
+  Quota headers only ever stop growth; they never admit more.
+- **It reopens on its own.** Once `rate` has stayed well above the busiest second of
+  recent traffic for a sustained period, with no 429 and healthy quota headers, the
+  scope drops pacing and is fully open again. A bursty workload whose bursts still fill
+  a second at the current `rate` stays paced, so its next burst doesn't start another
+  round of 429s.
+- **Your configured limits stay ceilings.** Adaptive spacing never goes below
+  `minIntervalMs`, and `maxConcurrent` still caps requests in flight.
+- **You'll see it once.** The first time a scope starts pacing, Axl logs one
+  `[axl] Rate governor: <family> returned a rate-limit 429; pacing this scope …`
+  warning. It names the provider family only, never the key or the endpoint. The
+  time a call spends waiting for its grant is in `CallTiming.queuedMs`.
+
+The window length, the halving factor, the recovery horizon, the minimum rate, the
+quota-header threshold and the reopen rule are internal and not configurable. They may
+be retuned; the only guarantee is that they err on the slow side. `adaptive: false` is
+the switch.
 
 #### Proactive pacing (opt-in)
 
@@ -607,7 +649,7 @@ export default defineConfig({
 | `maxConcurrent` | `number` | Max requests in flight for this provider. Must be a finite integer ≥ 1 (invalid values disable the cap with a warning). `1` serializes all requests (a throughput floor, not a deadlock — see below). |
 | `minIntervalMs` | `number` | Minimum ms between successive request *grants* (global spacing, no burst bucket). |
 | `acquireTimeoutMs` | `number` | If set, a call that waits longer than this in the queue for its **first** permit rejects (fail loud) instead of hanging on a misconfigured cap. A call that arrives during a rate-limit pause waits the pause out before this clock starts; a call already queued when a pause begins keeps its clock running. A retry after a rate-limit 429 is exempt. |
-| `adaptive` | `boolean` | Default `true` on OpenAI and Anthropic, where a rate-limit 429 pauses the scope and a spend-cap 429 fails fast (above). `false` restores the plain retry. No effect on other providers. |
+| `adaptive` | `boolean` | Default `true` on OpenAI and Anthropic, where a rate-limit 429 pauses the scope, then paces it adaptively until it reopens, and a spend-cap 429 fails fast (above). `false` restores the plain retry with no pause and no pacing. No effect on other providers. |
 | `maxRateLimitRetries` | `number` | Retries after a rate-limit 429 where `adaptive` applies. Default `8`; an integer ≥ 0 (invalid values warn and use the default). Separate from the `503`/`529` budget. |
 
 **Scope & caveats:**
@@ -673,7 +715,8 @@ export default defineConfig({
 - **The "request queued" warning is per scope.** The one-time
   `[axl] RateLimiter: request queued` warning fires the first time a call waits on
   a given scope's `maxConcurrent` or `minIntervalMs`, so a run that queues on three
-  models sees it three times. Waiting out a rate-limit pause does not trigger it.
+  models sees it three times. Waiting out a rate-limit pause or adaptive pacing does
+  not trigger it; adaptive pacing has its own one-time message (above).
 - **No deadlock on nesting.** A permit is held only across a single HTTP call, never
   across a nested `ctx.ask()` (tool handlers run between provider calls, not during),
   so an agent-as-tool chain on the same provider under `maxConcurrent: 1` still
@@ -702,7 +745,8 @@ apart: your own pacing, the provider's throttling, and the model's latency. Fiel
 reference: [api-reference.md → `CallTiming`](api-reference.md#calltiming).
 
 - **`queuedMs`** — every wait Axl imposes on itself: the first permit, `minIntervalMs`
-  spacing, a rate-limit pause, and the re-acquire after a rate-limit 429. `0` when
+  spacing, adaptive pacing after a rate-limit 429, a rate-limit pause, and the
+  re-acquire after a rate-limit 429. `0` when
   nothing waited, which includes every call before a scope's first rate-limit 429 when
   it has no `rateLimit`.
 - **`retryMs` and `attempts`** — the retry loop, excluding the waits already in

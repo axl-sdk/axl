@@ -44,6 +44,30 @@ import type { ApiKeySource } from './types.js';
 export const DEFAULT_MAX_RATE_LIMIT_RETRIES = 8;
 
 /**
+ * Tuning of the adaptive rate (rate-space AIMD) on a dialect scope. Internal
+ * and never config: the only contract is "slower is always safe". Exported so
+ * tests derive their expectations from these values instead of restating them.
+ */
+export const ADAPTIVE_RATE = Object.freeze({
+  /** The sliding window of grants (and braked spans) that demand is measured over. */
+  WINDOW_MS: 10_000,
+  /** Multiplicative decrease: a cut sets `rate = BETA × min(rate, demand)`. */
+  BETA: 0.5,
+  /** Additive increase regains one cut's rate (`rateAtLastCut`) in this much successful time. */
+  RECOVERY_HORIZON_MS: 30_000,
+  /** The floor a cut never goes below, in grants per second. */
+  MIN_RATE: 0.25,
+  /** Demand is trusted only once the window holds this much unbraked time (after a brake). */
+  MIN_DEMAND_SPAN_MS: 1_000,
+  /** A 2xx whose quota hint (`remaining / limit`) is below this holds growth and reopening. */
+  HINT_THRESHOLD: 0.1,
+  /** Reopen once `rate` exceeds the window's peak one-second grant count by this factor… */
+  REOPEN_FACTOR: 4,
+  /** …continuously for this long, with no 429 and a healthy hint. */
+  REOPEN_PERIOD_MS: 10_000,
+});
+
+/**
  * The governor for one scope. A {@link RateLimiter} whose limits can be
  * tightened in place when a second provider block reaches the same account.
  *
@@ -56,26 +80,42 @@ export const DEFAULT_MAX_RATE_LIMIT_RETRIES = 8;
  * behaves exactly as a plain `RateLimiter`.
  */
 export class ScopeGovernor extends RateLimiter {
-  // `RateLimiter`'s constructor runs the overridden `pump()` before these
-  // fields are initialized, so every brake read must treat `undefined` as
-  // "not braked" (see `braked()`).
+  // `RateLimiter`'s constructor runs the overridden `pump()` and
+  // `grantIntervalMs()` before these fields are initialized, so every brake and
+  // rate read must treat `undefined` as "not braked" / "fully open".
   private brakeUntil?: number;
   private brakeEndTimer?: ReturnType<typeof setTimeout>;
   private brakeEndAt?: number;
   private adaptive = true;
   private rateLimitRetries = DEFAULT_MAX_RATE_LIMIT_RETRIES;
   private warnedHint = false;
-  /**
-   * The last 2xx quota hint (`remaining / limit`, see `quota.ts`), for the
-   * adaptive-rate phase to hold recovery on. Not read yet.
-   */
+  private warnedEngaged = false;
+  /** The last 2xx quota hint (`remaining / limit`, see `quota.ts`); a low one holds growth. */
   lastHint: number | undefined;
+
+  // --- Adaptive rate (plan §4.4). Only an adapting scope records or reads these.
   /**
-   * `dispatchedAt` of the most recent request that drew a rate-limit 429.
-   * The adaptive-rate phase cuts at most once per congestion epoch by
-   * comparing it with the time of the last cut. Not read yet.
+   * Grants per second, or `undefined` while the scope is fully open (its state
+   * until the first rate-limit 429, and again after it reopens). Enforced as a
+   * minimum gap of `1000 / rate` ms between grants, never below `minIntervalMs`.
    */
-  lastRateLimitedDispatchAt: number | undefined;
+  private rate: number | undefined;
+  /** The rate the last cut set; recovery adds `rateAtLastCut / R` per second. */
+  private rateAtLastCut = 0;
+  /** When the last cut happened. A 429 cuts only if its request left after this. */
+  private lastCutAt = Number.NEGATIVE_INFINITY;
+  /**
+   * Recovery accrues from here. Advanced by each 2xx and pushed to the end of
+   * any brake, so braked time never accrues.
+   */
+  private lastProgressAt = Number.NEGATIVE_INFINITY;
+  /** Since when the reopen condition has held on every 2xx; `undefined` while it doesn't. */
+  private reopenSince: number | undefined;
+  /** Grant timestamps within `WINDOW_MS`, oldest first, from `grantsHead` on. */
+  private grants: number[] = [];
+  private grantsHead = 0;
+  /** Braked spans overlapping the window, oldest first, non-overlapping. */
+  private brakeSpans: { start: number; end: number }[] = [];
 
   /**
    * @param limits already sanitized (see `sanitizeRateLimitConfig`).
@@ -114,17 +154,157 @@ export class ScopeGovernor extends RateLimiter {
   }
 
   /**
-   * Brake every call on the scope for `ms` (already clamped by the caller to
-   * the transport's backoff ceiling). Extends, never shortens, an active
-   * brake. `dispatchedAt` is when the 429'd request left.
+   * On a rate-limit 429: brake every call on the scope for `ms` (already
+   * clamped by the caller to the transport's backoff ceiling), and cut the
+   * adaptive rate. Extends, never shortens, an active brake. `dispatchedAt` is
+   * when the 429'd request left.
    *
-   * This is the seam the adaptive-rate cut attaches to.
+   * The cut happens at most once per congestion epoch: only when the 429'd
+   * request left after the last cut. The rest of a wave that was already in
+   * flight extends the brake without cutting again.
    */
   brake(ms: number, dispatchedAt: number): void {
-    this.lastRateLimitedDispatchAt = dispatchedAt;
-    const until = Date.now() + Math.max(0, ms);
+    const now = Date.now();
+    if (dispatchedAt > this.lastCutAt) this.cut(now);
+    const until = now + Math.max(0, ms);
     if (this.brakeUntil === undefined || until > this.brakeUntil) this.brakeUntil = until;
+    this.recordBrakeSpan(now, this.brakeUntil);
+    this.lastProgressAt = Math.max(this.lastProgressAt, this.brakeUntil);
+    this.reopenSince = undefined;
     this.pump();
+  }
+
+  /** The adaptive rate in grants per second; `undefined` while fully open. @internal */
+  get currentRate(): number | undefined {
+    return this.rate;
+  }
+
+  /**
+   * `rate = BETA × min(rate ?? ∞, demand)`, floored at `MIN_RATE`, where demand
+   * is grants in the window over its unbraked elapsed time (floored at 1 s).
+   * Demand is used only when it can be trusted: when no brake overlaps the
+   * window (a burst from a cold scope reads its true count), or once the window
+   * holds `MIN_DEMAND_SPAN_MS` of unbraked time. Right after a long brake the
+   * window holds only a few spaced grants, so the cut uses the current rate.
+   */
+  private cut(now: number): void {
+    const { WINDOW_MS, BETA, MIN_RATE, MIN_DEMAND_SPAN_MS } = ADAPTIVE_RATE;
+    const windowStart = now - WINDOW_MS;
+    this.pruneWindow(now);
+    const count = Math.max(1, this.grants.length - this.grantsHead);
+    const spanStart = Math.max(windowStart, this.grants[this.grantsHead] ?? now);
+    const unbraked = now - spanStart - this.brakedOverlap(spanStart, now);
+    const demand = (count * 1000) / Math.max(unbraked, 1000);
+    const trusted =
+      this.rate === undefined ||
+      unbraked >= MIN_DEMAND_SPAN_MS ||
+      this.brakedOverlap(windowStart, now) === 0;
+    const base = trusted ? Math.min(this.rate ?? Infinity, demand) : this.rate!;
+    this.rate = Math.max(MIN_RATE, BETA * base);
+    this.rateAtLastCut = this.rate;
+    this.lastCutAt = now;
+    if (!this.warnedEngaged) {
+      this.warnedEngaged = true;
+      // Names the family only — never the credential, origin or model.
+      console.warn(
+        `[axl] Rate governor: ${this.family} returned a rate-limit 429; pacing this scope ` +
+          `(one model on one account) adaptively until it stops being throttled. ` +
+          `Set rateLimit: { adaptive: false } to turn this off.`,
+      );
+    }
+  }
+
+  /** Advance recovery on a 2xx, then check whether the scope can reopen (plan §4.4, Q11). */
+  private recover(now: number): void {
+    if (this.rate === undefined) return;
+    const { RECOVERY_HORIZON_MS, HINT_THRESHOLD, REOPEN_PERIOD_MS } = ADAPTIVE_RATE;
+    // Success-gated time: at most 1 s per 2xx, never braked time, never idle time past 1 s.
+    const accruedMs = Math.min(Math.max(0, now - this.lastProgressAt), 1000);
+    this.lastProgressAt = Math.max(this.lastProgressAt, now);
+    const hintLow = this.lastHint !== undefined && this.lastHint < HINT_THRESHOLD;
+    // A low hint only holds growth; it never admits more.
+    if (hintLow) {
+      this.reopenSince = undefined;
+      return;
+    }
+    this.rate += (this.rateAtLastCut * accruedMs) / RECOVERY_HORIZON_MS;
+    if (this.farAbovePeakDemand(now)) {
+      this.reopenSince ??= now;
+      if (now - this.reopenSince >= REOPEN_PERIOD_MS) {
+        this.rate = undefined;
+        this.reopenSince = undefined;
+      }
+    } else {
+      this.reopenSince = undefined;
+    }
+  }
+
+  /**
+   * Whether `rate` exceeds `REOPEN_FACTOR ×` the window's peak one-second grant
+   * count. The peak is at least the window's per-second average, so a scope
+   * paced near its demand (the common case, with the largest window) is
+   * answered without the O(window) scan.
+   */
+  private farAbovePeakDemand(now: number): boolean {
+    const { REOPEN_FACTOR, WINDOW_MS } = ADAPTIVE_RATE;
+    this.pruneWindow(now);
+    const inWindow = this.grants.length - this.grantsHead;
+    if (this.rate! <= (REOPEN_FACTOR * inWindow * 1000) / WINDOW_MS) return false;
+    return this.rate! > REOPEN_FACTOR * this.peakOneSecondGrants(now);
+  }
+
+  /** The most grants in any one-second span of the window (two pointers, O(window)). */
+  private peakOneSecondGrants(now: number): number {
+    this.pruneWindow(now);
+    let peak = 0;
+    let lo = this.grantsHead;
+    for (let hi = this.grantsHead; hi < this.grants.length; hi++) {
+      while (this.grants[hi]! - this.grants[lo]! >= 1000) lo++;
+      peak = Math.max(peak, hi - lo + 1);
+    }
+    return peak;
+  }
+
+  /** Total braked time inside `[from, to)`. */
+  private brakedOverlap(from: number, to: number): number {
+    let total = 0;
+    for (const { start, end } of this.brakeSpans) {
+      total += Math.max(0, Math.min(end, to) - Math.max(start, from));
+    }
+    return total;
+  }
+
+  private recordBrakeSpan(now: number, until: number): void {
+    const last = this.brakeSpans.at(-1);
+    if (last !== undefined && last.end >= now) last.end = Math.max(last.end, until);
+    else this.brakeSpans.push({ start: now, end: until });
+  }
+
+  /** Drop grants and braked spans older than the window; memory stays bounded by it. */
+  private pruneWindow(now: number): void {
+    const windowStart = now - ADAPTIVE_RATE.WINDOW_MS;
+    while (this.grantsHead < this.grants.length && this.grants[this.grantsHead]! < windowStart) {
+      this.grantsHead++;
+    }
+    if (this.grantsHead > 64 && this.grantsHead * 2 > this.grants.length) {
+      this.grants = this.grants.slice(this.grantsHead);
+      this.grantsHead = 0;
+    }
+    while (this.brakeSpans.length > 0 && this.brakeSpans[0]!.end < windowStart) {
+      this.brakeSpans.shift();
+    }
+  }
+
+  protected override onGrant(at: number): void {
+    if (!this.adapts) return;
+    this.grants.push(at);
+    this.pruneWindow(at);
+  }
+
+  /** Adaptive spacing on top of the configured `minIntervalMs`, never below it (RQ5). */
+  protected override grantIntervalMs(): number {
+    const configured = super.grantIntervalMs();
+    return this.rate === undefined ? configured : Math.max(configured, 1000 / this.rate);
   }
 
   /**
@@ -154,7 +334,10 @@ export class ScopeGovernor extends RateLimiter {
     return !this.braked() && this.tryGrant();
   }
 
-  /** Read the quota hint on a 2xx. Total: a throwing dialect warns once and is ignored. */
+  /**
+   * On a 2xx: read the quota hint, then advance recovery. Total: a throwing
+   * dialect warns once and is ignored (the hint is then treated as healthy).
+   */
   override observe(res: Response): void {
     if (!this.adapts || !res.ok) return;
     try {
@@ -169,6 +352,7 @@ export class ScopeGovernor extends RateLimiter {
         );
       }
     }
+    this.recover(Date.now());
   }
 
   /**

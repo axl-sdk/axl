@@ -1487,8 +1487,9 @@ export type ToolCallMessage = {
 export type CallTiming = {
   /**
    * Every wait Axl imposed on itself: the first permit (concurrency cap),
-   * `minIntervalMs` spacing, a rate-limit pause on the scope, and the
-   * re-acquire after a rate-limit 429. `0` when nothing waited. This is
+   * `minIntervalMs` spacing, adaptive pacing after a rate-limit 429, a
+   * rate-limit pause on the scope, and the re-acquire after a rate-limit 429.
+   * `0` when nothing waited. This is
    * self-imposed wait, not provider latency.
    */
   queuedMs: number;

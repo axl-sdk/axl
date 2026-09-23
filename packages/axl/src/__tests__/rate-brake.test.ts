@@ -9,7 +9,7 @@ import {
 } from '../providers/default-endpoints.js';
 import { DEFAULT_MAX_RATE_LIMIT_RETRIES, ScopeGovernor } from '../providers/governor-pool.js';
 import { fetchWithRetry, type FetchTiming } from '../providers/retry.js';
-import type { RateLimitConfig } from '../providers/rate-limiter.js';
+import { RateLimiter, type RateLimitConfig } from '../providers/rate-limiter.js';
 import type { ChatOptions, Provider, ProviderResponse, StreamChunk } from '../providers/types.js';
 
 // ---------------------------------------------------------------------------
@@ -23,6 +23,12 @@ import type { ChatOptions, Provider, ProviderResponse, StreamChunk } from '../pr
 // assertions name calls and times, not bare counts. Fake timers without
 // `shouldAdvanceTime`, `Math.random` pinned so jitter is exactly 1.0, manual
 // AbortControllers only.
+//
+// These cases pin the BRAKE's timeline, so Phase 5's adaptive spacing (the
+// cut every rate-limit 429 also makes) is neutralized here: the governor
+// spaces only by the configured `minIntervalMs`. The cut itself still runs
+// (and its once-per-scope message still prints). Adaptive spacing, and its
+// interaction with the brake, is pinned in `adaptive-rate.test.ts`.
 // ---------------------------------------------------------------------------
 
 const T0 = Date.UTC(2026, 8, 22); // a realistic epoch: HTTP-date parsing compares against it
@@ -233,6 +239,14 @@ beforeEach(() => {
   vi.setSystemTime(T0);
   vi.spyOn(Math, 'random').mockReturnValue(0.5); // jitter factor exactly 1.0
   warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  const configuredInterval = (RateLimiter.prototype as unknown as { grantIntervalMs(): number })
+    .grantIntervalMs;
+  vi.spyOn(
+    ScopeGovernor.prototype as unknown as { grantIntervalMs(): number },
+    'grantIntervalMs',
+  ).mockImplementation(function (this: RateLimiter) {
+    return configuredInterval.call(this);
+  });
   cancelledStreams = new Set();
   const cancel = ReadableStream.prototype.cancel;
   vi.spyOn(ReadableStream.prototype, 'cancel').mockImplementation(function (
@@ -336,7 +350,10 @@ describe('AC16/AC17: the fleet brake', () => {
         ['call-a', 1000],
         ['call-b', 1000],
       ]);
-      expect(warn).not.toHaveBeenCalled();
+      // No queued warning (nothing is capped); only adaptation's once-per-scope notice.
+      expect(warn.mock.calls.map((c) => String(c[0]))).toEqual([
+        expect.stringContaining('Rate governor'),
+      ]);
     },
   );
 });

@@ -252,9 +252,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     2 retries for 503/529/network errors, so a throttled fan-out stops losing
     items to exhausted retries. The retrying call gives its permit back while
     it waits and goes first when the pause ends.
-  - **Nothing changes before the first rate-limit 429.**
+  - **Then the scope paces itself.** The same 429 switches the scope to a
+    request rate seeded at half its recent demand, measured over the last few
+    seconds excluding paused time (a 25-call burst that all draw 429s is paced
+    at about 12.5/s). Grants, including the retries leaving the pause, are
+    spaced accordingly, so the pause does not end in a burst. A wave of 429s
+    from requests already in flight cuts the rate once. Recovery is linear on
+    successful responses and holds while quota headers show the account nearly
+    exhausted. Once traffic stays well under the rate, the scope drops pacing
+    entirely. The first time a scope starts pacing, Axl logs one warning naming
+    the provider family. The tuning is internal and not configurable, and
+    `minIntervalMs` / `maxConcurrent` stay ceilings.
+  - **Nothing changes before the first rate-limit 429.** Large base64 images and
+    cached prompts are not estimated, and quota headers alone never slow a
+    scope.
   - **Opting out.** `rateLimit: { adaptive: false }` restores the previous
-    behavior per provider. Other providers are unchanged.
+    behavior per provider (no pause, no separate budget, no pacing). Other
+    providers are unchanged.
 
   Also:
   - A call against a saturated account can now take several minutes rather than
@@ -268,8 +282,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The spend-cap body shapes follow the providers' documentation and have not
     yet been checked against live responses.
 - **`CallTiming.queuedMs` and `retryMs` no longer overlap.** `queuedMs` now
-  covers every wait Axl imposes on itself (the first permit, spacing, a
-  rate-limit pause, the re-acquire after a 429). `retryMs` is the span between
+  covers every wait Axl imposes on itself (the first permit, spacing, adaptive
+  pacing, a rate-limit pause, the re-acquire after a 429). `retryMs` is the span between
   the first and final dispatch *minus* those waits. So `429` → 30 s pause →
   `200` reports about 30 s of `queuedMs` and a `retryMs` of only the first
   attempt. On paths without a pause (for example `503` retries) `retryMs` is

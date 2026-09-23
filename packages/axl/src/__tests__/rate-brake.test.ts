@@ -534,6 +534,35 @@ describe('brake state', () => {
     expect(net.of('call-b')).toEqual([]);
   });
 
+  it('the brake-end timer does not outlive its waiters', async () => {
+    const net = stubFetch((d) =>
+      d.tag === 'call-a' && d.attempt === 1
+        ? { status: 429, headers: { 'retry-after': '30' } }
+        : { status: 200 },
+    );
+    const provider = providerFor('openai');
+    const ctrlA = new AbortController();
+    const ctrlB = new AbortController();
+    const a = outcome(ask(provider, 'call-a', { signal: ctrlA.signal })); // re-acquires behind the brake
+    await at(100);
+    const b = outcome(ask(provider, 'call-b', { signal: ctrlB.signal })); // waits for the brake to clear
+    await tick();
+    expect(vi.getTimerCount()).toBeGreaterThan(0);
+    ctrlA.abort(new Error('a gone'));
+    ctrlB.abort(new Error('b gone'));
+    await tick();
+    expect(((await a) as { error: Error }).error.message).toBe('a gone');
+    expect(((await b) as { error: Error }).error.message).toBe('b gone');
+    // Nothing is left to wake, so no timer holds the 30 s brake open.
+    expect(vi.getTimerCount()).toBe(0);
+    expect(net.log.map((d) => [d.tag, d.at - T0])).toEqual([['call-a', 0]]);
+    // The brake itself still stands for a newcomer.
+    const c = outcome(ask(provider, 'call-c'));
+    await vi.runAllTimersAsync();
+    expect((await c).ok).toBe(true);
+    expect(net.of('call-c').map((d) => d.at - T0)).toEqual([30_000]);
+  });
+
   it('a dialect scope already in use adopts a rateLimit that a later block contributes', async () => {
     const net = stubFetch(() => ({ status: 200, after: 100 }));
     const runtime = new AxlRuntime({

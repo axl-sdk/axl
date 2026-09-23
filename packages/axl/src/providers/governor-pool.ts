@@ -162,19 +162,35 @@ export class ScopeGovernor extends RateLimiter {
     }
   }
 
-  /** Grants nothing while braked; re-pumps at the brake's end if anyone is queued. */
+  /**
+   * Grants nothing while braked; re-pumps at the brake's end if anyone is
+   * queued. The brake-end timer lives only as long as its waiters: when the
+   * last one leaves (abort or timeout, both of which re-pump) it is cleared, so
+   * a long brake never holds the event loop open with nothing to wake. It is
+   * deliberately not `unref`'d — while a waiter exists, that timer is the only
+   * thing that will resume its call.
+   */
   protected override pump(): void {
     if (this.braked()) {
       if (this.hasWaiters()) this.armBrakeEnd();
+      else this.clearBrakeEnd();
       return;
     }
+    this.clearBrakeEnd();
     super.pump();
+  }
+
+  private clearBrakeEnd(): void {
+    if (this.brakeEndTimer === undefined) return;
+    clearTimeout(this.brakeEndTimer);
+    this.brakeEndTimer = undefined;
+    this.brakeEndAt = undefined;
   }
 
   private armBrakeEnd(): void {
     const until = this.brakeUntil!;
     if (this.brakeEndTimer !== undefined && this.brakeEndAt === until) return;
-    if (this.brakeEndTimer !== undefined) clearTimeout(this.brakeEndTimer);
+    this.clearBrakeEnd();
     this.brakeEndAt = until;
     this.brakeEndTimer = setTimeout(() => {
       this.brakeEndTimer = undefined;

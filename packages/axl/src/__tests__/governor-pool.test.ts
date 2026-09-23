@@ -1,5 +1,6 @@
 import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import { AxlRuntime } from '../runtime.js';
+import { isolateProviderEnv } from './helpers.js';
 import { ProviderRegistry } from '../providers/registry.js';
 import { OpenAIProvider } from '../providers/openai.js';
 import { RateLimiter } from '../providers/rate-limiter.js';
@@ -128,12 +129,14 @@ function resolveVia(runtime: AxlRuntime, uri: string): { provider: Provider; mod
 const originalFetch = globalThis.fetch;
 let warn: ReturnType<typeof vi.spyOn>;
 beforeEach(() => {
+  isolateProviderEnv();
   warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 });
 afterEach(() => {
   globalThis.fetch = originalFetch;
   vi.useRealTimers();
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
 });
 
 const mergeWarnings = () =>

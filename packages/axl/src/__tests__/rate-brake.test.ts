@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { AxlRuntime } from '../runtime.js';
+import { isolateProviderEnv } from './helpers.js';
 import { ProviderError } from '../providers/errors.js';
 import { AdmissionDeniedError } from '../errors.js';
 import { openaiQuotaDialect } from '../providers/quota.js';
@@ -235,6 +236,7 @@ const tick = () => vi.advanceTimersByTimeAsync(0);
 const originalFetch = globalThis.fetch;
 let warn: ReturnType<typeof vi.spyOn>;
 beforeEach(() => {
+  isolateProviderEnv();
   vi.useFakeTimers();
   vi.setSystemTime(T0);
   vi.spyOn(Math, 'random').mockReturnValue(0.5); // jitter factor exactly 1.0
@@ -261,6 +263,7 @@ afterEach(() => {
   globalThis.fetch = originalFetch;
   vi.useRealTimers();
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
 });
 
 // ---------------------------------------------------------------------------

@@ -179,4 +179,29 @@ describe('RateLimiter', () => {
       warn.mockRestore();
     }
   });
+  it('clears the spacing timer once every spaced waiter has aborted', async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const rl = new RateLimiter({ minIntervalMs: 5000 });
+      await rl.acquire(); // first grant is immediate; the next must wait 5 s
+      const controllers = [new AbortController(), new AbortController()];
+      const waits = controllers.map((c) => rl.acquire(c.signal).catch((e: unknown) => e));
+      expect(vi.getTimerCount()).toBe(1); // one shared spacing timer
+      for (const c of controllers) c.abort(new Error('gone'));
+      expect((await Promise.all(waits)).map((e) => (e as Error).message)).toEqual(['gone', 'gone']);
+      // Nothing is left to wake: no timer keeps the event loop alive for 5 s.
+      expect(vi.getTimerCount()).toBe(0);
+      // Spacing itself still holds for the next caller.
+      let granted = false;
+      void rl.acquire().then(() => (granted = true));
+      await vi.advanceTimersByTimeAsync(4999);
+      expect(granted).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(granted).toBe(true);
+    } finally {
+      warn.mockRestore();
+      vi.useRealTimers();
+    }
+  });
 });

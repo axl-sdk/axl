@@ -370,6 +370,31 @@ describe('AC29: no burst at brake end', () => {
   });
 });
 
+describe('timers do not outlive their waiters', () => {
+  it('callers aborted while adaptively spaced leave no spacing timer behind', async () => {
+    stubFetch((d) =>
+      isWaveFirstAttempt(d)
+        ? { status: 429, headers: { 'retry-after': '1' } }
+        : { status: 200, after: d.tag.startsWith('call-s') ? 0 : 10 },
+    );
+    const provider = providerFor();
+    const wave = launchWave(provider);
+    await vi.runAllTimersAsync();
+    await Promise.all(wave);
+    await at(10_000); // well past the last retrier's interval
+    // Paced at about BETA × 25/s: the first caller goes, the rest wait on spacing.
+    const first = ask(provider, 'call-s0');
+    const controllers = Array.from({ length: 4 }, () => new AbortController());
+    const spaced = controllers.map((c, k) => ask(provider, `call-s${k + 1}`, { signal: c.signal }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect((await first).ok).toBe(true);
+    expect(vi.getTimerCount()).toBe(1); // the shared spacing timer
+    for (const c of controllers) c.abort(new Error('gone'));
+    expect((await Promise.all(spaced)).every((r) => !r.ok)).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // AC37 / Q11 — linear, success-gated recovery.
 // ---------------------------------------------------------------------------

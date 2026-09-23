@@ -446,6 +446,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A response that is returned (success, a non-retryable error, or the last
   attempt after retries run out) keeps its body, so `ProviderError.body` is
   still the raw provider text.
+- **An aborted, rate-limited queue no longer holds the process open.** When
+  every call waiting on `minIntervalMs` spacing (or on adaptive pacing after a
+  rate-limit 429) aborts or times out, the limiter now clears its spacing
+  timer instead of leaving it armed for up to one interval.
 - **Retry backoffs no longer pile abort listeners onto a shared signal.** Each
   completed backoff sleep now removes its listener from the call's
   `AbortSignal`. Before, every retry on a long-lived signal (for example one

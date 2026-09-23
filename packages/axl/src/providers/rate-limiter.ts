@@ -410,6 +410,12 @@ export class RateLimiter {
     waiter.settled = true;
     const idx = this.queue.indexOf(waiter);
     if (idx !== -1) this.queue.splice(idx, 1);
+    // The spacing timer exists only to wake a queued waiter; with none left it
+    // would just hold the event loop open for up to one interval.
+    if (this.queue.length === 0 && this.spacingTimer !== undefined) {
+      clearTimeout(this.spacingTimer);
+      this.spacingTimer = undefined;
+    }
     this.clearWaiterTimers(waiter);
     waiter.reject(err);
     // A queued waiter never held a permit, so no release() is needed; but its

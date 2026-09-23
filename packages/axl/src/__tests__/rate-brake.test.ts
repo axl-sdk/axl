@@ -3,6 +3,10 @@ import { AxlRuntime } from '../runtime.js';
 import { ProviderError } from '../providers/errors.js';
 import { AdmissionDeniedError } from '../errors.js';
 import { openaiQuotaDialect } from '../providers/quota.js';
+import {
+  ANTHROPIC_DEFAULT_BASE_URL,
+  OPENAI_DEFAULT_BASE_URL,
+} from '../providers/default-endpoints.js';
 import { DEFAULT_MAX_RATE_LIMIT_RETRIES, ScopeGovernor } from '../providers/governor-pool.js';
 import { fetchWithRetry, type FetchTiming } from '../providers/retry.js';
 import type { RateLimitConfig } from '../providers/rate-limiter.js';
@@ -445,7 +449,7 @@ describe('AC19: rate-limit and transient retries use separate budgets', () => {
       const net = stubFetch((d) => replies[d.attempt - 1]!);
       let timing: FetchTiming | undefined;
       const p = fetchWithRetry(
-        'https://api.openai.com/v1/chat/completions',
+        `${OPENAI_DEFAULT_BASE_URL}/chat/completions`,
         { method: 'POST', body: '"call-a"' },
         { governor: gov, timing: { onComplete: (t) => (timing = t) } },
       );
@@ -681,7 +685,7 @@ describe('AC21 (guard): dialect-less scopes are unchanged', () => {
     const gov = new RateLimiter({ maxConcurrent: 2 });
     const net = stubFetch(() => ({ status: 429, headers: { 'retry-after': '1' } }));
     const p = fetchWithRetry(
-      'https://api.openai.com/v1/chat/completions',
+      `${OPENAI_DEFAULT_BASE_URL}/chat/completions`,
       { method: 'POST', body: '"call-a"' },
       { governor: gov },
     );
@@ -778,9 +782,13 @@ describe('AC21 (guard): a first-party family behind a proxy is dialect-less', ()
   );
 
   it.each<[Family, string]>([
-    ['openai', 'https://api.openai.com/v1'],
-    ['openai-responses', 'https://API.openai.com:443/v1/'],
-    ['anthropic', 'https://api.anthropic.com/v1'],
+    ['openai', OPENAI_DEFAULT_BASE_URL],
+    // A spelling variant of the default: upper-case host, explicit :443, trailing slash.
+    [
+      'openai-responses',
+      `${OPENAI_DEFAULT_BASE_URL.replace('api.', 'API.').replace('.com', '.com:443')}/`,
+    ],
+    ['anthropic', ANTHROPIC_DEFAULT_BASE_URL],
   ])('%s with baseUrl %s (the default origin) still brakes', async (family, baseUrl) => {
     const model = MODEL[family];
     const net = stubFetch((d) =>

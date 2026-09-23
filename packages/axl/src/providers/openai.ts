@@ -7,6 +7,7 @@ import type {
 } from './types.js';
 import { resolveThinkingOptions } from './types.js';
 import type { RateLimitConfig } from './rate-limiter.js';
+import { OPENAI_DEFAULT_BASE_URL } from './default-endpoints.js';
 import {
   OpenAICompatibleProvider,
   type ProviderProfile,
@@ -299,7 +300,7 @@ function directOpenAIModel(model: string): DirectOpenAIModel | undefined {
   return DIRECT_OPENAI_CATALOG.find((entry) => entry.aliases.includes(model));
 }
 
-const CANONICAL_OPENAI_BASE_URL = 'https://api.openai.com/v1';
+const CANONICAL_OPENAI_BASE_URL = OPENAI_DEFAULT_BASE_URL;
 
 function isTextContentPart(value: unknown, type: 'text' | 'input_text'): boolean {
   return (
@@ -775,7 +776,7 @@ export const openaiReasoningEmit: ReasoningEmit = (body, resolved, model) => {
 export const OPENAI_PROFILE: ProviderProfile = {
   name: 'openai',
   label: 'OpenAI',
-  defaultBaseUrl: 'https://api.openai.com/v1',
+  defaultBaseUrl: OPENAI_DEFAULT_BASE_URL,
   envApiKey: 'OPENAI_API_KEY',
   envBaseUrl: 'OPENAI_BASE_URL',
   pricing: { kind: 'table', table: OPENAI_PRICING, match: 'exact' },

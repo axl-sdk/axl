@@ -23,6 +23,7 @@ import { fetchWithRetry } from './retry.js';
 import { CallTimingRecorder, withCallTiming, withChatTiming } from './call-timing.js';
 import { buildProviderError, ProviderError } from './errors.js';
 import type { RateLimitConfig } from './rate-limiter.js';
+import { OPENAI_DEFAULT_BASE_URL } from './default-endpoints.js';
 import { AdapterGovernors, type ScopeGovernor } from './governor-pool.js';
 import { assertSafeProviderBaseUrl } from '../http-transport.js';
 import type { InputContentPart, InputMediaSource } from '../input.js';
@@ -238,7 +239,7 @@ export class OpenAIResponsesProvider implements Provider {
     this.baseUrl = (
       options.baseUrl ??
       process.env.OPENAI_BASE_URL ??
-      'https://api.openai.com/v1'
+      OPENAI_DEFAULT_BASE_URL
     ).replace(/\/$/, '');
     assertSafeProviderBaseUrl(
       this.baseUrl,

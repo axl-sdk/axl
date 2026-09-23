@@ -26,6 +26,7 @@
  *
  * Internal: nothing here is barrel-exported.
  */
+import { ANTHROPIC_DEFAULT_BASE_URL, OPENAI_DEFAULT_BASE_URL } from './default-endpoints.js';
 
 /**
  * Why a 429 was returned. `'unknown'` means the body did not identify either
@@ -244,12 +245,14 @@ export const anthropicQuotaDialect: QuotaDialect = makeDialect(
 /**
  * Keyed by governor-scope family (`governor-pool.ts`); a Map so no prototype key
  * resolves. Each dialect describes its vendor's own endpoint only, so it is paired
- * with that endpoint's origin: the adapters' default base URLs
- * (`https://api.openai.com/v1`, `https://api.anthropic.com/v1`).
+ * with the origin of the adapters' default base URL.
  */
 const DIALECTS: ReadonlyMap<string, { origin: string; dialect: QuotaDialect }> = new Map([
-  ['openai', { origin: 'https://api.openai.com', dialect: openaiQuotaDialect }],
-  ['anthropic', { origin: 'https://api.anthropic.com', dialect: anthropicQuotaDialect }],
+  ['openai', { origin: new URL(OPENAI_DEFAULT_BASE_URL).origin, dialect: openaiQuotaDialect }],
+  [
+    'anthropic',
+    { origin: new URL(ANTHROPIC_DEFAULT_BASE_URL).origin, dialect: anthropicQuotaDialect },
+  ],
 ]);
 
 /**

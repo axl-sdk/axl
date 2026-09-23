@@ -17,6 +17,7 @@ import { fetchWithRetry } from './retry.js';
 import { CallTimingRecorder, withCallTiming, withChatTiming } from './call-timing.js';
 import { buildProviderError } from './errors.js';
 import type { RateLimitConfig } from './rate-limiter.js';
+import { ANTHROPIC_DEFAULT_BASE_URL } from './default-endpoints.js';
 import { AdapterGovernors, type ScopeGovernor } from './governor-pool.js';
 import { assertSafeProviderBaseUrl } from '../http-transport.js';
 import type { InputContentPart, InputMediaSource } from '../input.js';
@@ -892,7 +893,7 @@ export class AnthropicProvider implements Provider {
     } = {},
   ) {
     this.apiKeySource = options.apiKey ?? process.env.ANTHROPIC_API_KEY ?? '';
-    this.baseUrl = (options.baseUrl ?? 'https://api.anthropic.com/v1').replace(/\/$/, '');
+    this.baseUrl = (options.baseUrl ?? ANTHROPIC_DEFAULT_BASE_URL).replace(/\/$/, '');
     assertSafeProviderBaseUrl(
       this.baseUrl,
       'Anthropic provider',

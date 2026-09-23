@@ -7,6 +7,10 @@ import {
   quotaDialectFor,
   type QuotaDialect,
 } from '../providers/quota.js';
+import {
+  ANTHROPIC_DEFAULT_BASE_URL,
+  OPENAI_DEFAULT_BASE_URL,
+} from '../providers/default-endpoints.js';
 
 const openai = openaiQuotaDialect;
 const anthropic = anthropicQuotaDialect;
@@ -68,27 +72,27 @@ const OPENAI_SLOW_DOWN = {
 };
 
 describe('quotaDialectFor', () => {
-  const OPENAI = 'https://api.openai.com';
-  const ANTHROPIC = 'https://api.anthropic.com';
+  // Derived from the adapters' default base URLs, never restated.
+  const OPENAI = new URL(OPENAI_DEFAULT_BASE_URL).origin;
+  const ANTHROPIC = new URL(ANTHROPIC_DEFAULT_BASE_URL).origin;
+  const openaiHost = new URL(OPENAI_DEFAULT_BASE_URL).host;
+  const anthropicHost = new URL(ANTHROPIC_DEFAULT_BASE_URL).host;
 
   it('returns a dialect for OpenAI and Anthropic at their own default origins', () => {
     expect(quotaDialectFor('openai', OPENAI)).toBe(openaiQuotaDialect);
     expect(quotaDialectFor('anthropic', ANTHROPIC)).toBe(anthropicQuotaDialect);
-    // The origins the adapters derive from their default base URLs.
-    expect(quotaDialectFor('openai', new URL('https://api.openai.com/v1').origin)).toBe(
-      openaiQuotaDialect,
-    );
-    expect(quotaDialectFor('anthropic', new URL('https://API.anthropic.com:443/v1').origin)).toBe(
-      anthropicQuotaDialect,
-    );
+    // Spelling variants normalize to the same origin.
+    expect(
+      quotaDialectFor('anthropic', new URL(`https://${anthropicHost.toUpperCase()}:443/v1`).origin),
+    ).toBe(anthropicQuotaDialect);
   });
 
   it('a first-party family at any other origin is dialect-less', () => {
     for (const origin of [
       'https://proxy.example.com',
-      'http://api.openai.com',
-      'https://api.openai.com:8443',
-      'https://eu.api.openai.com',
+      `http://${openaiHost}`,
+      `https://${openaiHost}:8443`,
+      `https://eu.${openaiHost}`,
       'http://localhost:4000',
       ANTHROPIC,
     ]) {

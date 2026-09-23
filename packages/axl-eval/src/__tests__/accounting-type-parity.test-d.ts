@@ -55,6 +55,9 @@ expectTrue<Equals<EvalConfig['scorerConcurrency'], RuntimeEvalConfigShape['score
 expectTrue<
   Equals<EvalConfig['failOnScorerErrorRate'], RuntimeEvalConfigShape['failOnScorerErrorRate']>
 >();
+expectTrue<
+  Equals<EvalConfig['failOnItemErrorRate'], RuntimeEvalConfigShape['failOnItemErrorRate']>
+>();
 expectTrue<Equals<EvalConfig['workflow'], RuntimeEvalConfigShape['workflow']>>();
 expectTrue<Equals<EvalConfig['metadata'], RuntimeEvalConfigShape['metadata']>>();
 

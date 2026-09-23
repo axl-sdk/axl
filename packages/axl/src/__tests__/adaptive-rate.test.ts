@@ -378,6 +378,56 @@ describe('AC29: no burst at brake end', () => {
   });
 });
 
+describe('AC39 with adaptive spacing live (review N2)', () => {
+  it('two 503 sleepers and a sibling 429 (Retry-After 60): no permit held through the brake; after it, the retriers and newcomers leave spaced', async () => {
+    const net = stubFetch((d) => {
+      if (d.tag === 'call-s1' && d.attempt === 1) return { status: 503, after: 10 };
+      if (d.tag === 'call-s2' && d.attempt === 1) return { status: 503, after: 0 };
+      if (d.tag === 'call-s2' && d.attempt === 2) {
+        return { status: 429, headers: { 'retry-after': '60' }, after: 5 };
+      }
+      return { status: 200, after: 5 };
+    });
+    const provider = providerFor({ rateLimit: { maxConcurrent: 2 } });
+    const gov = governorOf(provider);
+    const active = () => (gov as unknown as { active: number }).active;
+    const s1 = ask(provider, 'call-s1');
+    const s2 = ask(provider, 'call-s2');
+    await at(1011); // s2's retry drew the 429 at T0+1005; s1 woke into the brake at T0+1010
+    expect(active()).toBe(0);
+    const rate = gov.currentRate!;
+    expect(rate).toBeDefined();
+    await at(1100);
+    const n1 = ask(provider, 'call-n1');
+    const n2 = ask(provider, 'call-n2');
+    await at(61_004);
+    expect(net.log.map((d) => [d.tag, d.at])).toEqual([
+      ['call-s1', 0],
+      ['call-s2', 0],
+      ['call-s2', 1000],
+    ]);
+    expect(active()).toBe(0);
+    await vi.runAllTimersAsync();
+    expect((await Promise.all([s1, s2, n1, n2])).every((r) => r.ok)).toBe(true);
+    const after = net.log.slice(3);
+    // Retriers first, in the order they parked, then the newcomers.
+    expect(after.map((d) => [d.tag, d.attempt])).toEqual([
+      ['call-s2', 3],
+      ['call-s1', 2],
+      ['call-n1', 1],
+      ['call-n2', 1],
+    ]);
+    expect(after[0]!.at).toBe(61_005);
+    // Each grant is one adaptive interval after the last. Recovery can only
+    // shorten it: at most alpha per second of the (under 3 s) span.
+    const fastest = rate + alphaFor(rate) * (after.length - 1);
+    for (const gap of gaps(after.map((d) => d.at))) {
+      expect(gap).toBeGreaterThanOrEqual(Math.floor(1000 / fastest));
+      expect(gap).toBeLessThanOrEqual(Math.ceil(1000 / rate));
+    }
+  });
+});
+
 describe('timers do not outlive their waiters', () => {
   it('callers aborted while adaptively spaced leave no spacing timer behind', async () => {
     stubFetch((d) =>

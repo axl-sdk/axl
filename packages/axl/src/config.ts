@@ -22,7 +22,9 @@ export type ProviderConfig = {
    * Opt-in client-side rate governor for this provider's HTTP calls (see
    * {@link RateLimitConfig}). Bounds in-flight request concurrency (and,
    * optionally, request spacing) through the shared `fetchWithRetry` chokepoint.
-   * Omitted ⇒ no governor (behavior unchanged). Governors are pooled per
+   * Omitted ⇒ no static caps. On OpenAI's and Anthropic's own endpoints the
+   * adaptive brake and pacing still apply (turn them off with
+   * `{ adaptive: false }`); every other provider gets no governor. Governors are pooled per
    * runtime, one per scope: provider family (`openai` covers `openai-responses`)
    * + base-URL origin + credential source + model. Two blocks reaching one
    * scope use the strictest value per field. Caveat: governs **chat** calls

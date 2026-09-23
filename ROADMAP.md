@@ -31,6 +31,15 @@
   [testing.md](docs/testing.md), and
   [migration/eval-accounting.md](docs/migration/eval-accounting.md).
 
+- **Adaptive rate governance and honest eval coverage (live verification pending)** — `axl-eval` fails a run
+  (and `compare` refuses to certify a side) that lost more than 5% of its items,
+  and every failed item records a structured `failure` cause (provider, status,
+  retryable, request id). Rate governors are pooled per runtime scope (family +
+  origin + credential + model). On OpenAI and Anthropic's own endpoints, a
+  rate-limit 429 pauses the whole scope and retries on its own budget, a spend
+  cap fails fast, and the scope then paces itself (AIMD on the grant rate),
+  staying fully open until the first 429. See
+  [providers.md](docs/providers.md) "Rate limiting".
 - **Completed-file transcription** — `ctx.transcribe()` is a dedicated,
   non-chat finite-recording operation with OpenAI, Gemini Interactions/Files,
   and catalog-capable OpenRouter STT adapters; paired safe lifecycle events,
@@ -333,6 +342,13 @@ separate future product surfaces, not implied by today's `ModelInput` or
 
 Promote any item to Planned only when its user journey, lifecycle owner,
 provider scope, and live-verification budget are explicit.
+
+#### Rate governance follow-ups
+
+Each is gated on live evidence from the adaptive rate governance workstream:
+proactive token reservation (only if sustained utilization measures below 70%),
+a shareable cross-runtime governor pool, a header-driven pre-429 slowdown, and
+Gemini and OpenAI-compatible preset dialects.
 
 #### Realtime / Voice Agents
 

@@ -164,12 +164,15 @@ describe('runEval() — per-model timing rollup (R-T6)', () => {
         retryMs: { mean: 60, min: 60, max: 60, p50: 60, p95: 60 },
         firstTokenMs: { mean: 25, min: 25, max: 25, p50: 25, p95: 25 },
         firstTokenCalls: 6,
+        // These fixtures predate the field: a call that omits it adds 0.
+        rateLimitRetries: 0,
       },
       [B]: {
         calls: 5,
         wireMs: { mean: 200, min: 200, max: 200, p50: 200, p95: 200 },
         queuedMs: { mean: 100, min: 100, max: 100, p50: 100, p95: 100 },
         retryMs: { mean: 0, min: 0, max: 0, p50: 0, p95: 0 },
+        rateLimitRetries: 0,
       },
     });
     // B never streamed: absence, not a `0` that would look like an instant
@@ -357,6 +360,55 @@ describe('runEval() — per-model timing rollup (R-T6)', () => {
       [A]: { calls: 1, queuedMs: 10, retryMs: 0, wireMs: 30 },
     });
     expect(result.summary.modelTiming![A].calls).toBe(2);
+  });
+
+  it('sums rateLimitRetries over every timed call, failed items included, absent as 0', async () => {
+    // Per-call script for model A: 3, absent, 2, 0 rate-limit retries. The
+    // absent one is a custom-provider call that did not report the field.
+    const perCall: Array<number | undefined> = [3, undefined, 2, 0];
+    let i = 0;
+    const runtime = new AxlRuntime({ defaultProvider: 'test' });
+    runtime.registerProvider('test', {
+      name: 'test',
+      chat: async () => {
+        const rateLimitRetries = perCall[i++];
+        return {
+          content: 'x',
+          usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
+          cost: 0,
+          timing: {
+            queuedMs: 0,
+            attempts: 1 + (rateLimitRetries ?? 0),
+            retryMs: 0,
+            ttfbMs: 1,
+            wireMs: 10,
+            ...(rateLimitRetries !== undefined ? { rateLimitRetries } : {}),
+          },
+        };
+      },
+    } as never);
+
+    const result = await runEval(
+      { workflow: 'w', dataset: oneItemDataset(2), scorers: [passScorer], concurrency: 1 },
+      async (input, rt) => {
+        const ctx = rt.createContext();
+        await ctx.ask(agentA, 'one');
+        await ctx.ask(agentA, 'two');
+        // q1 fails AFTER its two successful calls; they stay in the population.
+        if ((input as { q: string }).q === 'q1') throw new Error('workflow blew up');
+        return { output: 'out' };
+      },
+      runtime,
+    );
+
+    expect(result.items[1].outcome).toBe('failed');
+    const stats = result.summary.modelTiming![A];
+    expect(stats.calls).toBe(4);
+    expect(stats.rateLimitRetries).toBe(5);
+    // The persisted per-item surface is unchanged: no count on item.timing.
+    for (const item of result.items) {
+      expect('rateLimitRetries' in item.timing![A]).toBe(false);
+    }
   });
 
   it('does not let the plain path newly abort a budgeted run', async () => {

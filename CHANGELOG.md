@@ -255,7 +255,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`CallTiming.rateLimitRetries`** counts the rate-limit 429s a call received
   and retried, so a throttled call is distinguishable from one queued behind a
   `maxConcurrent` cap. Built-in adapters always set it (`0` when none); also
-  the OTel span attribute `axl.agent.rate_limit_retries`.
+  the OTel span attribute `axl.agent.rate_limit_retries`. `axl-eval` totals it
+  per model on `summary.modelTiming[model].rateLimitRetries`, and the CLI adds
+  `rate-limited N×` to a model's timing row when the total is above 0.
 
 ### Changed
 

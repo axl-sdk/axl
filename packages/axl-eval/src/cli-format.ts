@@ -180,6 +180,11 @@ export function isTotalWipeout(result: EvalResult): boolean {
  * `first token` appears only when at least one call actually streamed one, so a
  * non-streaming run shows no misleading `0ms`.
  *
+ * `rate-limited N×` appears only when the model's calls absorbed rate-limit
+ * 429s (`rateLimitRetries > 0`): a sign to lower `concurrency` before calls
+ * start failing. A healthy run, or an artifact older than the field, prints
+ * nothing extra.
+ *
  * @param modelTiming `EvalSummary.modelTiming`, or undefined for no rows.
  * @param nameWidth   The scorer-name column width, so model names line up under it.
  */
@@ -195,6 +200,7 @@ export function formatModelTimingLines(
     }
     parts.push(`queued ${formatMs(t.queuedMs.mean)}`);
     parts.push(`retries ${formatMs(t.retryMs.mean)}`);
+    if (t.rateLimitRetries) parts.push(`rate-limited ${t.rateLimitRetries}×`);
     const calls = `${t.calls} call${t.calls === 1 ? '' : 's'}`;
     return `    ${model.padEnd(Math.max(nameWidth - 2, 0))}  ${parts.join(' · ')}  (${calls}, mean/p95 per call)`;
   });

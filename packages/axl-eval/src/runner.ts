@@ -885,6 +885,8 @@ function buildModelTiming(
           wireMs: computeStats(samples.map((s) => s.wireMs)),
           queuedMs: computeStats(samples.map((s) => s.queuedMs)),
           retryMs: computeStats(samples.map((s) => s.retryMs)),
+          // Custom providers may omit the optional field; that call adds 0.
+          rateLimitRetries: samples.reduce((sum, s) => sum + (s.rateLimitRetries ?? 0), 0),
           ...(firstToken.length > 0
             ? { firstTokenMs: computeStats(firstToken), firstTokenCalls: firstToken.length }
             : {}),

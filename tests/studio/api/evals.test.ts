@@ -1077,6 +1077,53 @@ describe('Studio API: Evals', () => {
     expect(entry.data.items.length).toBe(1);
   });
 
+  it.each([false, true])(
+    'POST /api/evals/import keeps summary.modelTiming.rateLimitRetries and accepts artifacts without it (redact %s)',
+    async (redact) => {
+      const { app } = createTestServer(undefined, { redact });
+      const stats = { mean: 10, min: 10, max: 10, p50: 10, p95: 10 };
+      const fakeResult = {
+        id: 'cli-id',
+        workflow: 'imported-wf',
+        dataset: 'imported-ds',
+        metadata: {},
+        timestamp: new Date().toISOString(),
+        totalCost: 0,
+        duration: 10,
+        items: [{ input: 'in', output: 'out', scores: { 'always-pass': 1 } }],
+        summary: {
+          count: 1,
+          failures: 0,
+          scorers: { 'always-pass': { mean: 1, min: 1, max: 1, p50: 1, p95: 1 } },
+          modelTiming: {
+            'openai:gpt-4o': {
+              calls: 3,
+              wireMs: stats,
+              queuedMs: stats,
+              retryMs: stats,
+              rateLimitRetries: 4,
+            },
+            // Written before the field existed.
+            'anthropic:claude': { calls: 1, wireMs: stats, queuedMs: stats, retryMs: stats },
+          },
+        },
+      };
+      const res = await app.request('/api/evals/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ result: fakeResult }),
+      });
+      expect(res.status).toBe(200);
+      const id = (await readJson(res)).data.id;
+
+      const hist = await readJson(await app.request('/api/evals/history'));
+      const entry = hist.data.find((e: { id: string }) => e.id === id);
+      const modelTiming = entry.data.summary.modelTiming;
+      expect(modelTiming['openai:gpt-4o'].rateLimitRetries).toBe(4);
+      expect('rateLimitRetries' in modelTiming['anthropic:claude']).toBe(false);
+    },
+  );
+
   it('POST /api/evals/import derives eval name from metadata.workflows first', async () => {
     // Modern CLI artifacts (post-0.14) carry workflow names in metadata.workflows
     // rather than at the top level. Import should pick up the first workflow

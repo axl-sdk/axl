@@ -572,7 +572,7 @@ the list and counts when reporting exact custom call counts. Cost and budget sem
 
 `runEval` therefore also rolls up per-model provider latency from `agent_call_end.timing`, on the default path as well as under `captureTraces`. Each item gets `item.timing[model] = { calls, queuedMs, retryMs, wireMs, firstTokenMs?, firstTokenCalls? }`, and the run gets `summary.modelTiming[model]`.
 
-Compare models on these four per-call distributions:
+Compare models on these four per-call distributions, plus one total:
 
 | Field | What it isolates |
 |---|---|
@@ -580,6 +580,7 @@ Compare models on these four per-call distributions:
 | `firstTokenMs` | Time to the first content delta. The figure that actually discriminates between models, since headers arrive at roughly one round trip regardless of model. Absent on a non-streaming run rather than `0` |
 | `queuedMs` | Wait on Axl's own governor, not the provider: your configured caps, plus the pause and pacing after a rate-limit 429 |
 | `retryMs` | Failed attempts and their `503`/`529`/network backoff, kept out of `wireMs`. Rate-limit waits are in `queuedMs` |
+| `rateLimitRetries` | Not a distribution: the total rate-limit 429s these calls absorbed and retried. Nonzero means the provider throttled the run, so lower `concurrency`. The CLI adds `rate-limited N×` to the row when it is above 0 |
 
 Each is a `{ mean, min, max, p50, p95 }` over **per-call** values pooled across every successful item, so one provider call is one sample and `calls` is the sample size. An item that makes ten calls weighs ten times an item that makes one. That is the right weighting for judging a model — and deliberately different from the wall-clock `summary.timing`, which samples once per item because it describes the workflow. Read the two side by side; do not expect them to agree.
 

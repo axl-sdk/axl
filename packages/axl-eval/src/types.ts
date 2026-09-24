@@ -350,6 +350,14 @@ export type ModelTimingStats = {
    *  throttled hard on the day of the run shows it here, which is what keeps
    *  `wireMs` an honest comparison. */
   retryMs: TimingStats;
+  /** Total `CallTiming.rateLimitRetries` over the same calls `calls` counts:
+   *  how many rate-limit 429s this model's calls absorbed and retried. A plain
+   *  sum, not a distribution; a call that did not report the field adds `0`.
+   *  Nonzero means the provider throttled the run, so lower `concurrency`
+   *  before calls start failing. `runEval` always sets it; optional because
+   *  artifacts written before it existed do not carry it, so treat absence as
+   *  "not recorded", not as `0`. */
+  rateLimitRetries?: number;
   /** Per-call time to first content delta (ms), over the STREAMING calls that
    *  reported one — non-streaming calls are excluded from the sample rather
    *  than entered as `0`. Absent when no call reported one. This is the

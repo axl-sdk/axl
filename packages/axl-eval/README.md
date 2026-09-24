@@ -465,7 +465,7 @@ console.log(results.summary.scorers['quality'].skipped); // 0  (items the applie
 console.log(results.summary.count);                     // 50 items
 console.log(results.summary.failures);                  // 2 workflow errors
 console.log(results.summary.timing);                    // { mean, min, max, p50, p95 } in ms — WORKFLOW wall clock
-console.log(results.summary.modelTiming);               // per model: { calls, wireMs, queuedMs, retryMs, firstTokenMs? } — PROVIDER latency, per-CALL distributions
+console.log(results.summary.modelTiming);               // per model: { calls, wireMs, queuedMs, retryMs, firstTokenMs?, rateLimitRetries? } — PROVIDER latency, per-CALL distributions
 console.log(results.totalCost);                          // 0.42 — MEASURED spend (workflow + judges)
 console.log(results.unpriced);                            // true when that total is only a lower bound
 console.log(results.accounting.completeness);             // 'complete' | 'incomplete' | 'unverified'

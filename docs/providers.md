@@ -531,69 +531,56 @@ part of the application's trust boundary. See
 
 #### Rate-limit 429s (on by default)
 
-Every built-in chat provider (OpenAI, OpenAI Responses, Anthropic, Gemini, and every
-OpenAI-compatible preset such as Azure, OpenRouter or Groq, at any `baseUrl`) handles
-a `429` the same way, with no configuration. On each scope (see "one governor per
-scope" below):
+**In short:** a `429` pauses the scope (one model on one account), retries on its own
+budget, then paces the scope until the provider stops pushing back. Nothing changes
+before the first `429`. `rateLimit: { adaptive: false }` turns it all off.
 
-- **A rate limit brakes the whole scope.** A `429` pauses **every** call on that scope
-  for the usual backoff: 1 s, then 2 s, doubling for each further 429 the same call
-  receives, up to 60 s. A longer `Retry-After` (or `retry-after-ms`) lengthens the
-  pause, still clamped at 60 s; a shorter one never shortens it, so a provider's
-  tens-of-milliseconds hint can't spend the retry budget in seconds. No `Retry-After`
-  has been observed from Gemini so far (a live check found none on successful
-  responses; no Gemini 429 has been captured yet), so expect a Gemini 429 to use this
-  backoff. During the pause nothing on the scope is sent: not calls queued for a permit, and not calls waking from a `503` backoff. The
-  call that hit the 429 gives its permit back while it waits and retries first once
-  the pause ends, ahead of calls that have not been sent yet.
+This applies to every built-in chat provider (OpenAI, OpenAI Responses, Anthropic,
+Gemini, and every OpenAI-compatible preset such as Azure, OpenRouter or Groq, at any
+`baseUrl`), with no configuration. Scopes are described in "one governor per scope"
+below.
+
+- **A 429 pauses the whole scope** for the backoff: 1 s, then 2 s, doubling for each
+  further 429 the same call receives, up to 60 s. A longer `Retry-After` or
+  `retry-after-ms` lengthens the pause (still clamped at 60 s). A shorter one never
+  shortens it, so a tens-of-milliseconds hint can't burn the retry budget in seconds.
+  No Gemini `Retry-After` has been observed yet, so expect Gemini to use the backoff.
+  While paused, nothing on the scope is sent. The call that hit the 429 gives its
+  permit back while it waits, and retries first when the pause ends.
 - **Rate limits have their own retry budget,** `maxRateLimitRetries` (default 8),
   separate from the 2 retries for `503`/`529`/network errors. A call against a
-  saturated account can therefore take several minutes (up to about 8 × 60 s), without
-  holding a permit. Your ask `timeout`, signal and `AdmissionController` still stop it.
-  When the budget runs out, the last `429` surfaces as a `ProviderError` with its raw
-  body and raw `retryAfterMs`.
-- **After a rate-limit 429 the scope paces itself** (see "Adaptive pacing" below), and
-  returns to unpaced once the provider stops pushing back.
-- **Nothing changes before the first rate-limit 429.** With no `rateLimit` configured
-  there is no cap, no spacing and no warning; calls go out exactly as before. Request
-  size doesn't matter (a large base64 image or a cached prompt is not estimated or
-  charged), and quota headers alone never slow a scope that has not been throttled.
-  `503`/`529` and network errors keep their usual retries.
+  saturated account can take several minutes, without holding a permit. Your ask
+  `timeout`, signal and `AdmissionController` still stop it. When the budget runs out,
+  the last `429` surfaces as a `ProviderError` with its raw body and `retryAfterMs`.
+- **Then the scope paces itself** (see "Adaptive pacing" below) and returns to unpaced
+  once the provider stops pushing back.
+- **Nothing changes before the first 429.** With no `rateLimit` there is no cap, no
+  spacing and no warning. Request size is never estimated, and quota headers alone
+  never slow a scope. `503`/`529` and network errors keep their usual retries.
 
-**Spend caps (first-party OpenAI and Anthropic only).** First-party OpenAI (`openai:`
-and `openai-responses:`) and Anthropic (`anthropic:`) are the only providers with a
-**quota dialect**: Axl reads their `429` bodies to tell a rate limit from a spend cap,
-and their quota headers to hold recovery (below). "First-party" means the vendor's own
-default endpoint: the origin of `https://api.openai.com/v1` or
-`https://api.anthropic.com/v1` (an explicit `baseUrl` with that origin counts). There,
-Anthropic's `enforced_spend_limit_reached`, and OpenAI's `insufficient_quota` and its
-billing codes (`credit_balance_exhausted`, `organization_spend_limit_exceeded`,
-`project_spend_limit_exceeded`, `organization_usage_limit_exceeded`), are returned at
-once as a `ProviderError` with `status: 429` and the raw body. They are not retried and
-hold up no other call, because waiting cannot fix them.
+**Spend caps: fast only on first-party OpenAI and Anthropic.** These are the only
+providers with a **quota dialect**, and only at the vendor's own origin
+(`https://api.openai.com`, `https://api.anthropic.com`). There, Axl reads the `429`
+body. Anthropic's `enforced_spend_limit_reached`, and OpenAI's `insufficient_quota`
+and billing codes (`credit_balance_exhausted`, `organization_spend_limit_exceeded`,
+`project_spend_limit_exceeded`, `organization_usage_limit_exceeded`), return at once
+as a `ProviderError` with `status: 429`, with no retry and no pause. Their quota
+headers also hold recovery (below). These body shapes come from the vendors'
+documentation and haven't been checked against a live spend cap. An unrecognized
+body is treated as a rate limit.
 
-Every other scope, including an `openai`, `openai-responses` or `anthropic` block whose
-`baseUrl` points at a proxy, an LLM gateway or a self-hosted server, has **no**
-dialect: its 429 bodies and quota headers are that server's, not the vendor's, so Axl
-never reads them. Every `429` there is treated as a rate limit. **The tradeoff:** a
-spend-cap or daily-quota `429` (for example Gemini's `RESOURCE_EXHAUSTED` quota
-errors) brakes the scope and fails only once `maxRateLimitRetries` is spent (at least
-about 3 minutes) instead of at once. It still fails with the same
-`ProviderError`; no item is lost to a transient rate limit on the way. Any `429` counts,
-not only throughput limits: a gateway that answers 429 for a per-request, non-throughput
-reason (for example a policy rejection of this key and model) now takes about 3 minutes
-to fail instead of about 3 s, and holds the other calls on that model while it does.
-`adaptive: false` on that provider block is the opt-out.
+Everywhere else (Gemini, the presets, and OpenAI or Anthropic behind a proxy,
+gateway or self-hosted `baseUrl`), Axl never reads the body, and **every `429` is a
+rate limit**. The tradeoff: a `429` that waiting can't fix fails only after the
+retry budget is spent, about 3 minutes instead of about 3 s, and holds the other
+calls on that model meanwhile. Examples are a spend cap, a daily quota such as
+Gemini's `RESOURCE_EXHAUSTED`, or a gateway's per-request policy rejection. It
+still fails with the same `ProviderError`. Use `adaptive: false` on that provider
+block if this matters more to you than riding out throttling.
 
-Set `rateLimit: { adaptive: false }` to turn all of this off for a provider (the pause,
-the separate budget and the adaptive pacing): a `429` then shares the transient budget
-(3 attempts) and holds up no other call, exactly as before this feature. Custom
-adapters that pass their own `RateLimiter` to `fetchWithRetry` are never adaptive.
-
-The spend-cap body shapes come from the providers' documentation and have not yet been
-checked against live spend-cap responses. A spend-cap 429 whose body Axl does not
-recognize is treated as a rate limit: it retries on the rate-limit budget and then fails
-with the same `ProviderError`.
+With `adaptive: false`, a `429` shares the 3-attempt transient budget and holds up no
+other call, exactly as before this feature. Custom adapters that pass their own
+`RateLimiter` to `fetchWithRetry` are never adaptive.
 
 #### Adaptive pacing after a rate-limit 429
 

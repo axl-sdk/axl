@@ -295,66 +295,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   decision is exported as `evaluateItemErrorRateGate(baseline, candidate,
   limit?)` beside `evaluateScorerErrorRateGate`.
 - **A rate-limit 429 now waits and retries instead of failing after 3
-  attempts, on every built-in chat provider.** OpenAI, OpenAI Responses,
-  Anthropic, Gemini and every OpenAI-compatible preset (Azure, OpenRouter,
-  Groq, …), at any `baseUrl`, now handle a 429 the same way. This is on by
-  default and needs no configuration:
-  - **A 429 pauses the scope.** It pauses **every** call on the scope (one
-    model on one account) for the usual exponential backoff, lengthened by a
-    longer `Retry-After`, clamped at 60 s. No `Retry-After` has been observed
-    from Gemini so far, so expect a Gemini 429 to use the backoff. The call
-    then retries on a new `RateLimitConfig.maxRateLimitRetries` budget
-    (default 8), separate from the 2 retries for 503/529/network errors, so a
-    throttled fan-out stops losing items to exhausted retries. The retrying call gives its permit back while
-    it waits and goes first when the pause ends.
-  - **Then the scope paces itself.** The same 429 switches the scope to a
-    request rate seeded at half its recent demand, measured over the last few
-    seconds excluding paused time (a 25-call burst that all draw 429s is paced
-    at about 12.5/s). Grants, including the retries leaving the pause, are
-    spaced accordingly, so the pause does not end in a burst. A wave of 429s
-    from requests already in flight cuts the rate once. Recovery is linear on
-    successful responses, with a minimum pace so one stray 429 on a quiet scope
-    can't pin a later fan-out for minutes, and (on first-party OpenAI and
-    Anthropic) holds while quota headers show the account nearly exhausted. Once traffic stays well under the rate, the scope drops pacing
-    entirely. The first time a scope starts pacing, Axl logs one warning naming
-    the provider family. The tuning is internal and not configurable, and
-    `minIntervalMs` / `maxConcurrent` stay ceilings.
-  - **Nothing changes before the first rate-limit 429.** Large base64 images and
-    cached prompts are not estimated, and quota headers alone never slow a
-    scope. `503`/`529` and network errors keep their usual 3 attempts.
-  - **Spend caps fail fast on first-party OpenAI and Anthropic.** On
-    `openai:`, `openai-responses:` and `anthropic:` at the vendor's own
-    endpoint (`api.openai.com`, `api.anthropic.com`), the transport reads the
-    429 body first: Anthropic `enforced_spend_limit_reached`, and OpenAI
-    `insufficient_quota` and its billing codes, return at once as
-    `ProviderError { status: 429 }` with the raw body, not retried and holding
-    up no other call. Their quota headers also hold recovery (above).
-  - **Everywhere else every 429 is a rate limit.** Gemini, the presets, and
-    OpenAI or Anthropic behind a proxy, gateway or self-hosted `baseUrl` have
-    no body or header format Axl can trust, so Axl never reads them. The
-    tradeoff: a spend-cap or daily-quota 429 there (for example Gemini's quota
-    `RESOURCE_EXHAUSTED`) fails only after `maxRateLimitRetries` braked
-    retries, at least about 3 minutes, instead of at once. Any 429 counts: a
-    gateway that answers 429 for a per-request, non-throughput reason (a
-    policy rejection, say) now takes about 3 minutes to fail instead of about
-    3 s, and holds the other calls on that model while it does. Set
-    `adaptive: false` on that provider block to opt out.
-  - **Opting out.** `rateLimit: { adaptive: false }` restores the previous
-    behavior per provider (no pause, no separate budget, no pacing; a 429
-    shares the 3-attempt transient budget). Custom adapters that pass their
-    own `RateLimiter` are unaffected.
+  attempts, on every built-in chat provider** (OpenAI, OpenAI Responses,
+  Anthropic, Gemini, and every OpenAI-compatible preset, at any `baseUrl`). On
+  by default, no configuration needed. See
+  [providers.md → Rate limiting](docs/providers.md#rate-limiting).
+  - **A 429 pauses the scope** (one model on one account) for the exponential
+    backoff (1 s, 2 s, 4 s, … up to 60 s), lengthened by a longer `Retry-After`.
+    The call retries on its own budget, `RateLimitConfig.maxRateLimitRetries`
+    (default 8), separate from the 2 retries for 503/529/network errors.
+  - **Then the scope paces itself** at about half its recent request rate,
+    recovers on success, and returns to unpaced once traffic stays well below
+    that rate. Axl logs one warning per scope when pacing starts.
+  - **Nothing changes before the first 429.** No request is estimated, and
+    quota headers alone never slow a scope.
+  - **Spend caps fail fast on first-party OpenAI and Anthropic**, which are the
+    only providers whose 429 bodies Axl reads. Everywhere else every 429 is
+    treated as a rate limit, so a spend-cap, daily-quota or gateway-policy 429
+    fails only after the retry budget is spent (about 3 minutes, instead of
+    about 3 s) and holds other calls on that model meanwhile.
+  - **Opt out** per provider with `rateLimit: { adaptive: false }`.
 
-  Also:
-  - A call against a saturated account can now take several minutes rather than
-    failing after about 3 s. Your ask `timeout`, signal and
-    `AdmissionController` still stop it.
-  - An abort during a pause, a queue wait or a `503` backoff on a built-in chat
-    provider now rejects with the signal's own `reason` rather than `fetch`'s
-    `AbortError`.
-  - `acquireTimeoutMs` bounds only a call's first permit wait, and a call
-    arriving during a pause starts that clock only once the pause ends.
-  - The spend-cap body shapes follow the providers' documentation and have not
-    yet been checked against live responses.
+  Also: a throttled call can now take minutes (your ask `timeout`, signal and
+  `AdmissionController` still stop it). An abort during a pause, queue wait or
+  `503` backoff rejects with the signal's own `reason`. `acquireTimeoutMs`
+  bounds only a call's first permit wait, starting after any pause.
 - **`CallTiming.queuedMs` and `retryMs` no longer overlap.** `queuedMs` now
   covers every wait Axl imposes on itself (the first permit, spacing, adaptive
   pacing, a rate-limit pause, the re-acquire after a 429). `retryMs` is the span between

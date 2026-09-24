@@ -578,8 +578,8 @@ Compare models on these four per-call distributions:
 |---|---|
 | `wireMs` | The provider's own time per call. On streams with content it is always at least `firstTokenMs`, while post-yield consumer pauses are excluded |
 | `firstTokenMs` | Time to the first content delta. The figure that actually discriminates between models, since headers arrive at roughly one round trip regardless of model. Absent on a non-streaming run rather than `0` |
-| `queuedMs` | Wait on **your** rate limiter, not the provider's |
-| `retryMs` | Failed attempts and backoff — the provider's throttling that day, kept out of `wireMs` |
+| `queuedMs` | Wait on Axl's own governor, not the provider: your configured caps, plus the pause and pacing after a rate-limit 429 |
+| `retryMs` | Failed attempts and their `503`/`529`/network backoff, kept out of `wireMs`. Rate-limit waits are in `queuedMs` |
 
 Each is a `{ mean, min, max, p50, p95 }` over **per-call** values pooled across every successful item, so one provider call is one sample and `calls` is the sample size. An item that makes ten calls weighs ten times an item that makes one. That is the right weighting for judging a model — and deliberately different from the wall-clock `summary.timing`, which samples once per item because it describes the workflow. Read the two side by side; do not expect them to agree.
 

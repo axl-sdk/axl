@@ -560,7 +560,8 @@ below.
 
 **Spend caps: fast only on first-party OpenAI and Anthropic.** These are the only
 providers with a **quota dialect**, and only at the vendor's own origin
-(`https://api.openai.com`, `https://api.anthropic.com`). There, Axl reads the `429`
+(`https://api.openai.com`, `https://api.anthropic.com`; an explicit `baseUrl` on that
+origin counts). There, Axl reads the `429`
 body. Anthropic's `enforced_spend_limit_reached`, and OpenAI's `insufficient_quota`
 and billing codes (`credit_balance_exhausted`, `organization_spend_limit_exceeded`,
 `project_spend_limit_exceeded`, `organization_usage_limit_exceeded`), return at once

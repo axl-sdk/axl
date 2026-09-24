@@ -318,7 +318,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Also: a throttled call can now take minutes (your ask `timeout`, signal and
   `AdmissionController` still stop it). An abort during a pause, queue wait or
   `503` backoff rejects with the signal's own `reason`. `acquireTimeoutMs`
-  bounds only a call's first permit wait, starting after any pause.
+  bounds only a call's first permit wait. A call that arrives during a pause
+  starts that clock when the pause ends.
 - **`CallTiming.queuedMs` and `retryMs` no longer overlap.** `queuedMs` now
   covers every wait Axl imposes on itself (the first permit, spacing, adaptive
   pacing, a rate-limit pause, the re-acquire after a 429). `retryMs` is the span between

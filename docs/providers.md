@@ -4,9 +4,9 @@ Agents reference models using the `provider:model` URI scheme. Axl ships four na
 adapters plus OpenAI-compatible presets, all built on raw `fetch` with no provider SDKs.
 
 All providers retry `429` (rate limit), `503` (unavailable), and `529` (overloaded)
-responses with exponential backoff. On OpenAI's and Anthropic's own endpoints a rate-limit
-`429` also pauses every call on the same account and model until the provider's
-`Retry-After`, and a spend-cap `429` fails fast; see
+responses with exponential backoff. On every built-in chat provider a rate-limit `429`
+also pauses every call on the same account and model and retries on its own budget; on
+OpenAI's and Anthropic's own endpoints a spend-cap `429` fails fast instead; see
 [Rate limiting](#rate-limiting).
 
 The base catalog and pricing were reviewed against first-party documentation on
@@ -540,9 +540,10 @@ scope" below):
   for the usual backoff: 1 s, then 2 s, doubling for each further 429 the same call
   receives, up to 60 s. A longer `Retry-After` (or `retry-after-ms`) lengthens the
   pause, still clamped at 60 s; a shorter one never shortens it, so a provider's
-  tens-of-milliseconds hint can't spend the retry budget in seconds. Gemini sends its retry hint in the error body rather than a header,
-  so a Gemini 429 always uses this backoff. During the pause nothing on the scope is
-  sent: not calls queued for a permit, and not calls waking from a `503` backoff. The
+  tens-of-milliseconds hint can't spend the retry budget in seconds. No `Retry-After`
+  has been observed from Gemini so far (a live check found none on successful
+  responses; no Gemini 429 has been captured yet), so expect a Gemini 429 to use this
+  backoff. During the pause nothing on the scope is sent: not calls queued for a permit, and not calls waking from a `503` backoff. The
   call that hit the 429 gives its permit back while it waits and retries first once
   the pause ends, ahead of calls that have not been sent yet.
 - **Rate limits have their own retry budget,** `maxRateLimitRetries` (default 8),
@@ -578,7 +579,11 @@ never reads them. Every `429` there is treated as a rate limit. **The tradeoff:*
 spend-cap or daily-quota `429` (for example Gemini's `RESOURCE_EXHAUSTED` quota
 errors) brakes the scope and fails only once `maxRateLimitRetries` is spent (at least
 about 3 minutes) instead of at once. It still fails with the same
-`ProviderError`; no item is lost to a transient rate limit on the way.
+`ProviderError`; no item is lost to a transient rate limit on the way. Any `429` counts,
+not only throughput limits: a gateway that answers 429 for a per-request, non-throughput
+reason (for example a policy rejection of this key and model) now takes about 3 minutes
+to fail instead of about 3 s, and holds the other calls on that model while it does.
+`adaptive: false` on that provider block is the opt-out.
 
 Set `rateLimit: { adaptive: false }` to turn all of this off for a provider (the pause,
 the separate budget and the adaptive pacing): a `429` then shares the transient budget

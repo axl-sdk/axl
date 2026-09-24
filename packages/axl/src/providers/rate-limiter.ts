@@ -1,5 +1,8 @@
 /**
- * Opt-in client-side rate governor for provider HTTP calls.
+ * Client-side rate governor for provider HTTP calls: the plain, non-adaptive
+ * base. Constructed directly (custom adapters, transcription) it applies only
+ * the configured static caps. The built-in chat adapters use its pooled,
+ * default-on adaptive subclass, `ScopeGovernor` (`governor-pool.ts`).
  *
  * Wraps the single `fetchWithRetry` chokepoint (see `retry.ts`) so a configured
  * provider can bound how many requests it has *in flight* at once and, optionally,

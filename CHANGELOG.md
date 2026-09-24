@@ -255,6 +255,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking (security): a configured `apiKey` now beats the environment.**
+  `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` and `GOOGLE_API_KEY`/`GEMINI_API_KEY`
+  used to overwrite a provider's configured `apiKey`, including a rotating-key
+  callback, whenever the variable was set. That could send one tenant's calls
+  on another credential. The variables are now only a fallback for a provider
+  with no `apiKey`, as `docs/api-reference.md` already documented. Any
+  configured `apiKey` wins, including a callback and an explicit empty
+  string: `apiKey: ''` (for example `process.env.MY_KEY ?? ''`) no longer
+  picks up the environment key and now fails as a missing API key (a preset
+  that allows no key, such as a local server, simply sends none). A config
+  that kept a placeholder key and relied on the variable must drop the
+  placeholder. `resolveConfig` also no longer mutates the caller's
+  `providers` object.
 - **Breaking (exit codes): `axl-eval` now fails a run that lost more than 5% of
   its items.** `EvalConfig.failOnItemErrorRate` defaults to `0.05`. A run whose
   `failed / (count − cancelled − budget_skipped − budget_interrupted)` is
@@ -284,11 +297,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default and needs no configuration:
   - **A 429 pauses the scope.** It pauses **every** call on the scope (one
     model on one account) for the usual exponential backoff, lengthened by a
-    longer `Retry-After`, clamped at 60 s. Gemini puts its retry hint in the error
-    body, not a header, so a Gemini 429 always uses the backoff. The call
-    then retries on a new `RateLimitConfig.maxRateLimitRetries` budget (default 8), separate from the
-    2 retries for 503/529/network errors, so a throttled fan-out stops losing
-    items to exhausted retries. The retrying call gives its permit back while
+    longer `Retry-After`, clamped at 60 s. No `Retry-After` has been observed
+    from Gemini so far, so expect a Gemini 429 to use the backoff. The call
+    then retries on a new `RateLimitConfig.maxRateLimitRetries` budget
+    (default 8), separate from the 2 retries for 503/529/network errors, so a
+    throttled fan-out stops losing items to exhausted retries. The retrying call gives its permit back while
     it waits and goes first when the pause ends.
   - **Then the scope paces itself.** The same 429 switches the scope to a
     request rate seeded at half its recent demand, measured over the last few
@@ -317,7 +330,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     no body or header format Axl can trust, so Axl never reads them. The
     tradeoff: a spend-cap or daily-quota 429 there (for example Gemini's quota
     `RESOURCE_EXHAUSTED`) fails only after `maxRateLimitRetries` braked
-    retries, at least about 3 minutes, instead of at once.
+    retries, at least about 3 minutes, instead of at once. Any 429 counts: a
+    gateway that answers 429 for a per-request, non-throughput reason (a
+    policy rejection, say) now takes about 3 minutes to fail instead of about
+    3 s, and holds the other calls on that model while it does. Set
+    `adaptive: false` on that provider block to opt out.
   - **Opting out.** `rateLimit: { adaptive: false }` restores the previous
     behavior per provider (no pause, no separate budget, no pacing; a 429
     shares the 3-attempt transient budget). Custom adapters that pass their
@@ -493,13 +510,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Breaking (security): a configured `apiKey` now beats the environment.**
-  `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` and `GOOGLE_API_KEY`/`GEMINI_API_KEY`
-  used to overwrite a provider's configured `apiKey`, including a rotating-key
-  callback, whenever the variable was set. That could send one tenant's calls
-  on another credential. The variables are now only a fallback for a provider
-  with no `apiKey`, as `docs/api-reference.md` already documented.
-  `resolveConfig` also no longer mutates the caller's `providers` object.
 - **`retry-after-ms` is honored, and no retry hint shortens a backoff.**
   OpenAI and Azure OpenAI send this millisecond retry hint. When it's present
   and positive, it now takes precedence over `Retry-After` (as in OpenAI's own

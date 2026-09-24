@@ -45,7 +45,9 @@ per-provider quirks in the profile (allowed to rot), not in the engine.
   (aborts propagate verbatim). `ProviderError.retryable` (via `isRetryableStatus`) is a
   **broader semantic failover hint** — kept SEPARATE from the narrow transport-retry set
   (`429`/`503`/`529`) in `retry.ts`. `parseRetryAfter` (`retry-after-ms` first, then
-  `Retry-After` numeric-seconds or HTTP-date) is the single source of truth, shared by both. Full table + rationale: `docs/providers.md`
+  `Retry-After` numeric-seconds or HTTP-date) is the single source of truth, shared by both.
+  The transport uses a hint only to lengthen its exponential backoff, never to shorten
+  it (`retryWaitMs`); `ProviderError.retryAfterMs` stays raw. Full table + rationale: `docs/providers.md`
   (typed provider errors) and `docs/api-reference.md`.
 - **Rate governance** (`governor-pool.ts`, `quota.ts`, `rate-limiter.ts`): every built-in
   chat adapter resolves a pooled `ScopeGovernor` per call, one per runtime scope (family +

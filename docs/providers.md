@@ -537,9 +537,10 @@ a `429` the same way, with no configuration. On each scope (see "one governor pe
 scope" below):
 
 - **A rate limit brakes the whole scope.** A `429` pauses **every** call on that scope
-  until its `Retry-After` (or `retry-after-ms`), clamped at 60 s. Without one the
-  pause is the usual backoff: 1 s, then 2 s, doubling for each further 429 the same
-  call receives. Gemini sends its retry hint in the error body rather than a header,
+  for the usual backoff: 1 s, then 2 s, doubling for each further 429 the same call
+  receives, up to 60 s. A longer `Retry-After` (or `retry-after-ms`) lengthens the
+  pause, still clamped at 60 s; a shorter one never shortens it, so a provider's
+  tens-of-milliseconds hint can't spend the retry budget in seconds. Gemini sends its retry hint in the error body rather than a header,
   so a Gemini 429 always uses this backoff. During the pause nothing on the scope is
   sent: not calls queued for a permit, and not calls waking from a `503` backoff. The
   call that hit the 429 gives its permit back while it waits and retries first once
@@ -575,8 +576,8 @@ Every other scope, including an `openai`, `openai-responses` or `anthropic` bloc
 dialect: its 429 bodies and quota headers are that server's, not the vendor's, so Axl
 never reads them. Every `429` there is treated as a rate limit. **The tradeoff:** a
 spend-cap or daily-quota `429` (for example Gemini's `RESOURCE_EXHAUSTED` quota
-errors) brakes the scope and fails only once `maxRateLimitRetries` is spent (about
-3 minutes with no `Retry-After`) instead of at once. It still fails with the same
+errors) brakes the scope and fails only once `maxRateLimitRetries` is spent (at least
+about 3 minutes) instead of at once. It still fails with the same
 `ProviderError`; no item is lost to a transient rate limit on the way.
 
 Set `rateLimit: { adaptive: false }` to turn all of this off for a provider (the pause,
@@ -857,11 +858,11 @@ present). Branch on the presence of `timing`, never on the status.
 ### Retry backoff — worst case
 
 The reactive retry does up to **2 retries (3 attempts total)** on `503`/`529` and
-network errors, and on `429` wherever `adaptive` does not apply. Delay per attempt
-honors a `Retry-After` header when present (clamped at 60 s); otherwise it's
-`1000ms × 2^n` (1s, then 2s) with ±25% jitter, and the wait is abort-aware (a
+network errors, and on `429` wherever `adaptive` does not apply. Delay per attempt is
+`1000ms × 2^n` (1s, then 2s), lengthened (never shortened) by a longer `Retry-After`
+or `retry-after-ms` and clamped at 60 s, with ±25% jitter; the wait is abort-aware (a
 cancelled signal short-circuits the sleep). Worst case for a single call that
-exhausts retries without `Retry-After`: roughly `1s + 2s ≈ 3s` of backoff plus three
+exhausts retries with no longer hint: roughly `1s + 2s ≈ 3s` of backoff plus three
 request round-trips before the final error surfaces. Under a governor that backoff
 runs inside the call's held permit, so it applies backpressure to other queued calls
 rather than letting them pile on a struggling provider. The body of each discarded
@@ -964,8 +965,9 @@ try {
 
 **Retry-After** is surfaced on the thrown error (`retryAfterMs`, raw/unclamped) in both
 numeric-seconds and HTTP-date forms. A positive `retry-after-ms` (sent by OpenAI and Azure
-OpenAI) takes precedence, as in OpenAI's own SDK. The in-loop transport sleep clamps to 60s so a
-hostile/huge header can't stall the loop; the raw value still rides on the error.
+OpenAI) takes precedence, as in OpenAI's own SDK. The transport uses the hint only to lengthen its
+exponential backoff, never to shorten it, and clamps the wait to 60s so a hostile/huge header
+can't stall the loop; the raw value still rides on the error.
 
 `ProviderError.body` carries the raw provider response — see `docs/security.md` for why
 it stays on the error and is never emitted on the event stream.

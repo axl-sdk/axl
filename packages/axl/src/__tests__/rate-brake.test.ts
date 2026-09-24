@@ -679,6 +679,72 @@ describe('AC20: brake duration', () => {
 });
 
 // ---------------------------------------------------------------------------
+// A retry hint only ever lengthens the backoff. OpenAI and Azure send
+// `retry-after-ms` in the tens of milliseconds; honored as-is under sustained
+// throttling, it would spend a whole budget in well under a second.
+// ---------------------------------------------------------------------------
+
+describe('retry hints are floored at the exponential backoff', () => {
+  const TINY_HINT = { 'retry-after-ms': '50' };
+
+  it('brake path: 20 s of 429s with retry-after-ms: 50 follow the backoff schedule and the call completes', async () => {
+    const net = stubFetch((d) =>
+      d.at < T0 + 20_000 ? { status: 429, headers: TINY_HINT } : { status: 200 },
+    );
+    const provider = providerFor('openai');
+    const a = outcome(ask(provider, 'call-a'));
+    await at(1);
+    const b = outcome(ask(provider, 'call-b'));
+    await vi.runAllTimersAsync();
+    const ra = await a;
+    expect(ra.ok).toBe(true);
+    // 1, 2, 4, 8, 16 s brakes: the fifth retry leaves after the throttling ends,
+    // well inside the 8-retry budget.
+    expect(net.of('call-a').map((d) => d.at - T0)).toEqual([0, 1000, 3000, 7000, 15_000, 31_000]);
+    expect((await b).ok).toBe(true);
+  });
+
+  it('brake path: an exhausted budget still carries the raw hint on the error', async () => {
+    const net = stubFetch(() => ({ status: 429, headers: TINY_HINT }));
+    const provider = providerFor('openai', { maxRateLimitRetries: 2 });
+    const a = outcome(ask(provider, 'call-a'));
+    await vi.runAllTimersAsync();
+    const err = ((await a) as { error: ProviderError }).error;
+    expect(err.status).toBe(429);
+    expect(err.retryAfterMs).toBe(50);
+    expect(net.of('call-a').map((d) => d.at - T0)).toEqual([0, 1000, 3000]);
+  });
+
+  it('transient path: 503s with retry-after-ms: 50 for 2.5 s wait 1 s then 2 s, and the third attempt succeeds', async () => {
+    const net = stubFetch((d) =>
+      d.at < T0 + 2500 ? { status: 503, headers: TINY_HINT } : { status: 200 },
+    );
+    const r = await outcome(
+      (async () => {
+        const p = ask(providerFor('openai'), 'call-a');
+        await vi.runAllTimersAsync();
+        return p;
+      })(),
+    );
+    expect(r.ok).toBe(true);
+    expect(net.of('call-a').map((d) => d.at - T0)).toEqual([0, 1000, 3000]);
+  });
+
+  it.each<[string, number]>([
+    ['429 (brake)', 429],
+    ['503 (transient)', 503],
+  ])('%s: a hint above the backoff is honored', async (_label, status) => {
+    const net = stubFetch((d) =>
+      d.attempt === 1 ? { status, headers: { 'retry-after-ms': '2500' } } : { status: 200 },
+    );
+    const r = outcome(ask(providerFor('openai'), 'call-a'));
+    await vi.runAllTimersAsync();
+    expect((await r).ok).toBe(true);
+    expect(net.of('call-a').map((d) => d.at - T0)).toEqual([0, 2500]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // AC21 (amended 2026-09-24, J5 reversal) — a scope with no quota dialect
 // (Gemini, an OpenAI-compatible preset, a first-party vendor behind a proxy)
 // adapts too: every 429 brakes the scope and retries on `maxRateLimitRetries`,
@@ -727,14 +793,14 @@ describe('AC21: dialect-less built-in scopes brake and retry on the rate-limit b
       expect((ra as { value: ProviderResponse }).value.timing?.attempts).toBe(5);
       // b arrived at T0+1, inside a's brake. Each time a brake ends, a's
       // retry goes first (AC27) and its 429 brakes again, so b leaves only
-      // after a's first success.
+      // after a's first success. Retry-After: 1 floors at the backoff.
       expect(net.log.map((d) => [d.tag, d.at - T0])).toEqual([
         ['call-a', 0],
         ['call-a', 1000],
-        ['call-a', 2000],
         ['call-a', 3000],
-        ['call-a', 4000],
-        ['call-b', 4000],
+        ['call-a', 7000],
+        ['call-a', 15_000],
+        ['call-b', 15_000],
       ]);
       // The engagement notice names the family only, never the origin.
       const messages = warn.mock.calls.map((c) => String(c[0]));
@@ -842,7 +908,7 @@ describe('AC21: dialect-less built-in scopes brake and retry on the rate-limit b
         ['call-a', 0],
         ['call-b', 1],
         ['call-a', 1000],
-        ['call-a', 2000],
+        ['call-a', 3000],
       ]);
       expect(warn).not.toHaveBeenCalled();
       expect(governorOf(provider, model).adapts).toBe(false);
@@ -859,7 +925,7 @@ describe('AC21: dialect-less built-in scopes brake and retry on the rate-limit b
     );
     await vi.runAllTimersAsync();
     expect((await p).status).toBe(429);
-    expect(net.log.map((d) => d.at - T0)).toEqual([0, 1000, 2000]);
+    expect(net.log.map((d) => d.at - T0)).toEqual([0, 1000, 3000]);
   });
 });
 
@@ -1237,12 +1303,14 @@ describe('AC27: re-acquire priority', () => {
     await vi.runAllTimersAsync();
     expect(((await r) as { error: ProviderError }).error.status).toBe(429);
     expect((await f).ok).toBe(true);
+    // Retry-After: 1 is the floor only for the first retry; the k-th brake is
+    // max(1 s, 2^k s), and the final 429 still brakes (8 s).
     expect(net.log.map((d) => [d.tag, d.at - T0])).toEqual([
       ['call-r', 0],
       ['call-r', 1000],
-      ['call-r', 2000],
       ['call-r', 3000],
-      ['call-f', 4000],
+      ['call-r', 7000],
+      ['call-f', 15_000],
     ]);
   });
 });
@@ -1532,7 +1600,7 @@ describe('adaptive: false and config handling', () => {
       ['call-a', 0],
       ['call-b', 1],
       ['call-a', 1000],
-      ['call-a', 2000],
+      ['call-a', 3000],
     ]);
   });
 

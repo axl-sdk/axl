@@ -128,6 +128,9 @@ export function isRetryableStatus(status: number): boolean {
  * Returns the RAW parsed ms (NOT clamped). Negative, zero, or unparseable
  * values → `undefined` (an unusable `retry-after-ms` falls through to
  * `Retry-After`).
+ *
+ * `fetchWithRetry` treats the result as a lower bound only: a hint may
+ * lengthen its exponential backoff (up to 60 s) but never shorten it.
  */
 export function parseRetryAfter(headers: Headers): number | undefined {
   const rawMs = headers.get('retry-after-ms')?.trim();

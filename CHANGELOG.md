@@ -283,8 +283,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Groq, …), at any `baseUrl`, now handle a 429 the same way. This is on by
   default and needs no configuration:
   - **A 429 pauses the scope.** It pauses **every** call on the scope (one
-    model on one account) until its `Retry-After`, clamped at 60 s, or else
-    the usual exponential backoff. Gemini puts its retry hint in the error
+    model on one account) for the usual exponential backoff, lengthened by a
+    longer `Retry-After`, clamped at 60 s. Gemini puts its retry hint in the error
     body, not a header, so a Gemini 429 always uses the backoff. The call
     then retries on a new `RateLimitConfig.maxRateLimitRetries` budget (default 8), separate from the
     2 retries for 503/529/network errors, so a throttled fan-out stops losing
@@ -317,7 +317,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     no body or header format Axl can trust, so Axl never reads them. The
     tradeoff: a spend-cap or daily-quota 429 there (for example Gemini's quota
     `RESOURCE_EXHAUSTED`) fails only after `maxRateLimitRetries` braked
-    retries, about 3 minutes with no `Retry-After`, instead of at once.
+    retries, at least about 3 minutes, instead of at once.
   - **Opting out.** `rateLimit: { adaptive: false }` restores the previous
     behavior per provider (no pause, no separate budget, no pacing; a 429
     shares the 3-attempt transient budget). Custom adapters that pass their
@@ -500,10 +500,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on another credential. The variables are now only a fallback for a provider
   with no `apiKey`, as `docs/api-reference.md` already documented.
   `resolveConfig` also no longer mutates the caller's `providers` object.
-- **`retry-after-ms` is honored.** OpenAI and Azure OpenAI send this
-  millisecond retry hint. When it's present and positive, it now takes
-  precedence over `Retry-After` (as in OpenAI's own SDK) for both the retry
-  wait and `ProviderError.retryAfterMs`.
+- **`retry-after-ms` is honored, and no retry hint shortens a backoff.**
+  OpenAI and Azure OpenAI send this millisecond retry hint. When it's present
+  and positive, it now takes precedence over `Retry-After` (as in OpenAI's own
+  SDK) for both the retry wait and `ProviderError.retryAfterMs`. On every
+  retry path a hint may now only lengthen the exponential backoff (1 s, 2 s,
+  4 s, …, clamped at 60 s), never shorten it: `retry-after-ms` values of tens
+  of milliseconds would otherwise spend a whole retry budget in seconds under
+  sustained throttling. Previously a short `Retry-After` (for example `1` on
+  a later retry) was used as-is. `ProviderError.retryAfterMs` still carries
+  the raw, unclamped value.
 - **Retried provider responses no longer leak their connection.** When the
   transport retries a 429, 503 or 529, it now cancels the discarded response's
   body before backing off, instead of leaving it open until garbage collection.

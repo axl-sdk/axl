@@ -29,6 +29,21 @@ const BASE_DELAY_MS = 1000;
 /** Cap an in-loop backoff sleep so a hostile/huge Retry-After can't stall us. */
 const MAX_BACKOFF_MS = 60_000;
 
+/**
+ * The wait before the `(retry + 1)`-th retry on one budget: the exponential
+ * backoff `backoffMs` (`BASE_DELAY_MS × 2^retry`, already jittered or not by
+ * the caller), lengthened, never shortened, by the provider's retry hint, and
+ * clamped at {@link MAX_BACKOFF_MS}.
+ *
+ * A hint may only lengthen a wait. OpenAI and Azure send `retry-after-ms`
+ * values of tens of milliseconds; honored as-is under sustained throttling,
+ * they would spend a whole retry budget in seconds and lose the call. The raw
+ * hint still reaches `ProviderError.retryAfterMs` unchanged.
+ */
+function retryWaitMs(hintMs: number | undefined, backoffMs: number): number {
+  return Math.min(Math.max(hintMs ?? 0, backoffMs), MAX_BACKOFF_MS);
+}
+
 /** Apply +/-25% jitter to a backoff delay. */
 function jitter(ms: number): number {
   return ms * (0.75 + Math.random() * 0.5);
@@ -209,6 +224,12 @@ function isAbortError(err: unknown, signal?: AbortSignal): boolean {
  * (429, 503, 529) with exponential backoff and jitter.
  * Returns the response as-is for non-retryable errors or after exhausting retries.
  *
+ * **Waits.** The k-th retry on a budget waits `BASE_DELAY_MS × 2^k` (1 s, 2 s,
+ * 4 s, …), lengthened by a longer `Retry-After` / `retry-after-ms`, never
+ * shortened by a shorter one, and clamped at {@link MAX_BACKOFF_MS}. On the
+ * transient path the whole sleep is jittered ±25%; a rate-limit brake jitters
+ * only the backoff floor and applies a longer hint exactly.
+ *
  * **Plain path** (no governor, a directly constructed `RateLimiter`, or a pooled
  * governor that does not adapt): a permit is acquired before the loop and
  * released in `finally`, so the loop and its backoff hold the permit
@@ -377,11 +398,15 @@ export async function fetchWithRetry(
           reportComplete();
           return res;
         }
-        // 'rate_limit' or 'unknown': brake every call on the scope.
-        const retryAfterMs = parseRetryAfter(res.headers);
-        const brakeMs =
-          retryAfterMs !== undefined ? retryAfterMs : jitter(BASE_DELAY_MS * 2 ** rateLimitRetries);
-        scope.brake(Math.min(brakeMs, MAX_BACKOFF_MS), dispatchedAt);
+        // 'rate_limit' or 'unknown': brake every call on the scope for the
+        // jittered exponential backoff, or the provider's hint if longer. A
+        // hint is used exactly (brakes line up across calls); only the
+        // backoff floor is jittered.
+        const brakeMs = retryWaitMs(
+          parseRetryAfter(res.headers),
+          jitter(BASE_DELAY_MS * 2 ** rateLimitRetries),
+        );
+        scope.brake(brakeMs, dispatchedAt);
         if (rateLimitRetries >= scope.maxRateLimitRetries || signal?.aborted) {
           // Budget spent (or aborted): the body stays intact for ProviderError.body.
           reportComplete();
@@ -407,15 +432,14 @@ export async function fetchWithRetry(
         return res;
       }
 
-      // Calculate delay: respect Retry-After header (shared parser, single
-      // source of truth in errors.ts), else exponential backoff. Clamp the
-      // in-loop sleep so a hostile/huge header can't stall the loop —
-      // `ProviderError.retryAfterMs` still carries the RAW value.
-      const retryAfterMs = parseRetryAfter(res.headers);
-      const baseDelay =
-        retryAfterMs !== undefined
-          ? Math.min(retryAfterMs, MAX_BACKOFF_MS)
-          : BASE_DELAY_MS * 2 ** transientRetries;
+      // Delay: the exponential backoff, lengthened by a longer provider hint
+      // (shared parser, single source of truth in errors.ts) and clamped so a
+      // hostile/huge header can't stall the loop. As before, the whole sleep
+      // is jittered. `ProviderError.retryAfterMs` still carries the RAW value.
+      const baseDelay = retryWaitMs(
+        parseRetryAfter(res.headers),
+        BASE_DELAY_MS * 2 ** transientRetries,
+      );
       transientRetries++;
 
       observer?.onRetry?.(dispatches, Date.now());

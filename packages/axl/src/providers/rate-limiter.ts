@@ -67,8 +67,9 @@ export type RateLimitConfig = {
   acquireTimeoutMs?: number;
   /**
    * Feedback-driven pacing on every built-in chat provider. Default `true`.
-   * When on, a rate-limit 429 brakes every call on the scope for its
-   * `Retry-After` (clamped at 60 s; without one, the exponential backoff) and
+   * When on, a rate-limit 429 brakes every call on the scope for the
+   * exponential backoff, lengthened (never shortened) by a longer
+   * `Retry-After` / `retry-after-ms` and clamped at 60 s, and
    * the call retries on its own budget (`maxRateLimitRetries`), and the scope
    * then paces its grants adaptively (a rate seeded from recent demand,
    * recovered linearly on success, dropped once traffic stays well below it;

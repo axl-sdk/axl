@@ -1,6 +1,6 @@
 import { getEventListeners } from 'node:events';
 import { createServer } from 'node:http';
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, onTestFinished } from 'vitest';
 import { fetchWithRetry, type FetchTiming } from '../providers/retry.js';
 import { RateLimiter } from '../providers/rate-limiter.js';
 import { expectWindow } from './helpers.js';
@@ -398,9 +398,13 @@ describe('fetchWithRetry timing observer', () => {
   });
 
   it('separates retry time from the final attempt, and notifies each dispatch (AC-2, T4-T6)', async () => {
-    // retry-after: 0.05 ⇒ a 50ms base backoff, jittered to 37.5–62.5ms, twice.
-    // The two failed attempts are fast (10ms) and the successful one is slow
-    // (200ms), so retryMs and the final wire occupy disjoint ranges.
+    // retry-after: 0.05 is below the backoff floor, so the two backoffs are
+    // 1 s and 2 s (jitter pinned to 1.0). The two failed attempts are fast
+    // (10ms) and the successful one is slow (200ms), so retryMs and the final
+    // wire occupy disjoint ranges.
+    vi.useFakeTimers();
+    const random = vi.spyOn(Math, 'random').mockReturnValue(0.5);
+    onTestFinished(() => random.mockRestore());
     const retryAfter = new Headers({ 'retry-after': '0.05' });
     const fetchStarts: number[] = [];
     let n = 0;
@@ -415,22 +419,24 @@ describe('fetchWithRetry timing observer', () => {
 
     const dispatches: Array<[number, number]> = [];
     let timing: FetchTiming | undefined;
-    const res = await fetchWithRetry('https://x', undefined, {
+    const pending = fetchWithRetry('https://x', undefined, {
       timing: {
         onDispatch: (attempt, at) => dispatches.push([attempt, at]),
         onComplete: (t) => (timing = t),
       },
     });
+    await vi.advanceTimersByTimeAsync(4000);
+    const res = await pending;
 
     expect(res.ok).toBe(true);
     const t = timing!;
     // `attempts` is a total, not a retry count: 2 would mean the final attempt
     // was not counted.
     expect(t.attempts).toBe(3);
-    // Two 10ms attempts plus two jittered ~50ms backoffs ⇒ roughly 95..145ms.
-    // The strict upper bound is what proves the final 200ms wire is NOT inside
-    // it — a first-dispatch-to-completion implementation would land near 300.
-    expectWindow(t.retryMs, [80, 200], 'retryMs');
+    // Two 10ms attempts plus the 1 s and 2 s backoffs ⇒ about 3020ms. The
+    // upper bound is what proves the final 200ms wire is NOT inside it — a
+    // first-dispatch-to-completion implementation would land near 3220.
+    expectWindow(t.retryMs, [3000, 3100], 'retryMs');
     // ttfb anchors on the FINAL attempt (~200ms), not the first (~10ms).
     expectWindow(t.headersAt - t.dispatchedAt, [160, 320], 'final ttfb');
     // `dispatchedAt` is the third attempt's fetch start.

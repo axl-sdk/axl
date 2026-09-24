@@ -92,6 +92,37 @@ describe('rescore()', () => {
     expect(rescored.summary.scorers['half'].max).toBe(0.5);
   });
 
+  it('carries summary.modelTiming forward unchanged, rateLimitRetries included', async () => {
+    const stats = { mean: 40, min: 10, max: 90, p50: 30, p95: 90 };
+    const modelTiming = {
+      'openai:gpt-4o': {
+        calls: 6,
+        wireMs: stats,
+        queuedMs: stats,
+        retryMs: stats,
+        rateLimitRetries: 4,
+        firstTokenMs: stats,
+        firstTokenCalls: 6,
+      },
+      // An artifact written before the field existed.
+      'anthropic:claude': { calls: 2, wireMs: stats, queuedMs: stats, retryMs: stats },
+    };
+    const result = makeResult({
+      summary: { ...makeResult().summary, modelTiming: structuredClone(modelTiming) },
+    });
+    const rescored = await rescore(result, [halfScorer], mockRuntime);
+
+    expect(rescored.summary.modelTiming).toEqual(modelTiming);
+    expect('rateLimitRetries' in rescored.summary.modelTiming!['anthropic:claude']).toBe(false);
+    // A copy, not an alias of the source artifact.
+    expect(rescored.summary.modelTiming).not.toBe(result.summary.modelTiming);
+  });
+
+  it('leaves modelTiming absent when the source run had none', async () => {
+    const rescored = await rescore(makeResult(), [halfScorer], mockRuntime);
+    expect('modelTiming' in rescored.summary).toBe(false);
+  });
+
   it('surfaces scored/failed counts (but never a degraded gate)', async () => {
     // Rescore reports the same trust-signal counts as runEval, but takes
     // RescoreOptions (no failOnScorerErrorRate) — so there is no degradation

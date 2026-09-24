@@ -481,6 +481,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`rescore` keeps `summary.modelTiming`.** A rescored result dropped the
+  source run's per-model provider latency. A rescore makes no generation
+  calls, so it now carries the original `modelTiming` forward unchanged.
 - **`retry-after-ms` is honored, and no retry hint shortens a backoff.**
   OpenAI and Azure OpenAI send this millisecond retry hint. When it's present
   and positive, it now takes precedence over `Retry-After` (as in OpenAI's own

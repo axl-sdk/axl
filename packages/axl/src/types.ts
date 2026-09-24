@@ -1499,6 +1499,14 @@ export type CallTiming = {
    */
   attempts: number;
   /**
+   * Rate-limit 429s this call received and retried: how often the provider
+   * throttled it. A 429 that is returned instead (a spend cap, or the last one
+   * once the retry budget is spent) is not counted, nor are 503/529/network
+   * retries. Built-in adapters always set it (`0` when none); optional so a
+   * custom `Provider` may omit it.
+   */
+  rateLimitRetries?: number;
+  /**
    * First attempt's dispatch → final attempt's dispatch, minus the
    * self-imposed waits inside that span (which are in `queuedMs`): failed
    * attempts and their 503/529/network backoff sleeps. Disjoint from

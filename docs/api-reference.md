@@ -2012,6 +2012,7 @@ valid, so treat every field as possibly absent.
 |-------|------|-------------|
 | `queuedMs` | `number` | Every wait Axl imposes on itself: the first permit (concurrency cap), `minIntervalMs` spacing, adaptive pacing after a rate-limit 429, a rate-limit pause on the scope, and the re-acquire after a rate-limit 429. `0` when nothing waited. Self-imposed wait, not provider latency |
 | `attempts` | `number` | Requests actually sent for this call, including the final one (≥ 1). A call held back by a pause before sending is not an attempt |
+| `rateLimitRetries` | `number?` | Rate-limit 429s this call received **and retried**. A returned 429 (spend cap, or the last one once the budget is spent) and `503`/`529`/network retries are not counted. Built-in adapters always set it (`0` when none) |
 | `retryMs` | `number` | First attempt's dispatch → final attempt's dispatch, **minus** the self-imposed waits inside that span (already in `queuedMs`): failed attempts plus their `503`/`529`/network backoff sleeps. Disjoint from `queuedMs`, so `queuedMs + retryMs` never exceeds the call's wall clock. `0` for a single attempt |
 | `ttfbMs` | `number` | Final dispatch → response headers |
 | `firstTokenMs` | `number?` | Final dispatch → first `text_delta`/`thinking_delta`, excluding consumer suspension after an earlier non-content chunk such as a tool delta. **Streaming only**, and absent on a stream that ends without a content delta. The model-discriminating figure — headers arrive at roughly one round trip regardless of model, first token does not |

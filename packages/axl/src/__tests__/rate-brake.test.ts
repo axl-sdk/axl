@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { AxlRuntime } from '../runtime.js';
-import { isolateProviderEnv } from './helpers.js';
+import { createTestCtx, isolateProviderEnv } from './helpers.js';
+import { agent } from '../agent.js';
+import type { AxlEvent } from '../types.js';
 import { ProviderError } from '../providers/errors.js';
 import { AdmissionDeniedError } from '../errors.js';
 import { openaiQuotaDialect } from '../providers/quota.js';
@@ -1698,5 +1700,173 @@ describe('adaptive: false and config handling', () => {
     expect(((await a) as { error: ProviderError }).error.status).toBe(429);
     // Adaptive (the default), with the default budget.
     expect(net.log).toHaveLength(DEFAULT_MAX_RATE_LIMIT_RETRIES + 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CallTiming.rateLimitRetries (J6): how often the provider throttled a call.
+// Counts the rate-limit 429s a call received AND retried, on either transport
+// path. Returned 429s (spend cap, spent budget) and 503/529/network retries
+// are never counted.
+// ---------------------------------------------------------------------------
+
+describe('CallTiming.rateLimitRetries', () => {
+  async function settle<T>(p: Promise<T>): Promise<T> {
+    await vi.runAllTimersAsync();
+    return p;
+  }
+
+  it('adaptive path: three rate-limit 429s then a 200 → 3 retries, 4 attempts', async () => {
+    stubFetch((d) => (d.attempt <= 3 ? { status: 429 } : { status: 200 }));
+    const t = (await settle(ask(providerFor('openai'), 'call-a'))).timing!;
+    expect({ attempts: t.attempts, rateLimitRetries: t.rateLimitRetries }).toEqual({
+      attempts: 4,
+      rateLimitRetries: 3,
+    });
+  });
+
+  it('adaptive path: 429 → 503 → 429 → 503 → 200 counts only the two 429s', async () => {
+    const replies: Reply[] = [
+      { status: 429 },
+      { status: 503 },
+      { status: 429 },
+      { status: 503 },
+      { status: 200 },
+    ];
+    stubFetch((d) => replies[d.attempt - 1]!);
+    const t = (await settle(ask(providerFor('openai'), 'call-a'))).timing!;
+    expect({ attempts: t.attempts, rateLimitRetries: t.rateLimitRetries }).toEqual({
+      attempts: 5,
+      rateLimitRetries: 2,
+    });
+  });
+
+  it('a spend-cap 429 at the vendor origin is returned unretried and counts 0', async () => {
+    stubFetch(() => ({ status: 429, body: OPENAI_SPEND_CAP }));
+    const r = await settle(outcome(ask(providerFor('openai'), 'call-a')));
+    const err = (r as { error: ProviderError }).error;
+    expect(err.status).toBe(429);
+    expect(err.timing).toMatchObject({ attempts: 1, rateLimitRetries: 0 });
+  });
+
+  it('adaptive path, budget spent: the ProviderError reports exactly maxRateLimitRetries', async () => {
+    stubFetch(() => ({ status: 429 }));
+    const r = await settle(
+      outcome(ask(providerFor('openai', { maxRateLimitRetries: 2 }), 'call-a')),
+    );
+    const err = (r as { error: ProviderError }).error;
+    expect(err.status).toBe(429);
+    // Three 429s received; the last was returned, not retried.
+    expect(err.timing).toMatchObject({ attempts: 3, rateLimitRetries: 2 });
+  });
+
+  it('plain path (adaptive: false): 429 → 503 → 200 counts the one 429 on the shared budget', async () => {
+    const replies: Reply[] = [{ status: 429 }, { status: 503 }, { status: 200 }];
+    stubFetch((d) => replies[d.attempt - 1]!);
+    const provider = providerFor('openai', { adaptive: false });
+    const t = (await settle(ask(provider, 'call-a'))).timing!;
+    expect({ attempts: t.attempts, rateLimitRetries: t.rateLimitRetries }).toEqual({
+      attempts: 3,
+      rateLimitRetries: 1,
+    });
+  });
+
+  it('plain path (adaptive: false), transient budget spent on 429s: counts the 2 retries, not the returned 429', async () => {
+    stubFetch(() => ({ status: 429 }));
+    const provider = providerFor('openai', { adaptive: false });
+    const err = ((await settle(outcome(ask(provider, 'call-a')))) as { error: ProviderError })
+      .error;
+    expect(err.status).toBe(429);
+    expect(err.timing).toMatchObject({ attempts: 3, rateLimitRetries: 2 });
+  });
+
+  it.each<[string, RateLimiter | undefined]>([
+    ['no governor', undefined],
+    ['a directly constructed RateLimiter', new RateLimiter({ maxConcurrent: 1 })],
+  ])('plain transport (%s): 429 → 200 reports 1; 503 → 200 reports 0', async (_l, governor) => {
+    const run = async (status: number) => {
+      stubFetch((d) => (d.attempt === 1 ? { status } : { status: 200 }));
+      let timing: FetchTiming | undefined;
+      await settle(
+        fetchWithRetry(
+          `${OPENAI_DEFAULT_BASE_URL}/chat/completions`,
+          { body: 'call-a' },
+          {
+            governor,
+            timing: { onComplete: (t) => (timing = t) },
+          },
+        ),
+      );
+      return timing!;
+    };
+    expect(await run(429)).toMatchObject({ attempts: 2, rateLimitRetries: 1 });
+    expect(await run(503)).toMatchObject({ attempts: 2, rateLimitRetries: 0 });
+  });
+
+  it.each<Family>(['openai', 'openai-responses', 'anthropic', 'google', 'groq'])(
+    '%s: a call with no 429 reports rateLimitRetries 0 (present, not absent)',
+    async (family) => {
+      stubFetch(() => ({ status: 200 }));
+      const t = (await settle(ask(providerFor(family), 'call-a', {}, MODEL[family]))).timing!;
+      expect(t.rateLimitRetries).toBe(0);
+    },
+  );
+
+  it('stream(): the done chunk carries the count', async () => {
+    stubFetch((d) =>
+      d.attempt <= 2
+        ? { status: 429 }
+        : { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    );
+    const provider = providerFor('openai');
+    const chunks = (async () => {
+      const out: StreamChunk[] = [];
+      for await (const c of provider.stream([{ role: 'user', content: 'call-a' }], {
+        model: 'gpt-4o',
+      })) {
+        out.push(c);
+      }
+      return out;
+    })();
+    const done = (await settle(chunks)).find((c) => c.type === 'done') as Extract<
+      StreamChunk,
+      { type: 'done' }
+    >;
+    expect(done.timing).toMatchObject({ attempts: 3, rateLimitRetries: 2 });
+  });
+
+  type CallEnd = Extract<AxlEvent, { type: 'agent_call_end' }>;
+  const callEnd = (traces: AxlEvent[]) =>
+    traces.find((e): e is CallEnd => e.type === 'agent_call_end')!;
+  const asker = agent({ name: 'a', model: 'mock:gpt-4o', system: 's' });
+
+  it('agent_call_end.timing carries it on a non-streaming and a streaming ask', async () => {
+    for (const streaming of [false, true]) {
+      stubFetch((d) =>
+        d.attempt === 1
+          ? { status: 429 }
+          : {
+              status: 200,
+              ...(streaming ? { headers: { 'content-type': 'text/event-stream' } } : {}),
+            },
+      );
+      const { ctx, traces } = createTestCtx({ provider: providerFor('openai') });
+      if (streaming) void ctx.events;
+      // The ask's prompt carries the tag, so the stub's per-call log works.
+      await settle(ctx.ask(asker, 'call-a'));
+      expect(callEnd(traces).timing, `streaming=${streaming}`).toMatchObject({
+        attempts: 2,
+        rateLimitRetries: 1,
+      });
+    }
+  });
+
+  it('agent_call_end.timing carries it on the error path', async () => {
+    stubFetch(() => ({ status: 429 }));
+    const { ctx, traces } = createTestCtx({
+      provider: providerFor('openai', { maxRateLimitRetries: 1 }),
+    });
+    await settle(ctx.ask(asker, 'call-a').catch(() => undefined));
+    expect(callEnd(traces).timing).toMatchObject({ attempts: 2, rateLimitRetries: 1 });
   });
 });

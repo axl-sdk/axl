@@ -104,6 +104,13 @@ export type FetchTiming = {
   /** Requests actually sent, including the successful/final one (≥ 1). */
   attempts: number;
   /**
+   * Rate-limit 429s this call received and retried: on the rate-limit budget
+   * on the adaptive path, on the shared transient budget on the plain path.
+   * A 429 that is returned (spend cap, budget spent, aborted) is not counted;
+   * nor are 503/529/network retries or brake-gate bounces.
+   */
+  rateLimitRetries: number;
+  /**
    * First attempt's dispatch → final attempt's dispatch, minus the part of
    * `queuedMs` inside that span, so the two are disjoint. `0` for a single attempt.
    */
@@ -281,6 +288,9 @@ export async function fetchWithRetry(
   // `retryMs` so the two stay disjoint (a brake is queue time, not retry time).
   let queuedAfterFirstDispatchMs = 0;
   // Explicit counters. A brake-gate bounce increments none of them.
+  // `rateLimitRetries` counts every retried 429 on either path: it is the
+  // rate-limit budget on the adaptive path and a reported count, not a
+  // budget, on the plain path (where 429s spend `transientRetries`).
   let dispatches = 0;
   let rateLimitRetries = 0;
   let transientRetries = 0;
@@ -299,6 +309,7 @@ export async function fetchWithRetry(
     observer?.onComplete?.({
       queuedMs,
       attempts: dispatches,
+      rateLimitRetries,
       retryMs: dispatchedAt - firstDispatchedAt - queuedAfterFirstDispatchMs,
       dispatchedAt,
       headersAt,
@@ -442,6 +453,8 @@ export async function fetchWithRetry(
         BASE_DELAY_MS * 2 ** transientRetries,
       );
       transientRetries++;
+      // Plain path only: an adaptive scope handled its 429 above.
+      if (res.status === 429) rateLimitRetries++;
 
       observer?.onRetry?.(dispatches, Date.now());
       // The loop continues with a new request, so this response is discarded:

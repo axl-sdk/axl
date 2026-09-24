@@ -90,6 +90,7 @@ export class CallTimingRecorder {
     return {
       queuedMs: t.queuedMs,
       attempts: t.attempts,
+      rateLimitRetries: t.rateLimitRetries,
       retryMs: t.retryMs,
       ttfbMs: Math.max(0, t.headersAt - t.dispatchedAt),
       wireMs: Math.max(0, Date.now() - t.dispatchedAt),
@@ -108,6 +109,7 @@ export class CallTimingRecorder {
     return {
       queuedMs: t.queuedMs,
       attempts: t.attempts,
+      rateLimitRetries: t.rateLimitRetries,
       retryMs: t.retryMs,
       ttfbMs,
       ...(firstTokenMs !== undefined ? { firstTokenMs } : {}),

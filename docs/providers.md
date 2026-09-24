@@ -775,6 +775,9 @@ reference: [api-reference.md → `CallTiming`](api-reference.md#calltiming).
   measured latency. The two never overlap: on `429` → 30 s pause → `200`, `queuedMs` is
   about 30 s and `retryMs` is only the first attempt's own time. `attempts` counts
   requests actually sent.
+- **`rateLimitRetries`** — how many rate-limit 429s the call received and retried. A
+  nonzero count means the provider throttled it; lower fan-out before calls start
+  failing. `503`/`529`/network retries and a returned 429 are not counted.
 - **`ttfbMs` and `firstTokenMs`** — response headers and, on a stream, the first content
   delta. Consumer suspension after an earlier tool delta is excluded. Headers land at
   roughly one round trip on any model; first token is the figure that actually separates a

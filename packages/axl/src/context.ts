@@ -1631,6 +1631,10 @@ export class WorkflowContext<TInput = unknown> {
                           span.setAttribute('axl.agent.queued_ms', t.queuedMs);
                           span.setAttribute('axl.agent.retry_ms', t.retryMs);
                           span.setAttribute('axl.agent.attempts', t.attempts);
+                          // Optional on the type: a custom provider may omit it.
+                          if (t.rateLimitRetries !== undefined) {
+                            span.setAttribute('axl.agent.rate_limit_retries', t.rateLimitRetries);
+                          }
                           span.setAttribute('axl.agent.ttfb_ms', t.ttfbMs);
                           span.setAttribute('axl.agent.wire_ms', t.wireMs);
                           if (t.firstTokenMs !== undefined) {

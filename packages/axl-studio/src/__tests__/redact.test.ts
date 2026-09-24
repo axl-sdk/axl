@@ -737,6 +737,30 @@ describe('redactStreamEvent', () => {
     expect(out.duration).toBe(100);
     expect(out.data.turn).toBe(1);
   });
+
+  it('preserves agent_call_end.timing, including rateLimitRetries, under redaction', () => {
+    const timing = {
+      queuedMs: 3000,
+      attempts: 3,
+      rateLimitRetries: 2,
+      retryMs: 10,
+      ttfbMs: 40,
+      wireMs: 90,
+    };
+    const event: AxlEvent = {
+      ...baseEvent(),
+      ...askScoped(),
+      type: 'agent_call_end',
+      agent: 'a1',
+      model: 'mock:gpt-4o',
+      duration: 3100,
+      timing,
+      data: { response: 'sensitive completion', turn: 1 },
+    };
+    const out = redactStreamEvent(event, true) as Extract<AxlEvent, { type: 'agent_call_end' }>;
+    expect(out.data.response).toBe('[redacted]');
+    expect(out.timing).toEqual(timing);
+  });
 });
 
 describe('redactEvalResult', () => {

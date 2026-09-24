@@ -992,7 +992,7 @@ Every `ctx.*` primitive emits a span. Spans nest naturally: a workflow span cont
 | Span Name | Key Attributes |
 |-----------|------------|
 | `axl.workflow.execute` | `axl.workflow.name`, `axl.workflow.duration`, `axl.workflow.cost` |
-| `axl.agent.ask` | `axl.agent.name`, `axl.agent.model`, `axl.agent.prompt_tokens`, `axl.agent.completion_tokens`, `axl.agent.cost`, `axl.agent.duration`, and — when the last provider call of the ask reported [`timing`](api-reference.md#calltiming) — `axl.agent.queued_ms`, `axl.agent.retry_ms`, `axl.agent.attempts`, `axl.agent.ttfb_ms`, `axl.agent.wire_ms`, `axl.agent.first_token_ms` (streaming only) |
+| `axl.agent.ask` | `axl.agent.name`, `axl.agent.model`, `axl.agent.prompt_tokens`, `axl.agent.completion_tokens`, `axl.agent.cost`, `axl.agent.duration`, and — when the last provider call of the ask reported [`timing`](api-reference.md#calltiming) — `axl.agent.queued_ms`, `axl.agent.retry_ms`, `axl.agent.attempts`, `axl.agent.rate_limit_retries` (when reported), `axl.agent.ttfb_ms`, `axl.agent.wire_ms`, `axl.agent.first_token_ms` (streaming only) |
 | `axl.tool.call` | `axl.tool.name`, `axl.tool.duration`, `axl.tool.outcome`, `axl.tool.success`, `axl.tool.phase` (failed/cancelled) |
 | `axl.ctx.spawn` | `axl.spawn.count`, `axl.spawn.quorum`, `axl.spawn.completed` |
 | `axl.ctx.race` | `axl.race.participants`, `axl.race.winner` |

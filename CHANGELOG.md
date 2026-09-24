@@ -252,6 +252,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `POST /api/evals/import` drops a `summary.itemErrorRate` that is
   inconsistent with its own counts and marks it
   `metadata.importedItemErrorRate: 'invalid'`.
+- **`CallTiming.rateLimitRetries`** counts the rate-limit 429s a call received
+  and retried, so a throttled call is distinguishable from one queued behind a
+  `maxConcurrent` cap. Built-in adapters always set it (`0` when none); also
+  the OTel span attribute `axl.agent.rate_limit_retries`.
 
 ### Changed
 

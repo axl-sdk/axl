@@ -491,6 +491,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on another credential. The variables are now only a fallback for a provider
   with no `apiKey`, as `docs/api-reference.md` already documented.
   `resolveConfig` also no longer mutates the caller's `providers` object.
+- **`retry-after-ms` is honored.** OpenAI and Azure OpenAI send this
+  millisecond retry hint. When it's present and positive, it now takes
+  precedence over `Retry-After` (as in OpenAI's own SDK) for both the retry
+  wait and `ProviderError.retryAfterMs`.
 - **Retried provider responses no longer leak their connection.** When the
   transport retries a 429, 503 or 529, it now cancels the discarded response's
   body before backing off, instead of leaving it open until garbage collection.

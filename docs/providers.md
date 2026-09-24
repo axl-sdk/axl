@@ -951,7 +951,8 @@ try {
   transport-level hint. Unmapped codes default to `false` (conservative).
 
 **Retry-After** is surfaced on the thrown error (`retryAfterMs`, raw/unclamped) in both
-numeric-seconds and HTTP-date forms. The in-loop transport sleep clamps to 60s so a
+numeric-seconds and HTTP-date forms. A positive `retry-after-ms` (sent by OpenAI and Azure
+OpenAI) takes precedence, as in OpenAI's own SDK. The in-loop transport sleep clamps to 60s so a
 hostile/huge header can't stall the loop; the raw value still rides on the error.
 
 `ProviderError.body` carries the raw provider response — see `docs/security.md` for why

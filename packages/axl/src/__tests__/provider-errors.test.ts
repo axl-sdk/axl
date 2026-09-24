@@ -92,6 +92,21 @@ describe('parseRetryAfter', () => {
   it('missing header → undefined', () => {
     expect(parseRetryAfter(new Headers())).toBeUndefined();
   });
+
+  it('retry-after-ms (OpenAI, Azure) → ms, preferred over retry-after', () => {
+    expect(parseRetryAfter(new Headers({ 'retry-after-ms': '250' }))).toBe(250);
+    expect(parseRetryAfter(new Headers({ 'retry-after-ms': '1500.5', 'retry-after': '2' }))).toBe(
+      1500.5,
+    );
+  });
+
+  it('unusable retry-after-ms falls back to retry-after', () => {
+    for (const bad of ['0', '-5', 'soon', '']) {
+      expect(parseRetryAfter(new Headers({ 'retry-after-ms': bad, 'retry-after': '3' }))).toBe(
+        3000,
+      );
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -118,6 +118,17 @@ describe('rescore()', () => {
     expect(rescored.summary.modelTiming).not.toBe(result.summary.modelTiming);
   });
 
+  it('carries the wall-clock summary.timing forward, and leaves it absent when the source had none', async () => {
+    const timing = { mean: 1200, min: 800, max: 2100, p50: 1100, p95: 2100 };
+    const result = makeResult({ summary: { ...makeResult().summary, timing: { ...timing } } });
+    const rescored = await rescore(result, [halfScorer], mockRuntime);
+    expect(rescored.summary.timing).toEqual(timing);
+    expect(rescored.summary.timing).not.toBe(result.summary.timing);
+
+    const bare = await rescore(makeResult(), [halfScorer], mockRuntime);
+    expect('timing' in bare.summary).toBe(false);
+  });
+
   it('leaves modelTiming absent when the source run had none', async () => {
     const rescored = await rescore(makeResult(), [halfScorer], mockRuntime);
     expect('modelTiming' in rescored.summary).toBe(false);

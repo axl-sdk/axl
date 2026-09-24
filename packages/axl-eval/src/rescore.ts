@@ -562,9 +562,11 @@ export async function rescore(
       failures,
       coverage: buildCoverage(rescored, scorerNames),
       scorers: scorerStats,
-      // A rescore makes no generation calls, so the source run's provider
-      // latency is still the only measurement of these items. It cannot be
-      // rebuilt from `item.timing` (sums, not per-call samples): carry it.
+      // A rescore makes no generation calls, so the source run's wall-clock
+      // and provider latency are still the only measurements of these items.
+      // `modelTiming` cannot be rebuilt from `item.timing` (sums, not per-call
+      // samples): carry both forward.
+      ...(result.summary.timing ? { timing: { ...result.summary.timing } } : {}),
       ...(result.summary.modelTiming
         ? { modelTiming: structuredClone(result.summary.modelTiming) }
         : {}),

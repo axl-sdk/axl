@@ -10,6 +10,8 @@
  *  - L4: which rate-limit headers Gemini actually sends (decides a Gemini dialect).
  *  - L8: on a first-party dialect scope with no `rateLimit`, image-heavy and
  *    cached-prompt calls add zero self-imposed wait before any 429 (the R1 guard).
+ *  - L10: the same guard on a dialect-less scope (Gemini), which is governed and
+ *    brakes on 429 since the J5 reversal.
  *
  * Evidence is printed as rate-limit header names and values only: never keys,
  * request bodies or response bodies.
@@ -157,6 +159,24 @@ describe.skipIf(!GOOGLE_KEY)('L4: Gemini 2xx headers (gemini-3.6-flash)', () => 
       headerNames: names.sort(),
     });
     expect(seen[0].status).toBe(200);
+  }, 60_000);
+});
+
+describe.skipIf(!GOOGLE_KEY)('L10: zero added wait on a dialect-less scope (Gemini)', () => {
+  it('concurrent calls with no rateLimit report queuedMs 0 and one attempt', async () => {
+    const { seen } = recordHeaders();
+    const provider = new GeminiProvider({ apiKey: GOOGLE_KEY! });
+    const results = await Promise.all(
+      [0, 1, 2].map(() => provider.chat(PROMPT, { model: 'gemini-3.6-flash', maxTokens: 32 })),
+    );
+    const timings = results.map((r) => r.timing);
+    evidence('L10', { statuses: seen.map((s) => s.status), timings });
+    expect(seen.every((s) => s.status === 200)).toBe(true);
+    for (const t of timings) {
+      expect(t).toBeDefined();
+      expect(t!.queuedMs).toBe(0);
+      expect(t!.attempts).toBe(1);
+    }
   }, 60_000);
 });
 

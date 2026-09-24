@@ -99,3 +99,21 @@ describe('formatModelTimingLines()', () => {
     expect(line.startsWith('    openai:gpt-4o')).toBe(true);
   });
 });
+
+describe('formatModelTimingLines() — rate-limit retries', () => {
+  it('appends rate-limited N× when the model absorbed rate-limit 429s', () => {
+    const [line] = formatModelTimingLines(
+      { 'openai:gpt-4o': { ...UNEVEN, rateLimitRetries: 7 } },
+      8,
+    );
+    expect(line).toContain('retries 0ms · rate-limited 7×  (10 calls');
+  });
+
+  it('prints nothing extra at 0 or when the field is absent (older artifacts)', () => {
+    const zero = formatModelTimingLines({ m: { ...UNEVEN, rateLimitRetries: 0 } }, 8)[0];
+    const absent = formatModelTimingLines({ m: UNEVEN }, 8)[0];
+    expect(zero).not.toContain('rate-limited');
+    // A healthy run's row is byte-identical to one written before the field.
+    expect(zero).toBe(absent);
+  });
+});

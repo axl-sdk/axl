@@ -7,6 +7,537 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-09-24
+
+### Added
+
+- **Authoritative cost accounting.** `runtime.trackOutcome(fn, options?)` runs
+  `fn` and **always** returns its outcome plus an `Accounting` record for every
+  paid operation inside it — provider chat/stream, tool invocations (including
+  each retry attempt), memory embeddings, transcription, and declared external
+  work. It never throws: a run that failed after a paid call now reports that
+  call's charge, and the rejected `error` is the **original thrown value**
+  (`===` what was thrown, primitives and frozen objects included). Accounting is
+  derived from settlement rather than from trace events, so it is byte-identical
+  under `trace: false`, `trace.level: 'steps'` / `'full'`, with `captureTraces`
+  on or off, and with redaction on or off. Scopes nest and are isolated: an
+  operation is counted exactly once in every enclosing scope, and concurrent
+  scopes on one runtime never see each other's operations or spend.
+- **Known $0 is distinguished from unknown.** `Accounting.completeness` is
+  `'complete'` only when every operation reached a terminal state with a usable
+  charge — a genuinely free call included. Otherwise it is `'incomplete'`,
+  `knownCost` is an explicit lower bound, and `reasons` counts why:
+  `unpriced_model`, `usage_missing`, `abandoned`, `external_unreported`, or
+  `uninstrumented`. At finalization `operations.total === settled + unknown`,
+  with denied operations tracked separately and excluded.
+- **`AdmissionController`** — a synchronous known-spend threshold for one
+  invocation, attached with `trackOutcome(fn, { admission })`. It closes at
+  `knownSpend >= limit` and refuses new paid operations with a typed
+  `AdmissionDeniedError` before the request leaves the process, so a refusal
+  never accompanies a charge. It is a threshold, not a reservation:
+  `knownOvershoot` reports how far a concurrently in-flight call pushed spend
+  past the limit. Built-in adapters check admission a second time immediately
+  before **every** `fetch` attempt — after the rate-governor grant and after
+  retry backoff — so a request that waited in a queue cannot spend against a
+  budget that closed while it waited; the governor permit is still released, so
+  a sibling request queued on the same governor proceeds.
+- **`externalOperation(descriptor, fn)` and `ctx.withExternalOperation(...)`** —
+  declare paid work Axl cannot observe (a vendor API called from a tool) so it
+  joins the scope's accounting and its budget. Admission is checked before `fn`
+  runs; a cost reported before a later throw is kept; not reporting one marks
+  the scope incomplete with `external_unreported` rather than being read as
+  free. A non-finite, negative, or duplicate `setCost` throws
+  `AxlError('INVALID_COST_REPORT')` so an invalid report can neither shrink nor
+  poison a total.
+- **`costProvenance`** on `ProviderResponse` and the terminal `StreamChunk`,
+  with `Accounting.provenance` reporting the split. A vendor-supplied USD figure
+  (`provider_reported`) stays distinguishable from an Axl price-table estimate
+  (`price_table_estimate`). Every built-in adapter stamps it; it is optional for
+  custom adapters, which are reported as `adapter_reported` rather than
+  mislabeled.
+- **Eval runs report measured spend.** `EvalResult.accounting` carries the run's
+  `Accounting` record — known cost, completeness and reasons, a
+  `generation` / `judging` / `external` breakdown, per-scorer detail on
+  `ScorerDetail.accounting`, and per-item detail on `EvalItem.accounting`.
+  `totalCost`, `unpriced`, `item.cost`, `item.scorerCost` and
+  `scoreDetails[].cost` remain as views over it. Every eval entry point
+  (`runEval`, `runtime.eval()`, `runRegisteredEval()`, the `axl-eval` CLI
+  including `--runs` and `rescore`) reports the same figures for the same work.
+- **`EvalConfig.budget` (and `axl-eval --budget`) stops a run at a threshold.**
+  Once known spend reaches the limit, later cases are `budget_skipped` and later
+  LLM scorers are skipped, while deterministic scorers still run; a case whose
+  next call is denied becomes `budget_interrupted` and keeps its earlier charge.
+  `accounting.budget` reports `limit`, `knownSpend`, `knownOvershoot`, `status`
+  and `closedBy`. An invalid limit throws `AxlError('INVALID_BUDGET')` before the
+  dataset is loaded. `rescore` accepts its own budget, covering only new judging.
+- **Item and scorer outcomes.** `EvalItem.outcome` and `ScorerDetail.outcome`
+  distinguish `completed` / `scored`, `failed`, `cancelled`, `budget_skipped`
+  and `budget_interrupted`, and `EvalSummary.coverage` counts both populations —
+  so a truncated run can no longer be mistaken for a clean one. Scorer means and
+  failure-rate gates exclude judges that never ran.
+- **`readAccounting(result)` and `aggregateAccounting(inputs)`.** The first
+  returns a result's accounting or synthesizes an `unverified` record from a
+  pre-0.24 artifact's `totalCost`; the second folds several conservatively
+  (worst completeness wins). `MultiRunSummary.accounting` uses them, and
+  `EvalComparison.cost` gains `certified` plus a `reason` — a cost comparison is
+  refused when either side is unverified or incomplete, the scopes differ, or the
+  two sides covered different amounts of work, with both raw totals still shown.
+  The `cost` block is emitted whenever either side carries accounting, including
+  when both totals are `$0`, and the scope check covers **every** run on a side
+  so a mixed run/rescore aggregate cannot certify. `deltaPercent` is `null`
+  rather than `Infinity` when the baseline was free.
+- **Studio presents measured eval spend, not bare totals.** Every eval view —
+  summary, history, item list and detail, compare, trends and the multi-run
+  aggregate — renders known spend through one badge that carries its
+  completeness (`complete`, `incomplete: 2 unpriced_model`, or
+  `unverified (legacy)`), in wording parallel to the `axl-eval` CLI. An unknown
+  `$0` is no longer hidden, and a pre-0.24 artifact is never shown as complete.
+  Runs with a budget get a dedicated outcome row (limit, status, known spend,
+  overshoot, `closedBy`) and a "budget stopped" badge in history, so a
+  truncated run reads as truncated rather than as a wall of model failures;
+  `summary.failures` stays visible with its legacy meaning spelled out.
+  Item and scorer outcomes each render distinctly — a judge the budget skipped
+  shows as "not run (budget)" instead of a zero — and per-item generation and
+  judging spend are shown separately, with any `callerReport` labelled
+  "caller-reported (not counted)". The compare view states whether the cost
+  comparison is certified and why not, and shows an uncertified delta
+  descriptively instead of as a saving. Multi-run groups and trend windows
+  union accounting conservatively: one legacy or incomplete run makes the whole
+  group or window uncertifiable rather than inheriting the first run's flags.
+- **`GET /api/eval-trends` carries spend completeness.** Each trend point gains
+  `completeness` and `budgetStopped`; each eval gains `costCompleteness` and
+  `budgetStoppedRuns`; the payload gains `totalCostCompleteness`. See
+  [docs/studio-api.md](docs/studio-api.md#eval-trend-spend-and-completeness).
+- **Opt-in request capture.** `runEval` / `runtime.eval()` / `runRegisteredEval`
+  / `rescore` accept `captureRequests`, and `axl-eval` accepts
+  `--capture-requests`, recording the provider-neutral request Axl submitted for
+  every model call in the run — the case's own turns, tool continuations, nested
+  asks, LLM-judge calls, and each transport attempt. `EvalResult.diagnostics`
+  reports what was captured (`fidelity: 'runtime_request'`, status, record and
+  byte counts, redaction), while `EvalItem.diagnostics` and
+  `ScorerDetail.diagnostics` point at the operations they own. Capture is
+  **off** by default and never changes what a run costs: a failing, bounded or
+  redacted capture leaves `accounting` byte-identical. Every capture entry point
+  is total — an unserializable schema or an unrecognized content part degrades
+  the diagnostics rail to `status: 'unavailable'` with a reason and leaves the
+  run's accounting, admission, retries and returned value untouched. Records are
+  bounded per record, per run and per pending queue, written through a queue
+  that never delays a provider call, and redacted before they are written
+  whenever `trace.redact` is on. A call that never returned leaves a `start`
+  record with no `end` — the one you most want to read. A request or response
+  that cannot be projected at all costs that ONE record — the same stub the byte
+  bound produces, told apart by a `captured.reason` where an over-size stub
+  carries `bytes` — never the rest of the run; `status: 'unavailable'` is
+  reserved for a failure that really is run-wide. The reason names the error's
+  class, never its message, because a stub is written straight to the sink and
+  a message can carry the very call redaction was meant to scrub. A retry record
+  that could not be projected costs only itself: the response that follows is
+  still captured. A
+  stream that was closed
+  early, aborted, ended without a `done` chunk, or threw mid-iteration is
+  instead sealed with an `end` record carrying an explicit `termination`, so the
+  two cases stay distinguishable.
+- **`RuntimeEvalConfigShape` and `EvalProgressEventShape` are exported from
+  `@axlsdk/axl`.** Both appear in the signature of `runtime.eval()`, so typing
+  that call no longer needs the optional `@axlsdk/eval` peer dependency.
+- **Diagnostic artifact store.** `diagnostics.artifacts` configures where
+  captured requests live: `root` for the built-in `FileDiagnosticArtifactStore`,
+  or a custom `store` implementing `DiagnosticArtifactStore`. Artifacts follow
+  the eval history row that owns them — staged while the run writes, committed
+  only after the row is saved (rolled back if that save fails), deleted with
+  `deleteEvalResult`, and reclaimed by a startup pass plus a periodic sweep for
+  anything orphaned, expired or abandoned by a dead writer. A row may only
+  commit or delete an artifact whose manifest names **it** as the owner, so one
+  result can never rewrite or destroy another's evidence; `commit`,
+  `markDeletePending` and `refreshExpiry` report an artifact that has already
+  gone (`{ ok: false, reason: 'missing' }` — the `ArtifactWriteResult` type is
+  exported alongside the interface) instead of succeeding silently, and
+  a result whose artifact vanished is stored as `unavailable` rather than
+  published claiming evidence it cannot serve — including when the SWEEP is
+  what removed it, so a stored result is self-describing and no reader has to
+  make a liveness call to discover its evidence is gone. That correction is
+  written back only while the state store still holds the row, so it can never
+  resurrect a result that expired or was deleted, nor extend the retention an
+  operator configured. Corrections go through a new optional
+  `StateStore.updateEvalResult` — an update-only, retention-neutral write
+  (`SET ... XX KEEPTTL` on Redis, which needs Redis >= 6.0; `UPDATE ... WHERE
+  id` on SQLite) — because checking first and then saving leaves a window a
+  delete slips through, and a store that cannot promise it simply gets no
+  correction written. A Redis older than 6.0 rejects `KEEPTTL`, which now
+  surfaces as a `REDIS_VERSION_UNSUPPORTED` error named once in a warning
+  rather than vanishing into a best-effort catch; corrections then apply to
+  that process's cache only, and the stored row is left untouched. A delete
+  started in-process beats a correction already in flight,
+  `runtime.getEvalResult(id)` confirms the row still exists before serving it —
+  and Studio's rescore and compare routes resolve every id through it, so a
+  rescore can never republish an expired run's items under a fresh id — and a
+  plain re-save keeps the time the row had left rather than
+  starting its `ttls.evalHistory` window over — including leaving a
+  deliberately untimed row untimed. The writer's lease is renewed on
+  a timer for as long as it holds the artifact — not by writing — so a run that
+  exhausted its capture bound early, or that is waiting on a tool or a human,
+  keeps its records; the hold is bounded by `artifacts.maxHoldMs` (24 h) and a
+  run that throws between staging and finalizing rolls its artifact back, so
+  neither a caller bug nor a failed run can pin an artifact the sweeper would
+  never reclaim. `runtime.openDiagnosticArtifact` serves only committed
+  artifacts. A `rescore` with `captureRequests` records the judge calls it makes
+  — correlated to the case they scored — into the same artifact its source
+  records were copied into, with one `maxRunBytes` budget covering both halves,
+  and every degraded rescore reports `artifactId: ''` rather than naming the
+  source run's artifact — dropping the per-item refs into it with it. The copy
+  may take at most three quarters of the run bound, so the judging it exists to
+  record always has room, and a rescore reports the WORSE of its two halves —
+  `unavailable` over `truncated` over `complete` — so a sink that died is never
+  reported as a limit the caller set. A rescore asked to capture on a runtime
+  that cannot host capture throws before any judging, exactly as `runEval` does.
+  Every path that stages an artifact releases it if it then fails — the runner,
+  the rescore, and Studio's import — so no failure leaves a directory renewing a
+  lease no sweep can reclaim. A manifest's `redaction` now reports what the writer
+  actually applied — a run captured under `trace.redact` reads back as
+  `applied`, an artifact holding copied records only claims `applied` when both
+  halves were scrubbed, and an imported bundle is described by its own records rather than
+  by the importing deployment's setting. Expiry mirrors the
+  owning row: `StateStore.getEvalRetention` is implemented by the Memory, SQLite
+  and Redis stores (the last from `PTTL`), and a custom store without it is
+  refused **at configuration time** rather than mid-run. An interrupted writer's
+  artifact reads back as `interrupted` with its records intact.
+- **`runtime.getEvalResult(id)`** returns one eval history entry without
+  materializing the whole history to find it. Studio's diagnostics routes
+  resolve an artifact through a history id on every request; the previous
+  `getEvalHistory()` scan copied every result's full `data` blob first.
+- **`axl-eval --capture-requests --output result.json`** writes a
+  `result.requests.jsonl` sidecar alongside the result — codec version 1, one
+  JSON record per line, validated on the way back in.
+- **Studio captured-request endpoints.** `GET /api/evals/:id/diagnostics`
+  returns the manifest and `GET /api/evals/:id/diagnostics/records` streams the
+  records as NDJSON, both resolved through the eval history id and both redacted
+  again at delivery. `POST /api/evals/:name/run` and `.../rescore` accept
+  `captureRequests: true`, and `POST /api/evals/import` accepts an optional
+  `requests` sidecar — bounded per record as well as in total, so one enormous
+  line inside the overall ceiling is refused — re-staged under a **new**
+  artifact id owned by the new history row — an imported bundle can never name a path, a URL, or storage in
+  the deployment it came from.
+- **Studio inspects and downloads captured requests.** A run whose result
+  carries a `diagnostics` block gets a "Captured requests" panel on its run
+  detail and a marker on its History row: status with what it means, record
+  count and size, fidelity, whether the **stored** bytes are redacted, expiry,
+  and a rescore's `copiedFrom` provenance. "Download records (.jsonl)" saves the
+  NDJSON as `<eval>-<id>.requests.jsonl`, and an inline viewer parses the same
+  stream line by line — capped at 200 operations, which it says — reassembling
+  the artifact's per-phase lines into one row per operation, so a completed call
+  shows its request and its response together and only a genuinely missing
+  record reads as missing. A stub names its own cause (over the size limit vs a
+  request that could not be projected), and a record scrubbed on delivery is
+  distinguished from stored bytes that are scrubbed. A manifest that reads
+  `unavailable`, or whose artifact was swept since the result was loaded, shows
+  the reason and disables both actions instead of repeating counters for
+  evidence that is gone; a run that captured nothing, and a multi-run aggregate
+  view (whose result carries run 1's manifest), render nothing.
+- **Eval items record why they failed.** A `failed` item now carries
+  `item.failure = { name, provider?, status?, retryable?, requestId? }`,
+  captured before the thrown value is flattened to `error`. Every field comes
+  from the first `ProviderError` on the thrown value or its `cause` chain
+  (bounded walk). With none, only the thrown `name` is recorded.
+  `failure` never records `ProviderError.body`; `item.error` keeps the error
+  message as before, which for some providers can include error-response text.
+  The CLI summary adds a
+  `Failure causes:` line that groups failed items by status and provider (for
+  example `5 × 429 (openai), 2 × other`), so throttling reads differently from a
+  bug. The field is additive: `EvalItemOutcome` and the coverage counters are
+  unchanged. `rescore` carries it through, and the type is exported as
+  `EvalItemFailure`. Studio's Eval Runner item detail shows the cause beside
+  the message (provider, `HTTP <status>` or `network`, retryable, request id;
+  the name alone for a non-provider error). Under `trace.redact`, `failure` is
+  projected to those five keys and any other key is dropped. A multi-run
+  Studio result's `summary.itemErrorRate` is the **worst** run's record (not
+  run 1's) plus `runsExceeded`, the number of runs over their limit.
+  `POST /api/evals/import` drops a `summary.itemErrorRate` that is
+  inconsistent with its own counts and marks it
+  `metadata.importedItemErrorRate: 'invalid'`.
+- **`CallTiming.rateLimitRetries`** counts the rate-limit 429s a call received
+  and retried, so a throttled call is distinguishable from one queued behind a
+  `maxConcurrent` cap. Built-in adapters always set it (`0` when none); also
+  the OTel span attribute `axl.agent.rate_limit_retries`. `axl-eval` totals it
+  per model on `summary.modelTiming[model].rateLimitRetries`, and the CLI adds
+  `rate-limited N×` to a model's timing row when the total is above 0.
+
+### Changed
+
+- **Breaking (security): a configured `apiKey` now beats the environment.**
+  `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` and `GOOGLE_API_KEY`/`GEMINI_API_KEY`
+  used to overwrite a provider's configured `apiKey`, including a rotating-key
+  callback, whenever the variable was set. That could send one tenant's calls
+  on another credential. The variables are now only a fallback for a provider
+  with no `apiKey`, as `docs/api-reference.md` already documented. Any
+  configured `apiKey` wins, including a callback and an explicit empty
+  string: `apiKey: ''` (for example `process.env.MY_KEY ?? ''`) no longer
+  picks up the environment key and now fails as a missing API key (a preset
+  that allows no key, such as a local server, simply sends none). A config
+  that kept a placeholder key and relied on the variable must drop the
+  placeholder. `resolveConfig` also no longer mutates the caller's
+  `providers` object.
+- **Breaking (exit codes): `axl-eval` now fails a run that lost more than 5% of
+  its items.** `EvalConfig.failOnItemErrorRate` defaults to `0.05`. A run whose
+  `failed / (count − cancelled − budget_skipped − budget_interrupted)` is
+  strictly above the limit exits non-zero with `ITEM ERROR RATE EXCEEDED`.
+  Previously a run that lost 250 of 339 items exited 0 and was scored over the
+  survivors. **To opt out**, set `failOnItemErrorRate: 1` in the eval file or pass
+  `--max-item-error-rate 1`. Any other value in `[0, 1]` sets the limit, and the
+  flag overrides the config. `runEval` records the verdict on the new
+  `summary.itemErrorRate` (present only when an item failed, so clean artifacts
+  are unchanged) and never throws on it. An invalid limit **throws**
+  `AxlError('INVALID_ITEM_ERROR_RATE')` before the dataset loads. Under `--runs N`
+  each run is gated individually, the failing run is named, and the result
+  artifact is still written. `rescore` does not apply the gate and rejects the
+  flag.
+- **Breaking (exit codes): `axl-eval compare` refuses to certify a thinned
+  side by default.** Each compared run's item error rate is checked against
+  `0.05`, and the refusal names coverage, the side, and the run. This includes
+  pre-0.24 artifacts, whose rate is derived from their items, and rescored
+  artifacts. `--max-item-error-rate <0..1>` overrides the limit (`1` disables
+  it). A side that lost items within the limit still gets a warning. The pure
+  decision is exported as `evaluateItemErrorRateGate(baseline, candidate,
+  limit?)` beside `evaluateScorerErrorRateGate`.
+- **A rate-limit 429 now waits and retries instead of failing after 3
+  attempts, on every built-in chat provider** (OpenAI, OpenAI Responses,
+  Anthropic, Gemini, and every OpenAI-compatible preset, at any `baseUrl`). On
+  by default, no configuration needed. See
+  [providers.md → Rate limiting](docs/providers.md#rate-limiting).
+  - **A 429 pauses the scope** (one model on one account) for the exponential
+    backoff (1 s, 2 s, 4 s, … up to 60 s), lengthened by a longer `Retry-After`.
+    The call retries on its own budget, `RateLimitConfig.maxRateLimitRetries`
+    (default 8), separate from the 2 retries for 503/529/network errors.
+  - **Then the scope paces itself** at about half its recent request rate,
+    recovers on success, and returns to unpaced once traffic stays well below
+    that rate. Axl logs one warning per scope when pacing starts.
+  - **Nothing changes before the first 429.** No request is estimated, and
+    quota headers alone never slow a scope.
+  - **Spend caps fail fast on first-party OpenAI and Anthropic**, which are the
+    only providers whose 429 bodies Axl reads. Everywhere else every 429 is
+    treated as a rate limit, so a spend-cap, daily-quota or gateway-policy 429
+    fails only after the retry budget is spent (about 3 minutes, instead of
+    about 3 s) and holds other calls on that model meanwhile.
+  - **Opt out** per provider with `rateLimit: { adaptive: false }`.
+
+  Also: a throttled call can now take minutes (your ask `timeout`, signal and
+  `AdmissionController` still stop it). An abort during a pause, queue wait or
+  `503` backoff rejects with the signal's own `reason`. `acquireTimeoutMs`
+  bounds only a call's first permit wait. A call that arrives during a pause
+  starts that clock when the pause ends.
+- **`CallTiming.queuedMs` and `retryMs` no longer overlap.** `queuedMs` now
+  covers every wait Axl imposes on itself (the first permit, spacing, adaptive
+  pacing, a rate-limit pause, the re-acquire after a 429). `retryMs` is the span between
+  the first and final dispatch *minus* those waits. So `429` → 30 s pause →
+  `200` reports about 30 s of `queuedMs` and a `retryMs` of only the first
+  attempt. On paths without a pause (for example `503` retries) `retryMs` is
+  unchanged. `attempts` counts requests actually sent.
+- **Rate governors are pooled per runtime, one per scope.** A scope is provider
+  family + base-URL origin + credential source + model. `openai` and
+  `openai-responses` are one family, a string `apiKey` is compared by value and
+  a callback by identity (a rotating token callback is one scope), and the key
+  is never logged. Consequences for existing `rateLimit` configs:
+  - **Behavior change: `openai:` + `openai-responses:` no longer add up.** With
+    one `providers.openai` block, calls through both adapters on one model now
+    share one `maxConcurrent` cap instead of each getting its own, so a config
+    sized for the sum sees half the concurrency.
+  - **Behavior change: caps are per model.** `maxConcurrent` bounds each model
+    separately, where one adapter-wide cap used to cover all of its models.
+  - Two provider blocks reaching one scope (for example `openai` and
+    `openai-responses` with the same key) use the strictest value per field and
+    warn once. A block with no `rateLimit` on such a scope is governed by the
+    other block.
+  - Runtimes never share governors by inference, even on one key. Register one
+    provider instance in both runtimes to share; `docs/providers.md` has the
+    recipe and its limits.
+  - `ProviderRegistry.register(name, factory)` is unchanged; user factories
+    still take `(config)`. `registry.clearCache()` now also discards the pooled
+    governors.
+  - **Breaking for `OpenAICompatibleProvider` subclasses:** the protected
+    `governor` field is replaced by `protected governorFor(model)`. A subclass
+    that issued its own `fetchWithRetry({ governor: this.governor })` must pass
+    `this.governorFor(model)` instead. The adapters' new private member is
+    namespaced (`axlRateGovernors`) so it does not collide with subclass members.
+  - `RateLimiter.pump()` is now `protected` so an internal subclass can gate
+    grants. It is not part of the documented API.
+  - A factory registered with `register()` is not joined to the runtime's pool,
+    like a registered instance. The one-time "request queued" warning now fires
+    once per scope rather than once per adapter.
+  - Transcription adapters and the memory embedder keep their per-instance
+    behavior.
+- **Breaking: `runtime.resolveProvider(uri)` returns a scoped facade**, so
+  `resolveProvider(uri).provider === registeredInstance` is now `false`. The
+  facade routes `chat`/`stream` through accounting and admission and forwards
+  everything else verbatim — custom properties, accessors, class private-field
+  methods, property writes, capability methods, and `instanceof`. Its identity
+  is stable per runtime per adapter. Exotic reflection (a custom
+  `Symbol.hasInstance`, identity-keyed maps) is not preserved. See
+  [the migration guide](docs/migration/eval-accounting.md).
+- **Breaking: `trackExecution().cost` / `.unpriced` derive from the accounting
+  scope**, not from a sum over trace events, and the result gains `accounting`.
+  `cost` is unchanged wherever the trace sum was already right and higher where
+  that rail lost a charge (a leaf that never settled). **`unpriced` is wider**:
+  it now also flags a call that dispatched and returned neither usage nor a
+  cost, so it flips `false` → `true` for usage-omitting gateways, custom
+  adapters returning bare content, $0 local adapters not declaring
+  `pricing: { kind: 'zero' }`, and caught provider failures. No new charge is
+  implied — Axl now says it could not confirm the figure instead of presenting a
+  lower bound as exact. `ctx.getBudgetStatus().unpriced` / `BudgetResult.unpriced`
+  deliberately keep the narrower positive-billable-work rule, so the two
+  surfaces can disagree about one run. `trackExecution` is now a throwing
+  compatibility wrapper over `trackOutcome`; `runtime.trackCost()` and every
+  `ctx.budget()` behavior are unchanged.
+- **Breaking: `AdmissionDeniedError` passes through every safe boundary
+  unwrapped.** A budget refusal is a stop, not a failure: it is never normalized
+  into a `ProviderError`, never wrapped in a `TranscriptionOperationError`,
+  never converted into a tool failure fed back to the model, and never retried.
+  Code that catches broadly around `ctx.ask` or a tool call and translates
+  errors into a model-visible message must rethrow it. `ctx.budget()`,
+  `BudgetExceededError`, and `hard_stop` semantics are unchanged.
+- **Breaking: an eval's `totalCost` is measured, not reported.** It is now a
+  view of `accounting.knownCost`, so a case that threw **after** a paid call
+  contributes that charge instead of `$0` — totals on failing runs go up,
+  because they were under-reported before. The figure no longer varies with
+  trace level, redaction or `captureTraces`, and `unpriced` is present exactly
+  when completeness is not `complete`.
+- **Breaking: a callback's `cost` is a claim, not a total.** A `cost` returned
+  from an eval `executeWorkflow` no longer sets `item.cost` or feeds the run
+  total; it is preserved on `EvalItem.callerReport.cost` and summarized on
+  `accounting.callerReported`. A scorer-returned `cost` reaches
+  `scoreDetails[].cost` only when nothing was measured for that scorer on an
+  uninstrumented runtime, and is never summed. Reserved diagnostic metadata keys
+  returned by a callback (`models`, `tokens`, …) no longer override the
+  runtime's own and are kept under `callerReport.metadata`. An uninstrumented
+  runtime (`{} as AxlRuntime`) now yields `incomplete` accounting with
+  `reasons.uninstrumented` and a `totalCost` of `0`.
+- **Studio reads "budget stopped" the way the eval package does.** The run
+  banner, the run/group history badges, the multi-run `budgetStoppedRuns` count
+  and the trend-window chip all now require refused work, not merely a closed
+  controller — a run that set its budget to its expected spend and completed
+  every case no longer reads as truncated in four places at once. The compare
+  view keeps the sign of an uncertified cost delta in its text (it is
+  deliberately uncoloured), labels the compared figure "Known spend (per run)"
+  because `compare.ts` averages a group, and a compare side with no runs loaded
+  reports `unverified` rather than a certified `$0.00`. The trends cost
+  sparkline marks lower-bound and unverified points as hollow rings on dashed
+  segments, with the count in its accessible name, instead of drawing them as
+  part of one measured trend; the window spend figure states its own
+  completeness rather than borrowing the shared cost badge's "unpriced model"
+  wording. A budget-thinned scorer mean now carries a caveat in the multi-run
+  aggregate view, which renders no coverage block of its own.
+- **`refusedWork(coverage)` and `isBudgetStopped(summary)`** are exported from
+  `@axlsdk/eval`. They own the one rule that separates "the budget closed" from
+  "the budget truncated this run" — a stop requires refused cases or refused
+  judges, not just a closed controller — so the CLI, the Studio server and the
+  Studio browser mirror cannot drift apart on it.
+- **`EvalComparison.summary` states a cost change only when `cost.certified`.**
+  A one-line "40% cheaper" has no room for the refusal reason, so an
+  uncertified saving read as a measured one. The structured `cost` block still
+  carries both totals, the delta and the reason.
+- **Breaking: `axl-eval` exits non-zero when a budget refused work**, printing a
+  distinct `[axl-eval] BUDGET STOPPED …` line first. The exit is driven by
+  coverage, not by the controller's status: a run whose spend lands exactly on
+  the limit with every case and scorer completed refused nothing and exits `0`.
+  `axl-eval rescore --budget` reports and exits by the same rule, after writing
+  the partial artifact. A budget stop is deliberately not
+  counted as a model failure in the wipeout/degraded logic, and the summary
+  prints known spend with a completeness label (e.g.
+  `Cost: $1.50 (incomplete: 1 unpriced_model)`) plus budget and coverage rows.
+  `EvalSummary.failures` keeps its old meaning — items that produced no output,
+  budget-stopped cases included — so gate CI on `summary.coverage` instead.
+- **Studio: `callerReport.metadata` is scrubbed under redaction.** It is raw
+  callback output, so it is dropped like scorer metadata; item and scorer
+  `outcome` / `accounting` are preserved as structural, non-content fields. Eval
+  imports without accounting are stamped `unverified` on the way in.
+- **Studio: a declared `accounting` on an import must prove itself.** An
+  imported result carrying its own `accounting` is kept only if the record is
+  internally consistent — version 1, USD, a finite non-negative `knownCost`, a
+  known `completeness`, `operations.total === settled + unknown`, and (for
+  `complete` / `incomplete`) provenance and breakdown splits that sum back to
+  `knownCost`. Item-level and scorer-level records are held to the same rule,
+  all-or-nothing — and so are the two accounting-derived facts a reader turns
+  into a budget-stopped badge: `accounting.budget` (finite non-negative figures,
+  a known `status`, `knownOvershoot === max(0, knownSpend - limit)`, and
+  `status === 'closed'` exactly when `knownSpend >= limit`, the only rule an
+  `AdmissionController` closes on) and
+  `summary.coverage` (every outcome key present as a non-negative integer),
+  including a coverage block that arrives with no accounting beside it.
+  A failing result loses all three, so nothing downstream can excuse its missing
+  cases as a budget stop. A record that fails is replaced by the same `unverified`
+  synthesis an artifact with no accounting receives, so `compare` refuses to
+  certify a cost delta from a hand-edited "complete" file. Import never rejects
+  a result over its accounting; `metadata.importedAccounting` records
+  `'declared'` or `'invalid'` so the decision is visible rather than inferred.
+- **Studio: in redact mode `EvalItem.metadata` keeps only the measured keys**
+  (`models`, `modelCallCounts`, `workflows`, `workflowCallCounts`, `tokens`,
+  `agentCalls`); every other key is masked, matching the policy already applied
+  to `callerReport.metadata`.
+- **A settled charge reaches its `AdmissionController` across duplicate
+  installs.** The internal settlement channel is a registry symbol and
+  `AdmissionDeniedError` is now recognized structurally, so a budget attached
+  through a second copy of `@axlsdk/axl` (ESM alongside CJS) still records spend
+  and still reads as a stop rather than a model failure. An object that carries
+  no settlement channel at all raises
+  `AxlError('INCOMPATIBLE_ADMISSION_CONTROLLER')` naming the duplicate-install
+  cause, instead of a bare `TypeError`. The new `isAdmissionDeniedError(err)`
+  predicate is exported for callers that classify errors themselves.
+
+### Fixed
+
+- **Studio no longer presents run 1's `modelTiming` as a multi-run
+  aggregate.** The aggregate summary of a multi-run eval (the sync response
+  and the Eval Runner's rebuilt group) spread run 1's per-model latency and
+  rate-limit totals as if they covered the batch. It now omits
+  `modelTiming`. Each run in `_multiRun.allRuns` keeps its own.
+- **`rescore` keeps `summary.timing` and `summary.modelTiming`.** A rescored
+  result dropped the source run's wall-clock and per-model provider latency. A
+  rescore makes no generation calls, so it now carries both forward unchanged.
+- **`retry-after-ms` is honored, and no retry hint shortens a backoff.**
+  OpenAI and Azure OpenAI send this millisecond retry hint. When it's present
+  and positive, it now takes precedence over `Retry-After` (as in OpenAI's own
+  SDK) for both the retry wait and `ProviderError.retryAfterMs`. On every
+  retry path a hint may now only lengthen the exponential backoff (1 s, 2 s,
+  4 s, …, clamped at 60 s), never shorten it: `retry-after-ms` values of tens
+  of milliseconds would otherwise spend a whole retry budget in seconds under
+  sustained throttling. Previously a short `Retry-After` (for example `1` on
+  a later retry) was used as-is. `ProviderError.retryAfterMs` still carries
+  the raw, unclamped value.
+- **A 503/529 retry never sleeps past 60 s.** A huge `Retry-After` was clamped to
+  60 s before the ±25% jitter was applied, so the wait could reach 75 s. The
+  clamp now applies after jitter as well.
+- **Retried provider responses no longer leak their connection.** When the
+  transport retries a 429, 503 or 529, it now cancels the discarded response's
+  body before backing off, instead of leaving it open until garbage collection.
+  A response that is returned (success, a non-retryable error, or the last
+  attempt after retries run out) keeps its body, so `ProviderError.body` is
+  still the raw provider text.
+- **An aborted, rate-limited queue no longer holds the process open.** When
+  every call waiting on `minIntervalMs` spacing (or on adaptive pacing after a
+  rate-limit 429) aborts or times out, the limiter now clears its spacing
+  timer instead of leaving it armed for up to one interval.
+- **Retry backoffs no longer pile abort listeners onto a shared signal.** Each
+  completed backoff sleep now removes its listener from the call's
+  `AbortSignal`. Before, every retry on a long-lived signal (for example one
+  `AbortController` for a whole run) left a listener behind until that signal
+  was aborted or collected, which could trigger Node's
+  `MaxListenersExceededWarning`.
+- **Studio: every run of a multi-run eval response is redacted.** Under
+  `trace.redact`, a synchronous `POST /api/evals/:name/run` with `runs > 1`
+  masked only the top-level `items`, while `_multiRun.allRuns` served each
+  run's inputs, outputs and error messages raw. Each run is now scrubbed the
+  same way as the top-level result, and so is `_multiRun.batchFailure`. The
+  history read applies the same rule to an imported artifact that carries
+  `_multiRun`. Import drops a `_multiRun` the read cannot walk and marks it
+  `metadata.importedMultiRun: 'invalid'`. Under redaction, a stored item or
+  run with an unexpected shape is replaced with `[redacted]` instead of
+  failing the whole history list.
+- **Studio: eval compare responses are redacted.** Under `trace.redact`,
+  `POST /api/evals/compare` returned each regression's and improvement's
+  `input` (the baseline item's raw input) and each side's
+  `metadata.batchFailure` unmasked, so comparing two history ids bypassed
+  the history scrub. `readOnly` deployments allow compare, so this was
+  reachable by the least-privileged Studio role. Those fields are now masked;
+  `itemIndex`, scores and every statistic are unchanged.
+
 ## [0.23.3] - 2026-09-09
 
 ### Added
@@ -151,6 +682,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   executions are not rewritten.
 
 ### Fixed
+
+- **`SQLiteStore`, `SqliteVectorStore` and `RedisStore` work from the ESM
+  build.** Each loads its optional dependency with a synchronous `require()`,
+  which the bundler rewrote to a shim that has no `require` to bind in an ESM
+  output and throws on call. The stores caught that throw and reported it as a
+  missing dependency, so an ESM consumer saw "better-sqlite3 is required" /
+  "redis is required" with the package installed and resolvable. The CJS build
+  was unaffected. The ESM bundle now defines `require` via `createRequire`, and
+  a smoke test constructs each store from the built ESM entry point.
 
 - **Gemini Interactions now honors response service tiers when estimating cost.**
   Top-level response tiers, the `x-gemini-service-tier` header, and streaming
@@ -1644,7 +2184,8 @@ Initial public open-source release on npm under the `@axlsdk` scope. No new feat
 - `createServer()` factory, `ConnectionManager` for channel subscriptions, `CostAggregator` for cost tracking
 - Eight panels: Agent Playground, Workflow Runner, Trace Explorer, Cost Dashboard, Memory Browser, Session Manager, Tool Inspector, Eval Runner
 
-[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.23.3...HEAD
+[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.24.0...HEAD
+[0.24.0]: https://github.com/axl-sdk/axl/compare/v0.23.3...v0.24.0
 [0.23.3]: https://github.com/axl-sdk/axl/compare/v0.23.2...v0.23.3
 [0.23.2]: https://github.com/axl-sdk/axl/compare/v0.23.1...v0.23.2
 [0.23.1]: https://github.com/axl-sdk/axl/compare/v0.23.0...v0.23.1

@@ -1,6 +1,6 @@
 import { Fragment, useMemo, useState } from 'react';
 import { ChevronDown, ChevronRight, Layers, ArrowRight, Download, Trash2 } from 'lucide-react';
-import { cn, formatCost, formatDuration } from '../../lib/utils';
+import { cn, formatDuration } from '../../lib/utils';
 import {
   scoreTextColor,
   getResultModels,
@@ -9,7 +9,12 @@ import {
   getResultWorkflowCounts,
   formatModelName,
   aggregateGroupModelCounts,
+  aggregateGroupAccounting,
 } from './types';
+import { isRunBudgetStopped, readAccounting } from './accounting';
+import { SpendBadge } from './SpendBadge';
+import { BudgetStoppedBadge } from './RunAccountingPanel';
+import { CapturedRequestsBadge } from './RunDiagnosticsPanel';
 import type { EvalResultData } from './types';
 import type { EvalHistoryEntry } from '../../lib/types';
 
@@ -292,17 +297,39 @@ export function EvalHistoryTable({
           </td>
           <td className="px-3 py-2.5 text-right font-mono">{data.summary.count}</td>
           <td className="px-3 py-2.5 text-right font-mono">
-            {data.summary.failures > 0 ? (
-              <span className="text-red-600 dark:text-red-400">{data.summary.failures}</span>
-            ) : (
-              <span className="text-[hsl(var(--muted-foreground))]">0</span>
-            )}
+            {(() => {
+              // `summary.failures` is the legacy count of items carrying an
+              // error string — cancelled and budget-stopped items carry one
+              // too. When coverage is available, colour it by the real failure
+              // count so a budget-truncated run is not painted as broken.
+              const coverage = data.summary.coverage?.items;
+              const realFailures = coverage ? coverage.failed : data.summary.failures;
+              const title = coverage
+                ? `${coverage.failed} failed, ${coverage.cancelled} cancelled, ${coverage.budget_skipped} budget-skipped, ${coverage.budget_interrupted} budget-interrupted. This column is the legacy count of items carrying an error string, which includes all of them.`
+                : 'Legacy count of items carrying an error string — includes cancelled and budget-stopped items.';
+              return (
+                <span
+                  title={title}
+                  className={
+                    realFailures > 0
+                      ? 'text-red-600 dark:text-red-400'
+                      : 'text-[hsl(var(--muted-foreground))]'
+                  }
+                >
+                  {data.summary.failures}
+                </span>
+              );
+            })()}
           </td>
           <td className="px-3 py-2.5 text-right font-mono text-[hsl(var(--muted-foreground))]">
             {data.duration > 0 ? formatDuration(data.duration) : '-'}
           </td>
           <td className="px-3 py-2.5 text-right font-mono text-[hsl(var(--muted-foreground))]">
-            {data.totalCost > 0 ? formatCost(data.totalCost) : '-'}
+            <span className="inline-flex items-center gap-1 justify-end">
+              <SpendBadge accounting={readAccounting(data)} />
+              <BudgetStoppedBadge result={data} />
+              <CapturedRequestsBadge result={data} />
+            </span>
           </td>
           {(() => {
             const allMeans = Object.values(data.summary?.scorers ?? {}).map((s) => s.mean);
@@ -623,9 +650,13 @@ export function EvalHistoryTable({
                     (sum, e) => sum + (e.data as EvalResultData).duration,
                     0,
                   );
-                  const totalCost = row.entries.reduce(
-                    (sum, e) => sum + (e.data as EvalResultData).totalCost,
-                    0,
+                  // Union, not a sum of `totalCost`: a group holding one legacy
+                  // or budget-truncated run cannot present a certified total.
+                  const groupAccounting = aggregateGroupAccounting(
+                    row.entries.map((e) => e.data as EvalResultData),
+                  );
+                  const groupBudgetStopped = row.entries.some((e) =>
+                    isRunBudgetStopped(e.data as EvalResultData),
                   );
 
                   return (
@@ -731,7 +762,18 @@ export function EvalHistoryTable({
                           {totalDuration > 0 ? formatDuration(totalDuration) : '-'}
                         </td>
                         <td className="px-3 py-2.5 text-right font-mono text-[hsl(var(--muted-foreground))]">
-                          {totalCost > 0 ? formatCost(totalCost) : '-'}
+                          <span className="inline-flex items-center gap-1 justify-end">
+                            <SpendBadge accounting={groupAccounting} label="Group known spend" />
+                            {groupBudgetStopped && (
+                              <span
+                                title="At least one run in this group stopped on budget — the group covers less work than a complete batch."
+                                aria-label="Budget stopped"
+                                className="inline-flex items-center px-1.5 py-0.5 rounded-md text-[9px] font-medium uppercase tracking-wide bg-amber-100 text-amber-900 dark:bg-amber-950/60 dark:text-amber-200"
+                              >
+                                budget stopped
+                              </span>
+                            )}
+                          </span>
                         </td>
                         <td className="px-3 py-2.5 text-right font-mono font-medium border-l border-[hsl(var(--border))]">
                           {groupStats.overall ? (

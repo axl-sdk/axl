@@ -3,6 +3,8 @@ import { ChevronRight, XCircle, AlertTriangle } from 'lucide-react';
 import { cn, extractLabel } from '../../lib/utils';
 import type { EvalItem } from './types';
 import { scoreTextColor } from './types';
+import { itemOutcome } from './accounting';
+import { ItemOutcomeBadge } from './OutcomeBadge';
 
 type Props = {
   items: EvalItem[];
@@ -37,7 +39,16 @@ export function EvalItemSidebar({
     [items, scorerNames],
   );
 
-  const failureCount = items.filter((i) => i.error).length;
+  // Count real workflow failures separately from budget stops. `item.error` is
+  // set for cancelled and budget-stopped items too, so counting it alone would
+  // report a truncated run as a broken one.
+  const failureCount = items.filter((i) =>
+    itemOutcome(i) != null ? itemOutcome(i) === 'failed' : !!i.error,
+  ).length;
+  const budgetStoppedCount = items.filter((i) => {
+    const outcome = itemOutcome(i);
+    return outcome === 'budget_skipped' || outcome === 'budget_interrupted';
+  }).length;
 
   return (
     <div className="flex flex-col h-full">
@@ -55,15 +66,26 @@ export function EvalItemSidebar({
           >
             {items.length} items
           </button>
-          {failureCount > 0 ? (
-            <span className="text-[10px] font-medium text-red-600 dark:text-red-400">
-              {failureCount} failed
-            </span>
-          ) : (
-            <span className="text-[10px] font-medium text-emerald-600 dark:text-emerald-400">
-              all passed
-            </span>
-          )}
+          <span className="flex items-center gap-1.5">
+            {failureCount > 0 && (
+              <span className="text-[10px] font-medium text-red-600 dark:text-red-400">
+                {failureCount} failed
+              </span>
+            )}
+            {budgetStoppedCount > 0 && (
+              <span
+                className="text-[10px] font-medium text-amber-600 dark:text-amber-400"
+                title="Items the run budget skipped or interrupted — not model failures"
+              >
+                {budgetStoppedCount} stopped on budget
+              </span>
+            )}
+            {failureCount === 0 && budgetStoppedCount === 0 && (
+              <span className="text-[10px] font-medium text-emerald-600 dark:text-emerald-400">
+                all passed
+              </span>
+            )}
+          </span>
         </div>
       </div>
 
@@ -110,7 +132,11 @@ export function EvalItemSidebar({
                   and touch users (no `title` hover) can still tell workflow
                   failures (red XCircle) apart from scorer-only failures
                   (amber AlertTriangle). */}
-              {item.error && (
+              {/* An outcome, once recorded, replaces the icon: a case the
+                  budget never started is not a workflow error, and the red
+                  XCircle would say it was. */}
+              <ItemOutcomeBadge outcome={itemOutcome(item)} className="shrink-0" />
+              {itemOutcome(item) == null && item.error && (
                 <span
                   className="inline-flex items-center text-red-500 shrink-0"
                   title="Workflow error"

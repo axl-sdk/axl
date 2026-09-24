@@ -4,9 +4,119 @@ import type {
   EvalCompareOptions,
   EvalRegression,
   EvalImprovement,
+  ItemErrorRate,
 } from './types.js';
 import { pairedBootstrapCI } from './bootstrap.js';
-import { scorerCounts, evaluateScorerTolerance, round } from './utils.js';
+import {
+  scorerCounts,
+  evaluateScorerTolerance,
+  evaluateItemErrorRate,
+  isErrorRateLimit,
+  round,
+  formatPercent,
+  DEFAULT_ITEM_ERROR_RATE_LIMIT,
+} from './utils.js';
+import { readAccounting } from './accounting.js';
+import { buildCoverage } from './runner.js';
+
+/**
+ * Decide whether two sides' costs are comparable AS SPEND. Returns `null` to
+ * certify, or a human-readable refusal reason.
+ *
+ * Cost certification is deliberately separate from the quality gates: a legacy
+ * baseline must not disable regression detection, it must only stop the tool
+ * from claiming the candidate is cheaper. The four refusals, in the order a
+ * reader would want to hear them:
+ *
+ * 1. **Not measured** — either side is `incomplete` (some operation had no
+ *    usable price) or `unverified` (a pre-0.24 artifact). The totals are lower
+ *    bounds, so their difference is not one.
+ * 2. **Different scope** — a `rescore` total covers judging only. Comparing it
+ *    against a full run's total and reporting a saving is the headline failure
+ *    this exists to prevent.
+ * 3. **Different case coverage** — one side skipped or failed cases the other
+ *    completed, so it spent less by doing less.
+ * 4. **Different scorer coverage** — the same, one judge at a time.
+ *
+ * Cases and scorers are matched BY INDEX, which is how the rest of `evalCompare`
+ * pairs them: two dataset items with identical inputs and different annotations
+ * stay two distinct items rather than collapsing into one key.
+ */
+function certifyCost(
+  baselineRuns: EvalResult[],
+  candidateRuns: EvalResult[],
+  scorerNames: readonly string[],
+): string | null {
+  for (const [side, runs] of [
+    ['baseline', baselineRuns],
+    ['candidate', candidateRuns],
+  ] as const) {
+    for (const run of runs) {
+      const accounting = readAccounting(run);
+      if (accounting.completeness === 'unverified') {
+        return `${side} run ${run.id} carries no accounting (unverified) — its total is not a measured figure.`;
+      }
+      if (accounting.completeness === 'incomplete') {
+        const reasons = Object.keys(accounting.reasons).join(', ') || 'unknown spend';
+        return `${side} run ${run.id} has incomplete accounting (${reasons}) — its total is a lower bound.`;
+      }
+    }
+  }
+
+  // Scope is checked on EVERY run, not just the first. A multi-run side can be
+  // assembled from history by `runGroupId`, and a group that mixes a run-scope
+  // artifact with a judging-only rescore would otherwise pass this gate on
+  // run[0] alone and certify a per-run average built from two different
+  // denominators — exactly the failure this function exists to refuse.
+  const scopes = new Map<string, string>();
+  for (const [side, runs] of [
+    ['baseline', baselineRuns],
+    ['candidate', candidateRuns],
+  ] as const) {
+    for (const run of runs) {
+      const scope = readAccounting(run).scope;
+      const seen = scopes.get(side);
+      if (seen !== undefined && seen !== scope) {
+        return `${side} mixes accounting scopes ("${seen}" and "${scope}") — a rescore total covers judging only and cannot be averaged with a full run.`;
+      }
+      scopes.set(side, scope);
+    }
+  }
+  const baselineScope = scopes.get('baseline');
+  const candidateScope = scopes.get('candidate');
+  if (baselineScope !== candidateScope) {
+    return `accounting scope differs (baseline "${baselineScope}" vs candidate "${candidateScope}") — a rescore total covers judging only.`;
+  }
+
+  const runCount = Math.min(baselineRuns.length, candidateRuns.length);
+  for (let r = 0; r < runCount; r++) {
+    const bRun = baselineRuns[r];
+    const cRun = candidateRuns[r];
+    if (bRun.items.length !== cRun.items.length) {
+      return `item counts differ (baseline ${bRun.items.length} vs candidate ${cRun.items.length}) — the runs did different amounts of work.`;
+    }
+    for (let i = 0; i < bRun.items.length; i++) {
+      const bItem = bRun.items[i];
+      const cItem = cRun.items[i];
+      const bRan = !bItem.error;
+      const cRan = !cItem.error;
+      if (bRan !== cRan) {
+        const stopped = bRan ? cItem : bItem;
+        return `case coverage differs at item ${i}: ${bRan ? 'candidate' : 'baseline'} did not complete it (${stopped.outcome ?? stopped.error}) — the cheaper side did less work.`;
+      }
+      if (!bRan) continue;
+      for (const name of scorerNames) {
+        const bScored = bItem.scores[name] != null;
+        const cScored = cItem.scores[name] != null;
+        if (bScored !== cScored) {
+          return `scorer coverage differs for "${name}" at item ${i}: only ${bScored ? 'baseline' : 'candidate'} produced a score.`;
+        }
+      }
+    }
+  }
+
+  return null;
+}
 
 const DEFAULT_LLM_THRESHOLD = 0.05;
 const DEFAULT_DETERMINISTIC_THRESHOLD = 0;
@@ -258,21 +368,38 @@ export function evalCompare(
     timing = { baselineMean: round(bMean), candidateMean: round(cMean), delta, deltaPercent };
   }
 
-  // Cost comparison (per-run average for multi-run)
+  // Cost comparison (per-run average for multi-run).
+  //
+  // Raw numbers are always reported; what the `certified` flag adds is whether
+  // they are comparable AS SPEND. A run that stopped early is cheaper because
+  // it did less work, so an uncertified saving is not a saving at all.
   let cost: EvalComparison['cost'];
   const baselineAvgCost =
-    baselineRuns.reduce((sum, r) => sum + r.totalCost, 0) / baselineRuns.length;
+    baselineRuns.reduce((sum, r) => sum + readAccounting(r).knownCost, 0) / baselineRuns.length;
   const candidateAvgCost =
-    candidateRuns.reduce((sum, r) => sum + r.totalCost, 0) / candidateRuns.length;
-  if (baselineAvgCost > 0 || candidateAvgCost > 0) {
+    candidateRuns.reduce((sum, r) => sum + readAccounting(r).knownCost, 0) / candidateRuns.length;
+  // Emit the block whenever EITHER side carries an accounting record, not only
+  // when a positive number appeared. Two runs whose every model was unpriced
+  // both report `knownCost: 0` with `completeness: 'incomplete'` — the most
+  // uncertain comparison there is, and the one that previously printed nothing
+  // at all, leaving a reader to conclude the two cost the same. A `$0.00 /
+  // $0.00 (not certified: …)` row says what is actually known.
+  const hasAccounting = [...baselineRuns, ...candidateRuns].some((r) => r.accounting != null);
+  if (baselineAvgCost > 0 || candidateAvgCost > 0 || hasAccounting) {
     const deltaRaw = candidateAvgCost - baselineAvgCost;
     const delta = round(deltaRaw);
-    const deltaPercent = baselineAvgCost > 0 ? round((deltaRaw / baselineAvgCost) * 100) : 0;
+    // A percentage change from a zero baseline is not a number. Reporting `0`
+    // (or `Infinity`) would read as "no change" for a run that went from free
+    // to paid, so the field is explicitly null and the absolute delta stands.
+    const deltaPercent = baselineAvgCost > 0 ? round((deltaRaw / baselineAvgCost) * 100) : null;
+    const verdict = certifyCost(baselineRuns, candidateRuns, baselineScorerNames);
     cost = {
       baselineTotal: round(baselineAvgCost),
       candidateTotal: round(candidateAvgCost),
       delta,
       deltaPercent,
+      certified: verdict === null,
+      ...(verdict !== null ? { reason: verdict } : {}),
     };
   }
 
@@ -294,7 +421,12 @@ export function evalCompare(
     const dir = timing.delta > 0 ? 'slower' : 'faster';
     parts.push(`${Math.abs(timing.deltaPercent).toFixed(0)}% ${dir}`);
   }
-  if (cost && Math.abs(cost.deltaPercent) > 1) {
+  // Only a CERTIFIED delta earns a place in the prose summary. "40% cheaper"
+  // in a one-line verdict carries no room for the refusal reason, so an
+  // uncertified saving printed here reads as a measured one; the structured
+  // `cost` block still carries both totals and the reason for a reader who
+  // wants them.
+  if (cost?.certified && cost.deltaPercent !== null && Math.abs(cost.deltaPercent) > 1) {
     const dir = cost.delta > 0 ? 'more expensive' : 'cheaper';
     parts.push(`${Math.abs(cost.deltaPercent).toFixed(0)}% ${dir}`);
   }
@@ -420,4 +552,99 @@ export function evaluateScorerErrorRateGate(
     }
   }
   return null;
+}
+
+/** One compared run's item error rate — see {@link compareItemErrorRates}. */
+export type SideItemErrorRate = {
+  side: 'baseline' | 'candidate';
+  /** 0-based position within the side's truncated pool. */
+  runIndex: number;
+  runId: string;
+  /** `true` when the rate was derived from the items of a pre-0.24 artifact. */
+  legacy: boolean;
+} & ItemErrorRate;
+
+/**
+ * Every compared run's item error rate against `maxItemErrorRate`, over the
+ * same truncated pool `evalCompare` compares (the first `min(baseline,
+ * candidate)` runs of each side). Each run is evaluated INDIVIDUALLY: pooling
+ * would let clean runs dilute one thinned run below the limit.
+ *
+ * Uses the same rule as `runEval`'s produce-time gate
+ * ({@link evaluateItemErrorRate}). A pre-0.24 artifact without
+ * `summary.coverage` is evaluated on a rate derived from its items with the
+ * legacy rule (`outcome ?? (error ? 'failed' : 'completed')`) — never skipped,
+ * which would certify exactly the thinned legacy runs this floor exists to
+ * catch. A rescore artifact carries its source's item outcomes, so it is
+ * evaluated on them.
+ */
+export function compareItemErrorRates(
+  baseline: EvalResult | EvalResult[],
+  candidate: EvalResult | EvalResult[],
+  maxItemErrorRate: number = DEFAULT_ITEM_ERROR_RATE_LIMIT,
+): SideItemErrorRate[] {
+  if (!isErrorRateLimit(maxItemErrorRate)) {
+    throw new Error(
+      `Invalid maxItemErrorRate (${String(maxItemErrorRate)}): expected a number in [0, 1].`,
+    );
+  }
+  const baselineRuns = Array.isArray(baseline) ? baseline : [baseline];
+  const candidateRuns = Array.isArray(candidate) ? candidate : [candidate];
+  const runCount = Math.min(baselineRuns.length, candidateRuns.length);
+  const rates: SideItemErrorRate[] = [];
+  for (const [side, runs] of [
+    ['baseline', baselineRuns],
+    ['candidate', candidateRuns],
+  ] as const) {
+    for (let r = 0; r < runCount; r++) {
+      const run = runs[r];
+      const coverage = run.summary.coverage?.items;
+      const legacy = coverage === undefined;
+      const verdict = legacy
+        ? evaluateItemErrorRate(
+            buildCoverage(run.items, []).items,
+            run.items.length,
+            maxItemErrorRate,
+          )
+        : evaluateItemErrorRate(coverage, run.summary.count, maxItemErrorRate);
+      rates.push({ side, runIndex: r, runId: run.id, legacy, ...verdict });
+    }
+  }
+  return rates;
+}
+
+/** Human-readable description of one run's item error rate, for CLI lines. */
+export function describeItemErrorRate(rate: SideItemErrorRate, multiRun: boolean): string {
+  const which = multiRun ? ` run ${rate.runIndex + 1} (${rate.runId})` : ` (${rate.runId})`;
+  const legacy = rate.legacy ? ', derived from the items of a pre-0.24 artifact' : '';
+  return (
+    `${rate.side}${which} item error rate ${formatPercent(rate.rate)} ` +
+    `(${rate.failed}/${rate.attempted} attempted items failed${legacy})`
+  );
+}
+
+/**
+ * Decide whether a comparison must be REFUSED because a side lost too many
+ * items (`axl-eval compare`, default-on at `0.05`, overridden by
+ * `--max-item-error-rate`; `1` disables it). Pure and testable — returns a
+ * human-readable refusal reason naming coverage and the side, or `null` to
+ * allow. See {@link compareItemErrorRates} for the per-run rule.
+ *
+ * Throws on an invalid limit: the gate is default-on, so a bad value must not
+ * quietly disable it.
+ */
+export function evaluateItemErrorRateGate(
+  baseline: EvalResult | EvalResult[],
+  candidate: EvalResult | EvalResult[],
+  maxItemErrorRate: number = DEFAULT_ITEM_ERROR_RATE_LIMIT,
+): string | null {
+  const rates = compareItemErrorRates(baseline, candidate, maxItemErrorRate);
+  const multiRun = rates.some((r) => r.runIndex > 0);
+  const over = rates.find((r) => r.exceeded);
+  if (!over) return null;
+  return (
+    `coverage: ${describeItemErrorRate(over, multiRun)} exceeds the ` +
+    `${formatPercent(maxItemErrorRate)} limit — its scores cover only the surviving items. ` +
+    `Pass --max-item-error-rate <0..1> to accept a thinned side (1 disables the check).`
+  );
 }

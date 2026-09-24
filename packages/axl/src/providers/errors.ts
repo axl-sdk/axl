@@ -115,18 +115,30 @@ export function isRetryableStatus(status: number): boolean {
 }
 
 /**
- * Parse a `Retry-After` header into milliseconds. SINGLE source of truth for
+ * Parse a provider's retry hint into milliseconds. SINGLE source of truth for
  * both the in-loop transport sleep (clamped by the caller) and
  * `ProviderError.retryAfterMs` (raw).
  *
- * Supports both forms of the header:
+ * A usable `retry-after-ms` (OpenAI, Azure OpenAI; a positive decimal) wins,
+ * as it does in OpenAI's own SDK: it is more precise than whole seconds.
+ * Otherwise both forms of the standard `Retry-After` header are supported:
  *  - delay-seconds: `Retry-After: 120` → `120_000`
  *  - HTTP-date:     `Retry-After: <http-date>` → `Date.parse(v) - Date.now()`
  *
  * Returns the RAW parsed ms (NOT clamped). Negative, zero, or unparseable
- * values → `undefined`.
+ * values → `undefined` (an unusable `retry-after-ms` falls through to
+ * `Retry-After`).
+ *
+ * `fetchWithRetry` treats the result as a lower bound only: a hint may
+ * lengthen its exponential backoff (up to 60 s) but never shorten it.
  */
 export function parseRetryAfter(headers: Headers): number | undefined {
+  const rawMs = headers.get('retry-after-ms')?.trim();
+  if (rawMs && /^\d+(\.\d+)?$/.test(rawMs)) {
+    const ms = Number(rawMs);
+    if (ms > 0) return ms;
+  }
+
   const raw = headers.get('retry-after');
   if (!raw) return undefined;
 

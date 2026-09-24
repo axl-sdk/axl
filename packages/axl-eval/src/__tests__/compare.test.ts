@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { evalCompare, evaluateScorerErrorRateGate } from '../compare.js';
-import type { EvalResult } from '../types.js';
+import { emptyAccounting } from '../accounting.js';
+import type { EvalAccounting, EvalResult } from '../types.js';
 
 function makeEvalResult(overrides: Partial<EvalResult> = {}): EvalResult {
   return {
@@ -20,6 +21,19 @@ function makeEvalResult(overrides: Partial<EvalResult> = {}): EvalResult {
       scorers: { accuracy: { mean: 0.7, min: 0.6, max: 0.8, p50: 0.7, p95: 0.8 } },
     },
     ...overrides,
+  };
+}
+
+/** A complete, measured accounting record for `cost` known spend. */
+function measured(cost: number): EvalAccounting {
+  return {
+    ...emptyAccounting(),
+    knownCost: cost,
+    completeness: 'complete',
+    breakdown: { generation: cost, judging: 0, external: 0 },
+    provenance: { price_table_estimate: cost },
+    operations: { total: 1, settled: 1, unknown: 0, denied: 0, byKind: { provider_chat: 1 } },
+    scope: 'run',
   };
 }
 
@@ -493,13 +507,27 @@ describe('evalCompare()', () => {
     expect(comparison.summary).toContain('slower');
   });
 
-  it('includes cost delta in summary string', () => {
+  it('includes a CERTIFIED cost delta in the summary string', () => {
+    const baseline = makeEvalResult({ totalCost: 2.0, accounting: measured(2.0) });
+    const candidate = makeEvalResult({ totalCost: 0.5, accounting: measured(0.5) });
+
+    const comparison = evalCompare(baseline, candidate);
+
+    expect(comparison.cost!.certified).toBe(true);
+    expect(comparison.summary).toContain('cheaper');
+  });
+
+  it('leaves an uncertified cost delta out of the summary string', () => {
+    // Two pre-0.24 artifacts: their totals are repeated, not measured. The
+    // structured block still reports the delta and why it is not certified.
     const baseline = makeEvalResult({ totalCost: 2.0 });
     const candidate = makeEvalResult({ totalCost: 0.5 });
 
     const comparison = evalCompare(baseline, candidate);
 
-    expect(comparison.summary).toContain('cheaper');
+    expect(comparison.cost!.certified).toBe(false);
+    expect(comparison.cost!.deltaPercent).toBeCloseTo(-75, 6);
+    expect(comparison.summary).not.toContain('cheaper');
   });
 
   // ── Configurable threshold tests ────────────────────────────────

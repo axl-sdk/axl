@@ -103,12 +103,50 @@ export interface StateStore {
   deleteExecution?(executionId: string): Promise<boolean>;
 
   // Eval history
-  /** Save an eval result to history. */
+  /** Save an eval result to history. Creates the row, or replaces it. */
   saveEvalResult?(entry: EvalHistoryEntry): Promise<void>;
+  /**
+   * Replace an eval history row that ALREADY EXISTS, leaving its retention
+   * exactly as it was. Returns `true` iff a row was there and was updated;
+   * **never creates one**.
+   *
+   * This is how the runtime writes a CORRECTION — a diagnostics sweep rewriting
+   * a row whose artifact it just reclaimed, a commit failure downgrading one.
+   * Such a write has no business creating anything: the row may have been
+   * deleted (a right-to-be-forgotten request) or expired between the moment the
+   * correction was computed and the moment it lands, and `saveEvalResult` would
+   * bring it back — permanently on a store with no expiry. Checking first and
+   * then saving does not close that window; only the store can, so the
+   * condition lives here.
+   *
+   * Implement it conditionally and atomically: `SET ... XX KEEPTTL` on Redis,
+   * `UPDATE ... WHERE id = ?` on SQL, a presence check on an in-process map.
+   * A store that does not implement it gets no correction written at all.
+   */
+  updateEvalResult?(entry: EvalHistoryEntry): Promise<boolean>;
   /** List eval history entries (most recent first). */
   listEvalResults?(limit?: number): Promise<EvalHistoryEntry[]>;
   /** Delete an eval history entry by id. Returns true if an entry was deleted. */
   deleteEvalResult?(id: string): Promise<boolean>;
+  /**
+   * Retention capability: does this eval history row still exist, and when does
+   * the store itself expire it?
+   *
+   * Diagnostic artifacts (opt-in captured requests) live OUTSIDE the state store
+   * — typically on a filesystem — and their lifetime must follow the history row
+   * that owns them. A store with server-side expiry (Redis `PTTL`) cannot notify
+   * that filesystem when a key ages out, so the runtime mirrors the absolute
+   * `expiresAt` onto the artifact manifest at commit time and sweeps expired
+   * bytes on a timer and at startup. Physical deletion is therefore EVENTUAL,
+   * not synchronous with the store's expiry.
+   *
+   * Built-ins implement it: `MemoryStore` and `SqliteStore` never expire, so
+   * `expiresAt` is `undefined`; `RedisStore` reports existence and any live TTL.
+   * A custom store WITHOUT this method cannot host managed artifact capture —
+   * `AxlRuntime` rejects that configuration when it is constructed rather than
+   * after a run has spent money.
+   */
+  getEvalRetention?(id: string): Promise<{ exists: boolean; expiresAt?: number }>;
 
   // Sessions (Studio introspection)
   /** List all session IDs (used by Studio session browser). */

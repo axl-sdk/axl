@@ -35,8 +35,16 @@ import type {
   HistoricalAxlEvent,
   EvalHistoryEntry,
 } from '@axlsdk/axl';
-import { redactHistoricalEvent } from '@axlsdk/axl';
-import type { EvalResult, EvalItem, ScorerDetail } from '@axlsdk/eval';
+import { redactCapturedRequest, redactHistoricalEvent } from '@axlsdk/axl';
+import type { CapturedRequestRecord } from '@axlsdk/axl';
+import type {
+  EvalComparison,
+  EvalItem,
+  EvalItemFailure,
+  EvalRegression,
+  EvalResult,
+  ScorerDetail,
+} from '@axlsdk/eval';
 
 // Stream events on the wire are `AxlEvent` — the translation layer was
 // deleted in PR 1 commit 4. The legacy `StreamEvent` shapes are gone;
@@ -293,35 +301,154 @@ export function sanitizeRichInputFailure(event: HistoricalAxlEvent): HistoricalA
  *
  * Preserved fields (structural / metrics):
  *   scores (numeric), duration, cost, scorerCost
+ *   failure (projected to name/provider/status/retryable/requestId — see
+ *            projectItemFailure; any other key is dropped)
  *   scoreDetails[*].{score, duration, cost, skipped} (but not metadata)
  *   metadata (execution metadata: models, tokens, agentCalls, workflows)
  *   traces (trace events — already redacted at emission time)
  */
-function redactEvalItem(item: EvalItem): EvalItem {
+/**
+ * Metadata keys the RUNTIME measured. Everything else on `EvalItem.metadata` is
+ * the workflow callback's own free-form return value — the same category as
+ * `output` and `callerReport.metadata`, and just as capable of echoing user
+ * input — so it is masked rather than passed through.
+ *
+ * Kept as an allowlist, not a denylist: a new caller key must not become a new
+ * leak simply because nobody thought to add it to a blocklist.
+ */
+const MEASURED_METADATA_KEYS: ReadonlySet<string> = new Set([
+  'models',
+  'modelCallCounts',
+  'workflows',
+  'workflowCallCounts',
+  'tokens',
+  'agentCalls',
+]);
+
+function redactItemMetadata(
+  metadata: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (!metadata) return metadata;
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(metadata)) {
+    out[key] = MEASURED_METADATA_KEYS.has(key) ? value : REDACTED;
+  }
+  return out;
+}
+
+/**
+ * Project `EvalItem.failure` onto its five known keys, each only when present
+ * with the type `@axlsdk/eval` writes. The runner never records a body or
+ * message there, but an imported artifact is stored verbatim and a newer writer
+ * could add a key — an allowlist keeps either from becoming a leak. Without a
+ * string `name` there is no cause to show, so the record is dropped.
+ */
+function projectItemFailure(failure: unknown): EvalItemFailure | undefined {
+  if (!failure || typeof failure !== 'object') return undefined;
+  const f = failure as Record<string, unknown>;
+  if (typeof f.name !== 'string') return undefined;
+  return {
+    name: f.name,
+    ...(typeof f.provider === 'string' ? { provider: f.provider } : {}),
+    ...(typeof f.status === 'number' && Number.isFinite(f.status) ? { status: f.status } : {}),
+    ...(typeof f.retryable === 'boolean' ? { retryable: f.retryable } : {}),
+    ...(typeof f.requestId === 'string' ? { requestId: f.requestId } : {}),
+  };
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Redact one scorer detail, or replace it when it is not an object. Only the
+ * structural keys survive; `metadata` (LLM scorer reasoning) never does.
+ */
+function redactScorerDetail(detail: unknown): ScorerDetail {
+  if (!isPlainObject(detail)) return REDACTED as unknown as ScorerDetail;
+  const d = detail as ScorerDetail;
+  return {
+    score: d.score,
+    ...(d.duration !== undefined ? { duration: d.duration } : {}),
+    ...(d.cost !== undefined ? { cost: d.cost } : {}),
+    // `skipped` is a structural boolean (the `applies` predicate verdict),
+    // not user/LLM content — preserve it so the client's N/A chip renders.
+    ...(d.skipped !== undefined ? { skipped: d.skipped } : {}),
+    // `outcome` and `accounting` are structural (a classification and a set
+    // of counts), so they survive redaction the way `skipped` does — without
+    // them a compliance-mode reader cannot tell a judge that was stopped on
+    // budget from one that scored 0.
+    ...(d.outcome !== undefined ? { outcome: d.outcome } : {}),
+    ...(d.accounting !== undefined ? { accounting: d.accounting } : {}),
+    // `diagnostics` survives for the same reason `accounting` does: it is a
+    // list of operation ids and statuses, not content.
+    ...(d.diagnostics !== undefined ? { diagnostics: d.diagnostics } : {}),
+    // metadata deliberately omitted — may contain LLM scorer reasoning
+  };
+}
+
+/**
+ * Redact one item. Total by design: a history row is whatever import or an
+ * older writer stored, so a part that does not have the expected shape is
+ * replaced with the sentinel — never forwarded (a leak) and never allowed to
+ * throw (which would fail the whole redacted history list). Same stance as
+ * `redactRecordLine` on an unparseable line.
+ */
+function redactEvalItem(item: unknown): EvalItem {
+  if (!isPlainObject(item)) return REDACTED as unknown as EvalItem;
+  const { failure, ...rest } = item as EvalItem;
+  const typed = item as EvalItem;
+  const projectedFailure = failure !== undefined ? projectItemFailure(failure) : undefined;
   const scrubbed: EvalItem = {
-    ...item,
+    ...rest,
+    ...(projectedFailure ? { failure: projectedFailure } : {}),
     input: REDACTED,
     output: REDACTED,
-    ...(item.annotations !== undefined ? { annotations: REDACTED } : {}),
-    ...(item.error !== undefined ? { error: REDACTED } : {}),
-    ...(item.scorerErrors !== undefined
-      ? { scorerErrors: item.scorerErrors.map(() => REDACTED) }
+    // `diagnostics` is spread through untouched on purpose: it holds operation
+    // IDs, kinds, turn/attempt indexes and a status — pointers into an artifact,
+    // never content. The records themselves are redacted by the core rule at
+    // both write time and delivery time (`redactRecordLine`).
+    ...(typed.metadata !== undefined
+      ? {
+          metadata: isPlainObject(typed.metadata)
+            ? redactItemMetadata(typed.metadata)
+            : (REDACTED as unknown as Record<string, unknown>),
+        }
+      : {}),
+    ...(typed.annotations !== undefined ? { annotations: REDACTED } : {}),
+    ...(typed.error !== undefined ? { error: REDACTED } : {}),
+    ...(typed.scorerErrors !== undefined
+      ? {
+          scorerErrors: Array.isArray(typed.scorerErrors)
+            ? typed.scorerErrors.map(() => REDACTED)
+            : (REDACTED as unknown as string[]),
+        }
+      : {}),
+    // `callerReport.metadata` is whatever the workflow callback returned — free-
+    // form user content, exactly like `output`, so it is dropped rather than
+    // masked (same treatment as scorer metadata below). Its sibling `cost` is a
+    // plain number and stays. (`outcome` and `accounting` are spread through
+    // untouched: both are structural counts and classifications, no content.)
+    ...(typed.callerReport !== undefined
+      ? {
+          callerReport: isPlainObject(typed.callerReport)
+            ? typeof typed.callerReport.cost === 'number'
+              ? { cost: typed.callerReport.cost }
+              : {}
+            : (REDACTED as unknown as EvalItem['callerReport']),
+        }
       : {}),
   };
-  if (item.scoreDetails) {
-    const detailsOut: Record<string, ScorerDetail> = {};
-    for (const [name, detail] of Object.entries(item.scoreDetails)) {
-      detailsOut[name] = {
-        score: detail.score,
-        ...(detail.duration !== undefined ? { duration: detail.duration } : {}),
-        ...(detail.cost !== undefined ? { cost: detail.cost } : {}),
-        // `skipped` is a structural boolean (the `applies` predicate verdict),
-        // not user/LLM content — preserve it so the client's N/A chip renders.
-        ...(detail.skipped !== undefined ? { skipped: detail.skipped } : {}),
-        // metadata deliberately omitted — may contain LLM scorer reasoning
-      };
+  if (typed.scoreDetails !== undefined) {
+    if (isPlainObject(typed.scoreDetails)) {
+      const detailsOut: Record<string, ScorerDetail> = {};
+      for (const [name, detail] of Object.entries(typed.scoreDetails)) {
+        detailsOut[name] = redactScorerDetail(detail);
+      }
+      scrubbed.scoreDetails = detailsOut;
+    } else {
+      scrubbed.scoreDetails = REDACTED as unknown as Record<string, ScorerDetail>;
     }
-    scrubbed.scoreDetails = detailsOut;
   }
   return scrubbed;
 }
@@ -339,19 +466,138 @@ function redactEvalItem(item: EvalItem): EvalItem {
  * error string that may quote user input (e.g. a guardrail rejection that
  * echoes the prompt). Scrub it here so imports under redact mode don't
  * leak.
+ *
+ * A sync multi-run response also carries `_multiRun.allRuns` — every run's
+ * full `EvalResult`, items included — so each run is scrubbed the same way,
+ * along with `_multiRun.batchFailure`. `_multiRun.aggregate` is scorer
+ * statistics, cost and counts, and passes through.
  */
 export function redactEvalResult(result: EvalResult, redact: boolean): EvalResult {
   if (!redact) return result;
-  const meta = result.metadata as Record<string, unknown> | undefined;
-  const scrubbedMetadata =
-    meta && typeof meta.batchFailure === 'string'
-      ? { ...meta, batchFailure: REDACTED }
-      : result.metadata;
+  return redactResultShape(result);
+}
+
+/**
+ * The redacting walk behind `redactEvalResult`, total over whatever was stored:
+ * `items` that is not an array, and `_multiRun` / `allRuns` / a nested run that
+ * does not have the expected shape, are replaced with the sentinel.
+ */
+function redactResultShape(result: EvalResult): EvalResult {
+  const scrubbedMetadata = redactResultMetadata(result.metadata);
+  const hasMultiRun = '_multiRun' in result;
+  const multiRun = (result as { _multiRun?: unknown })._multiRun;
   return {
     ...result,
     metadata: scrubbedMetadata,
-    items: result.items.map(redactEvalItem),
+    items: Array.isArray(result.items)
+      ? result.items.map(redactEvalItem)
+      : (REDACTED as unknown as EvalItem[]),
+    ...(hasMultiRun && multiRun !== undefined
+      ? {
+          _multiRun: isPlainObject(multiRun) ? redactMultiRun(multiRun) : REDACTED,
+        }
+      : {}),
   };
+}
+
+/** Result-level metadata is structural except `batchFailure`, a raw error message. */
+function redactResultMetadata<M>(metadata: M): M {
+  const meta = metadata as unknown;
+  return isPlainObject(meta) && typeof meta.batchFailure === 'string'
+    ? ({ ...meta, batchFailure: REDACTED } as M)
+    : metadata;
+}
+
+function redactMultiRun(multiRun: Record<string, unknown>): Record<string, unknown> {
+  const { allRuns } = multiRun;
+  return {
+    ...multiRun,
+    ...(allRuns !== undefined
+      ? {
+          allRuns: Array.isArray(allRuns)
+            ? allRuns.map((run) =>
+                isPlainObject(run) && Array.isArray(run.items)
+                  ? redactResultShape(run as unknown as EvalResult)
+                  : REDACTED,
+              )
+            : REDACTED,
+        }
+      : {}),
+    ...(typeof multiRun.batchFailure === 'string' ? { batchFailure: REDACTED } : {}),
+  };
+}
+
+/**
+ * Scrub an `EvalComparison` for `POST /api/evals/compare`.
+ *
+ * Compare copies the baseline item's `input` onto every regression and
+ * improvement, and each side's result `metadata` onto `baseline` / `candidate`.
+ * Those are the same fields `redactEvalResult` scrubs on history, so they get
+ * the same rule here — otherwise comparing two history ids bypasses the scrub.
+ * `input` is masked rather than dropped (it is a required key); `itemIndex`,
+ * scores and every statistic stay. `summary` is built from scorer names and
+ * numbers only, so it passes through.
+ */
+export function redactEvalComparison(comparison: EvalComparison, redact: boolean): EvalComparison {
+  if (!redact) return comparison;
+  const maskInput = (r: EvalRegression): EvalRegression => ({ ...r, input: REDACTED });
+  const side = <S extends { metadata: Record<string, unknown> }>(s: S): S => ({
+    ...s,
+    metadata: redactResultMetadata(s.metadata),
+  });
+  return {
+    ...comparison,
+    baseline: side(comparison.baseline),
+    candidate: side(comparison.candidate),
+    regressions: comparison.regressions.map(maskInput),
+    improvements: comparison.improvements.map(maskInput),
+  };
+}
+
+/**
+ * Scrub one captured-request JSONL line on its way out of the server.
+ *
+ * Records are ALREADY redacted at write time when the runtime has redaction on,
+ * so under normal configuration this is a no-op that re-applies an idempotent
+ * rule. It earns its place for the configurations where it is not a no-op:
+ * an artifact captured before redaction was enabled, and an artifact imported
+ * from another deployment. Neither should be able to serve raw prompts out of
+ * a Studio that is running in compliance mode.
+ *
+ * A line that does not parse is replaced rather than forwarded — an unparseable
+ * line cannot be redacted, and forwarding it would be exactly the bypass this
+ * function exists to close.
+ */
+export function redactRecordLine(line: string, redact: boolean): string {
+  if (!redact) return line;
+  let parsed: CapturedRequestRecord;
+  try {
+    parsed = JSON.parse(line) as CapturedRequestRecord;
+  } catch {
+    // A line that will not parse still has to leave the door as a VALID record:
+    // this stream is re-importable, and `validateRequestSidecar` rejects the
+    // whole bundle over one line missing `operationId` or a known `phase`. A
+    // stub that says plainly it stands in for something unreadable keeps the
+    // rest of the artifact importable.
+    const stub: CapturedRequestRecord = {
+      v: 1,
+      phase: 'end',
+      operationId: 'unknown',
+      kind: 'chat',
+      transportAttempts: 1,
+      provider: 'unknown',
+      model: 'unknown',
+      termination: 'the stored record could not be parsed',
+      captured: {
+        fidelity: 'runtime_request',
+        redacted: true,
+        truncated: true,
+        omitted: ['record'],
+      },
+    };
+    return JSON.stringify(stub);
+  }
+  return JSON.stringify(redactCapturedRequest(parsed));
 }
 
 /**

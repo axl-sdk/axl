@@ -1,6 +1,8 @@
+import type { Accounting } from '@axlsdk/axl';
 import type { EvalResult } from './types.js';
 import { randomUUID } from 'node:crypto';
 import { round } from './utils.js';
+import { aggregateAccounting, readAccounting } from './accounting.js';
 
 export type MultiRunSummary = {
   runGroupId: string;
@@ -13,7 +15,16 @@ export type MultiRunSummary = {
    */
   workflows: string[];
   dataset: string;
+  /** Compatibility view: the sum of each run's `totalCost`. */
   totalCost: number;
+  /**
+   * The union of every run's accounting, folded conservatively: known spend and
+   * operation counts sum, incompleteness reasons union, and the group takes the
+   * WORST completeness in it — one legacy run makes the whole group
+   * `'unverified'`, one incomplete run makes it `'incomplete'`. Inheriting
+   * run[0]'s flags would report a contaminated group as clean.
+   */
+  accounting: Accounting;
   totalDuration: number;
   scorers: Record<
     string,
@@ -124,6 +135,7 @@ export function aggregateRuns(runs: EvalResult[]): MultiRunSummary {
     workflows,
     dataset,
     totalCost: round(totalCost),
+    accounting: aggregateAccounting(runs.map((r) => readAccounting(r))),
     totalDuration: round(totalDuration),
     scorers,
     timing,

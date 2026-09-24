@@ -175,6 +175,140 @@ runtime.on('decision_cleanup_failed', (e) => {
 
 `ExecutionInfo.metadata` strips internal session control-plane keys (`sessionHistory`, `sessionId`) before persistence so a multi-tenant tag bag stays clean. The snapshot is `structuredClone`'d for isolation from caller mutation.
 
+## Diagnostic artifact storage
+
+[Captured requests](observability.md#captured-requests-opt-in) are far too large
+to live inside an eval result, so they live beside it as an **artifact** and the
+result carries a manifest pointing at one. That makes them a two-store problem:
+the history row is in your `StateStore`, the bytes are in an artifact store, and
+every interesting failure is a partial one.
+
+```ts
+const runtime = new AxlRuntime({
+  state: { store: 'sqlite' },
+  diagnostics: {
+    artifacts: {
+      root: '.axl/artifacts', // built-in FileDiagnosticArtifactStore
+      sweepIntervalMs: 60_000, // reclamation cadence (default)
+      leaseMs: 300_000,        // how long a writer's lease survives (default)
+    },
+  },
+});
+```
+
+Supply `store` instead of `root` to plug in your own `DiagnosticArtifactStore`
+(S3, a blob column, anything). `commit`, `markDeletePending` and `refreshExpiry`
+return an `ArtifactWriteResult` (`{ ok: true, manifest } | { ok: false, reason:
+'missing' }`) — both the interface and that type are exported from `@axlsdk/axl`
+— so an artifact that has already gone is reported rather than silently
+succeeding. `copy` returns a **staged** artifact (`renewLease` included) plus
+the bytes it carried and the source's `redaction`, because a copy is the start
+of the new owner's capture, not the end of it. Supplying neither while a run asks for capture
+raises `AxlError('DIAGNOSTICS_UNAVAILABLE')` **before** the run starts, never
+halfway through.
+
+### Lifecycle
+
+An artifact is only ever published behind its history row:
+
+1. **stage** — a lease is taken and records stream in
+2. **finalize** — the writer declares `complete` / `truncated` / `unavailable`
+3. **save** — `runtime.saveEvalResult` writes the history row **first**
+4. **commit** — only then does the artifact become owned, carrying the row's
+   expiry
+
+If step 3 throws, the artifact is rolled back rather than left as an orphan
+pointing at a row that never existed. A result may only commit or delete an
+artifact whose manifest names **that result** as its owner, so a rescore that
+degraded while naming its source — or a hand-edited import — can never rewrite
+or destroy another run's evidence. When step 4 finds nothing to commit, the
+stored row is corrected to `diagnostics.status: 'unavailable'` rather than
+published claiming evidence that is not there.
+
+`runtime.deleteEvalResult(id)` runs the mirror image: the history row is removed
+**first**, and only then is the artifact marked `delete_pending` and deleted. A
+storage failure surfaces to the caller; a crash between the two steps is covered
+by reclamation, which already reclaims a committed artifact whose owning row is
+gone. (Recording the intent first would have the sweeper destroy, within a
+minute, the evidence of a result the caller was just told had *not* been
+deleted.)
+
+### Reclamation
+
+A pass runs at startup and then every `sweepIntervalMs` (unref'd, so it never
+holds the process open; stopped by `runtime.shutdown()`). It removes:
+
+- artifacts marked `delete_pending`
+- committed artifacts whose owning row is gone or whose expiry has passed
+- staged artifacts whose writer lease expired — a crashed run
+
+The lease is held for the **writer's lifetime**, renewed on a timer the runtime
+owns and stopped at finalize or rollback — not renewed by writing. It is also
+bounded: past `maxHoldMs` (24 h by default) the runtime lets go, so a caller
+that never finalizes degrades to an ordinary abandoned writer instead of pinning
+the artifact forever. A run that
+exhausts its capture byte bound early, or that waits on a tool or a human for
+longer than a lease, therefore keeps its artifact.
+
+A staged artifact whose lease is **live** is never touched, so a sweep cannot
+race a running eval. A writer that died mid-run reads back as `interrupted`
+with its records intact up to the truncation point.
+
+### Retention and `getEvalRetention`
+
+An artifact must not outlive the row that owns it, and with Redis that row can
+expire server-side while this process is offline. Stores therefore expose:
+
+```ts
+getEvalRetention?(id: string): Promise<{ exists: boolean; expiresAt?: number }>;
+```
+
+`MemoryStore` and `SQLiteStore` report existence with no expiry; `RedisStore`
+derives both from `PTTL`, so a configured `ttls.evalHistory` is mirrored onto
+the artifact as an absolute `expiresAt`.
+
+**Re-saving an existing eval result never extends its retention.** Only a
+genuinely new row gets the configured `ttls.evalHistory` window; an existing one
+keeps the time it had left, and a row deliberately left untimed (`PERSIST`, or
+one predating the setting) stays untimed. A result is re-saved by corrections
+that have nothing to do with your retention policy — the diagnostics sweep
+rewriting a row whose artifact it just reclaimed, a commit failure downgrading
+one — and renewing the window on each of those would keep item inputs, outputs
+and scores alive indefinitely on a busy server.
+
+Those corrections go through `StateStore.updateEvalResult`, an **update-only,
+retention-neutral** write: it replaces a row that is already there and returns
+`false` rather than creating one. That is not the same as checking first and
+then saving — between the check and the write a row can be deleted (a
+right-to-be-forgotten request) or expire, and the save would bring it back,
+permanently on a store with no expiry. The condition therefore has to be inside
+the store:
+
+| Store | How | Note |
+|---|---|---|
+| `RedisStore` | `SET key value XX KEEPTTL` | **Requires Redis ≥ 6.0** for `KEEPTTL`. Nothing else in `RedisStore` does |
+| `SQLiteStore` | `UPDATE … WHERE id = ?` | no expiry, so a resurrection here would be permanent |
+| `MemoryStore` | presence check, then set | as above |
+| a custom store | omit it | corrections are then **not persisted at all**; the in-process cache is still corrected |
+
+On a Redis older than 6.0 the server rejects `KEEPTTL`, and the store raises an
+`AxlError` with code `REDIS_VERSION_UNSUPPORTED` naming the floor. The runtime
+warns once per process and then keeps correcting its own cache only: this
+process stops serving a promise of bytes that are gone, and the stored row is
+left exactly as it is — never rewritten with a fresh retention window. Upgrade
+the server to persist corrections.
+
+A same-process delete also beats a correction already in flight: the runtime
+records the id before it asks the store, and a correction for a recorded id is
+refused outright. Physical deletion is **eventual**: the
+row disappears the instant Redis expires it, and the bytes are reclaimed by the
+next sweep (or the next startup). Reads are gated on the logical expiry, so an
+expired artifact stops being served immediately regardless.
+
+A custom `StateStore` **without** `getEvalRetention` cannot host managed
+capture: it is rejected at runtime construction, with the method named, rather
+than being allowed to silently accumulate artifacts nothing will ever reclaim.
+
 ## Axl Studio
 
 Axl Studio provides a browser-based development UI for any Axl project.

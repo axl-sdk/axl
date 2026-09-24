@@ -1,8 +1,13 @@
 import { describe, it, expect } from 'vitest';
+import { z } from 'zod';
 import type { AxlRuntime } from '@axlsdk/axl';
 import type { EvalResult } from '../types.js';
 import type { Scorer } from '../scorer.js';
 import { rescore } from '../rescore.js';
+import { runEval } from '../runner.js';
+import { dataset } from '../dataset.js';
+import { llmScorer } from '../llm-scorer.js';
+import { askExecute, scriptedRuntime } from './accounting-helpers.js';
 
 const mockRuntime = {} as AxlRuntime;
 
@@ -87,6 +92,48 @@ describe('rescore()', () => {
     expect(rescored.summary.scorers['half'].max).toBe(0.5);
   });
 
+  it('carries summary.modelTiming forward unchanged, rateLimitRetries included', async () => {
+    const stats = { mean: 40, min: 10, max: 90, p50: 30, p95: 90 };
+    const modelTiming = {
+      'openai:gpt-4o': {
+        calls: 6,
+        wireMs: stats,
+        queuedMs: stats,
+        retryMs: stats,
+        rateLimitRetries: 4,
+        firstTokenMs: stats,
+        firstTokenCalls: 6,
+      },
+      // An artifact written before the field existed.
+      'anthropic:claude': { calls: 2, wireMs: stats, queuedMs: stats, retryMs: stats },
+    };
+    const result = makeResult({
+      summary: { ...makeResult().summary, modelTiming: structuredClone(modelTiming) },
+    });
+    const rescored = await rescore(result, [halfScorer], mockRuntime);
+
+    expect(rescored.summary.modelTiming).toEqual(modelTiming);
+    expect('rateLimitRetries' in rescored.summary.modelTiming!['anthropic:claude']).toBe(false);
+    // A copy, not an alias of the source artifact.
+    expect(rescored.summary.modelTiming).not.toBe(result.summary.modelTiming);
+  });
+
+  it('carries the wall-clock summary.timing forward, and leaves it absent when the source had none', async () => {
+    const timing = { mean: 1200, min: 800, max: 2100, p50: 1100, p95: 2100 };
+    const result = makeResult({ summary: { ...makeResult().summary, timing: { ...timing } } });
+    const rescored = await rescore(result, [halfScorer], mockRuntime);
+    expect(rescored.summary.timing).toEqual(timing);
+    expect(rescored.summary.timing).not.toBe(result.summary.timing);
+
+    const bare = await rescore(makeResult(), [halfScorer], mockRuntime);
+    expect('timing' in bare.summary).toBe(false);
+  });
+
+  it('leaves modelTiming absent when the source run had none', async () => {
+    const rescored = await rescore(makeResult(), [halfScorer], mockRuntime);
+    expect('modelTiming' in rescored.summary).toBe(false);
+  });
+
   it('surfaces scored/failed counts (but never a degraded gate)', async () => {
     // Rescore reports the same trust-signal counts as runEval, but takes
     // RescoreOptions (no failOnScorerErrorRate) — so there is no degradation
@@ -125,7 +172,7 @@ describe('rescore()', () => {
     expect(rescored.summary.failures).toBe(1);
   });
 
-  it('tracks only scorer cost (no workflow cost)', async () => {
+  it('reports no measured spend on an uninstrumented runtime, keeping the caller value per scorer', async () => {
     const costScorer: Scorer = {
       name: 'costly',
       description: 'Returns cost',
@@ -136,8 +183,22 @@ describe('rescore()', () => {
     const result = makeResult();
     const rescored = await rescore(result, [costScorer], mockRuntime);
 
-    // 3 items × $0.01 per scorer call = $0.03
-    expect(rescored.totalCost).toBeCloseTo(0.03, 4);
+    // This runtime has no measurement rail, so the honest total is $0 with an
+    // explicit `uninstrumented` reason — NOT the sum of what the scorer claimed.
+    expect(rescored.totalCost).toBe(0);
+    expect(rescored.accounting!.scope).toBe('rescore');
+    expect(rescored.accounting!.completeness).toBe('incomplete');
+    expect(rescored.accounting!.reasons.uninstrumented).toBe(1);
+    // The claim survives for inspection on each scorer detail.
+    for (const item of rescored.items) {
+      expect(item.scoreDetails!.costly.cost).toBe(0.01);
+      expect(item.scorerCost).toBe(0);
+    }
+    // The source run's generation spend is recorded, never added to the total.
+    expect(rescored.accounting!.source).toEqual({
+      runId: 'original-id',
+      generation: null,
+    });
   });
 
   it('stores rescored metadata with originalId', async () => {
@@ -245,12 +306,14 @@ describe('rescore()', () => {
     const result = makeResult();
     const rescored = await rescore(result, [costErrorScorer], mockRuntime);
 
-    // 3 items × $0.01 per error = $0.03
-    expect(rescored.totalCost).toBeCloseTo(0.03, 4);
+    // The cost attached to the thrown error is still surfaced per scorer; it is
+    // a caller report, so it does not become the run's measured total.
+    expect(rescored.totalCost).toBe(0);
     for (const item of rescored.items) {
       expect(item.scores['cost-err']).toBeNull();
-      expect(item.scorerCost).toBe(0.01);
+      expect(item.scorerCost).toBe(0);
       expect(item.scoreDetails!['cost-err'].cost).toBe(0.01);
+      expect(item.scoreDetails!['cost-err'].outcome).toBe('failed');
     }
   });
 
@@ -397,11 +460,14 @@ describe('rescore()', () => {
         },
       );
 
-      // 3 items × (0.01 + 0.02) = 0.09
-      expect(rescored.totalCost).toBeCloseTo(0.09, 10);
+      // Both judges ran concurrently and each reported its own claim; neither
+      // is summed into the measured total on an uninstrumented runtime.
+      expect(rescored.totalCost).toBe(0);
       for (const item of rescored.items) {
         expect(item.scores.a).toBe(1);
         expect(item.scores.b).toBe(1);
+        expect(item.scoreDetails!.a.cost).toBe(0.01);
+        expect(item.scoreDetails!.b.cost).toBe(0.02);
       }
     });
 
@@ -424,6 +490,142 @@ describe('rescore()', () => {
         expect(item.scores.bad).toBeNull();
         expect(item.scorerErrors![0]).toContain('kaboom');
       }
+    });
+  });
+
+  describe('budget (A13.4)', () => {
+    /** A judge on its own provider so judging spend is exactly predictable. */
+    function judgeOn(runtime: AxlRuntime, cost: number, name: string): Scorer {
+      (
+        runtime as unknown as { registerProvider: (n: string, p: unknown) => void }
+      ).registerProvider('judgep', {
+        name: 'judgep',
+        chat: async () => ({
+          content: JSON.stringify({ score: 1, reasoning: 'x' }),
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          cost,
+        }),
+      });
+      return llmScorer({
+        name,
+        description: 'judge',
+        model: 'judgep:model',
+        system: 'Rate it',
+        schema: z.object({ score: z.number(), reasoning: z.string() }),
+      }) as unknown as Scorer;
+    }
+
+    it("does NOT seed the source run's spend into the rescore budget", async () => {
+      // This is the load-bearing claim of a rescore budget: the original run's
+      // cost is history. Seeding it would make a $2 rescore budget useless after
+      // a $2 run — the controller would open already closed and refuse every
+      // judge, which reads as "your judges are broken" rather than "you already
+      // spent this".
+      const { runtime } = scriptedRuntime([{ cost: 0.5 }]);
+      const original = await runEval(
+        {
+          workflow: 'w',
+          dataset: dataset({
+            name: 'd',
+            schema: z.object({ q: z.string() }),
+            items: [{ input: { q: 'a' } }, { input: { q: 'b' } }],
+          }),
+          scorers: [],
+        },
+        askExecute(),
+        runtime,
+      );
+      expect(original.accounting!.knownCost).toBeCloseTo(1, 10);
+
+      const judge = judgeOn(runtime, 0.1, 'judge');
+      const rescored = await rescore(original, [judge], runtime, { budget: '$1' });
+
+      // A $1 budget against $0.20 of new judging: nothing is refused, even
+      // though the source run alone already spent the whole $1.
+      expect(rescored.accounting!.budget).toMatchObject({ limit: 1, status: 'open' });
+      expect(rescored.accounting!.knownCost).toBeCloseTo(0.2, 10);
+      expect(rescored.items.every((i) => i.scores.judge === 1)).toBe(true);
+      expect(rescored.summary.coverage!.scorers.judge.budget_skipped).toBe(0);
+    });
+
+    it('closes on new judging spend and marks later judges budget_skipped', async () => {
+      const { runtime } = scriptedRuntime([{ cost: 0 }]);
+      const original = await runEval(
+        {
+          workflow: 'w',
+          dataset: dataset({
+            name: 'd',
+            schema: z.object({ q: z.string() }),
+            items: [{ input: { q: 'a' } }, { input: { q: 'b' } }, { input: { q: 'c' } }],
+          }),
+          scorers: [],
+        },
+        askExecute(),
+        runtime,
+      );
+
+      const judge = judgeOn(runtime, 0.6, 'judge');
+      const rescored = await rescore(original, [judge], runtime, {
+        budget: '$1',
+        concurrency: 1,
+      });
+
+      // Two judges reach $1.20; the third is refused.
+      expect(rescored.accounting!.budget).toMatchObject({ status: 'closed', limit: 1 });
+      const outcomes = rescored.items.map((i) => i.scoreDetails!.judge.outcome);
+      expect(outcomes).toEqual(['scored', 'scored', 'budget_skipped']);
+      expect(rescored.summary.coverage!.scorers.judge.budget_skipped).toBe(1);
+      // A skipped judge is not a scorer failure and not a scored 0.
+      expect(rescored.summary.scorers.judge.scored).toBe(2);
+      expect(rescored.summary.scorers.judge.failed).toBe(0);
+      expect(rescored.summary.scorers.judge.mean).toBe(1);
+    });
+
+    it('rejects an invalid rescore budget before scoring anything', async () => {
+      const { runtime, provider } = scriptedRuntime([{ cost: 0 }]);
+      const original = await runEval(
+        {
+          workflow: 'w',
+          dataset: dataset({
+            name: 'd',
+            schema: z.object({ q: z.string() }),
+            items: [{ input: { q: 'a' } }],
+          }),
+          scorers: [],
+        },
+        askExecute(),
+        runtime,
+      );
+      const callsBefore = provider.callCount;
+      const judge = judgeOn(runtime, 0.1, 'judge');
+
+      await expect(rescore(original, [judge], runtime, { budget: 'free' })).rejects.toThrow(
+        /INVALID_BUDGET|budget/i,
+      );
+      expect(provider.callCount).toBe(callsBefore);
+    });
+
+    it('leaves the source run untouched', async () => {
+      const { runtime } = scriptedRuntime([{ cost: 0.5 }]);
+      const original = await runEval(
+        {
+          workflow: 'w',
+          dataset: dataset({
+            name: 'd',
+            schema: z.object({ q: z.string() }),
+            items: [{ input: { q: 'a' } }],
+          }),
+          scorers: [],
+        },
+        askExecute(),
+        runtime,
+      );
+      const snapshot = JSON.stringify(original);
+
+      const judge = judgeOn(runtime, 2, 'judge');
+      await rescore(original, [judge], runtime, { budget: '$0.10' });
+
+      expect(JSON.stringify(original)).toBe(snapshot);
     });
   });
 });

@@ -1,3 +1,4 @@
+import { currentDispatchAdmission } from '../accounting.js';
 import { InvalidTranscriptionInputError, UnsupportedTranscriptionInputError } from '../errors.js';
 import { assertSafeProviderBaseUrl } from '../http-transport.js';
 import type { ApiKeySource } from './types.js';
@@ -281,7 +282,11 @@ export class GeminiTranscriptionProvider implements TranscriptionProvider {
         body: JSON.stringify({ file: { display_name: 'axl-transcription' } }),
         signal: request.signal,
       },
-      { governor: this.governor, provider: this.name, maxRetries: 0 },
+      {
+        governor: this.governor,
+        provider: this.name,
+        maxRetries: 0,
+      },
     );
     if (!start.ok) {
       const body = await start.text();
@@ -333,7 +338,11 @@ export class GeminiTranscriptionProvider implements TranscriptionProvider {
         body: bytes,
         signal: request.signal,
       },
-      { governor: this.governor, provider: this.name, maxRetries: 0 },
+      {
+        governor: this.governor,
+        provider: this.name,
+        maxRetries: 0,
+      },
     );
     if (!finalize.ok) {
       const body = await finalize.text();
@@ -378,7 +387,11 @@ export class GeminiTranscriptionProvider implements TranscriptionProvider {
       const res = await fetchWithRetry(
         `${this.baseUrl}/${current.name}`,
         { method: 'GET', headers: { 'x-goog-api-key': key }, signal },
-        { governor: this.governor, provider: this.name, maxRetries: 0 },
+        {
+          governor: this.governor,
+          provider: this.name,
+          maxRetries: 0,
+        },
       );
       if (!res.ok) {
         const body = await res.text();
@@ -429,7 +442,7 @@ export class GeminiTranscriptionProvider implements TranscriptionProvider {
         body: JSON.stringify(body),
         signal: request.signal,
       },
-      { governor: this.governor, provider: this.name },
+      { governor: this.governor, provider: this.name, admission: currentDispatchAdmission() },
     );
     if (!res.ok) {
       const errorBody = await res.text();
@@ -517,7 +530,11 @@ export class GeminiTranscriptionProvider implements TranscriptionProvider {
       const res = await fetchWithRetry(
         `${this.baseUrl}/${fileName}`,
         { method: 'DELETE', headers: { 'x-goog-api-key': key }, signal: controller.signal },
-        { governor: this.governor, provider: this.name, maxRetries: 0 },
+        {
+          governor: this.governor,
+          provider: this.name,
+          maxRetries: 0,
+        },
       );
       return res.ok ? 'deleted' : 'failed';
     } catch {

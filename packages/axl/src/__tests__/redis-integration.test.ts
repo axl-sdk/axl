@@ -1,6 +1,10 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { randomUUID } from 'node:crypto';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { RedisStore } from '../state/redis.js';
+import { AxlRuntime } from '../runtime.js';
 import type { ExecutionInfo, AxlEvent } from '../types.js';
 
 /**
@@ -175,6 +179,151 @@ describe.skipIf(!REDIS_URL)('RedisStore integration (real Redis)', () => {
 
     afterAll(async () => {
       await ttlStore.close?.();
+    });
+
+    /**
+     * A13.10 — eval-history durability plus the retention probe that diagnostic
+     * artifacts are reclaimed on. Real Redis is the only place PTTL's -1/-2
+     * sentinels and TTL drift between SET EX and EXPIRE are actually exercised.
+     */
+    it('round-trips an eval result and reports its real retention', async () => {
+      const id = `ev-ttl-${randomUUID()}`;
+      const data = {
+        id,
+        totalCost: 1.25,
+        accounting: { version: 1, currency: 'USD', knownCost: 1.25, completeness: 'complete' },
+        diagnostics: { artifactId: 'artifact-abc', status: 'complete' },
+      };
+
+      await ttlStore.saveEvalResult({ id, eval: 'suite', timestamp: Date.now(), data });
+
+      const listed = (await ttlStore.listEvalResults()).find((e) => e.id === id);
+      // Durability is the claim: never infer it from the Memory store.
+      expect(listed?.data).toEqual(data);
+
+      const retention = await ttlStore.getEvalRetention(id);
+      expect(retention.exists).toBe(true);
+      // This store configures no evalHistory TTL, so the row never expires and
+      // the artifact must not be scheduled for reclamation.
+      expect(retention.expiresAt).toBeUndefined();
+
+      await ttlStore.deleteEvalResult(id);
+      // After deletion PTTL returns -2, which must read as "owner gone" so the
+      // artifact bytes get reclaimed rather than leaked forever.
+      expect(await ttlStore.getEvalRetention(id)).toEqual({ exists: false });
+    });
+
+    it('reports an absolute expiry for an eval row written under a TTL', async () => {
+      const expiring = await RedisStore.create({
+        url: REDIS_URL!,
+        keyPrefix: `${TEST_PREFIX}evalttl-`,
+        skipMigration: true,
+        ttls: { evalHistory: 120 },
+      });
+      try {
+        const id = `ev-exp-${randomUUID()}`;
+        await expiring.saveEvalResult({ id, eval: 'suite', timestamp: Date.now(), data: {} });
+
+        const before = Date.now();
+        const retention = await expiring.getEvalRetention(id);
+
+        expect(retention.exists).toBe(true);
+        expect(retention.expiresAt!).toBeGreaterThan(before);
+        expect(retention.expiresAt!).toBeLessThanOrEqual(Date.now() + 120_000);
+      } finally {
+        await expiring.close?.();
+      }
+    });
+
+    it('a diagnostics sweep does not hand an eval row a fresh TTL window', async () => {
+      // The sweep corrects a row whose artifact it just reclaimed. That
+      // correction goes through the process-global history cache, which never
+      // evicts on a store-side expiry — so a write-back that is not both
+      // update-only and retention-neutral re-SETs the row with a whole new
+      // window, silently extending the retention the operator configured, or
+      // un-deletes one that is already gone.
+      const expiring = await RedisStore.create({
+        url: REDIS_URL!,
+        keyPrefix: `${TEST_PREFIX}sweepttl-`,
+        skipMigration: true,
+        ttls: { evalHistory: 120 },
+      });
+      const root = await mkdtemp(path.join(tmpdir(), 'axl-sweep-ttl-'));
+      try {
+        const runtime = new AxlRuntime({
+          state: { store: expiring },
+          diagnostics: { artifacts: { root, sweepIntervalMs: 3_600_000, leaseMs: 3_600_000 } },
+        });
+        // One artifact per sweep: the first reclaim removes the manifest, so a
+        // second sweep over the same one never reaches the write-back at all.
+        const stage = async (id: string): Promise<string> => {
+          const staged = await runtime.stageDiagnosticArtifact({ kind: 'eval', id });
+          await staged.sink.append(JSON.stringify({ v: 1, phase: 'start', operationId: 'op_1' }));
+          await runtime.finalizeDiagnosticArtifact(staged.artifactId, 'complete');
+          return staged.artifactId;
+        };
+
+        const id = `ev-sweep-${randomUUID()}`;
+        const first = await stage(id);
+        await runtime.saveEvalResult({
+          id,
+          eval: 'suite',
+          timestamp: Date.now(),
+          data: { id, diagnostics: { artifactId: first, status: 'complete' } },
+        });
+
+        // Read the remaining window through the store's own retention view, so
+        // this cannot drift from however RedisStore names its keys.
+        const before = (await expiring.getEvalRetention(id)).expiresAt!;
+        expect(before).toBeGreaterThan(Date.now());
+
+        await new Promise((r) => setTimeout(r, 1_100));
+        await runtime.getDiagnosticArtifactStore()!.refreshExpiry(first, Date.now() - 1);
+        await runtime.reconcileDiagnosticArtifacts();
+
+        // The absolute expiry may only move EARLIER or stay put. `SET ... EX`
+        // pushes it forward by the full window; `SET ... XX KEEPTTL` cannot
+        // move it at all. The tolerance absorbs the client/RTT jitter between
+        // two derived reads — a blind `EX` moves it forward by the time
+        // elapsed since the first save (about 1.1 s here), well past the slack.
+        const after = (await expiring.getEvalRetention(id)).expiresAt!;
+        expect(after).toBeLessThanOrEqual(before + 250);
+
+        // And a row that is gone stays gone. A SECOND artifact, so this sweep
+        // actually reaches the write-back rather than finding nothing to
+        // reclaim — the row is deleted while that manifest is still live.
+        //
+        // It has to be saved through the RUNTIME: that is what commits the
+        // artifact (a store-level save leaves it `staged`, and the staged
+        // branch reclaims only on lease expiry, which is an hour away here) and
+        // what repoints the cached row at the new artifact id. Saved through
+        // the store, the sweep reclaims nothing and the write-back is never
+        // reached, so the final assertion holds trivially.
+        const second = await stage(id);
+        await runtime.saveEvalResult({
+          id,
+          eval: 'suite',
+          timestamp: Date.now(),
+          data: { id, diagnostics: { artifactId: second, status: 'complete' } },
+        });
+        // Deleted behind the runtime's back: no in-process tombstone, so the
+        // store's own `XX` condition is the only thing that can refuse the
+        // correction.
+        await expiring.deleteEvalResult(id);
+        await runtime.getDiagnosticArtifactStore()!.refreshExpiry(second, Date.now() - 1);
+
+        const { removed } = await runtime.reconcileDiagnosticArtifacts();
+        // The sweep reclaimed the committed artifact, so the correction path
+        // was entered. (`getEvalResult` notices the row is gone and drops it
+        // before any `SET XX` is issued, so this row guards resurrection; the
+        // `XX` refusal itself is exercised by the next test.)
+        expect(removed).toContain(second);
+        expect(await expiring.getEvalRetention(id)).toEqual({ exists: false });
+        await runtime.shutdown();
+      } finally {
+        await rm(root, { recursive: true, force: true });
+        await expiring.close?.();
+      }
     });
 
     it('saveCheckpoint applies EXPIRE NX (fixed-from-first-write window)', async () => {
@@ -388,6 +537,20 @@ describe.skipIf(!REDIS_URL)('RedisStore integration (real Redis)', () => {
       const removed = await store.deleteEvalResult(id);
       expect(removed).toBe(true);
 
+      const refetch = await store.listEvalResults();
+      expect(refetch.find((e) => e.id === id)).toBeUndefined();
+    });
+
+    it('updateEvalResult refuses a row the store no longer holds (SET XX)', async () => {
+      const id = `ev-upd-${randomUUID()}`;
+      const entry = { id, eval: 'integration-test', timestamp: 6000, data: { score: 0.5 } };
+      await store.saveEvalResult(entry);
+      expect(await store.updateEvalResult(entry)).toBe(true);
+
+      expect(await store.deleteEvalResult(id)).toBe(true);
+      // A correction can only rewrite a row that still exists: `XX` makes
+      // Redis refuse to create one, so a deleted row cannot be resurrected.
+      expect(await store.updateEvalResult(entry)).toBe(false);
       const refetch = await store.listEvalResults();
       expect(refetch.find((e) => e.id === id)).toBeUndefined();
     });

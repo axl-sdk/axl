@@ -28,7 +28,7 @@ Studio exposes a REST API that the SPA consumes. You can also call these directl
 | `POST /api/executions/:id/abort` | Abort a running execution (signal-driven; wakes paused `ctx.awaitHuman`) |
 | `DELETE /api/executions/:id` | Delete an execution from history (GDPR scrub). Calls `runtime.deleteExecution` AND scrubs the WS replay buffer for `execution:{id}`. Returns `{ id, deleted: true }` or 404. Blocked in readOnly |
 | `GET /api/costs?window=24h\|7d\|30d\|all` | Aggregated cost data for a time window (default `7d`). `?windows=all` returns all four windows at once for debugging |
-| `GET /api/eval-trends?window=` | Per-eval score trends (latest, mean, std), cost totals, recent runs with `model`/`duration` |
+| `GET /api/eval-trends?window=` | Per-eval score trends (latest, mean, std), known-spend totals with a conservative `completeness` flag, budget-stopped run counts, recent runs with `model`/`duration`. Payload shape: [Eval trend spend and completeness](#eval-trend-spend-and-completeness) |
 | `GET /api/workflow-stats?window=` | Per-workflow totals, completed/failed counts, p50/p95/avg duration, failure rate |
 | `GET /api/trace-stats?window=` | Event-type distribution, version-separated tool lifecycle counts, and retry breakdown by agent |
 | `GET /api/memory/:scope/:key` | Read memory entry |
@@ -36,17 +36,53 @@ Studio exposes a REST API that the SPA consumes. You can also call these directl
 | `DELETE /api/memory/:scope/:key` | Delete memory entry |
 | `GET /api/evals` | List registered eval configs |
 | `GET /api/evals/history` | List eval run history |
-| `POST /api/evals/:name/run` | Run a registered eval by name. Body: `{ runs?: N, stream?: true, captureTraces?: true }` (`runs` capped at 25). When `stream: true`, returns `{ evalRunId }` immediately and broadcasts progress over the `eval:{evalRunId}` WS channel: `item_done` per item, `run_done` per successful run, `run_failed` on a provider error, `run_cancelled` on user-initiated abort, terminal `done` (carrying only `{ evalResultId, runGroupId? }` plus `partial: true / batchCompleted / batchAttempted` and either `cancelled: true` OR `batchFailure` — never both — when the batch is partial), or terminal `error` if no runs completed. Clients refetch the full result from history. `captureTraces: true` populates per-item `EvalItem.traces` on every item (success + failure); the Eval Runner panel renders these inline on item detail. Synchronous mode (default) returns the full `EvalResult` enriched with `_multiRun.partial` markers when applicable |
+| `POST /api/evals/:name/run` | Run a registered eval by name. Body: `{ runs?: N, stream?: true, captureTraces?: true, captureRequests?: true }` (`runs` capped at 25). When `stream: true`, returns `{ evalRunId }` immediately and broadcasts progress over the `eval:{evalRunId}` WS channel: `item_done` per item, `run_done` per successful run, `run_failed` on a provider error, `run_cancelled` on user-initiated abort, terminal `done` (carrying only `{ evalResultId, runGroupId? }` plus `partial: true / batchCompleted / batchAttempted` and either `cancelled: true` OR `batchFailure` — never both — when the batch is partial), or terminal `error` if no runs completed. Clients refetch the full result from history. `captureTraces: true` populates per-item `EvalItem.traces` on every item (success + failure); the Eval Runner panel renders these inline on item detail. Synchronous mode (default) returns the full `EvalResult` enriched with `_multiRun.partial` markers when applicable. A multi-run result's `summary.itemErrorRate` is the worst run's record (highest rate; first run wins a tie) plus `runsExceeded` (runs over their limit), matching the CLI's per-run gate rather than a pooled rate; it is absent when no run had a failed item. The aggregate `summary` has no `modelTiming`: its per-call distributions describe one run and cannot be pooled, so read each run's in `_multiRun.allRuns` |
 | `POST /api/evals/runs/:evalRunId/cancel` | Abort an active streaming eval run. The cancelled run appears in history with remaining items marked as cancelled |
-| `POST /api/evals/:name/rescore` | Re-score a history entry with the eval's current scorers |
-| `POST /api/evals/import` | Import a CLI eval artifact (parsed `EvalResult` JSON) into runtime history. Body: `{ result: EvalResult \| EvalResult[], eval? }`. The CLI's `--output` writes a JSON array when `--runs N > 1` (including for partial batches), so array form is supported — each entry imports as its own history entry with shared `runGroupId`, rendering as a coherent group in the History tab. Single-object response is `{ id, eval, timestamp }`; array response is `{ imported: [{ id, eval, timestamp }, ...] }`. Per-entry validation; import is all-or-nothing |
+| `POST /api/evals/:name/rescore` | Re-score a history entry with the eval's current scorers. Body accepts `captureRequests?: true`, which captures the new judging calls and copies the source run's captured generation requests (bounded, original operation ids preserved). The source row is resolved by id and confirmed against the state store's retention, so a result that expired or was deleted 404s instead of being republished under a fresh id with a fresh window |
+| `GET /api/evals/:id/diagnostics` | Manifest for a history entry's [captured requests](observability.md#captured-requests-opt-in): `{ artifactId, status, reason?, records, bytes, fidelity, redaction, expiresAt?, copiedFrom? }`. `redaction` describes the STORED bytes (what the writer applied, or for an imported bundle what its own records say) — not whether this deployment redacts on delivery, which it always does when `trace.redact` is on. 404 when the entry captured nothing or its artifact is gone. The artifact is resolved **through the history id** — a client can never name storage directly |
+| `GET /api/evals/:id/diagnostics/records` | The captured records, streamed as `application/x-ndjson` (one `v: 1` JSON record per line) rather than buffered into an array. Re-redacted line by line when `trace.redact` is on |
+| `POST /api/evals/import` | Import a CLI eval artifact (parsed `EvalResult` JSON) into runtime history. Body: `{ result: EvalResult \| EvalResult[], eval?, requests? }`. `requests` is an optional captured-request JSONL sidecar (`<name>.requests.jsonl` from `axl-eval --capture-requests --output`); it accompanies a **single** result only, is validated in full before anything is stored, and is re-staged under a new artifact id owned by the new history row. A result that claims captured requests but arrives without them is imported with `diagnostics.status: 'unavailable'` rather than rejected. The CLI's `--output` writes a JSON array when `--runs N > 1` (including for partial batches), so array form is supported — each entry imports as its own history entry with shared `runGroupId`, rendering as a coherent group in the History tab. Single-object response is `{ id, eval, timestamp }`; array response is `{ imported: [{ id, eval, timestamp }, ...] }`. Per-entry validation; import is all-or-nothing |
 | `DELETE /api/evals/history/:id` | Delete a single history entry. Blocked in readOnly |
-| `POST /api/evals/compare` | Compare two eval results by history ID. Body: `{ baselineId, candidateId, options? }` where each ID is `string` (single run) or `string[]` (pooled multi-run). Resolves IDs server-side from `runtime.getEvalHistory()` so the wire payload stays small |
+| `POST /api/evals/compare` | Compare two eval results by history ID. Body: `{ baselineId, candidateId, options? }` where each ID is `string` (single run) or `string[]` (pooled multi-run). Resolves each ID server-side through `runtime.getEvalResult(id)` so the wire payload stays small; an ID the state store no longer holds is reported in the 404 alongside IDs that never existed |
 | `POST /api/playground/chat` | Chat with an agent directly (no workflow required). Accepts `{ message, agent?, sessionId?, image? }`, where `image` is `{ mediaType: 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif', data: string }`: standard base64 only (no data URL), one image, up to 5 MiB decoded. Streams results via WebSocket. |
 | `GET /api/decisions` | List pending decisions |
 | `POST /api/decisions/:id/resolve` | Resolve a pending decision in its owning runtime. Returns 400 for an invalid exact decision union, 404 for an unknown/already-resolved ID, and 409 for a persisted request whose process-local owner is gone |
 
 All endpoints return `{ ok: true, data: {...} }` on success or `{ ok: false, error: { code, message } }` on error.
+
+**How the Studio client reads the two diagnostics routes.** A run whose result
+carries a `diagnostics` block renders a "Captured requests" panel on the run
+detail, beside the accounting footer, and a marker on its History row. The panel
+shows the result's own manifest immediately and then confirms availability
+against `GET /api/evals/:id/diagnostics` — that route is the only place a
+rescore's `copiedFrom` provenance exists, and a 404 from it means the bytes were
+swept since the result was loaded, which downgrades the panel to `unavailable`
+and disables the download. A manifest reading `unavailable` (or carrying the
+empty-string artifact id) never repeats its `records`/`bytes` figures, because
+they describe evidence that has just been declared absent. "Download records
+(.jsonl)" takes the whole `/diagnostics/records` body and saves it as
+`<eval>-<id>.requests.jsonl`; the inline viewer parses the same stream line by
+line and keeps 200 **operations** — not lines — says so, and points at the
+download for the rest. It reads the stream to the end and retains only the
+admitted operations' lines: because eval cases run concurrently, an operation's
+`end` arrives after later `start`s, and stopping at the cap would drop the `end`
+of an operation already on screen. The artifact is one line per phase (`start` carries the
+request, `end` the response, error or termination), so the viewer reassembles
+them by `operationId` and renders one row per operation: an absent half is only
+ever reported when the line that would have carried it is absent, and a `start`
+with no `end` reads as "no response recorded" rather than as a completed call.
+Per-run only: the multi-run aggregate view renders no panel, because a group's
+result carries run 1's `diagnostics`. A result with no `diagnostics` block —
+every pre-0.24 artifact and every run that did not opt in — renders nothing.
+
+Two honesty details worth knowing when reading the panel. Its `redaction` line
+describes the **stored** bytes; when this deployment re-redacts on delivery
+(`trace.redact`) the rendered records also carry `captured.redacted`, and the
+viewer says so separately so scrubbed content under a "not redacted" header is
+not mistaken for scrubbed bytes on disk. And the History-row marker reads only
+the embedded manifest: a sweep downgrades the owning history row, so the marker
+goes stale only between that sweep and the next history fetch — the panel's
+route confirmation closes that window when the run is opened.
 
 ### Versioned execution history and tool aggregates
 
@@ -85,6 +121,64 @@ The v1 bucket stays separate because a legacy end does not encode the v2
 terminal status. Additional v2 starts, rejections, and terminal events change
 trace counts only. Cost and billing still fold cost-bearing model/embedder
 events, so the expanded tool lifecycle does not add spend.
+
+### Eval trend spend and completeness
+
+`GET /api/eval-trends?window=` (and the `eval-trends` WS channel, which carries
+the same state) reports spend alongside how complete that spend figure is.
+A total on its own is not a fact: `$0.00` from a fully priced run and `$0.00`
+from a run whose model had no price are opposite claims, and a window holding
+one pre-accounting artifact cannot be summed into a certified number.
+
+```typescript
+type EvalTrendCompleteness = 'complete' | 'incomplete' | 'unverified';
+
+{
+  byEval: Record<string, {
+    runs: Array<{
+      timestamp: number; id: string; scores: Record<string, number>;
+      cost: number;                        // EvalResult.accounting.knownCost
+      completeness: EvalTrendCompleteness; // how to read `cost`
+      budgetStopped?: boolean;             // budget closed AND refused work
+      model?: string; duration?: number;
+      runGroupId?: string; batchAttempted?: number;
+    }>;
+    latestScores: Record<string, number>;
+    scoreMean: Record<string, number>;
+    scoreStd: Record<string, number>;
+    costTotal: number;
+    costCompleteness: EvalTrendCompleteness; // worst of every run in the window
+    budgetStoppedRuns: number;
+    runCount: number;
+  }>;
+  totalRuns: number;
+  totalCost: number;
+  totalCostCompleteness: EvalTrendCompleteness; // worst across every eval
+}
+```
+
+`budgetStopped` (and the per-eval `budgetStoppedRuns` count) follows
+`@axlsdk/eval`'s `isBudgetStopped`: the run's budget must have closed **and**
+refused work — cases never started or stopped mid-flight, or judges refused for
+the same reason. A controller that closed on a final settlement landing exactly
+on its limit refused nothing and is not reported as stopped; a run whose
+artifact carries no `coverage` block (pre-0.24) is never reported as stopped
+either, because nothing recorded that work was refused. Spend folded into a
+window follows the same `usableCost` rule the eval package's
+`aggregateAccounting` uses: a negative or non-finite figure contributes `0`
+rather than dragging a window total. When an `accounting` block is present it
+is authoritative — an unusable `knownCost` reads `$0.00`, never the legacy
+`totalCost` beside it, so `cost` agrees with what `readAccounting` gives every
+other consumer.
+
+`completeness` mirrors core's `AccountingCompleteness`. A history entry with no
+`accounting` block predates measured spend: its `totalCost` is repeated as
+`cost` but reported `unverified`, and it is never upgraded to `complete`.
+The two window-level flags take the **worst** completeness of every run folded
+into their totals — including runs the 50-run window cap has already evicted
+from `runs`, since `costTotal` still counts them. One legacy or unpriced run
+therefore makes the whole window uncertifiable, which is what stops a trend
+chart from implying a precision the data never had.
 
 ## WebSocket
 
@@ -457,6 +551,64 @@ If you currently use `npx @axlsdk/studio` with a config file:
 
 The `axl.config.ts` file is no longer needed. The standalone CLI continues to work for projects that don't need embedded middleware.
 
+### Imported accounting validation
+
+An imported result is the one eval in history Studio did not measure, and
+`compare` will certify a cost delta from an `accounting` block that says
+`completeness: 'complete'`. So a **declared** record has to earn that trust:
+
+| Check | Rule |
+|---|---|
+| Shape | `version === 1`, `currency === 'USD'`, finite non-negative `knownCost`, `completeness` in the enum, numeric `reasons` / `usage` |
+| Operations | `operations.total === settled + unknown`, with `denied` and `byKind` numeric |
+| Provenance | values sum to `knownCost` (float tolerance) |
+| Breakdown | `generation + judging + external` sums to `knownCost` |
+| Budget | when `accounting.budget` is present: finite non-negative `limit` / `knownSpend` / `knownOvershoot`, `status` in `open`/`closed`, `closedBy` in the enum, `knownOvershoot === max(0, knownSpend - limit)`, and `status === 'closed'` exactly when `knownSpend >= limit` (an `AdmissionController` closes on nothing else) |
+| Coverage | when `summary.coverage` is present: every item-outcome key and every scorer-outcome key per scorer, each a non-negative integer |
+
+The two sum identities are checked only for `'complete'` and `'incomplete'`. An
+`'unverified'` record is by definition a synthesis with no operations,
+provenance or breakdown behind it, so it is accepted as-is.
+
+Item-level and scorer-level `accounting` are held to the same rules, and the
+verdict is **all-or-nothing** across the result: a run total that adds up while
+its items are forged is not half-trustworthy.
+
+`accounting.budget` and `summary.coverage` are in the same verdict because
+together they are the whole "this run was stopped by its budget" claim, which
+three surfaces render (the CLI summary, the eval-trends aggregate and the run
+panel's badge) and which a reader treats as "the numbers are short for a known
+reason" rather than "the numbers are wrong". A failing record loses both along
+with its accounting, so nothing downstream can badge it budget-stopped. A
+coverage block that arrives without any accounting at all is validated on its
+own; a malformed one is dropped AND recorded as `importedAccounting: 'invalid'`
+— `EvalCoverage` promises every key including zeros, a partial block reads
+downstream as zeros (turning refused work into a clean run), and a reader has to
+be able to tell "never had coverage" from "its coverage was refused".
+
+A failing record is replaced with the `unverified` synthesis an artifact with no
+accounting receives — the numbers stay readable, the certification does not
+survive. Import **never rejects** a result over its accounting; the outcome is
+recorded on `metadata.importedAccounting` as `'declared'` or `'invalid'` so it
+is visible rather than inferred.
+
+`summary.itemErrorRate` is checked separately, because it is a verdict rather
+than accounting. The record must satisfy the identities `@axlsdk/eval` writes:
+`rate = failed / attempted` (0 when nothing was attempted),
+`exceeded = attempted > 0 && rate > limit`, `failed <= attempted`, and `limit`
+in [0, 1]. A record that fails is dropped and marked
+`metadata.importedItemErrorRate: 'invalid'`, leaving `importedAccounting`
+untouched. The multi-run view promotes the worst run's record and counts
+exceeded runs, so a forged record would otherwise pose as the worst run.
+
+A `_multiRun` block (a saved sync multi-run response) must be a walkable shape:
+if `allRuns` is present, it must be an array of objects, each with an `items`
+array of objects. A block that fails is dropped and marked
+`metadata.importedMultiRun: 'invalid'`; the top-level result still imports.
+Separately, the redacted history read handles any stored shape without
+failing: a part it cannot walk (a non-object item, a run without `items`) is
+replaced with `[redacted]` rather than served or allowed to fail the list.
+
 ## Observability-boundary redaction
 
 When the runtime is constructed with `config.trace.redact: true`, Studio scrubs user/LLM content at three layers — trace events at emission, REST route responses at serialization, and WebSocket broadcasts at send time — while preserving structural metadata (IDs, keys, agent/tool/workflow names, roles, cost/token/duration metrics, timestamps).
@@ -466,7 +618,7 @@ const runtime = new AxlRuntime({ trace: { redact: true } });
 const studio = createStudioMiddleware({ runtime });
 ```
 
-Under `redact: true`, the following Studio endpoints scrub user content server-side before responding: `GET /api/executions{,/:id}` (also scrubs `ExecutionInfo.metadata` to `{ redacted: true }` — caller-supplied `userId`/`tenantId`/correlation ids are PII surfaces), `GET /api/memory/:scope{,/:key}` (keys preserved so Memory Browser stays navigable), `GET /api/sessions/:id`, `GET /api/evals/history`, `POST /api/evals/:name/run` (sync), `POST /api/evals/:name/rescore`, `GET /api/decisions`, `POST /api/tools/:name/test`, `POST /api/workflows/:name/execute` (sync); streaming WS broadcasts on `/workflows/:name/execute` with `stream: true`, `/api/playground/chat`, AND the trace channel firehose (`trace:{executionId}`) all scrub `AxlEvent` content before send.
+Under `redact: true`, the following Studio endpoints scrub user content server-side before responding: `GET /api/executions{,/:id}` (also scrubs `ExecutionInfo.metadata` to `{ redacted: true }` — caller-supplied `userId`/`tenantId`/correlation ids are PII surfaces), `GET /api/memory/:scope{,/:key}` (keys preserved so Memory Browser stays navigable), `GET /api/sessions/:id`, `GET /api/evals/history`, `POST /api/evals/:name/run` (sync), `POST /api/evals/:name/rescore`, `POST /api/evals/compare` (regression/improvement `input`s and each side's `metadata.batchFailure`), `GET /api/evals/:id/diagnostics/records` (each record re-redacted on the way out), `GET /api/decisions`, `POST /api/tools/:name/test`, `POST /api/workflows/:name/execute` (sync); streaming WS broadcasts on `/workflows/:name/execute` with `stream: true`, `/api/playground/chat`, AND the trace channel firehose (`trace:{executionId}`) all scrub `AxlEvent` content before send. Eval items keep their structural `failure` cause, projected to `name`/`provider`/`status`/`retryable`/`requestId` (any other key, such as one carried by an imported artifact, is dropped), while `error` is masked. A multi-run response scrubs every run in `_multiRun.allRuns` the same way.
 
 Session execution has the same boundary: `POST /api/sessions/:id/send` scrubs
 its result, and `POST /api/sessions/:id/stream` scrubs every `AxlEvent` before

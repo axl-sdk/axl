@@ -3,6 +3,7 @@ import { execSync } from 'node:child_process';
 import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 const ROOT = join(import.meta.dirname, '../..');
 
@@ -278,5 +279,176 @@ describe('Smoke: Downstream Type Export Contract', () => {
     });
     // If tsc exits non-zero, execSync throws and the test fails with
     // the stderr captured. A clean exit means the consumer compiles.
+  });
+});
+
+/**
+ * A16.15 — the packaged tarballs, exercised by specifier.
+ *
+ * The suites above check that files are IN the tarball and that the types
+ * compose. Neither would notice a new module missing from the `tsup` entry
+ * list or the `exports` map: source-relative tests import through the
+ * workspace and stay green while `import { runEval } from '@axlsdk/eval'` on a
+ * real install throws `ERR_PACKAGE_PATH_NOT_EXPORTED`.
+ *
+ * So this one installs the packed core + testing + eval into a sandbox and runs
+ * a budgeted eval for real, asserting the two numbers a user actually reads:
+ * the measured spend and the budget's terminal state.
+ */
+describe('Smoke: Packaged Runtime Contract', () => {
+  it('runs a budgeted eval from the installed tarballs and reports measured spend', () => {
+    const core = pack(join(ROOT, 'packages/axl'));
+    const testing = pack(join(ROOT, 'packages/axl-testing'));
+    const evalPkg = pack(join(ROOT, 'packages/axl-eval'));
+
+    const sandbox = mkdtempSync(join(tmpdir(), 'axl-runtime-smoke-'));
+    writeFileSync(
+      join(sandbox, 'package.json'),
+      JSON.stringify(
+        {
+          name: 'axl-smoke-runner',
+          version: '0.0.0',
+          private: true,
+          type: 'module',
+          dependencies: {
+            '@axlsdk/axl': `file:${core}`,
+            '@axlsdk/testing': `file:${testing}`,
+            '@axlsdk/eval': `file:${evalPkg}`,
+            zod: '^4.0.0',
+          },
+        },
+        null,
+        2,
+      ),
+    );
+
+    // Three cases at $0.30 against a $0.50 limit: the run must spend, then
+    // close, and say so. A single case would not distinguish "budget honored"
+    // from "budget ignored".
+    writeFileSync(
+      join(sandbox, 'run.mjs'),
+      [
+        "import { z } from 'zod';",
+        "import { AxlRuntime, agent, workflow } from '@axlsdk/axl';",
+        "import { MockProvider } from '@axlsdk/testing';",
+        "import { dataset, scorer } from '@axlsdk/eval';",
+        '',
+        'const provider = MockProvider.sequence([',
+        "  { content: 'a', cost: 0.3 },",
+        "  { content: 'b', cost: 0.3 },",
+        "  { content: 'c', cost: 0.3 },",
+        ']);',
+        'const runtime = new AxlRuntime({ trace: { enabled: false } });',
+        "runtime.registerProvider('mock', provider);",
+        "const bot = agent({ name: 'bot', model: 'mock:m', system: 's' });",
+        'runtime.register(',
+        '  workflow({',
+        "    name: 'wf',",
+        '    input: z.any(),',
+        "    handler: async (ctx) => ctx.ask(bot, 'go'),",
+        '  }),',
+        ');',
+        '',
+        'const result = await runtime.eval({',
+        "  workflow: 'wf',",
+        '  dataset: dataset({',
+        "    name: 'ds',",
+        '    schema: z.object({ q: z.string() }),',
+        "    items: [{ input: { q: '1' } }, { input: { q: '2' } }, { input: { q: '3' } }],",
+        '  }),',
+        "  scorers: [scorer({ name: 'pass', description: 'p', score: () => 1 })],",
+        "  budget: '$0.50',",
+        '});',
+        '',
+        'console.log(',
+        '  JSON.stringify({',
+        '    knownCost: result.accounting?.knownCost,',
+        '    completeness: result.accounting?.completeness,',
+        '    budget: result.accounting?.budget,',
+        '  }),',
+        ');',
+        '',
+      ].join('\n'),
+    );
+
+    execSync('npm install --no-audit --no-fund --loglevel=error', {
+      cwd: sandbox,
+      stdio: 'pipe',
+      timeout: 90_000,
+    });
+
+    const stdout = execSync('node run.mjs', { cwd: sandbox, encoding: 'utf-8' });
+    const report = JSON.parse(stdout.trim().split('\n').pop());
+
+    // Measured, not declared: the provider reported $0.30 per call.
+    expect(report.knownCost).toBeGreaterThan(0);
+    expect(report.completeness).toBe('complete');
+    // The budget closed, and the record says so rather than clamping the total.
+    expect(report.budget.limit).toBe(0.5);
+    expect(report.budget.status).toBe('closed');
+    expect(report.budget.knownSpend).toBeCloseTo(report.knownCost, 10);
+  }, 150_000);
+});
+
+/**
+ * Optional-dependency loading in the ESM bundle.
+ *
+ * `SQLiteStore`, `SqliteVectorStore` and `RedisStore` load their optional
+ * native deps with a synchronous `require()` — a sync constructor like
+ * `new SQLiteStore(path)` cannot await a dynamic import. esbuild rewrites
+ * those calls to its `__require` shim, which in an ESM output finds no
+ * `require` binding and falls back to a Proxy that throws on call. Each
+ * store caught that throw and reported it as a missing dependency, so every
+ * ESM consumer saw "better-sqlite3 is required" / "redis is required" with
+ * the package installed and resolvable. The CJS bundle was fine, and the
+ * unit suite runs against TS source, so nothing caught it.
+ *
+ * These run the built ESM bundle the way a consumer imports it.
+ */
+describe('Smoke: ESM bundle optional dependencies', () => {
+  const DIST = join(ROOT, 'packages/axl/dist/index.js');
+
+  function runEsm(body: string): string {
+    const dir = mkdtempSync(join(tmpdir(), 'axl-esm-smoke-'));
+    const script = join(dir, 'probe.mjs');
+    writeFileSync(script, body.replace('__DIST__', pathToFileURL(DIST).href));
+    return execSync(`node ${script}`, { encoding: 'utf-8', stdio: 'pipe' }).trim();
+  }
+
+  it('constructs the SQLite-backed stores from the ESM build', () => {
+    const out = runEsm(
+      [
+        "import { SQLiteStore, SqliteVectorStore } from '__DIST__';",
+        "import { mkdtempSync } from 'node:fs';",
+        "import { tmpdir } from 'node:os';",
+        "import { join } from 'node:path';",
+        "const dir = mkdtempSync(join(tmpdir(), 'axl-esm-db-'));",
+        "const store = new SQLiteStore(join(dir, 'state.db'));",
+        "const vectors = new SqliteVectorStore(join(dir, 'vectors.db'));",
+        'store.close?.();',
+        'vectors.close?.();',
+        "console.log('constructed');",
+      ].join('\n'),
+    );
+    expect(out).toBe('constructed');
+  });
+
+  it('loads the redis client from the ESM build, failing only on the connection', () => {
+    // Port 1 is never a Redis server, so `create()` must reject — but on the
+    // connection, having loaded the client. A rejection naming the dependency
+    // is the bundler defect, not a missing package.
+    const out = runEsm(
+      [
+        "import { RedisStore } from '__DIST__';",
+        'try {',
+        "  await RedisStore.create({ url: 'redis://127.0.0.1:1' });",
+        "  console.log('connected-unexpectedly');",
+        '} catch (err) {',
+        '  console.log(err.message);',
+        '}',
+      ].join('\n'),
+    );
+    expect(out).not.toMatch(/redis is required for RedisStore/);
+    expect(out).not.toMatch(/does not export createClient/);
   });
 });

@@ -326,7 +326,7 @@ const runtime = new AxlRuntime({
 **The three layers:**
 
 1. **AxlEvents** at emission — `agent_call_start.data.prompt`/`.system`/`.messages`, `agent_call_end.data.response`/`.thinking`/`.error`, `ask_start.prompt`, `ask_end.outcome` (`outcome.result` on success, `outcome.error` on failure), gate-event `reason`/`feedbackMessage`, rejected-tool args/messages, `tool_call_start.data.args`, tool-end args/results/reasons/error details, `tool_approval.data.args`/`.reason`, `handoff_start.data.message` (roundtrip only), `workflow_start.data.input`, `workflow_end.data.result`/`.error`, `done.data.result`, `error.data.message`, string fields on `log` events (one-level walk — nested numeric/boolean fields like `usage.tokens` / `usage.cost` survive so the Cost Dashboard's byEmbedder bucket still works).
-2. **Studio REST route responses** at serialization — `GET /api/executions{,/:id}` (also scrubs `ExecutionInfo.metadata` to `{ redacted: true }` — caller-supplied `userId`/`tenantId`/correlation ids are PII surfaces compliance mode must protect), `GET /api/memory/:scope{,/:key}` (keys preserved so Memory Browser remains navigable), `GET /api/sessions/:id`, `GET /api/evals/history`, `POST /api/evals/:name/run` (sync), `POST /api/evals/:name/rescore`, `GET /api/decisions`, `POST /api/tools/:name/test`, `POST /api/workflows/:name/execute` (sync).
+2. **Studio REST route responses** at serialization — `GET /api/executions{,/:id}` (also scrubs `ExecutionInfo.metadata` to `{ redacted: true }` — caller-supplied `userId`/`tenantId`/correlation ids are PII surfaces compliance mode must protect), `GET /api/memory/:scope{,/:key}` (keys preserved so Memory Browser remains navigable), `GET /api/sessions/:id`, `GET /api/evals/history`, `POST /api/evals/:name/run` (sync), `POST /api/evals/:name/rescore`, `POST /api/evals/compare` (regression/improvement `input`s), `GET /api/decisions`, `POST /api/tools/:name/test`, `POST /api/workflows/:name/execute` (sync).
 3. **Studio WebSocket broadcasts** — `AxlEvent` content scrubbed on `POST /api/workflows/:name/execute` with `stream: true` and `POST /api/playground/chat` (`token.data`, rejected-tool args/messages, `tool_call_start.data.args`, tool-end args/results/reasons/error details, `tool_approval.data.args`/`.reason`, `ask_start.prompt`, `ask_end.outcome`, `done.data.result`, `error.data.message`, `handoff_start.data.message`). The **trace firehose channel** (`trace:*`) applies the same event redaction filter, so it cannot bypass the per-route scrub.
 
 Session routes follow the same serialization boundary:
@@ -351,6 +351,81 @@ error *message* (`data.error`, already subject to `trace.redact`) plus the struc
 `data.status` / `data.retryable`, but not `body`. This keeps the redaction surface
 unchanged — operators who need the raw body must inspect the caught `ProviderError`
 programmatically. See [providers.md](./providers.md#typed-provider-errors).
+
+## Captured requests
+
+[Request capture](observability.md#captured-requests-opt-in) writes the prompts
+and responses of a run to disk. That is exactly the material redaction exists to
+contain, so the same policy applies, twice:
+
+- **Before the write.** When `trace.redact` is on, every record passes through
+  `redactCapturedRequest()` before it reaches the sink. Message content, tool-call
+  arguments, response content, error messages and gate `reason` /
+  `feedbackMessage` become `'[redacted]'`; structure (roles, counts, model,
+  provider, timings, ids) survives, and the record is stamped
+  `captured.redacted: true`.
+- **Again at delivery.** Studio re-applies redaction when streaming records out,
+  because an artifact may have been written before the flag was switched on.
+
+Rich media never lands in an artifact: image, audio and file parts are replaced
+by descriptors. `providerOptions` contributes **keys only** — a credential
+passed through it cannot reach the file even unredacted.
+
+Capture is off unless a run asks for it, and asking requires a configured
+artifact root or store; there is no implicit location and no ambient default.
+Artifacts are deleted with the eval result that owns them
+(see [Right-to-be-Forgotten](#right-to-be-forgotten--execution-deletion)) —
+`runtime.deleteEvalResult(id)` marks the artifact for deletion *before* the
+history row goes, so a failure leaves an intent the next sweep completes rather
+than an orphan nobody will ever look for.
+
+### Imported bundles
+
+`POST /api/evals/import` accepts an optional `requests` sidecar. Nothing in it
+is ever dereferenced: the server does not open a path, fetch a URL, or reuse the
+exporter's artifact id. The sidecar must be JSONL that parses, declares codec
+`v: 1`, and carries an `operationId` and a known `phase` on every line, under a
+size ceiling — per record as well as in total, so one enormous line inside the
+overall budget is refused — and it is validated in full before a single result
+is stored.
+Accepted records are re-staged under a **new** artifact id owned by the **new**
+history row, so an imported reference can only ever resolve to bytes this
+runtime wrote itself.
+
+A declared `accounting` block on an imported result is likewise not taken on
+trust — see [studio-api.md](studio-api.md#imported-accounting-validation).
+
+## The budget settlement channel is a process-global symbol
+
+`AdmissionController` receives settled spend through a property keyed by
+`Symbol.for('axl.accounting.recordSpend')` — a key in the **cross-realm symbol
+registry**, not a module-private `Symbol()`.
+
+That is deliberate, and the reason is dual copies rather than convenience:
+`@axlsdk/axl` legitimately loads twice in one process (an ESM app whose eval run
+dynamically imports `@axlsdk/eval`, which resolves its own copy of the core, is
+the ordinary case). A module-private symbol would make a controller built by
+copy A invisible to the settlement walk in copy B, and spend would then stop
+reaching the budget **silently** — the failure mode a cost rail must not have.
+
+The security consequence is worth stating plainly:
+
+- Any code running **in the same process** can compute that key and therefore
+  read or write a controller's settlement channel. It is an in-process
+  integrity surface, not a sandbox boundary — the same trust level as anything
+  else that can reach into your objects (monkey-patching `fetch`, replacing a
+  provider adapter, mutating a config). Axl offers no protection against
+  hostile code inside the process, here or anywhere else.
+- Nothing crosses a process, a realm boundary, or the wire. The symbol names a
+  channel between object references that already share a heap; it is never
+  serialized, never sent to a provider, and never persisted.
+- The practical rule is unchanged: **do not run untrusted code in the process
+  that owns your budgets**. Untrusted evaluation belongs in its own process
+  with its own cost ceiling.
+
+Budget enforcement itself remains honest rather than absolute — it is a
+threshold, not a reservation, and it cannot enforce on spend it cannot price.
+See [observability.md → Budget honesty](observability.md#budget-honesty).
 
 ## Multi-Tenant Deployments (Studio Middleware)
 

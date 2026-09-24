@@ -213,6 +213,13 @@ export class MemoryStore implements StateStore {
     this.evalHistory.set(entry.id, structuredClone(entry));
   }
 
+  /** Update-only write: see `StateStore.updateEvalResult`. */
+  async updateEvalResult(entry: EvalHistoryEntry): Promise<boolean> {
+    if (!this.evalHistory.has(entry.id)) return false;
+    this.evalHistory.set(entry.id, structuredClone(entry));
+    return true;
+  }
+
   async listEvalResults(limit?: number): Promise<EvalHistoryEntry[]> {
     const sorted = [...this.evalHistory.values()].sort((a, b) => b.timestamp - a.timestamp);
     const result = limit ? sorted.slice(0, limit) : sorted;
@@ -221,6 +228,11 @@ export class MemoryStore implements StateStore {
 
   async deleteEvalResult(id: string): Promise<boolean> {
     return this.evalHistory.delete(id);
+  }
+
+  /** In-memory history never expires on its own — only existence is meaningful. */
+  async getEvalRetention(id: string): Promise<{ exists: boolean; expiresAt?: number }> {
+    return { exists: this.evalHistory.has(id) };
   }
 
   // ── Sessions (Studio introspection) ─────────────────────────────────

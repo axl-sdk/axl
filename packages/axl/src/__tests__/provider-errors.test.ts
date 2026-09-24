@@ -92,6 +92,21 @@ describe('parseRetryAfter', () => {
   it('missing header → undefined', () => {
     expect(parseRetryAfter(new Headers())).toBeUndefined();
   });
+
+  it('retry-after-ms (OpenAI, Azure) → ms, preferred over retry-after', () => {
+    expect(parseRetryAfter(new Headers({ 'retry-after-ms': '250' }))).toBe(250);
+    expect(parseRetryAfter(new Headers({ 'retry-after-ms': '1500.5', 'retry-after': '2' }))).toBe(
+      1500.5,
+    );
+  });
+
+  it('unusable retry-after-ms falls back to retry-after', () => {
+    for (const bad of ['0', '-5', 'soon', '']) {
+      expect(parseRetryAfter(new Headers({ 'retry-after-ms': bad, 'retry-after': '3' }))).toBe(
+        3000,
+      );
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -385,7 +400,13 @@ describe('fetchWithRetry transport ↔ typed error compose', () => {
     // Default maxRetries on the adapter path; use fake timers to skip backoff.
     vi.useFakeTimers({ shouldAdvanceTime: true });
     const body = JSON.stringify({ error: { message: 'overloaded' } });
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(errorResponse(503, body)));
+    // A fresh Response per attempt, as real fetch returns: the transport
+    // cancels each retried response's body, so one shared object would reach
+    // the adapter already consumed.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => errorResponse(503, body)),
+    );
     const adapter = new OpenAIProvider({ apiKey: 'sk-test' });
 
     const call = adapter.chat(MESSAGES, OPTS);

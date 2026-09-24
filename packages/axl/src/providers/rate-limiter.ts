@@ -1,5 +1,8 @@
 /**
- * Opt-in client-side rate governor for provider HTTP calls.
+ * Client-side rate governor for provider HTTP calls: the plain, non-adaptive
+ * base. Constructed directly (custom adapters, transcription) it applies only
+ * the configured static caps. The built-in chat adapters use its pooled,
+ * default-on adaptive subclass, `ScopeGovernor` (`governor-pool.ts`).
  *
  * Wraps the single `fetchWithRetry` chokepoint (see `retry.ts`) so a configured
  * provider can bound how many requests it has *in flight* at once and, optionally,
@@ -18,10 +21,13 @@
  *   its whole lifetime. Non-streaming calls still hold it across generation in
  *   practice, because a provider sends no headers until the completion is
  *   finished. Neither bounds tokens/min.
- * - **Per provider instance.** Providers are singletons per (runtime, provider
- *   type), so one governor governs all calls through that adapter — but NOT
- *   embedder calls (the embedder is constructed outside the registry) and NOT
- *   other processes/runtimes sharing the same API key.
+ * - **One governor per scope, per runtime.** The built-in chat adapters don't
+ *   construct this class directly: they resolve a governor per call from the
+ *   runtime's `GovernorPool` (`governor-pool.ts`), one per provider family +
+ *   base-URL origin + credential source + model. A directly constructed
+ *   `RateLimiter` (custom adapters) governs exactly the calls it is passed to.
+ *   Neither covers embedder calls (constructed outside the registry) nor other
+ *   processes.
  * - **`minIntervalMs` is global spacing, not a burst bucket.** A single
  *   last-grant timestamp gates every grant: a permit may be free yet a grant
  *   still waits out the interval. There is no accumulated burst allowance.
@@ -29,8 +35,9 @@
  *   never across a nested `ctx.ask`, so an agent-as-tool chain on the same
  *   provider under `maxConcurrent: 1` still completes — permits don't stack.
  *
- * `observe(res)` is a no-op seam in v1 for a future adaptive (header-driven)
- * pacing follow-up.
+ * `observe(res)` is a no-op here. The per-scope governor in `governor-pool.ts`
+ * overrides it (quota-header hint) and adds the rate-limit brake; a directly
+ * constructed `RateLimiter` is never adaptive.
  */
 
 /** Configuration for a provider's {@link RateLimiter}. All fields optional. */
@@ -53,8 +60,43 @@ export type RateLimitConfig = {
    * If set, `acquire()` rejects (fail loud) when a caller has queued longer than
    * this many ms, instead of waiting indefinitely — surfaces a misconfigured
    * cap rather than silently hanging the run.
+   *
+   * Bounds only a call's FIRST wait for a permit. On a scope that adapts (see
+   * `adaptive`), a call first waits out any active rate-limit brake and only
+   * then starts this clock; a call already queued when a brake begins keeps
+   * its clock running through it. A retry's re-acquire after a rate-limit 429
+   * is exempt: it is bounded by `maxRateLimitRetries` and the ask's `timeout`.
    */
   acquireTimeoutMs?: number;
+  /**
+   * Feedback-driven pacing on every built-in chat provider. Default `true`.
+   * When on, a rate-limit 429 brakes every call on the scope for the
+   * exponential backoff, lengthened (never shortened) by a longer
+   * `Retry-After` / `retry-after-ms` and clamped at 60 s, and
+   * the call retries on its own budget (`maxRateLimitRetries`), and the scope
+   * then paces its grants adaptively (a rate seeded from recent demand,
+   * recovered linearly on success, dropped once traffic stays well below it;
+   * tuning is internal) until it reopens. Nothing waits before the first 429.
+   *
+   * Only first-party OpenAI (`openai:`, `openai-responses:`) and Anthropic at
+   * the vendor's default endpoint origin read the 429 body: there a spend-cap
+   * 429 fails fast, and a low quota header holds recovery. Everywhere else
+   * (Gemini, OpenAI-compatible presets, a proxy or gateway `baseUrl`) every
+   * 429 is a rate limit, so a spend-cap or daily-quota 429 fails only once
+   * `maxRateLimitRetries` is spent.
+   *
+   * `false` restores the plain behavior: a 429 shares the transient retry
+   * budget, holds up no other call, and nothing is paced. Ignored by a
+   * directly constructed `RateLimiter`, which is never adaptive.
+   */
+  adaptive?: boolean;
+  /**
+   * Retries after a rate-limit 429 on an adaptive scope, separate from the
+   * transient (503/529/network) budget. Default `8`. A non-negative integer;
+   * `0` still brakes the scope but returns the 429. Ignored where
+   * `adaptive` has no effect.
+   */
+  maxRateLimitRetries?: number;
 };
 
 type Waiter = {
@@ -67,16 +109,86 @@ type Waiter = {
   settled?: boolean;
   /** Set synchronously when the waiter is granted a permit (vs. parked in the queue). */
   granted?: boolean;
+  /** Queued ahead of every non-priority waiter (a retry re-acquiring its permit). */
+  priority?: boolean;
 };
+
+/**
+ * Validate a {@link RateLimitConfig}, emitting the same warnings the
+ * {@link RateLimiter} constructor always has, and return only the fields that
+ * take effect: an invalid or non-positive value is dropped (absent), and
+ * `maxConcurrent` is floored. The result is what the constructor applies, and
+ * what the per-runtime governor pool merges across provider blocks, so a
+ * typo'd `0` in one block never reads as the "strictest" value.
+ *
+ * Internal (not barrel-exported).
+ */
+export function sanitizeRateLimitConfig(config: RateLimitConfig): RateLimitConfig {
+  const limits: RateLimitConfig = {};
+  const mc = config.maxConcurrent;
+  if (mc != null) {
+    if (!Number.isFinite(mc) || mc < 1) {
+      // A typo'd 0 / negative / NaN must not deadlock the provider — ignore the
+      // cap (no limit) and say so loudly.
+      console.warn(
+        `[axl] RateLimiter: ignoring invalid maxConcurrent (${mc}); expected an integer >= 1. No concurrency cap applied.`,
+      );
+    } else {
+      limits.maxConcurrent = Math.floor(mc);
+      if (limits.maxConcurrent < 2) {
+        console.warn(
+          `[axl] RateLimiter: maxConcurrent=${limits.maxConcurrent} serializes every request to this provider. ` +
+            `Nested same-provider calls still complete (permits aren't held across a nested ask), but throughput is a floor, not a guarantee.`,
+        );
+      }
+    }
+  }
+  if (
+    config.minIntervalMs != null &&
+    Number.isFinite(config.minIntervalMs) &&
+    config.minIntervalMs > 0
+  ) {
+    limits.minIntervalMs = config.minIntervalMs;
+  }
+  if (
+    config.acquireTimeoutMs != null &&
+    Number.isFinite(config.acquireTimeoutMs) &&
+    config.acquireTimeoutMs > 0
+  ) {
+    limits.acquireTimeoutMs = config.acquireTimeoutMs;
+  }
+  if (config.adaptive != null) {
+    if (typeof config.adaptive === 'boolean') {
+      limits.adaptive = config.adaptive;
+    } else {
+      console.warn(
+        `[axl] RateLimiter: ignoring invalid adaptive (${String(config.adaptive)}); expected a boolean.`,
+      );
+    }
+  }
+  const rlr = config.maxRateLimitRetries;
+  if (rlr != null) {
+    if (typeof rlr === 'number' && Number.isInteger(rlr) && rlr >= 0) {
+      limits.maxRateLimitRetries = rlr;
+    } else {
+      console.warn(
+        `[axl] RateLimiter: ignoring invalid maxRateLimitRetries (${String(rlr)}); expected an integer >= 0. The default applies.`,
+      );
+    }
+  }
+  return limits;
+}
 
 /**
  * Counting semaphore + FIFO waiter queue. Dependency-free. Not shared across
  * processes — purely an in-process pacing aid.
  */
 export class RateLimiter {
-  private readonly maxConcurrent: number;
-  private readonly minIntervalMs: number;
-  private readonly acquireTimeoutMs?: number;
+  // Mutable and protected so the internal per-scope governor can tighten a live
+  // governor when a second provider block reaches the same scope.
+  protected maxConcurrent = Infinity;
+  protected minIntervalMs = 0;
+  protected acquireTimeoutMs?: number;
 
   private active = 0;
   // `-Infinity` (not 0) so the FIRST grant is always immediate regardless of the
@@ -90,38 +202,22 @@ export class RateLimiter {
   private warnedQueued = false;
 
   constructor(config: RateLimitConfig = {}) {
-    const mc = config.maxConcurrent;
-    if (mc == null) {
-      this.maxConcurrent = Infinity;
-    } else if (!Number.isFinite(mc) || mc < 1) {
-      // A typo'd 0 / negative / NaN must not deadlock the provider — ignore the
-      // cap (no limit) and say so loudly.
-      console.warn(
-        `[axl] RateLimiter: ignoring invalid maxConcurrent (${mc}); expected an integer >= 1. No concurrency cap applied.`,
-      );
-      this.maxConcurrent = Infinity;
-    } else {
-      this.maxConcurrent = Math.floor(mc);
-      if (this.maxConcurrent < 2) {
-        console.warn(
-          `[axl] RateLimiter: maxConcurrent=${this.maxConcurrent} serializes every request to this provider. ` +
-            `Nested same-provider calls still complete (permits aren't held across a nested ask), but throughput is a floor, not a guarantee.`,
-        );
-      }
-    }
+    this.applyLimits(sanitizeRateLimitConfig(config));
+  }
 
-    this.minIntervalMs =
-      config.minIntervalMs != null &&
-      Number.isFinite(config.minIntervalMs) &&
-      config.minIntervalMs > 0
-        ? config.minIntervalMs
-        : 0;
-    this.acquireTimeoutMs =
-      config.acquireTimeoutMs != null &&
-      Number.isFinite(config.acquireTimeoutMs) &&
-      config.acquireTimeoutMs > 0
-        ? config.acquireTimeoutMs
-        : undefined;
+  /**
+   * Apply already-sanitized limits (see {@link sanitizeRateLimitConfig}). An
+   * absent field means "no limit". Takes effect for the next grant; a waiter
+   * already queued keeps the `acquireTimeoutMs` timer it was armed with.
+   *
+   * @internal Extension point for Axl's own per-scope governor; not a supported
+   * public contract and may change without notice.
+   */
+  protected applyLimits(limits: RateLimitConfig): void {
+    this.maxConcurrent = limits.maxConcurrent ?? Infinity;
+    this.minIntervalMs = limits.minIntervalMs ?? 0;
+    this.acquireTimeoutMs = limits.acquireTimeoutMs;
+    this.pump();
   }
 
   /**
@@ -138,31 +234,57 @@ export class RateLimiter {
    * With `acquireTimeoutMs`, a waiter that sits in the queue too long rejects.
    */
   acquire(signal?: AbortSignal): Promise<void> {
+    return this.enqueue(signal, { priority: false, timeoutMs: this.acquireTimeoutMs });
+  }
+
+  /**
+   * Queue for a permit. A `priority` waiter goes ahead of every non-priority
+   * waiter (FIFO among priority waiters) and never warns about queueing;
+   * `timeoutMs` arms the fail-loud queue timeout (`undefined`: none).
+   *
+   * @internal Extension point for Axl's own per-scope governor (a retry's
+   * re-acquire); not a supported public contract and may change without notice.
+   */
+  protected enqueue(
+    signal: AbortSignal | undefined,
+    options: { priority: boolean; timeoutMs: number | undefined },
+  ): Promise<void> {
     if (signal?.aborted) return Promise.reject(signal.reason);
 
     return new Promise<void>((resolve, reject) => {
-      const waiter: Waiter = { resolve, reject, signal };
+      const waiter: Waiter = { resolve, reject, signal, priority: options.priority };
 
       if (signal) {
         waiter.onAbort = () => this.settleWaiter(waiter, signal.reason);
         signal.addEventListener('abort', waiter.onAbort, { once: true });
       }
-      if (this.acquireTimeoutMs != null) {
+      // Capture the timeout this waiter is armed with: a pooled governor can be
+      // tightened while it waits, and the message must name the value that fired.
+      const timeoutMs = options.timeoutMs;
+      if (timeoutMs != null) {
         waiter.timer = setTimeout(
           () =>
             this.settleWaiter(
               waiter,
-              new Error(`RateLimiter.acquire timed out after ${this.acquireTimeoutMs}ms`),
+              new Error(`RateLimiter.acquire timed out after ${timeoutMs}ms`),
             ),
-          this.acquireTimeoutMs,
+          timeoutMs,
         );
       }
 
-      this.queue.push(waiter);
+      if (options.priority) {
+        const firstOrdinary = this.queue.findIndex((w) => !w.priority);
+        this.queue.splice(firstOrdinary === -1 ? this.queue.length : firstOrdinary, 0, waiter);
+      } else {
+        this.queue.push(waiter);
+      }
       this.pump();
 
       // If pump() couldn't grant this waiter synchronously, it genuinely queued.
-      if (!waiter.granted && !this.warnedQueued) {
+      // Warn only about the configured caps: a queue caused by something else
+      // (a rate-limit brake or adaptive spacing on a pooled governor) is not a
+      // cap to raise.
+      if (!waiter.granted && !options.priority && this.staticCapBinding() && !this.warnedQueued) {
         this.warnedQueued = true;
         console.warn(
           `[axl] RateLimiter: request queued (maxConcurrent=${this.maxConcurrent}${this.minIntervalMs ? `, minIntervalMs=${this.minIntervalMs}` : ''}). ` +
@@ -170,6 +292,69 @@ export class RateLimiter {
         );
       }
     });
+  }
+
+  /**
+   * Take a permit synchronously if one is free right now — nobody queued,
+   * capacity available and spacing satisfied — exactly when `acquire()` would
+   * grant without waiting. Returns whether it took one; the caller pairs a
+   * `true` with one {@link release}.
+   *
+   * @internal Extension point for Axl's own per-scope governor.
+   */
+  protected tryGrant(): boolean {
+    if (this.queue.length > 0 || this.active >= this.maxConcurrent) return false;
+    if (this.spacingWaitMs() > 0) return false;
+    this.active++;
+    this.lastGrantAt = Date.now();
+    this.onGrant(this.lastGrantAt);
+    return true;
+  }
+
+  /**
+   * The minimum gap between two grants, in ms. Every grant path (the queue
+   * pump, priority waiters and {@link tryGrant}) spaces by it.
+   *
+   * @internal Extension point for Axl's own per-scope governor, which widens it
+   * while adaptively paced; not a supported public contract.
+   */
+  protected grantIntervalMs(): number {
+    return this.minIntervalMs;
+  }
+
+  /**
+   * Called on every grant, with its timestamp.
+   *
+   * @internal Extension point for Axl's own per-scope governor.
+   */
+  protected onGrant(_at: number): void {
+    // intentionally empty
+  }
+
+  /** How long the next grant must wait for spacing; `<= 0` means it may go now. */
+  private spacingWaitMs(): number {
+    const interval = this.grantIntervalMs();
+    return interval > 0 ? interval - (Date.now() - this.lastGrantAt) : 0;
+  }
+
+  /**
+   * Whether a CONFIGURED cap is what stops a grant right now: the concurrency
+   * cap is full, or the configured spacing has not elapsed. Queueing for any
+   * other reason (a brake, adaptive spacing) is not a cap the user can raise,
+   * so it never triggers the queued warning.
+   */
+  private staticCapBinding(): boolean {
+    if (this.active >= this.maxConcurrent) return true;
+    return this.minIntervalMs > 0 && this.minIntervalMs - (Date.now() - this.lastGrantAt) > 0;
+  }
+
+  /**
+   * Whether any caller is queued for a permit.
+   *
+   * @internal Extension point for Axl's own per-scope governor.
+   */
+  protected hasWaiters(): boolean {
+    return this.queue.length > 0;
   }
 
   /** Release a previously acquired permit and wake the next waiter. */
@@ -188,26 +373,31 @@ export class RateLimiter {
     this.pump();
   }
 
-  /** v1 no-op seam for a future adaptive (rate-limit-header-driven) pacing follow-up. */
+  /** No-op; the per-scope governor overrides it to read quota headers. */
   observe(_res: Response): void {
     // intentionally empty
   }
 
-  /** Drain the queue: grant head waiters while a permit is free and spacing allows. */
-  private pump(): void {
+  /**
+   * Drain the queue: grant head waiters while a permit is free and spacing allows.
+   * Protected so the internal per-scope governor can gate grants on its own
+   * state (for example a brake) by overriding it.
+   *
+   * @internal Extension point for Axl's own per-scope governor; not a supported
+   * public contract and may change without notice.
+   */
+  protected pump(): void {
     while (this.queue.length > 0 && this.active < this.maxConcurrent) {
-      if (this.minIntervalMs > 0) {
-        const waitMs = this.minIntervalMs - (Date.now() - this.lastGrantAt);
-        if (waitMs > 0) {
-          // Head-of-line waits out the spacing interval. One shared timer re-pumps.
-          if (!this.spacingTimer) {
-            this.spacingTimer = setTimeout(() => {
-              this.spacingTimer = undefined;
-              this.pump();
-            }, waitMs);
-          }
-          return;
+      const waitMs = this.spacingWaitMs();
+      if (waitMs > 0) {
+        // Head-of-line waits out the spacing interval. One shared timer re-pumps.
+        if (!this.spacingTimer) {
+          this.spacingTimer = setTimeout(() => {
+            this.spacingTimer = undefined;
+            this.pump();
+          }, waitMs);
         }
+        return;
       }
       const waiter = this.queue.shift()!;
       this.grant(waiter);
@@ -220,6 +410,7 @@ export class RateLimiter {
     this.active++;
     this.lastGrantAt = Date.now();
     this.clearWaiterTimers(waiter);
+    this.onGrant(this.lastGrantAt);
     waiter.resolve();
   }
 
@@ -229,6 +420,12 @@ export class RateLimiter {
     waiter.settled = true;
     const idx = this.queue.indexOf(waiter);
     if (idx !== -1) this.queue.splice(idx, 1);
+    // The spacing timer exists only to wake a queued waiter; with none left it
+    // would just hold the event loop open for up to one interval.
+    if (this.queue.length === 0 && this.spacingTimer !== undefined) {
+      clearTimeout(this.spacingTimer);
+      this.spacingTimer = undefined;
+    }
     this.clearWaiterTimers(waiter);
     waiter.reject(err);
     // A queued waiter never held a permit, so no release() is needed; but its

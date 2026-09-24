@@ -46,6 +46,29 @@ import {
   normalizeStoredExecution as normalizeHistoricalExecution,
 } from './event-schema.js';
 import { eventCostContribution, isUnpricedLeaf } from './event-utils.js';
+import {
+  runInAccountingScope,
+  type Accounting,
+  type AdmissionController,
+  type OperationPurpose,
+} from './accounting.js';
+import { createScopedProvider } from './providers/scoped-provider.js';
+import {
+  FileDiagnosticArtifactStore,
+  type ArtifactManifest,
+  type ArtifactOwner,
+  type ArtifactStatus,
+  type DiagnosticArtifactStore,
+  type OpenedArtifact,
+  type StagedArtifact,
+} from './diagnostics/artifact-store.js';
+import {
+  RequestCaptureChannel,
+  runWithCaptureChannel,
+  runWithCaptureCorrelation,
+  type CaptureCorrelation,
+  type RequestCaptureSink,
+} from './diagnostics/capture.js';
 import { NoopSpanManager } from './telemetry/noop.js';
 import { createSpanManager } from './telemetry/index.js';
 import type { SpanManager, SpanHandle } from './telemetry/types.js';
@@ -55,8 +78,12 @@ import type { SpanManager, SpanHandle } from './telemetry/types.js';
  * `runtime.execute(workflow, input)` behavior. The runtime injects itself as
  * the second argument so user code can call `runtime.createContext()` etc.
  *
- * Returns `{ output, cost?, metadata? }` — cost and metadata are optional and
- * fall back to values derived from `runtime.trackExecution()` when omitted.
+ * Returns `{ output, cost?, metadata? }`. Both extras are optional and purely
+ * informational: since 0.24 the eval runner MEASURES spend on the accounting
+ * rail, so a `cost` reported here is recorded as a caller claim
+ * (`EvalItem.callerReport`) and never becomes a run total. Reserved diagnostic
+ * metadata keys (`models`, `tokens`, …) are likewise kept apart from the
+ * runtime's own.
  *
  * Single source of truth for the eval-execution contract; consumed by
  * `registerEval`, `getRegisteredEval`, the `axl-eval` CLI, and
@@ -82,6 +109,20 @@ function hashInput(input: unknown): string {
 const DEFAULT_MAX_EVENTS_PER_EXECUTION = 50_000;
 const DEFAULT_STREAMING_BATCH_SIZE = 100;
 const DEFAULT_STREAMING_BATCH_INTERVAL = 1_000; // ms
+/** How often orphaned/expired diagnostic artifacts are reclaimed. */
+const DEFAULT_ARTIFACT_SWEEP_MS = 60_000;
+/** How long an actively-written (staged) artifact is protected from the sweep. */
+const DEFAULT_ARTIFACT_LEASE_MS = 300_000;
+/** How long one artifact's lease is renewed before the runtime gives up on it. */
+const DEFAULT_ARTIFACT_MAX_HOLD_MS = 24 * 60 * 60 * 1000;
+/** How many dropped eval history ids the runtime remembers. See `deletedEvalIds`. */
+const DELETED_EVAL_MEMORY = 1024;
+/**
+ * One warning per process for a store that cannot do a retention-neutral
+ * update. It is a static misconfiguration — a Redis older than 6.0 — so every
+ * later correction would repeat the same line, and corrections fire on a timer.
+ */
+let warnedUpdateUnsupported = false;
 
 /** Sentinel workflow name on synthesized ExecutionInfos when the streaming
  *  buffer doesn't include a `workflow_start` event. The `__axl/` prefix
@@ -501,6 +542,8 @@ export type RuntimeEvalConfigShape = {
   scorerConcurrency?: number;
   budget?: string;
   failOnScorerErrorRate?: number;
+  /** Mirrors `EvalConfig.failOnItemErrorRate` (default `0.05`; `1` disables the gate). */
+  failOnItemErrorRate?: number;
   metadata?: Record<string, unknown>;
 };
 
@@ -575,6 +618,166 @@ function forwardAbortSignal(
 }
 
 /**
+ * Event-derived execution metadata returned by {@link AxlRuntime.trackExecution}
+ * and {@link AxlRuntime.trackOutcome}.
+ *
+ * Derived from trace events, so it follows trace configuration — unlike
+ * `Accounting`, which is independent of it.
+ */
+export type TrackExecutionMetadata = {
+  /** Unique effective model URIs observed, in first-seen order. */
+  models: string[];
+  modelCallCounts?: Record<string, number>;
+  /**
+   * Agent token totals only — embedder tokens from semantic memory are a
+   * different category and are excluded. Read `Accounting.usage` for the
+   * folded, category-separated totals.
+   */
+  tokens: { input: number; output: number; reasoning: number };
+  agentCalls: number;
+  /**
+   * Unique workflow names observed during execution, ordered by first
+   * appearance (outermost first for nested calls). Captured automatically
+   * from `workflow_start` trace events — callers don't need to declare
+   * anything. Parallel mechanism to `models`.
+   */
+  workflows: string[];
+  /** Call counts per workflow, if workflows.length > 0. */
+  workflowCallCounts?: Record<string, number>;
+};
+
+/**
+ * Per-model sums of `agent_call_end.timing`, keyed by the same effective
+ * model URI as `TrackExecutionMetadata.modelCallCounts`. Present only when at
+ * least one tracked call reported timing, so absence means "nothing was
+ * instrumented" rather than "everything took zero ms".
+ *
+ * `calls` counts the SUCCESSFUL timed calls only — it can be lower than the
+ * same model's `modelCallCounts` entry when a provider omits `timing` or a
+ * call failed. Divide a sum by `calls`, never by `modelCallCounts`.
+ *
+ * Failed calls are excluded even though they now report timing: a non-2xx
+ * response is a measured round trip, but a rollup blending answers with
+ * failures describes neither, and a fast 429 would improve a model's
+ * apparent latency. The failures stay on the events themselves.
+ *
+ * `firstTokenMs` is streaming-only and is summed across the calls that
+ * reported it; it is omitted entirely when no call did, so a non-streaming
+ * model never reports a misleading `0`. Its denominator is `firstTokenCalls`,
+ * NOT `calls` — the two travel together and are present or absent together,
+ * so a mixed streaming/non-streaming model still yields an exact mean.
+ *
+ * Sums are per-call totals, so `wireMs` across concurrent calls can exceed
+ * the wall clock of the tracked function — that is expected under fan-out and
+ * is why nothing in the core sums timing at the ask level.
+ */
+export type ModelTimingRollup = Record<
+  string,
+  {
+    calls: number;
+    queuedMs: number;
+    retryMs: number;
+    wireMs: number;
+    firstTokenMs?: number;
+    /** Timed calls that reported a `firstTokenMs` — the denominator for it. */
+    firstTokenCalls?: number;
+    /**
+     * The per-call blocks the sums were built from, in event order.
+     * `length === calls`. Present only under `captureTimingSamples`, because
+     * retaining it is O(calls) in memory and the sums alone are O(models) — a
+     * caller that needs a real DISTRIBUTION (percentiles, min/max) cannot
+     * recover one from sums, and everyone else should not pay for it.
+     */
+    samples?: CallTiming[];
+  }
+>;
+
+/** Options for {@link AxlRuntime.trackOutcome}. */
+export type TrackOutcomeOptions = {
+  /**
+   * How this scope's operations are classified in `Accounting.breakdown`.
+   * Defaults to the enclosing scope's purpose, else `'generation'`.
+   */
+  purpose?: OperationPurpose;
+  /** Stop admitting new paid operations once known spend reaches its limit. */
+  admission?: AdmissionController;
+  /** Collect the raw `AxlEvent[]` observed during the call. */
+  captureTraces?: boolean;
+  /** Retain the per-call `CallTiming` blocks behind the `modelTiming` sums. */
+  captureTimingSamples?: boolean;
+  /**
+   * Opt in to bounded, redaction-aware capture of the provider-neutral REQUESTS
+   * this scope submits, written into `sink` as JSONL.
+   *
+   * Diagnostics only: capture can be truncated, fail outright, or be turned off
+   * entirely and `accounting` is byte-identical either way. The sink is never
+   * awaited by a provider call. Nested scopes inherit the enclosing channel, so
+   * declare it once at the outermost scope of a run.
+   *
+   * The CALLER owns the channel because the caller is the one that has to
+   * `close()` it and read back its operation ledger after the run.
+   */
+  capture?: RequestCaptureChannel;
+  /**
+   * Stamp consumer-side identity onto every record captured inside this scope
+   * (an eval's `caseIndex`, a judge's `scorer` name). Merged over the enclosing
+   * scope's correlation, so a scorer scope keeps its item's case index.
+   */
+  captureCorrelation?: CaptureCorrelation;
+};
+
+/** The result of {@link AxlRuntime.trackOutcome} — never a rejection. */
+export type TrackedOutcome<T> = (
+  | { status: 'fulfilled'; value: T }
+  /** The ORIGINAL thrown value: primitives and frozen objects are untouched. */
+  | { status: 'rejected'; error: unknown }
+) & {
+  /** Authoritative spend. Independent of trace level, capture and redaction. */
+  accounting: Accounting;
+  metadata: TrackExecutionMetadata;
+  modelTiming?: ModelTimingRollup;
+  traces?: AxlEvent[];
+};
+
+/** The result of {@link AxlRuntime.trackExecution}. */
+export type TrackExecutionResult<T> = {
+  result: T;
+  /** Compatibility view of `accounting.knownCost`. */
+  cost: number;
+  /** Compatibility view of `accounting.completeness !== 'complete'`. When true,
+   *  `cost` is a LOWER BOUND. */
+  unpriced: boolean;
+  /** The authoritative record `cost` and `unpriced` are derived from. */
+  accounting: Accounting;
+  modelTiming?: ModelTimingRollup;
+  traces?: AxlEvent[];
+  metadata: TrackExecutionMetadata;
+};
+
+/**
+ * Attach captured traces to a thrown value so `trackExecution` callers can
+ * recover the diagnostic trail on failure. Non-enumerable so it does not
+ * pollute JSON serialization or stack traces.
+ *
+ * Best effort by design: a frozen or sealed error must come back to the caller
+ * with its identity intact, so a failed attachment is swallowed rather than
+ * replacing the user's error with a `TypeError` about property definition.
+ */
+function attachCapturedTraces(error: unknown, traces: AxlEvent[]): void {
+  if (typeof error !== 'object' || error === null) return;
+  try {
+    Object.defineProperty(error, 'axlCapturedTraces', {
+      value: traces,
+      enumerable: false,
+      writable: true,
+      configurable: true,
+    });
+  } catch {
+    // Frozen/sealed thrown value — the error identity matters more.
+  }
+}
+
+/**
  * The main entry point for executing Axl workflows.
  * Manages workflow registration, provider resolution, state storage, tracing, MCP servers,
  * and human-in-the-loop decision handling. Supports both synchronous (`execute`) and
@@ -586,6 +789,9 @@ export class AxlRuntime extends EventEmitter {
   private tools = new Map<string, Tool>();
   private agents = new Map<string, Agent>();
   private providerRegistry: ProviderRegistry;
+  /** Raw adapter → its scoped facade. Keyed weakly so a registry that drops an
+   *  adapter does not pin it here. */
+  private scopedProviders = new WeakMap<Provider, Provider>();
   private transcriptionProviderRegistry: TranscriptionProviderRegistry;
   private stateStore: StateStore;
   private executions = new Map<string, ExecutionInfo>();
@@ -641,6 +847,30 @@ export class AxlRuntime extends EventEmitter {
    *  The Set is mutated by the chain's own `.finally` so entries clear as
    *  soon as the work settles. */
   private persistInflight = new Set<Promise<void>>();
+  /** Resolved diagnostic artifact backend, when `diagnostics.artifacts` is set. */
+  private artifactStore?: DiagnosticArtifactStore;
+  private artifactLeaseMs = DEFAULT_ARTIFACT_LEASE_MS;
+  private artifactMaxHoldMs = DEFAULT_ARTIFACT_MAX_HOLD_MS;
+  private artifactSweepTimer?: ReturnType<typeof setInterval>;
+  /**
+   * Eval history ids this process has established are gone.
+   *
+   * Two jobs. It makes a delete started here beat a correction already in
+   * flight, which no store-side condition can do while the delete has not
+   * landed yet. And it keeps the lazy first load from merging a row back in
+   * from a snapshot taken before the eviction. Ids are minted per result and
+   * never reused, so an entry can only ever be right.
+   *
+   * Bounded like the artifact store's deleted-id window, and for the same
+   * reason: a long-lived server with TTL churn would otherwise grow it for the
+   * life of the process. Both jobs are windows measured in the length of one
+   * in-flight write or one lazy first load, so the oldest ids are the ones with
+   * nothing left to protect. Past the window the row is simply re-read from the
+   * store, which by then is the authority anyway.
+   */
+  private readonly deletedEvalIds = new Set<string>();
+  /** Lease-renewal timers for artifacts currently being written, by id. */
+  private readonly artifactRenewals = new Map<string, ReturnType<typeof setInterval>>();
 
   constructor(config?: AxlConfig) {
     super();
@@ -695,6 +925,454 @@ export class AxlRuntime extends EventEmitter {
             `methods on your custom StateStore.`,
         );
       }
+    }
+    this.setUpDiagnosticArtifacts();
+  }
+
+  // ── Diagnostic artifacts (opt-in request capture) ────────────────────
+
+  /**
+   * Resolve the artifact backend and arm reclamation.
+   *
+   * Two configuration errors are raised HERE rather than at capture time,
+   * because both mean "this deployment can never host managed capture" and the
+   * alternative is discovering it after an eval has already spent money:
+   * a `diagnostics.artifacts` block with neither `store` nor `root`, and a
+   * custom `StateStore` that cannot report eval retention.
+   */
+  private setUpDiagnosticArtifacts(): void {
+    const artifacts = this.config.diagnostics?.artifacts;
+    if (!artifacts) return;
+    if (artifacts.store) {
+      this.artifactStore = artifacts.store;
+    } else if (typeof artifacts.root === 'string' && artifacts.root.trim() !== '') {
+      this.artifactStore = new FileDiagnosticArtifactStore({ root: artifacts.root });
+    } else {
+      throw new AxlError(
+        'DIAGNOSTICS_UNAVAILABLE',
+        'config.diagnostics.artifacts requires either `root` (built-in filesystem store) ' +
+          'or `store` (a host-supplied DiagnosticArtifactStore). Axl will not write captured ' +
+          'requests to a process temp folder.',
+      );
+    }
+    if (typeof this.stateStore.getEvalRetention !== 'function') {
+      throw new AxlError(
+        'DIAGNOSTICS_UNAVAILABLE',
+        'config.diagnostics.artifacts requires a StateStore implementing getEvalRetention(id) ' +
+          'so artifact lifetime can follow the eval history row that owns it. The built-in ' +
+          'memory, SQLite and Redis stores implement it; add it to your custom store.',
+      );
+    }
+    this.artifactLeaseMs =
+      typeof artifacts.leaseMs === 'number' && artifacts.leaseMs > 0
+        ? artifacts.leaseMs
+        : DEFAULT_ARTIFACT_LEASE_MS;
+    this.artifactMaxHoldMs =
+      typeof artifacts.maxHoldMs === 'number' && artifacts.maxHoldMs > 0
+        ? artifacts.maxHoldMs
+        : DEFAULT_ARTIFACT_MAX_HOLD_MS;
+    const sweepMs =
+      typeof artifacts.sweepIntervalMs === 'number' && artifacts.sweepIntervalMs > 0
+        ? artifacts.sweepIntervalMs
+        : DEFAULT_ARTIFACT_SWEEP_MS;
+    // Startup reconciliation: a process that was down while a Redis TTL expired
+    // (or that died mid-run) has orphaned bytes on disk right now. Fire-and-
+    // forget so construction stays synchronous; failures are diagnostics-only.
+    void this.reconcileDiagnosticArtifacts().catch(() => undefined);
+    this.artifactSweepTimer = setInterval(() => {
+      void this.reconcileDiagnosticArtifacts().catch(() => undefined);
+    }, sweepMs);
+    // Never hold the event loop open for a diagnostics sweeper.
+    this.artifactSweepTimer.unref?.();
+  }
+
+  /** The configured artifact backend, or `undefined` when capture is off. */
+  getDiagnosticArtifactStore(): DiagnosticArtifactStore | undefined {
+    return this.artifactStore;
+  }
+
+  private requireArtifactStore(): DiagnosticArtifactStore {
+    if (!this.artifactStore) {
+      throw new AxlError(
+        'DIAGNOSTICS_UNAVAILABLE',
+        'Request capture was requested but no diagnostic artifact store is configured. ' +
+          'Set config.diagnostics.artifacts = { root: "<dir>" } (or supply your own `store`).',
+      );
+    }
+    return this.artifactStore;
+  }
+
+  /**
+   * Reserve an artifact for `owner` and hand back a sink to write records into.
+   *
+   * Throws `AxlError('DIAGNOSTICS_UNAVAILABLE')` BEFORE any work when capture is
+   * not configured, which is why `runEval` calls it ahead of loading the
+   * dataset. The returned sink renews the staging lease as it writes, so a long
+   * run is never swept out from under itself, while a run that dies leaves a
+   * lease that expires and is reclaimed.
+   */
+  async stageDiagnosticArtifact(owner: ArtifactOwner): Promise<{
+    artifactId: string;
+    sink: RequestCaptureSink;
+  }> {
+    const staged = await this.requireArtifactStore().stage(owner, {
+      leaseMs: this.artifactLeaseMs,
+    });
+    return this.holdStagedArtifact(staged);
+  }
+
+  /**
+   * Hold a staged artifact's lease for as long as its writer lives, and hand
+   * back the sink that writer appends through.
+   *
+   * The lease belongs to the WRITER's lifetime, not to its write rate. Renewing
+   * from inside `append` looks equivalent and is not: a run that exhausts
+   * `maxRunBytes` at minute two stops appending forever, and a run waiting on a
+   * tool or a human approval may not call a provider for longer than a lease.
+   * Either way the sweeper would delete a live run's evidence, and the run
+   * would then fail to finalize the artifact it had been filling.
+   */
+  private holdStagedArtifact(staged: StagedArtifact): {
+    artifactId: string;
+    sink: RequestCaptureSink;
+  } {
+    const store = this.requireArtifactStore();
+    // A caller that neither finalizes nor rolls back would otherwise pin this
+    // artifact FOREVER: the sweeper only reclaims a lease that expired, so a
+    // renewal nobody stops removes the last self-healing path. The hold is
+    // therefore bounded — past `maxHoldMs` the runtime lets go, the lease runs
+    // out, and the artifact is reclaimed like any abandoned writer's. Callers
+    // still stop their own timers; this is the floor under a caller bug.
+    const heldUntil = Date.now() + this.artifactMaxHoldMs;
+    const timer = setInterval(
+      () => {
+        if (Date.now() >= heldUntil) {
+          this.stopArtifactRenewal(staged.artifactId);
+          return;
+        }
+        void staged.renewLease().catch(() => undefined);
+      },
+      Math.max(1, Math.floor(this.artifactLeaseMs / 2)),
+    );
+    timer.unref?.();
+    this.artifactRenewals.set(staged.artifactId, timer);
+    return {
+      artifactId: staged.artifactId,
+      sink: {
+        append: (line: string) => store.append(staged.artifactId, line),
+      },
+    };
+  }
+
+  /** Stop renewing a lease once the writer is done with the artifact. */
+  private stopArtifactRenewal(artifactId: string): void {
+    const timer = this.artifactRenewals.get(artifactId);
+    if (!timer) return;
+    clearInterval(timer);
+    this.artifactRenewals.delete(artifactId);
+  }
+
+  /** Seal a staged artifact's manifest. Called before the history row is saved. */
+  async finalizeDiagnosticArtifact(
+    artifactId: string,
+    status: ArtifactStatus,
+    reason?: string,
+    redaction?: 'applied' | 'none',
+  ): Promise<ArtifactManifest> {
+    // Stop renewing FIRST: a renewal landing after the finalized manifest is
+    // exactly the write the store's serializer exists to order, and there is
+    // nothing left to keep alive.
+    this.stopArtifactRenewal(artifactId);
+    return this.requireArtifactStore().finalize(artifactId, status, reason, redaction);
+  }
+
+  /** Discard a staged artifact whose owner will never be written. */
+  async rollbackDiagnosticArtifact(artifactId: string): Promise<void> {
+    this.stopArtifactRenewal(artifactId);
+    await this.requireArtifactStore().rollback(artifactId);
+  }
+
+  /**
+   * Copy a source run's artifact into a new owner (rescore provenance).
+   *
+   * Bounded by `maxBytes`; a partial copy reports `truncated` so the caller can
+   * finalize the new manifest honestly. Returns `undefined` when the source is
+   * gone — a rescore of a run whose artifact was deleted still produces numbers,
+   * it just reports its diagnostics as `unavailable`.
+   *
+   * The copy comes back STAGED and lease-held, with a sink: the new owner
+   * carries the source records forward AND keeps writing its own calls into the
+   * same artifact, which is what makes one rescore result hold both halves of
+   * its evidence.
+   */
+  async copyDiagnosticArtifact(
+    sourceId: string,
+    owner: ArtifactOwner,
+    opts: { maxBytes: number },
+  ): Promise<
+    | {
+        artifactId: string;
+        truncated: boolean;
+        bytes: number;
+        /** What the SOURCE manifest said about the copied bytes. Never inferred. */
+        redaction: 'applied' | 'none';
+        sink: RequestCaptureSink;
+      }
+    | undefined
+  > {
+    const copied = await this.requireArtifactStore().copy(sourceId, owner, {
+      maxBytes: opts.maxBytes,
+      leaseMs: this.artifactLeaseMs,
+    });
+    if (!copied) return undefined;
+    return {
+      ...this.holdStagedArtifact(copied),
+      truncated: copied.truncated,
+      bytes: copied.bytes,
+      redaction: copied.redaction,
+    };
+  }
+
+  /**
+   * Read a committed artifact's records, or `undefined`.
+   *
+   * Two logical checks stand between a caller and the bytes, because the bytes
+   * outlive the store that governs them: the owning history row must still
+   * exist, and the mirrored `expiresAt` must not have passed. A Redis row that
+   * aged out while this process was offline therefore reads as unavailable the
+   * moment it is asked for, not whenever the sweeper next runs.
+   */
+  async openDiagnosticArtifact(artifactId: string): Promise<OpenedArtifact | undefined> {
+    if (!this.artifactStore) return undefined;
+    const opened = await this.artifactStore.open(artifactId);
+    if (!opened) return undefined;
+    const { manifest } = opened;
+    // §12.1: only a committed artifact is readable here. A staged one has no
+    // owner row yet (or never will), and a delete_pending one is on its way
+    // out. The CLI's standalone bundle is deliberately not on this path — it
+    // reads through `getDiagnosticArtifactStore()` because it has no history
+    // row to resolve through.
+    if (manifest.state !== 'committed') return undefined;
+    if (manifest.expiresAt !== undefined && manifest.expiresAt <= Date.now()) return undefined;
+    const retention = await this.stateStore.getEvalRetention?.(manifest.owner.id);
+    if (retention && !retention.exists) return undefined;
+    return opened;
+  }
+
+  /**
+   * Reclaim artifacts nothing can legitimately read any more.
+   *
+   * Removed: everything marked `delete_pending` (a delete that did not finish),
+   * every `committed` artifact whose owner row is gone or whose expiry has
+   * passed, and every `staged` artifact whose lease ran out. A staged artifact
+   * with a LIVE lease is never touched — that is an active writer, and sweeping
+   * it would race a run that is still producing evidence.
+   */
+  async reconcileDiagnosticArtifacts(): Promise<{ removed: string[] }> {
+    const store = this.artifactStore;
+    if (!store) return { removed: [] };
+    const now = Date.now();
+    const removed: string[] = [];
+    for (const manifest of await store.list()) {
+      let cause: string | undefined;
+      if (manifest.state === 'delete_pending') {
+        cause = 'a delete that did not finish was completed by the sweep';
+      } else if (manifest.state === 'staged') {
+        if (manifest.leaseUntil === undefined || manifest.leaseUntil <= now) {
+          cause = "its writer's lease expired, so the sweep reclaimed it";
+        }
+      } else {
+        if (manifest.expiresAt !== undefined && manifest.expiresAt <= now) {
+          cause = 'it reached its retention expiry and was reclaimed';
+        } else {
+          const retention = await this.stateStore.getEvalRetention?.(manifest.owner.id);
+          if (retention && !retention.exists) {
+            cause = 'the history row that owned it is gone, so it was reclaimed';
+          }
+        }
+      }
+      if (cause === undefined) continue;
+      try {
+        await store.delete(manifest.artifactId);
+        removed.push(manifest.artifactId);
+      } catch {
+        // Leave it for the next sweep rather than aborting the whole pass —
+        // one undeletable artifact must not strand every other orphan.
+        continue;
+      }
+      // The bytes are gone; the row that points at them must say so, or every
+      // reader is left depending on a liveness check to discover it — and the
+      // ones that cannot make one (an export, a CLI listing, a client cache
+      // rendered from a stored result) publish a result promising evidence
+      // nothing can serve. A staged or delete_pending artifact usually has no
+      // committed owner row, but if one exists it gets the same treatment: the
+      // lookup is by owner id and does not care which state it was reclaimed
+      // from.
+      await this.downgradeReclaimedOwner(manifest, cause);
+    }
+    return { removed };
+  }
+
+  /**
+   * Rewrite the history row that owned an artifact the sweep has just removed.
+   *
+   * Best effort by design: reclaiming the bytes is the operation that had to
+   * succeed, and a state store that cannot take the correction must not turn a
+   * routine sweep into a throwing one. The next `saveEvalResult` or artifact
+   * read corrects the row anyway, because both already downgrade a dangling id.
+   */
+  private async downgradeReclaimedOwner(manifest: ArtifactManifest, cause: string): Promise<void> {
+    if (manifest.owner.kind !== 'eval') return;
+    try {
+      const entry = await this.getEvalResult(manifest.owner.id);
+      // Only the row that actually names THIS artifact: a degraded rescore
+      // carries its source's id in provenance, and rewriting a row over an
+      // artifact it does not own is the cross-result corruption §12.1 forbids.
+      if (!entry || this.artifactIdOf(entry.data) !== manifest.artifactId) return;
+      this.downgradeDiagnostics(
+        entry,
+        `the captured-request artifact for this result is gone: ${cause}`,
+      );
+      await this.persistCorrectedRow(entry);
+    } catch {
+      // See the docstring: the bytes are already gone either way.
+    }
+  }
+
+  /**
+   * Write back a history row this process corrected in memory — but ONLY while
+   * the store still holds it.
+   *
+   * The history cache is process-global, loaded once and evicted only by
+   * `deleteEvalResult`. It therefore outlives whatever the STORE decided: a
+   * Redis TTL that elapsed, a delete by another process, a
+   * right-to-be-forgotten request. A blind `saveEvalResult` of a cached row
+   * resurrects all of it — item inputs, outputs and scores — and on Redis
+   * re-SETs it with a fresh full TTL window, silently extending the retention
+   * the operator configured. Correcting a row must never be able to un-delete
+   * one, so the store is asked first and the stale cache entry is dropped when
+   * the answer is no.
+   *
+   * A store with no retention view cannot answer, and a blind write is exactly
+   * what this exists to prevent, so nothing is written: the cache is corrected
+   * and the store keeps what it decided. In practice the question does not
+   * arise, because configuring artifacts at all requires `getEvalRetention`.
+   */
+  private async persistCorrectedRow(entry: EvalHistoryEntry): Promise<boolean> {
+    // A delete this process already started always wins. It may still be in
+    // flight — `deleteEvalResult` awaits the store — and the store cannot
+    // refuse a write for a row it has not removed yet.
+    if (this.deletedEvalIds.has(entry.id)) {
+      this.forgetEvalRow(entry.id);
+      return false;
+    }
+    // Update-only or nothing. A store that cannot promise the write will not
+    // CREATE the row cannot be handed a correction at all: checking first and
+    // then saving leaves a window a delete or an expiry slips through, and on a
+    // store with no expiry the row it recreates never ages back out. The cache
+    // is corrected either way, so this process stops publishing a promise of
+    // bytes that are gone.
+    if (!this.stateStore.updateEvalResult) return false;
+    let updated: boolean;
+    try {
+      updated = await this.stateStore.updateEvalResult(entry);
+    } catch (err) {
+      // A store that cannot express the write at all is a misconfiguration, and
+      // every caller here is best-effort: the raw rejection would vanish into
+      // their catches and the operator would never learn that no correction has
+      // ever been persisted. Only this one class is absorbed; anything else
+      // keeps the existing behaviour and propagates to the caller.
+      if (!(err instanceof AxlError) || err.code !== 'REDIS_VERSION_UNSUPPORTED') throw err;
+      if (!warnedUpdateUnsupported) {
+        warnedUpdateUnsupported = true;
+        console.warn(`[axl] ${err.message} Corrections apply to this process's cache only.`);
+      }
+      return false;
+    }
+    if (!updated) this.forgetEvalRow(entry.id);
+    return updated;
+  }
+
+  /**
+   * Drop a row from the history cache and refuse to re-add it.
+   *
+   * The cache is process-global and loaded once, so a row the STORE has
+   * dropped — expired, deleted here or elsewhere — would otherwise be served
+   * for the life of the process, and an in-flight first load whose snapshot
+   * predates the eviction would merge it straight back in.
+   */
+  private forgetEvalRow(id: string): void {
+    this.evalHistory = this.evalHistory.filter((e) => e.id !== id);
+    // Re-adding does not move an existing id to the back of a Set's insertion
+    // order, but an id re-enters the cache only through a save, which clears
+    // its tombstone, so there is nothing to refresh.
+    this.deletedEvalIds.add(id);
+    while (this.deletedEvalIds.size > DELETED_EVAL_MEMORY) {
+      const oldest = this.deletedEvalIds.values().next();
+      if (oldest.done) break;
+      this.deletedEvalIds.delete(oldest.value);
+    }
+  }
+
+  /** The artifact id an eval result carries, when it carries one. */
+  private artifactIdOf(data: unknown): string | undefined {
+    const diagnostics = (data as { diagnostics?: { artifactId?: unknown } } | undefined)
+      ?.diagnostics;
+    if (typeof diagnostics?.artifactId !== 'string') return undefined;
+    return diagnostics.artifactId === '' ? undefined : diagnostics.artifactId;
+  }
+
+  /**
+   * Rewrite an entry's diagnostics to say plainly that its evidence is gone.
+   *
+   * Mutates the entry in place on purpose: the caller usually holds the same
+   * `EvalResult` object it is about to return to a user, and a result that
+   * claims `complete` while storage has nothing is the failure being fixed.
+   * The dangling id is cleared too — `''` is the sentinel every lifecycle path
+   * already skips.
+   */
+  private downgradeDiagnostics(entry: EvalHistoryEntry, reason?: string): void {
+    const data = entry.data as { diagnostics?: Record<string, unknown> } | undefined;
+    if (!data?.diagnostics) return;
+    if (data.diagnostics.artifactId === '' && data.diagnostics.status === 'unavailable') return;
+    // `records`, `bytes` and `expiresAt` described evidence this rewrite has
+    // just declared absent. Spreading them through would leave a result reading
+    // `status: 'unavailable', records: 137, bytes: 2100000` — a count of
+    // something nobody can read. `unavailableManifest` on the eval side zeroes
+    // them for the same reason.
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const { expiresAt, ...rest } = data.diagnostics;
+    data.diagnostics = {
+      ...rest,
+      artifactId: '',
+      status: 'unavailable',
+      reason: reason ?? 'the captured-request artifact for this result is no longer available',
+      records: 0,
+      bytes: 0,
+    };
+  }
+
+  /**
+   * The artifact id `ownerId` actually owns, or `undefined`.
+   *
+   * `diagnostics.artifactId` is data on a result object, and a result can carry
+   * an id that belongs to a DIFFERENT run — a rescore that degraded while
+   * naming its source, or an imported blob. Committing or deleting on the
+   * strength of that field alone lets one entry rewrite or destroy another
+   * entry's evidence, so ownership is confirmed against the manifest before
+   * any lifecycle write.
+   */
+  private async ownedArtifactId(
+    artifactId: string | undefined,
+    ownerId: string,
+  ): Promise<string | undefined> {
+    if (!artifactId || !this.artifactStore) return undefined;
+    try {
+      const opened = await this.artifactStore.open(artifactId);
+      if (!opened) return undefined;
+      return opened.manifest.owner.id === ownerId ? artifactId : undefined;
+    } catch {
+      return undefined;
     }
   }
 
@@ -1069,12 +1747,20 @@ export class AxlRuntime extends EventEmitter {
       signal?: AbortSignal;
       /**
        * When `true`, populate `EvalItem.traces` on every item (success + failure
-       * paths). Forwards to `runEval({ captureTraces: true })`, which wraps each
-       * item's execution in `runtime.trackExecution({ captureTraces: true })`.
+       * paths). Forwards to `runEval({ captureTraces: true })`, which opens each
+       * item's accounting scope with `trackOutcome({ captureTraces: true })`.
        * Verbose-mode `agent_call_start.data.messages` snapshots are stripped from
        * captured traces to keep memory bounded.
        */
       captureTraces?: boolean;
+      /**
+       * Forwarded to `runEval({ captureRequests })`. Requires
+       * `config.diagnostics.artifacts`; without it the run fails fast with
+       * `AxlError('DIAGNOSTICS_UNAVAILABLE')` before any provider call.
+       */
+      captureRequests?:
+        | boolean
+        | { maxRecordBytes?: number; maxRunBytes?: number; maxQueueBytes?: number };
     },
   ): Promise<unknown> {
     const entry = this.registeredEvals.get(name);
@@ -1095,6 +1781,7 @@ export class AxlRuntime extends EventEmitter {
           onProgress?: (event: EvalProgressEventShape) => void;
           signal?: AbortSignal;
           captureTraces?: boolean;
+          captureRequests?: unknown;
         },
       ) => Promise<unknown>;
       try {
@@ -1107,33 +1794,22 @@ export class AxlRuntime extends EventEmitter {
       }
       const originalExecuteFn = entry.executeWorkflow!;
 
-      // Wrap with trackExecution for transparent cost + metadata capture.
-      // When captureTraces is on, runEval wraps this again in a second
-      // trackExecution({ captureTraces: true }) — nested trackExecution walks
-      // the AsyncLocalStorage parent chain so both scopes observe events.
+      // Forward the callback VERBATIM. The runner owns measurement now: it opens
+      // the accounting scope for each item, so a `cost`/`metadata` fallback
+      // injected here would arrive as a caller report competing with the
+      // measurement — the exact replacement precedence the 0.24 cutover removed.
       const wrappedExecuteFn = async (
         input: unknown,
         runtime: unknown,
       ): Promise<{ output: unknown; cost?: number; metadata?: Record<string, unknown> }> => {
-        const {
-          result,
-          cost: trackedCost,
-          metadata,
-        } = await this.trackExecution(async () => {
-          return originalExecuteFn(input, runtime as AxlRuntime);
-        });
-        // Prefer user-supplied cost if present, fall back to tracked cost
-        return {
-          output: result.output,
-          cost: result.cost ?? trackedCost,
-          metadata: result.metadata ?? metadata,
-        };
+        return originalExecuteFn(input, runtime as AxlRuntime);
       };
 
       result = await runEvalFn(entry.config, wrappedExecuteFn, this, {
         onProgress: options?.onProgress,
         signal: options?.signal,
         captureTraces: options?.captureTraces,
+        captureRequests: options?.captureRequests,
       });
     } else {
       // Default: use runtime.eval() which creates its own executeWorkflow.
@@ -1144,6 +1820,7 @@ export class AxlRuntime extends EventEmitter {
         onProgress: options?.onProgress,
         signal: options?.signal,
         captureTraces: options?.captureTraces,
+        captureRequests: options?.captureRequests,
       });
     }
 
@@ -1245,6 +1922,7 @@ export class AxlRuntime extends EventEmitter {
       metadata: options?.metadata,
       config: this.config,
       providerRegistry: this.providerRegistry,
+      resolveProvider: (uri) => this.resolveProvider(uri),
       transcriptionProviderRegistry: this.transcriptionProviderRegistry,
       stateStore: this.stateStore,
       mcpManager: this.mcpManager,
@@ -1286,9 +1964,32 @@ export class AxlRuntime extends EventEmitter {
     this.transcriptionProviderRegistry.registerInstance(name, provider);
   }
 
-  /** Resolve a provider:model URI to a Provider instance and model name. */
+  /**
+   * Resolve a `provider:model` URI to a provider and model name.
+   *
+   * **The returned provider is a scoped FACADE, not the registered instance.**
+   * It forwards everything to the adapter — custom properties and accessors,
+   * class private-field methods, property writes, capability methods, ordinary
+   * `instanceof` — while routing `chat`/`stream` through accounting and budget
+   * admission whenever a `trackOutcome` scope is active. Outside a scope it
+   * delegates verbatim.
+   *
+   * Identity is stable per runtime per adapter (repeated calls return the same
+   * facade), but `resolveProvider(uri).provider === registeredInstance` is now
+   * `false`. See `docs/migration/eval-accounting.md`.
+   */
   resolveProvider(uri: string): { provider: Provider; model: string } {
-    return this.providerRegistry.resolve(uri, this.config);
+    const { provider, model } = this.providerRegistry.resolve(uri, this.config);
+    return { provider: this.scopedProvider(provider), model };
+  }
+
+  /** One facade per raw adapter per runtime, so repeated resolution is stable. */
+  private scopedProvider(raw: Provider): Provider {
+    const existing = this.scopedProviders.get(raw);
+    if (existing) return existing;
+    const facade = createScopedProvider(raw);
+    this.scopedProviders.set(raw, facade);
+    return facade;
   }
 
   /** Execute a workflow and return the result. */
@@ -1355,6 +2056,7 @@ export class AxlRuntime extends EventEmitter {
       metadata: options?.metadata,
       config: this.config,
       providerRegistry: this.providerRegistry,
+      resolveProvider: (uri) => this.resolveProvider(uri),
       transcriptionProviderRegistry: this.transcriptionProviderRegistry,
       sessionHistory,
       signal: controller.signal,
@@ -1536,6 +2238,7 @@ export class AxlRuntime extends EventEmitter {
         metadata: options?.metadata,
         config: this.config,
         providerRegistry: this.providerRegistry,
+        resolveProvider: (uri) => this.resolveProvider(uri),
         transcriptionProviderRegistry: this.transcriptionProviderRegistry,
         sessionHistory,
         signal: controller.signal,
@@ -1735,6 +2438,15 @@ export class AxlRuntime extends EventEmitter {
       controller.abort();
     }
     this.abortControllers.clear();
+
+    // Stop the artifact sweeper before anything else touches the state store —
+    // a sweep that fires mid-teardown would query a closing connection.
+    for (const timer of this.artifactRenewals.values()) clearInterval(timer);
+    this.artifactRenewals.clear();
+    if (this.artifactSweepTimer) {
+      clearInterval(this.artifactSweepTimer);
+      this.artifactSweepTimer = undefined;
+    }
 
     // Drain in-flight per-session work before closing the state store —
     // otherwise a Session.send/stream that's mid-save will write to a
@@ -1963,12 +2675,57 @@ export class AxlRuntime extends EventEmitter {
 
   /** Save an eval result to history. */
   async saveEvalResult(entry: EvalHistoryEntry): Promise<void> {
-    // Add to in-memory cache (newest first)
+    // Only an artifact this entry OWNS may be committed against it. A result
+    // carrying someone else's id — a degraded rescore naming its source, an
+    // imported blob — would otherwise rewrite that artifact's retention.
+    const artifactId = await this.ownedArtifactId(this.artifactIdOf(entry.data), entry.id);
+    // A pointer to an artifact that is already gone (swept, or removed out of
+    // band) must not be persisted as if it were readable.
+    if (!artifactId) this.downgradeDiagnostics(entry);
+
+    // Add to in-memory cache (newest first). Replacing rather than prepending:
+    // a re-save of an existing id would otherwise leave two entries, and every
+    // by-id read would serve whichever landed first.
+    this.evalHistory = this.evalHistory.filter((e) => e.id !== entry.id);
     this.evalHistory.unshift(entry);
+    // An explicit save is a deliberate write, so it clears any tombstone: the
+    // caller is asserting this id exists again.
+    this.deletedEvalIds.delete(entry.id);
 
     // Persist to store
     if (this.stateStore.saveEvalResult) {
-      await this.stateStore.saveEvalResult(entry);
+      try {
+        await this.stateStore.saveEvalResult(entry);
+      } catch (error) {
+        // The owner row does not exist, so the staged artifact must not survive
+        // as an orphan. Rollback is best effort; the SAVE failure is what the
+        // caller needs to see, not a cleanup failure layered over it.
+        if (artifactId && this.artifactStore) {
+          await this.artifactStore.rollback(artifactId).catch(() => undefined);
+        }
+        throw error;
+      }
+    }
+
+    // Ownership becomes real only now that the history row exists. Mirroring the
+    // store's own retention onto the manifest is what lets a Redis deployment —
+    // whose server-side TTL can never notify a filesystem — still expire the
+    // bytes it owns.
+    if (artifactId && this.artifactStore) {
+      const retention = await this.stateStore.getEvalRetention?.(entry.id);
+      const committed = await this.artifactStore.commit(artifactId, {
+        ...(retention?.expiresAt !== undefined ? { expiresAt: retention.expiresAt } : {}),
+      });
+      if (!committed.ok) {
+        // The artifact vanished between the ownership check and the commit.
+        // The row is already stored, so correct it in place rather than leaving
+        // a published result promising evidence it cannot serve.
+        this.downgradeDiagnostics(entry);
+        // Same rule as the sweep's write-back: the row was saved a moment ago,
+        // but "a moment ago" is not proof it is still there, and a blind
+        // re-save would resurrect one deleted or expired in between.
+        await this.persistCorrectedRow(entry).catch(() => undefined);
+      }
     }
 
     // Emit for live aggregation (e.g., Studio eval trends)
@@ -2102,14 +2859,40 @@ export class AxlRuntime extends EventEmitter {
     // was against an unknown id.
     const existing = this.evalHistory.find((e) => e.id === id);
     const evalName = existing?.eval;
+    const artifactId = this.artifactIdOf(existing?.data);
+
+    // Confirmed ownership only: a result carrying another run's artifact id
+    // must not be able to delete that run's evidence.
+    const ownedArtifactId = await this.ownedArtifactId(artifactId, id);
 
     const beforeLength = this.evalHistory.length;
-    this.evalHistory = this.evalHistory.filter((e) => e.id !== id);
+    // Tombstoned BEFORE the store delete, not after: a correction already in
+    // flight (the sweep's downgrade, a commit failure's) reaches its write
+    // while this method is still awaiting the store, and the store cannot
+    // refuse a write for a row it has not removed yet. The intent is what
+    // makes the delete win.
+    this.forgetEvalRow(id);
     const removedFromMemory = this.evalHistory.length < beforeLength;
 
+    // The row goes FIRST, then the deletion intent. Writing the intent first
+    // looked safer and is not: a row delete that then fails leaves an intent
+    // the sweeper honours within a minute, destroying the evidence of a result
+    // the caller was just told had NOT been deleted. Crash-safety in the other
+    // direction is already covered — reconciliation reclaims any committed
+    // artifact whose owner row is gone.
     let removedFromStore = false;
     if (this.stateStore.deleteEvalResult) {
       removedFromStore = await this.stateStore.deleteEvalResult(id);
+    }
+
+    // The bytes are part of the delete, not an afterthought: this method reports
+    // success only once they are gone. A failure here surfaces to the caller
+    // with the `delete_pending` intent recorded, so a retry or the next
+    // reconciliation sweep completes it.
+    if (ownedArtifactId && this.artifactStore) {
+      this.stopArtifactRenewal(ownedArtifactId);
+      await this.artifactStore.markDeletePending(ownedArtifactId);
+      await this.artifactStore.delete(ownedArtifactId);
     }
 
     const removed = removedFromMemory || removedFromStore;
@@ -2137,7 +2920,10 @@ export class AxlRuntime extends EventEmitter {
           // Merge: stored entries not already in memory
           const ids = new Set(this.evalHistory.map((e) => e.id));
           for (const entry of stored) {
-            if (!ids.has(entry.id)) {
+            // The snapshot may predate an eviction that happened while it was
+            // in flight, and re-adding a row the store has dropped is the same
+            // staleness eviction exists to end.
+            if (!ids.has(entry.id) && !this.deletedEvalIds.has(entry.id)) {
               this.evalHistory.push(entry);
             }
           }
@@ -2153,6 +2939,47 @@ export class AxlRuntime extends EventEmitter {
       await this.evalHistoryLoadPromise;
     }
     return [...this.evalHistory];
+  }
+
+  /**
+   * One eval history entry by id, or `undefined`.
+   *
+   * A read that wants one entry should not have to materialize the whole
+   * history to find it. Studio's diagnostics routes resolve an artifact through
+   * a history id on every request, and `getEvalHistory()` copies the entire
+   * array — every result's full `data` blob — before the caller discards all
+   * but one of them.
+   *
+   * The lazy first load is still whole-history (that is how the cache is
+   * populated); what this avoids is paying for a copy of it per request.
+   *
+   * The row is confirmed against the store's retention view before it is
+   * served, and dropped when the store says it is gone. The cache outlives
+   * whatever the store decided — a Redis TTL that elapsed, a delete elsewhere —
+   * and this is the read a rescore resolves its SOURCE through, copying that
+   * row's items into a brand-new result with a brand-new retention window. An
+   * expired run could otherwise be republished indefinitely, one rescore at a
+   * time. `getEvalHistory()` is still served from the cache unconfirmed; the
+   * per-row check is affordable here because it is one row.
+   */
+  async getEvalResult(id: string): Promise<EvalHistoryEntry | undefined> {
+    if (this.deletedEvalIds.has(id)) return undefined;
+    let entry = this.evalHistory.find((e) => e.id === id);
+    if (!entry) {
+      // Not in memory yet: make sure the store has been read at least once.
+      await this.getEvalHistory();
+      entry = this.evalHistory.find((e) => e.id === id);
+    }
+    if (!entry) return undefined;
+    const retention = await this.stateStore.getEvalRetention?.(id);
+    // A store with no retention view has nothing to contradict the cache with.
+    if (!retention) return entry;
+    const expired = retention.expiresAt !== undefined && retention.expiresAt <= Date.now();
+    if (!retention.exists || expired) {
+      this.forgetEvalRow(id);
+      return undefined;
+    }
+    return entry;
   }
 
   /** List pending human decisions. */
@@ -2246,7 +3073,10 @@ export class AxlRuntime extends EventEmitter {
    * Used by Session to summarize dropped messages when history.summarize is enabled.
    */
   async summarizeMessages(messages: ChatMessage[], modelUri: string): Promise<string> {
-    const { provider, model } = this.providerRegistry.resolve(modelUri, this.config);
+    // Through the facade: a session-history summary is a real paid call and
+    // belongs to whatever accounting scope is active, even though it runs
+    // before any workflow execution id exists.
+    const { provider, model } = this.resolveProvider(modelUri);
     const response = await provider.chat(
       [
         {
@@ -2281,6 +3111,11 @@ export class AxlRuntime extends EventEmitter {
       onProgress?: (event: EvalProgressEventShape) => void;
       signal?: AbortSignal;
       captureTraces?: boolean;
+      /** Forwarded to `runEval({ captureRequests })`. See
+       *  {@link AxlRuntime.runRegisteredEval}. */
+      captureRequests?:
+        | boolean
+        | { maxRecordBytes?: number; maxRunBytes?: number; maxQueueBytes?: number };
     },
   ): Promise<unknown> {
     let runEvalFn: (
@@ -2294,6 +3129,7 @@ export class AxlRuntime extends EventEmitter {
         onProgress?: (event: EvalProgressEventShape) => void;
         signal?: AbortSignal;
         captureTraces?: boolean;
+        captureRequests?: unknown;
       },
     ) => Promise<unknown>;
     try {
@@ -2305,13 +3141,14 @@ export class AxlRuntime extends EventEmitter {
       );
     }
 
+    // No `trackExecution` wrapper: the runner opens the per-item accounting
+    // scope, and `runtime.execute` inside it settles into that scope. Reporting
+    // a `cost` here would make the runtime a CALLER of its own eval, and the
+    // caller's number is never the measurement.
     const executeWorkflow = async (
       input: unknown,
     ): Promise<{ output: unknown; cost?: number; metadata?: Record<string, unknown> }> => {
-      const { result, cost, metadata } = await this.trackExecution(async () => {
-        return this.execute(config.workflow, input);
-      });
-      return { output: result, cost, metadata };
+      return { output: await this.execute(config.workflow, input) };
     };
 
     return runEvalFn(config, executeWorkflow, this, options);
@@ -2352,119 +3189,32 @@ export class AxlRuntime extends EventEmitter {
   }
 
   /**
-   * Track cost and execution metadata across any runtime operations within the given function.
-   * Uses AsyncLocalStorage to scope attribution to specific execution IDs,
-   * making it correct with concurrent calls.
+   * Run `fn` and ALWAYS return its outcome plus the authoritative
+   * {@link Accounting} for everything paid that happened inside it.
    *
-   * Returns cost (same as `trackCost`) plus metadata extracted from trace events:
-   * models (unique URIs), tokens (input/output/reasoning sums), and agent call count.
+   * This is the accounting entry point. Unlike {@link trackExecution} it does
+   * not throw on failure — a workflow that threw after a paid call still
+   * returns that call's charge, which is what makes "what did the failed run
+   * cost?" answerable. The thrown value is handed back verbatim in `error`:
+   * primitives, frozen objects, `AbortError`, `ProviderError` and
+   * `BudgetExceededError` all come back `===` what was thrown.
    *
-   * ## Cost vs tokens semantics
+   * Scopes nest. An operation settled inside a child `trackOutcome` is counted
+   * exactly once in every enclosing scope, so a parent total is the sum of
+   * disjoint operations. Concurrent `trackOutcome` calls on one runtime are
+   * isolated: neither sees the other's operations, budget closure or spend.
    *
-   * - `cost` is the full aggregate across EVERY event with a top-level
-   *   `event.cost` set: agent calls, tool calls, semantic memory ops, etc.
-   *   This is the number to reconcile against your provider bill.
+   * Pass `{ admission: new AdmissionController({ limit }) }` to stop admitting
+   * new paid operations once known spend reaches the limit. Already-dispatched
+   * work still settles and is still counted.
    *
-   * - `metadata.tokens` is narrowly scoped to **agent** prompt/completion/
-   *   reasoning tokens. Embedder tokens from semantic `ctx.remember({embed:true})`
-   *   / `ctx.recall({query})` are deliberately NOT summed here — they're a
-   *   different category (input-only, different pricing, different model).
-   *   Conflating them would make "prompt tokens" misleading in the UI. If you
-   *   need embedder token counts, subscribe to `runtime.on('trace', ...)` and
-   *   read `data.usage.tokens` on `memory_remember` / `memory_recall` events.
-   *
-   * Pass `{ captureTraces: true }` to also collect the raw `AxlEvent[]` observed
-   * during `fn()`. This is opt-in because it keeps every event in memory for the
-   * duration of the call — useful for eval per-item capture, debugging, and test
-   * assertions, but overhead grows with trace volume. When enabled, verbose-mode
-   * `agent_call_start.data.messages` snapshots are omitted from captured events (still
-   * broadcast via onTrace) to keep memory bounded — callers who need the full
-   * verbose snapshot should subscribe to `runtime.on('trace', ...)` directly.
-   *
-   * Works with both `createContext()` and `execute()` calls inside `fn`.
+   * `metadata`, `modelTiming` and `traces` remain EVENT-derived and therefore
+   * depend on trace configuration; `accounting` never does.
    */
-  async trackExecution<T>(
+  async trackOutcome<T>(
     fn: () => Promise<T>,
-    options?: { captureTraces?: boolean; captureTimingSamples?: boolean },
-  ): Promise<{
-    result: T;
-    cost: number;
-    /** True when any tracked call was unpriced — `cost` is then a LOWER BOUND.
-     *  Aggregate counterpart of `ExecutionInfo.unpriced`, via `isUnpricedLeaf`. */
-    unpriced: boolean;
-    /**
-     * Per-model sums of `agent_call_end.timing`, keyed by the same effective
-     * model URI as `metadata.modelCallCounts`. Present only when at least one
-     * tracked call reported timing, so absence means "nothing was instrumented"
-     * rather than "everything took zero ms".
-     *
-     * `calls` counts the SUCCESSFUL timed calls only — it can be lower than the
-     * same model's `modelCallCounts` entry when a provider omits `timing` or a
-     * call failed. Divide a sum by `calls`, never by `modelCallCounts`.
-     *
-     * Failed calls are excluded even though they now report timing: a non-2xx
-     * response is a measured round trip, but a rollup blending answers with
-     * failures describes neither, and a fast 429 would improve a model's
-     * apparent latency. The failures stay on the events themselves.
-     *
-     * `firstTokenMs` is streaming-only and is summed across the calls that
-     * reported it; it is omitted entirely when no call did, so a non-streaming
-     * model never reports a misleading `0`. Its denominator is `firstTokenCalls`,
-     * NOT `calls` — the two travel together and are present or absent together,
-     * so a mixed streaming/non-streaming model still yields an exact mean.
-     *
-     * Sums are per-call totals, so `wireMs` across concurrent calls can exceed
-     * the wall clock of `fn` — that is expected under fan-out and is why
-     * nothing in the core sums timing at the ask level.
-     *
-     * `samples` carries the raw per-call `CallTiming` blocks behind the sums, in
-     * `agent_call_end` order, so a caller that needs a DISTRIBUTION (percentiles,
-     * min/max) rather than a mean can compute one over real per-call values. It
-     * is the same data the sums were built from — `samples.length === calls` —
-     * and is deliberately not something callers should persist per item: the
-     * sums are the compact form, `samples` is the working form.
-     *
-     * It is **opt-in** via `captureTimingSamples` and the key is absent
-     * otherwise. Retaining it is O(calls) in memory for the lifetime of `fn`,
-     * which no caller should pay for a figure it never reads — the sums alone
-     * are O(models).
-     */
-    modelTiming?: Record<
-      string,
-      {
-        calls: number;
-        queuedMs: number;
-        retryMs: number;
-        wireMs: number;
-        firstTokenMs?: number;
-        /** Timed calls that reported a `firstTokenMs` — the denominator for it. */
-        firstTokenCalls?: number;
-        /** The per-call blocks the sums were built from, in event order.
-         *  `length === calls`. Present only under `captureTimingSamples`. */
-        samples?: CallTiming[];
-      }
-    >;
-    traces?: AxlEvent[];
-    metadata: {
-      models: string[];
-      modelCallCounts?: Record<string, number>;
-      /**
-       * Agent token totals only — does not include embedder tokens from
-       * semantic memory operations. See the method-level JSDoc above.
-       */
-      tokens: { input: number; output: number; reasoning: number };
-      agentCalls: number;
-      /**
-       * Unique workflow names observed during execution, ordered by first
-       * appearance (outermost first for nested calls). Captured automatically
-       * from `workflow_start` trace events — callers don't need to declare
-       * anything. Parallel mechanism to `models`.
-       */
-      workflows: string[];
-      /** Call counts per workflow, if workflows.length > 0. */
-      workflowCallCounts?: Record<string, number>;
-    };
-  }> {
+    options?: TrackOutcomeOptions,
+  ): Promise<TrackedOutcome<T>> {
     const parentScope = costScopeStorage.getStore();
     const scope: CostScope = {
       totalCost: 0,
@@ -2495,16 +3245,15 @@ export class AxlRuntime extends EventEmitter {
     const workflowCalls = new Map<string, number>();
     const tokens = { input: 0, output: 0, reasoning: 0 };
     let agentCalls = 0;
-    let unpriced = false;
     const capturedTraces: AxlEvent[] | undefined = options?.captureTraces ? [] : undefined;
 
     const listener = (event: AxlEvent) => {
       if (!scope.trackedIds.has(event.executionId)) return;
       // Cost rollup via shared helper — one source of truth for the
-      // "skip ask_end, finite-check, leaf-only" invariant (spec §10).
+      // "skip ask_end, finite-check, leaf-only" invariant (spec §10). This
+      // total feeds `trackCost`-era consumers of the TRACE rail only; the
+      // authoritative figure is `accounting.knownCost`.
       scope.totalCost += eventCostContribution(event);
-      // Honest aggregate: one unpriced leaf makes `cost` a lower bound.
-      if (isUnpricedLeaf(event)) unpriced = true;
       if (event.type === 'agent_call_end') {
         if (event.model) modelCalls.set(event.model, (modelCalls.get(event.model) ?? 0) + 1);
         agentCalls++;
@@ -2517,9 +3266,9 @@ export class AxlRuntime extends EventEmitter {
         // bucket, so an uninstrumented provider adds nothing rather than
         // contributing zeros that would deflate a mean.
         //
-        // SUCCESSFUL calls only — see the `modelTiming` JSDoc for why. `data.error`
-        // is set on the error-path `agent_call_end` and never on the success
-        // path, so it is the discriminator.
+        // SUCCESSFUL calls only — see the `ModelTimingRollup` docs for why.
+        // `data.error` is set on the error-path `agent_call_end` and never on
+        // the success path, so it is the discriminator.
         const failed = event.data?.error != null;
         if (event.model && event.timing && !failed) {
           const t = event.timing;
@@ -2602,42 +3351,106 @@ export class AxlRuntime extends EventEmitter {
     // Temporarily increase maxListeners to avoid warnings at high concurrency
     this.setMaxListeners(this.getMaxListeners() + 1);
     this.on('trace', listener);
+    let outcome: { status: 'fulfilled'; value: T } | { status: 'rejected'; error: unknown };
+    let accounting: Accounting;
     try {
-      const result = await costScopeStorage.run(scope, fn);
-      return {
-        result,
-        cost: scope.totalCost,
-        unpriced,
-        ...(modelTiming.size > 0 ? { modelTiming: Object.fromEntries(modelTiming) } : {}),
-        ...(capturedTraces ? { traces: capturedTraces } : {}),
-        metadata: {
-          models: [...modelCalls.keys()],
-          modelCallCounts: modelCalls.size > 0 ? Object.fromEntries(modelCalls) : undefined,
-          tokens,
-          agentCalls,
-          workflows: [...workflowCalls.keys()],
-          workflowCallCounts:
-            workflowCalls.size > 0 ? Object.fromEntries(workflowCalls) : undefined,
-        },
-      };
-    } catch (err) {
-      // Attach captured traces to the thrown error so callers using
-      // `captureTraces: true` can recover the diagnostic trail on failure
-      // (e.g., eval runner per-item traces for failed items). Non-enumerable
-      // so the property doesn't pollute JSON serialization or stack traces.
-      if (capturedTraces && typeof err === 'object' && err !== null) {
-        Object.defineProperty(err, 'axlCapturedTraces', {
-          value: capturedTraces,
-          enumerable: false,
-          writable: true,
-          configurable: true,
-        });
-      }
-      throw err;
+      // The accounting scope wraps the cost scope, so both are active for `fn`
+      // and both are finalized on the same settlement — including the throwing
+      // path, which is exactly where the old trace-only rail lost charges.
+      ({ outcome, accounting } = await runInAccountingScope<T>(
+        { purpose: options?.purpose, admission: options?.admission },
+        () =>
+          // Capture wraps the cost scope rather than the other way round so a
+          // record can never be written for an operation the accounting scope
+          // did not see. Both are pure ALS frames; omitting either is a no-op.
+          runWithCaptureChannel(options?.capture, () =>
+            runWithCaptureCorrelation(options?.captureCorrelation, () =>
+              costScopeStorage.run(scope, fn),
+            ),
+          ),
+      ));
     } finally {
       this.off('trace', listener);
       this.setMaxListeners(this.getMaxListeners() - 1);
     }
+
+    if (outcome.status === 'rejected' && capturedTraces) {
+      // Side channel for `trackExecution` callers, which only see the thrown
+      // value. Best-effort: a frozen or non-object thrown value keeps its
+      // identity rather than the attachment succeeding, because preserving the
+      // error is the stronger contract.
+      attachCapturedTraces(outcome.error, capturedTraces);
+    }
+
+    return {
+      ...outcome,
+      accounting,
+      ...(modelTiming.size > 0 ? { modelTiming: Object.fromEntries(modelTiming) } : {}),
+      ...(capturedTraces ? { traces: capturedTraces } : {}),
+      metadata: {
+        models: [...modelCalls.keys()],
+        modelCallCounts: modelCalls.size > 0 ? Object.fromEntries(modelCalls) : undefined,
+        tokens,
+        agentCalls,
+        workflows: [...workflowCalls.keys()],
+        workflowCallCounts: workflowCalls.size > 0 ? Object.fromEntries(workflowCalls) : undefined,
+      },
+    };
+  }
+
+  /**
+   * Throwing compatibility wrapper over {@link trackOutcome}.
+   *
+   * Returns the same shape it always has, now derived from the accounting rail
+   * rather than summed from trace events: `cost` is `accounting.knownCost` and
+   * `unpriced` is `accounting.completeness !== 'complete'`. For instrumented
+   * paths the numbers are identical; they differ only where the trace rail used
+   * to lose a charge (notably a leaf that never settled). `accounting` is
+   * exposed alongside them so callers can migrate incrementally.
+   *
+   * On failure it rethrows the ORIGINAL error and, under `captureTraces`,
+   * attaches the non-enumerable `axlCapturedTraces` side channel — prefer
+   * {@link trackOutcome}, which returns the accounting for a failed run too.
+   *
+   * ## Cost vs tokens semantics
+   *
+   * - `cost` covers EVERY settled operation: agent calls, tool calls, semantic
+   *   memory embeddings, transcriptions, declared external work. This is the
+   *   number to reconcile against your provider bill.
+   *
+   * - `metadata.tokens` is narrowly scoped to **agent** prompt/completion/
+   *   reasoning tokens. Embedder tokens from semantic `ctx.remember({embed:true})`
+   *   / `ctx.recall({query})` are deliberately NOT summed here — they're a
+   *   different category (input-only, different pricing, different model).
+   *   Conflating them would make "prompt tokens" misleading in the UI. Read
+   *   `accounting.usage` for the folded, category-separated totals.
+   *
+   * Pass `{ captureTraces: true }` to also collect the raw `AxlEvent[]` observed
+   * during `fn()`. This is opt-in because it keeps every event in memory for the
+   * duration of the call — useful for eval per-item capture, debugging, and test
+   * assertions, but overhead grows with trace volume. When enabled, verbose-mode
+   * `agent_call_start.data.messages` snapshots are omitted from captured events (still
+   * broadcast via onTrace) to keep memory bounded — callers who need the full
+   * verbose snapshot should subscribe to `runtime.on('trace', ...)` directly.
+   *
+   * Works with both `createContext()` and `execute()` calls inside `fn`.
+   */
+  async trackExecution<T>(
+    fn: () => Promise<T>,
+    options?: { captureTraces?: boolean; captureTimingSamples?: boolean },
+  ): Promise<TrackExecutionResult<T>> {
+    const outcome = await this.trackOutcome(fn, options);
+    if (outcome.status === 'rejected') throw outcome.error;
+    const { accounting, metadata, modelTiming, traces } = outcome;
+    return {
+      result: outcome.value,
+      cost: accounting.knownCost,
+      unpriced: accounting.completeness !== 'complete',
+      accounting,
+      metadata,
+      ...(modelTiming ? { modelTiming } : {}),
+      ...(traces ? { traces } : {}),
+    };
   }
 
   /** Register an execution ID with the active cost scope for trackCost() attribution. */

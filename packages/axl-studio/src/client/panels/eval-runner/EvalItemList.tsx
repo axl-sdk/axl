@@ -1,8 +1,11 @@
 import { useMemo } from 'react';
 import { ChevronRight, XCircle, AlertTriangle } from 'lucide-react';
-import { cn, formatCost, formatDuration, extractLabel } from '../../lib/utils';
+import { cn, formatDuration, extractLabel } from '../../lib/utils';
 import type { EvalItem } from './types';
 import { scoreTextColor } from './types';
+import { itemOutcome, readItemAccounting, scorerDidNotRun, scorerOutcome } from './accounting';
+import { ItemOutcomeBadge, ScorerOutcomeBadge } from './OutcomeBadge';
+import { SpendBadge } from './SpendBadge';
 
 type ErrorFilter = 'all' | 'errors' | 'no-errors';
 type SortDir = 'asc' | 'desc';
@@ -81,8 +84,9 @@ export function EvalItemList({
         av = a.item.duration ?? Infinity;
         bv = b.item.duration ?? Infinity;
       } else if (sortField === 'cost') {
-        av = a.item.cost ?? Infinity;
-        bv = b.item.cost ?? Infinity;
+        // Sort on the same measured figure the column renders.
+        av = readItemAccounting(a.item).knownCost;
+        bv = readItemAccounting(b.item).knownCost;
       } else {
         // scorer name
         av = a.item.scores[sortField] ?? -Infinity;
@@ -229,7 +233,12 @@ export function EvalItemList({
                   >
                     <td className="px-3 py-2 font-mono text-[hsl(var(--muted-foreground))]">
                       {index + 1}
-                      {item.error && (
+                      {/* The recorded outcome wins when there is one: it tells a
+                          budget skip from a model failure, which the error icon
+                          alone cannot. The legacy icons stay for pre-0.24 items
+                          (and for scorer-only errors, which have no item outcome). */}
+                      <ItemOutcomeBadge outcome={itemOutcome(item)} className="ml-1.5" />
+                      {itemOutcome(item) == null && item.error && (
                         <span
                           className="ml-1 inline-flex items-center text-red-500"
                           title="Workflow error"
@@ -270,6 +279,13 @@ export function EvalItemList({
                             <span className={cn('font-medium tabular-nums', scoreTextColor(score))}>
                               {score.toFixed(2)}
                             </span>
+                          ) : scorerDidNotRun(detail) ? (
+                            // A judge the budget stopped produced no number at
+                            // all. Rendering the usual em-dash here would put it
+                            // in the same visual bucket as a judge that ran and
+                            // failed — and a reader who assumes a missing score
+                            // is a bad score is exactly who this badge is for.
+                            <ScorerOutcomeBadge outcome={scorerOutcome(detail)} />
                           ) : skipped ? (
                             <span
                               className="text-[10px] text-[hsl(var(--muted-foreground))]"
@@ -292,7 +308,14 @@ export function EvalItemList({
                       {item.duration != null ? formatDuration(item.duration) : '\u2014'}
                     </td>
                     <td className="text-right px-3 py-2 font-mono text-[hsl(var(--muted-foreground))]">
-                      {item.cost != null && item.cost > 0 ? formatCost(item.cost) : '\u2014'}
+                      {/* Known spend for this item, generation + judging. Shown
+                          even at $0 \u2014 hiding an unknown zero behind an em-dash
+                          is the presentation defect this replaces. */}
+                      <SpendBadge
+                        accounting={readItemAccounting(item)}
+                        label={`Item ${index + 1} known spend`}
+                        compact
+                      />
                     </td>
                     <td className="px-2 py-2">
                       <ChevronRight

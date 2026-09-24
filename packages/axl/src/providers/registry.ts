@@ -6,6 +6,7 @@ import { GeminiProvider } from './gemini.js';
 import { OpenAICompatibleProvider, type ProviderProfile } from './openai-compatible.js';
 import { BUILTIN_PROFILES } from './profiles/index.js';
 import type { AxlConfig } from '../config.js';
+import { bindGovernorPool, GovernorPool } from './governor-pool.js';
 
 /**
  * Resolved result from a provider:model URI.
@@ -15,55 +16,87 @@ export type ResolvedProvider = {
   model: string;
 };
 
+/** A user factory registered with {@link ProviderRegistry.register}. */
 type ProviderFactory = (config: AxlConfig) => Provider;
+
+/**
+ * What the registry hands a built-in factory besides the config. Internal:
+ * user factories registered with `register()` receive only the config.
+ */
+type BuiltinFactoryContext = {
+  /** The registry's per-runtime governor pool; see `governor-pool.ts`. */
+  governors: GovernorPool;
+};
+
+type BuiltinProviderFactory = (config: AxlConfig, context: BuiltinFactoryContext) => Provider;
+
+type RegisteredFactory =
+  | { kind: 'builtin'; create: BuiltinProviderFactory }
+  | { kind: 'custom'; create: ProviderFactory };
 
 // ---------------------------------------------------------------------------
 // Built-in provider factories
 // ---------------------------------------------------------------------------
 
-const builtinFactories: Record<string, ProviderFactory> = {
-  openai: (config) => {
+// Rate governors are pooled per registry (i.e. per runtime), one per scope =
+// provider family + base-URL origin + credential source + model. Each factory
+// binds the registry's pool to the adapter it builds, so `openai:` and
+// `openai-responses:` on one key and origin share ONE governor per model (not
+// one per adapter, whose caps used to add up). Two provider blocks reaching one
+// scope merge their `rateLimit` strictest-per-field with one warning. Sharing
+// across runtimes is explicit: register one provider instance in both. See
+// `governor-pool.ts` and the "Rate limiting" section of docs/providers.md.
+const builtinFactories: Record<string, BuiltinProviderFactory> = {
+  openai: (config, { governors }) => {
     const opts = config.providers?.openai ?? {};
-    return new OpenAIProvider({
-      apiKey: opts.apiKey,
-      baseUrl: opts.baseUrl,
-      dangerouslyAllowInsecureHttp: opts.dangerouslyAllowInsecureHttp,
-      rateLimit: opts.rateLimit,
-    });
+    return bindGovernorPool(
+      new OpenAIProvider({
+        apiKey: opts.apiKey,
+        baseUrl: opts.baseUrl,
+        dangerouslyAllowInsecureHttp: opts.dangerouslyAllowInsecureHttp,
+        rateLimit: opts.rateLimit,
+      }),
+      governors,
+    );
   },
-  // NB: each adapter builds its OWN RateLimiter from its config — caps are
-  // per-adapter-instance, not pooled. Configuring `openai` AND using both
-  // `openai:` and `openai-responses:` yields two independent governors against
-  // the same key (effective concurrency = the sum). Documented in providers.md.
-  'openai-responses': (config) => {
-    // Falls back to the `openai` provider config (incl. its rateLimit) so
-    // `providers.openai.rateLimit` also governs the Responses adapter — but as a
-    // SEPARATE governor instance (see the note above), not a shared counter.
+  'openai-responses': (config, { governors }) => {
+    // Falls back to the `openai` provider config (incl. its rateLimit). On the
+    // same key and origin both adapters are one scope family, so the fallback
+    // governs both through the SAME governor per model.
     const opts = config.providers?.['openai-responses'] ?? config.providers?.openai ?? {};
-    return new OpenAIResponsesProvider({
-      apiKey: opts.apiKey,
-      baseUrl: opts.baseUrl,
-      dangerouslyAllowInsecureHttp: opts.dangerouslyAllowInsecureHttp,
-      rateLimit: opts.rateLimit,
-    });
+    return bindGovernorPool(
+      new OpenAIResponsesProvider({
+        apiKey: opts.apiKey,
+        baseUrl: opts.baseUrl,
+        dangerouslyAllowInsecureHttp: opts.dangerouslyAllowInsecureHttp,
+        rateLimit: opts.rateLimit,
+      }),
+      governors,
+    );
   },
-  anthropic: (config) => {
+  anthropic: (config, { governors }) => {
     const opts = config.providers?.anthropic ?? {};
-    return new AnthropicProvider({
-      apiKey: opts.apiKey,
-      baseUrl: opts.baseUrl,
-      dangerouslyAllowInsecureHttp: opts.dangerouslyAllowInsecureHttp,
-      rateLimit: opts.rateLimit,
-    });
+    return bindGovernorPool(
+      new AnthropicProvider({
+        apiKey: opts.apiKey,
+        baseUrl: opts.baseUrl,
+        dangerouslyAllowInsecureHttp: opts.dangerouslyAllowInsecureHttp,
+        rateLimit: opts.rateLimit,
+      }),
+      governors,
+    );
   },
-  google: (config) => {
+  google: (config, { governors }) => {
     const opts = config.providers?.google ?? {};
-    return new GeminiProvider({
-      apiKey: opts.apiKey,
-      baseUrl: opts.baseUrl,
-      dangerouslyAllowInsecureHttp: opts.dangerouslyAllowInsecureHttp,
-      rateLimit: opts.rateLimit,
-    });
+    return bindGovernorPool(
+      new GeminiProvider({
+        apiKey: opts.apiKey,
+        baseUrl: opts.baseUrl,
+        dangerouslyAllowInsecureHttp: opts.dangerouslyAllowInsecureHttp,
+        rateLimit: opts.rateLimit,
+      }),
+      governors,
+    );
   },
 };
 
@@ -72,17 +105,20 @@ const builtinFactories: Record<string, ProviderFactory> = {
  * reading per-provider config under the profile's name. The key/baseURL fall
  * back to the profile's env vars inside the engine when config omits them.
  */
-function presetFactory(profile: ProviderProfile): ProviderFactory {
-  return (config) => {
+function presetFactory(profile: ProviderProfile): BuiltinProviderFactory {
+  return (config, { governors }) => {
     const opts = config.providers?.[profile.name] ?? {};
-    return new OpenAICompatibleProvider({
-      profile,
-      apiKey: opts.apiKey,
-      baseUrl: opts.baseUrl,
-      dangerouslyAllowInsecureHttp: opts.dangerouslyAllowInsecureHttp,
-      authHeader: opts.authHeader,
-      rateLimit: opts.rateLimit,
-    });
+    return bindGovernorPool(
+      new OpenAICompatibleProvider({
+        profile,
+        apiKey: opts.apiKey,
+        baseUrl: opts.baseUrl,
+        dangerouslyAllowInsecureHttp: opts.dangerouslyAllowInsecureHttp,
+        authHeader: opts.authHeader,
+        rateLimit: opts.rateLimit,
+      }),
+      governors,
+    );
   };
 }
 
@@ -114,15 +150,21 @@ export class ProviderRegistry {
   private instances = new Map<string, Provider>();
 
   /** Factory functions, keyed by provider name */
-  private factories = new Map<string, ProviderFactory>();
+  private factories = new Map<string, RegisteredFactory>();
+
+  /**
+   * Rate governors for the adapters built-in factories construct, one per
+   * scope. Per registry, so per runtime: the state dies with the runtime.
+   */
+  private governors = new GovernorPool();
 
   /** Fallback provider returned when no factory or instance matches */
   private fallbackInstance?: Provider;
 
   constructor() {
     // Register built-in providers
-    for (const [name, factory] of Object.entries(builtinFactories)) {
-      this.factories.set(name, factory);
+    for (const [name, create] of Object.entries(builtinFactories)) {
+      this.factories.set(name, { kind: 'builtin', create });
     }
   }
 
@@ -132,7 +174,7 @@ export class ProviderRegistry {
    * any cached instance is evicted.
    */
   register(name: string, factory: ProviderFactory): void {
-    this.factories.set(name, factory);
+    this.factories.set(name, { kind: 'custom', create: factory });
     this.instances.delete(name); // evict stale cache
   }
 
@@ -177,7 +219,10 @@ export class ProviderRegistry {
     // Create via factory
     const factory = this.factories.get(name);
     if (factory) {
-      const instance = factory(config);
+      const instance =
+        factory.kind === 'builtin'
+          ? factory.create(config, { governors: this.governors })
+          : factory.create(config);
       this.instances.set(name, instance);
       return instance;
     }
@@ -232,9 +277,13 @@ export class ProviderRegistry {
 
   /**
    * Clear all cached provider instances. Useful for testing or reconfiguration.
+   * Also starts a fresh governor pool, so adapters rebuilt from a changed
+   * `rateLimit` are not merged with the discarded ones. A call already in
+   * flight finishes on the governor it holds.
    */
   clearCache(): void {
     this.instances.clear();
+    this.governors = new GovernorPool();
   }
 
   /**

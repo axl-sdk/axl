@@ -364,6 +364,68 @@ export class BudgetExceededError extends AxlError {
   }
 }
 
+/**
+ * Thrown when an `AdmissionController` refuses to admit a paid operation
+ * because known spend has reached its limit.
+ *
+ * This is a *stop*, not a failure of the provider: it is never wrapped in a
+ * `ProviderError`, never auto-retried by the transport, and never treated as
+ * an abort. It is raised either when the operation opens or at the transport's
+ * pre-dispatch check — in both cases before the request leaves the process, so
+ * it never accompanies a charge.
+ *
+ * Distinct from `BudgetExceededError`, which is `ctx.budget()`'s own
+ * workflow-scoped policy and keeps its existing semantics.
+ */
+export class AdmissionDeniedError extends AxlError {
+  /** The controller's configured USD threshold. */
+  readonly limit: number;
+  /** Known settled spend at the moment of refusal. Unknown spend is excluded. */
+  readonly knownSpend: number;
+  /** What was refused. */
+  readonly operation: { kind: string; model?: string };
+
+  constructor(options: {
+    limit: number;
+    knownSpend: number;
+    operation: { kind: string; model?: string };
+  }) {
+    super(
+      'ADMISSION_DENIED',
+      `Admission denied for ${options.operation.kind} operation` +
+        `${options.operation.model ? ` (${options.operation.model})` : ''}: ` +
+        `known spend ${formatBudgetCost(options.knownSpend)} reached the ` +
+        `${formatBudgetCost(options.limit)} limit`,
+    );
+    this.name = 'AdmissionDeniedError';
+    this.limit = options.limit;
+    this.knownSpend = options.knownSpend;
+    this.operation = options.operation;
+  }
+}
+
+/**
+ * Is this an admission denial, regardless of which copy of `@axlsdk/axl` threw it?
+ *
+ * `instanceof AdmissionDeniedError` is the natural check and it is the WRONG one
+ * across a module boundary: `runtime.eval()` dynamically imports `@axlsdk/eval`,
+ * which resolves its own `@axlsdk/axl`, and a dual ESM/CJS consumer can hold two
+ * copies at once. The classes are then structurally identical and referentially
+ * distinct, so `instanceof` returns false and a budget stop gets misreported as
+ * an ordinary workflow failure — the item reads `failed` instead of
+ * `budget_interrupted`, which is a lie about why the run stopped.
+ *
+ * Duck-typing on the stable public identity (`code` + `name`) is realm-proof.
+ * Prefer this over `instanceof` in any consumer that can be loaded separately
+ * from the runtime that threw.
+ */
+export function isAdmissionDeniedError(error: unknown): error is AdmissionDeniedError {
+  if (error instanceof AdmissionDeniedError) return true;
+  if (typeof error !== 'object' || error === null) return false;
+  const candidate = error as { code?: unknown; name?: unknown };
+  return candidate.code === 'ADMISSION_DENIED' && candidate.name === 'AdmissionDeniedError';
+}
+
 /** Thrown when an agent exceeds its maximum number of tool-calling turns */
 export class MaxTurnsError extends AxlError {
   readonly maxTurns: number;

@@ -4,12 +4,20 @@ import { readdirSync, statSync } from 'node:fs';
 import { readFile as readFileAsync, writeFile as writeFileAsync, mkdir } from 'node:fs/promises';
 import * as path from 'node:path';
 import type { AxlRuntime, EvalExecuteWorkflow } from '@axlsdk/axl';
-import { evalCompare, evaluateScorerErrorRateGate } from './compare.js';
+import {
+  compareItemErrorRates,
+  describeItemErrorRate,
+  evalCompare,
+  evaluateItemErrorRateGate,
+  evaluateScorerErrorRateGate,
+} from './compare.js';
 import { runEval } from './runner.js';
 import { rescore } from './rescore.js';
 import { aggregateRuns } from './multi-run.js';
 import type { MultiRunSummary } from './multi-run.js';
 import type { EvalConfig, EvalResult } from './types.js';
+import { readAccounting } from './accounting.js';
+import { serializeRequestRecords, type RequestRecord } from './diagnostics.js';
 import {
   findConfig,
   resolveRuntime,
@@ -21,9 +29,17 @@ import {
   CONFIG_CANDIDATES,
 } from './cli-utils.js';
 import { validateEvalConfig } from './cli-validate.js';
-import { parseEvalArgs, envInt } from './cli-args.js';
-import { formatModelTimingLines } from './cli-format.js';
-import { scorerCounts } from './utils.js';
+import { parseEvalArgs, parseErrorRateFlag, envInt } from './cli-args.js';
+import {
+  budgetStopMessage,
+  formatBudgetLine,
+  formatCoverageLine,
+  formatKnownSpend,
+  formatModelTimingLines,
+  isTotalWipeout,
+  itemErrorRateMessage,
+} from './cli-format.js';
+import { formatPercent, scorerCounts } from './utils.js';
 
 /**
  * Refuse to certify a comparison and exit non-zero, with one consistent
@@ -103,7 +119,16 @@ Usage:
                                           (success + failure). Adds memory
                                           overhead proportional to dataset size
                                           x turns x agents; off by default.
+  axl-eval <path> --budget <amount>       Stop admitting spend once known cost
+                                          reaches the limit (e.g. "$1", "0.50").
+                                          Overrides the eval file's budget and
+                                          applies PER RUN under --runs. A
+                                          budget-stopped run exits 1 with a
+                                          distinct BUDGET STOPPED line.
   axl-eval rescore <results> <eval-file>  Re-run scorers on saved outputs
+  axl-eval rescore <results> <eval-file> --budget <amount>  Limit the NEW judging
+                                          spend only; the source run's cost is
+                                          not counted against it.
   axl-eval compare <a> <b>                Compare two eval result files
   axl-eval compare <a> <b> --threshold <v>  Set regression threshold (global or per-scorer)
   axl-eval compare <a> <b> --fail-on-regression  Exit 1 if regressions
@@ -118,7 +143,8 @@ Config auto-detection (when --config is not specified):
   ${CONFIG_CANDIDATES.join(' -> ')}
 
 When a config is found, the exported AxlRuntime is passed to executeWorkflow
-and cost is tracked automatically via runtime.trackCost().
+and spend is measured by the runner's accounting scope (a "cost" your callback
+returns is recorded under item.callerReport, never used as the measurement).
 When no config is found, a bare AxlRuntime is created (providers from env vars).
 `);
     process.exit(0);
@@ -197,20 +223,36 @@ function scorerFilteredScorers(r: EvalResult | EvalResult[]): string[] | undefin
   return Array.isArray(meta.scorersRun) ? (meta.scorersRun as string[]) : [];
 }
 
+/**
+ * Parse compare's `--max-item-error-rate <0..1>`. Unlike the scorer flag this
+ * gate is ON by default (`0.05`), so an absent flag means the default, never
+ * "off"; `1` disables it.
+ */
+function parseMaxItemErrorRate(args: string[]): number | undefined {
+  const idx = args.indexOf('--max-item-error-rate');
+  if (idx === -1) return undefined;
+  if (idx + 1 >= args.length) {
+    console.error('Error: --max-item-error-rate requires a value in [0, 1]');
+    process.exit(1);
+  }
+  return parseErrorRateFlag('--max-item-error-rate', args[idx + 1]);
+}
+
 async function runCompare(args: string[]) {
   const failOnRegression = args.includes('--fail-on-regression');
   const thresholds = parseThresholdArg(args);
   const maxScorerErrorRate = parseMaxScorerErrorRate(args);
+  const maxItemErrorRate = parseMaxItemErrorRate(args);
   // Exclude flags and the values consumed by value-taking flags so neither a
   // threshold nor an error-rate value is mistaken for a result file path.
-  const valueFlags = new Set(['--threshold', '--max-scorer-error-rate']);
+  const valueFlags = new Set(['--threshold', '--max-scorer-error-rate', '--max-item-error-rate']);
   const files = args.filter(
     (a, i) => !a.startsWith('--') && !(i > 0 && valueFlags.has(args[i - 1])),
   );
 
   if (files.length !== 2) {
     console.error(
-      'Usage: axl-eval compare <baseline.json> <candidate.json> [--threshold <value>] [--fail-on-regression] [--max-scorer-error-rate <0..1>]',
+      'Usage: axl-eval compare <baseline.json> <candidate.json> [--threshold <value>] [--fail-on-regression] [--max-scorer-error-rate <0..1>] [--max-item-error-rate <0..1>]',
     );
     process.exit(1);
   }
@@ -289,9 +331,20 @@ async function runCompare(args: string[]) {
   if (comparison.cost) {
     const c = comparison.cost;
     const sign = c.delta > 0 ? '+' : '';
+    // A null percentage means the baseline was free — print the absolute delta
+    // rather than a fabricated 0% or Infinity%.
+    const change =
+      c.deltaPercent === null
+        ? `${sign}$${Math.abs(c.delta).toFixed(2)}, no % from a $0 baseline`
+        : `${sign}${c.deltaPercent.toFixed(1)}%`;
     console.log(
-      `  Cost: baseline $${c.baselineTotal.toFixed(2)} -> candidate $${c.candidateTotal.toFixed(2)} (${sign}${c.deltaPercent.toFixed(1)}%)`,
+      `  Cost: baseline $${c.baselineTotal.toFixed(2)} -> candidate $${c.candidateTotal.toFixed(2)} (${change})`,
     );
+    // Say plainly when the two totals are not comparable as spend, so a
+    // truncated or legacy run is never read as a saving.
+    if (!c.certified) {
+      console.log(`        not certified: ${c.reason ?? 'costs are not comparable'}`);
+    }
   }
 
   const baselineRef = Array.isArray(baseline) ? baseline[0] : baseline;
@@ -362,6 +415,23 @@ async function runCompare(args: string[]) {
     if (reason) refuseToGate(reason);
   }
 
+  // Coverage floor (default-on, F2). A side that lost more than the limit of
+  // its attempted items is scored over survivors, so its means are not a
+  // trustworthy baseline or candidate. Any side that lost items at all is
+  // named, so accepting a thinned side with the flag is never silent.
+  const itemRates = compareItemErrorRates(baseline, candidate, maxItemErrorRate);
+  const multiRunCompare = itemRates.some((r) => r.runIndex > 0);
+  for (const rate of itemRates) {
+    if (rate.failed > 0 && !rate.exceeded) {
+      console.error(
+        `[axl-eval] WARNING: ${describeItemErrorRate(rate, multiRunCompare)}, within the ` +
+          `${formatPercent(rate.limit)} limit; its scores cover only the surviving items.`,
+      );
+    }
+  }
+  const coverageReason = evaluateItemErrorRateGate(baseline, candidate, maxItemErrorRate);
+  if (coverageReason) refuseToGate(coverageReason);
+
   if (failOnRegression && comparison.regressions.length > 0) {
     // When CI is available, only fail on significant regressions
     const hasSignificance = scorerNames.some((n) => comparison.scorers[n].significant != null);
@@ -377,8 +447,16 @@ async function runCompare(args: string[]) {
 }
 
 async function runRescore(args: string[], signal: AbortSignal) {
-  const { outputPath, configArg, conditions, concurrency, scorerNames, paths } =
-    parseEvalArgs(args);
+  const {
+    outputPath,
+    configArg,
+    conditions,
+    concurrency,
+    scorerNames,
+    budget,
+    maxItemErrorRate,
+    paths,
+  } = parseEvalArgs(args);
 
   if (paths.length < 2) {
     console.error('Usage: axl-eval rescore <results.json> <eval-file> [--output <file>]');
@@ -394,6 +472,16 @@ async function runRescore(args: string[], signal: AbortSignal) {
     );
     process.exit(1);
   }
+  // Rescore does not re-run the workflow: its failed items are the SOURCE
+  // run's, carried through with their outcomes, so an item gate here would
+  // re-litigate that run. The source run was gated when it was produced, and
+  // `compare` re-applies the floor to the rescored artifact at consume time.
+  if (maxItemErrorRate != null) {
+    console.error(
+      'Error: --max-item-error-rate is not supported with rescore; item failures belong to the source run — gate them with `axl-eval compare`.',
+    );
+    process.exit(1);
+  }
 
   // Honor the same item-concurrency override as the run command (flag > env).
   // scorerConcurrency keeps its rescore default (5).
@@ -404,6 +492,9 @@ async function runRescore(args: string[], signal: AbortSignal) {
   const results: EvalResult[] = Array.isArray(raw) ? raw : [raw];
 
   const runtime = await getRuntime(configArg, conditions);
+  // Set inside the try, acted on after `finally` has shut the runtime down —
+  // `process.exit` would otherwise abandon the shutdown mid-flight.
+  let exitCode = 0;
   try {
     const mod = await importModule(path.resolve(evalFilePath), import.meta.url);
     const evalConfig = pickDefault<EvalConfig>(mod);
@@ -420,30 +511,61 @@ async function runRescore(args: string[], signal: AbortSignal) {
     }
 
     const rescored: EvalResult[] = [];
-    for (const resultData of results) {
-      if (signal.aborted) break;
-      rescored.push(
-        await rescore(resultData, evalConfig.scorers, runtime, {
-          signal,
-          ...(itemConcurrency != null ? { concurrency: itemConcurrency } : {}),
-        }),
-      );
+    // A rejected `--budget` skips the reporting below, but must NOT `return`:
+    // a return inside the outer try runs `finally` and then leaves the function,
+    // jumping over the `process.exit(exitCode)` that follows it — the CLI would
+    // print the error and still exit 0.
+    let budgetUsable = true;
+    try {
+      for (const resultData of results) {
+        if (signal.aborted) break;
+        rescored.push(
+          await rescore(resultData, evalConfig.scorers, runtime, {
+            signal,
+            ...(itemConcurrency != null ? { concurrency: itemConcurrency } : {}),
+            // Gates the NEW judging spend only — the source run's cost is history
+            // and is not counted against this limit.
+            ...(budget != null ? { budget } : {}),
+          }),
+        );
+      }
+    } catch (err) {
+      // An unusable `--budget` is a user error, not a crash: print it the way
+      // the run command does rather than letting a raw AxlError stack out of
+      // `main().catch`.
+      if ((err as { code?: string })?.code === 'INVALID_BUDGET') {
+        console.error(`[axl-eval] ${err instanceof Error ? err.message : String(err)}`);
+        exitCode = 1;
+        budgetUsable = false;
+      } else {
+        throw err;
+      }
     }
 
-    for (const r of rescored) {
-      console.log('\n' + formatTable(r) + '\n');
-    }
+    if (budgetUsable) {
+      for (const r of rescored) {
+        console.log('\n' + formatTable(r) + '\n');
+      }
 
-    if (outputPath) {
-      const output = Array.isArray(raw) ? rescored : rescored[0];
-      const outputDir = path.dirname(path.resolve(outputPath));
-      await mkdir(outputDir, { recursive: true });
-      await writeFileAsync(outputPath, JSON.stringify(output, null, 2), 'utf-8');
-      console.log(`Rescored results saved to ${outputPath}`);
+      if (outputPath) {
+        const output = Array.isArray(raw) ? rescored : rescored[0];
+        const outputDir = path.dirname(path.resolve(outputPath));
+        await mkdir(outputDir, { recursive: true });
+        await writeFileAsync(outputPath, JSON.stringify(output, null, 2), 'utf-8');
+        console.log(`Rescored results saved to ${outputPath}`);
+      }
+
+      // A rescore that exhausted its judging budget scored nothing on the items
+      // it skipped, and must fail the build for the same reason a run does.
+      // Reported AFTER the artifact is written, so partial scores are saved.
+      for (const r of rescored) {
+        if (reportBudgetStop(r, `rescore ${resultsPath}`)) exitCode = 1;
+      }
     }
   } finally {
     await runtime.shutdown().catch(() => {});
   }
+  if (exitCode !== 0) process.exit(exitCode);
 }
 
 /**
@@ -538,11 +660,15 @@ function formatTable(result: EvalResult): string {
   lines.push(...formatModelTimingLines(result.summary.modelTiming, maxNameLen));
 
   const durationSec = (result.duration / 1000).toFixed(1);
-  const costStr = result.totalCost > 0 ? `$${result.totalCost.toFixed(2)}` : '$0.00';
+  const accounting = readAccounting(result);
   lines.push('');
   lines.push(
-    `  Failures: ${result.summary.failures}/${result.summary.count} | Cost: ${costStr} | Duration: ${durationSec}s`,
+    `  Failures: ${result.summary.failures}/${result.summary.count} | Cost: ${formatKnownSpend(accounting)} | Duration: ${durationSec}s`,
   );
+  const budgetLine = formatBudgetLine(accounting);
+  if (budgetLine) lines.push(budgetLine);
+  const coverageLine = formatCoverageLine(result);
+  if (coverageLine) lines.push(coverageLine);
 
   const itemsWithErrors = result.items.filter((i) => i.scorerErrors?.length);
   if (itemsWithErrors.length > 0) {
@@ -596,10 +722,11 @@ function formatMultiRunTable(summary: MultiRunSummary): string {
     );
   }
 
-  const costStr = summary.totalCost > 0 ? `$${summary.totalCost.toFixed(2)}` : '$0.00';
   const durationStr = (summary.totalDuration / 1000).toFixed(1);
   lines.push('');
-  lines.push(`  Total Cost: ${costStr} | Total Duration: ${durationStr}s`);
+  lines.push(
+    `  Total Cost: ${formatKnownSpend(summary.accounting)} | Total Duration: ${durationStr}s`,
+  );
 
   return lines.join('\n');
 }
@@ -651,6 +778,30 @@ function reportFullySkippedScorers(result: EvalResult, label: string): void {
 }
 
 /**
+ * Print the budget-stop reason, first and distinctly, and report whether the run
+ * was budget-stopped so the caller can exit non-zero for incomplete execution
+ * without counting it as a model failure.
+ */
+function reportBudgetStop(result: EvalResult, label: string): boolean {
+  const message = budgetStopMessage(result, label);
+  if (!message) return false;
+  console.error(message);
+  return true;
+}
+
+/**
+ * Print the item-coverage gate's failure (default-on `failOnItemErrorRate`) and
+ * report whether it tripped. Skipped when the run was a total wipeout: that
+ * diagnostic already names the stronger fact, and one cause gets one line.
+ */
+function reportItemErrorRate(result: EvalResult, label: string, wipeout: boolean): boolean {
+  const message = itemErrorRateMessage(result, label);
+  if (!message) return false;
+  if (!wipeout) console.error(message);
+  return true;
+}
+
+/**
  * A run where EVERY item errored in the workflow (0 succeeded) produced no valid
  * output to score — the eval is meaningless and must never pass CI green. This
  * is distinct from (and complementary to) the scorer failure-rate gate: that one
@@ -659,15 +810,15 @@ function reportFullySkippedScorers(result: EvalResult, label: string): void {
  * this guard a 100%-workflow-error run exits 0 — a silent-green trap.
  *
  * Non-configurable on purpose: a 0%-success eval is unambiguously broken, so this
- * always fails. (A configurable `failOnItemErrorRate` for PARTIAL workflow-failure
- * gating is a reasonable future opt-in; the per-item failure count is already shown
- * loudly in the table either way.) Returns whether the run was a total wipeout.
+ * always fails, even with the item gate disabled (`--max-item-error-rate 1`).
+ * PARTIAL workflow failure is the default-on `failOnItemErrorRate` gate's job —
+ * see `reportItemErrorRate`. Prints the diagnostic and returns whether the run
+ * was a total wipeout.
  */
 function reportTotalWipeout(result: EvalResult, label: string): boolean {
-  const { count, failures } = result.summary;
-  if (count === 0 || failures < count) return false;
+  if (!isTotalWipeout(result)) return false;
   console.error(
-    `[axl-eval] FAILED: ${label} — all ${count} item(s) errored in the workflow ` +
+    `[axl-eval] FAILED: ${label} — all ${result.summary.count} item(s) errored in the workflow ` +
       `(0 succeeded); the eval produced no scorable output.`,
   );
   return true;
@@ -748,6 +899,56 @@ async function getRuntime(configArg?: string, conditions?: string[]): Promise<Ax
   return new AxlRuntime();
 }
 
+/**
+ * Write `<name>.requests.jsonl` beside `--output` when a run captured requests.
+ *
+ * The bundle is deliberately two files rather than one: the JSON result stays
+ * the compact, diffable, comparable artifact it has always been, and the
+ * evidence — which can be orders of magnitude larger — sits next to it and can
+ * be deleted independently. The sidecar is written from the runtime's own
+ * artifact, so it contains exactly the redacted, bounded records the run
+ * produced and nothing that was reconstructed after the fact.
+ *
+ * The artifact is read through the STORE, not `runtime.openDiagnosticArtifact`:
+ * a CLI run never saves an eval history row, so its artifact is legitimately
+ * staged-and-unowned and the owner-existence check would (correctly, for every
+ * other caller) refuse to serve it. This is the same staged bundle, published
+ * without claiming a history save happened.
+ *
+ * Best effort by design: a run's numbers are already on disk by the time this
+ * is called, and a missing or expired artifact must not turn a completed eval
+ * into a failed CLI invocation.
+ */
+async function writeRequestSidecar(
+  runtime: AxlRuntime,
+  outputPath: string,
+  results: readonly EvalResult[],
+): Promise<void> {
+  const artifactIds = results
+    .map((result) => result.diagnostics?.artifactId)
+    .filter((id): id is string => typeof id === 'string' && id !== '');
+  if (artifactIds.length === 0) return;
+  const store = runtime.getDiagnosticArtifactStore();
+  if (!store) return;
+  const records: RequestRecord[] = [];
+  for (const artifactId of artifactIds) {
+    const opened = await store.open(artifactId).catch(() => undefined);
+    if (!opened) continue;
+    for await (const line of opened.lines) {
+      try {
+        records.push(JSON.parse(line) as RequestRecord);
+      } catch {
+        // A partially-written final line (an interrupted capture) is skipped
+        // rather than failing the export: the rest of the evidence is valid.
+      }
+    }
+  }
+  if (records.length === 0) return;
+  const sidecarPath = outputPath.replace(/\.json$/i, '') + '.requests.jsonl';
+  await writeFileAsync(sidecarPath, serializeRequestRecords(records), 'utf-8');
+  console.log(`Captured requests saved to ${sidecarPath}`);
+}
+
 // ── Main eval command ──────────────────────────────────────────────
 
 async function runEvalCommand(args: string[], signal: AbortSignal) {
@@ -757,8 +958,11 @@ async function runEvalCommand(args: string[], signal: AbortSignal) {
     conditions,
     runs,
     captureTraces,
+    captureRequests,
     concurrency,
     scorerNames,
+    budget,
+    maxItemErrorRate,
     paths,
   } = parseEvalArgs(args);
 
@@ -812,6 +1016,15 @@ async function runEvalCommand(args: string[], signal: AbortSignal) {
         evalConfig.concurrency =
           concurrency ?? envInt('AXL_EVAL_CONCURRENCY') ?? evalConfig.concurrency ?? 5;
 
+        // `--budget` overrides the eval file's own limit. Each run in a
+        // `--runs N` batch builds its own controller from this value, so the
+        // limit is PER RUN — never divided across the batch and never shared,
+        // which would make run 2's items depend on run 1's spend.
+        if (budget != null) evalConfig.budget = budget;
+        // `--max-item-error-rate` overrides the file's `failOnItemErrorRate`
+        // the same way, per run, so the summary records the limit that applied.
+        if (maxItemErrorRate != null) evalConfig.failOnItemErrorRate = maxItemErrorRate;
+
         // --scorers: run a subset of scorers for a focused iteration loop.
         // (The single-file guard already ran before the loop.) Validate-then-
         // filter so the error lists every available name.
@@ -853,29 +1066,16 @@ async function runEvalCommand(args: string[], signal: AbortSignal) {
         let executeWorkflow: EvalExecuteWorkflow;
 
         if (customExecute) {
-          // Wrap custom executeWorkflow with trackExecution for cost + metadata attribution
-          executeWorkflow = async (input, rt) => {
-            const {
-              result,
-              cost: trackedCost,
-              metadata,
-            } = await runtime.trackExecution(async () => {
-              return customExecute(input, rt);
-            });
-            return {
-              output: result.output,
-              cost: result.cost ?? trackedCost,
-              metadata: result.metadata ?? metadata,
-            };
-          };
+          // Forward the user's callback verbatim. `runEval` opens the per-item
+          // accounting scope, so wrapping here would only add a caller-reported
+          // cost competing with the measurement.
+          executeWorkflow = async (input, rt) => customExecute(input, rt);
         } else if (runtime.getWorkflow(evalConfig.workflow)) {
-          // No executeWorkflow exported but workflow is registered — use runtime.execute()
-          executeWorkflow = async (input) => {
-            const { result, cost, metadata } = await runtime.trackExecution(async () => {
-              return runtime.execute(evalConfig.workflow, input);
-            });
-            return { output: result, cost, metadata };
-          };
+          // No executeWorkflow exported but workflow is registered — use
+          // runtime.execute() inside the runner's scope, which measures it.
+          executeWorkflow = async (input) => ({
+            output: await runtime.execute(evalConfig.workflow, input),
+          });
         } else {
           // Fail loudly. The previous identity-passthrough fallback silently
           // produced all-zero scores in CI — exactly the kind of footgun the
@@ -924,7 +1124,11 @@ async function runEvalCommand(args: string[], signal: AbortSignal) {
         // cost/metadata correctly.
         // Always pass the SIGINT-driven signal so Ctrl+C aborts in-flight
         // workflows + scorer LLM calls instead of dropping the connection mid-request.
-        const runOptions = { signal, ...(captureTraces ? { captureTraces: true } : {}) };
+        const runOptions = {
+          signal,
+          ...(captureTraces ? { captureTraces: true } : {}),
+          ...(captureRequests ? { captureRequests: true } : {}),
+        };
 
         // Stamp filtered runs so a scorer-subset result can't be silently used
         // as a full baseline. `compare` warns (and refuses to gate) on it. Must
@@ -1024,16 +1228,21 @@ async function runEvalCommand(args: string[], signal: AbortSignal) {
           console.log('\n' + formatMultiRunTable(summary) + '\n');
           for (const r of runResults) results.push(r);
 
-          // Failure-rate gate (opt-in via failOnScorerErrorRate) + total-wipeout
-          // guard (always). Report every run; count the file as failed unless it
-          // was already counted as a partial batch above (avoids double-count).
+          // Failure-rate gates (scorer: opt-in; item: default-on) + total-wipeout
+          // guard (always). Every run is gated INDIVIDUALLY — a pooled rate would
+          // let clean runs hide a thinned one. Report every run; count the file
+          // as failed unless it was already counted as a partial batch above
+          // (avoids double-count).
           let anyFailing = false;
-          for (const r of runResults) {
-            // Call both (no short-circuit) so each prints its own diagnostic.
+          for (const [i, r] of runResults.entries()) {
+            // Call each (no short-circuit) so every one prints its diagnostic,
+            // budget stop first.
+            const budgetStopped = reportBudgetStop(r, filePath);
             const wipeout = reportTotalWipeout(r, filePath);
+            const thinned = reportItemErrorRate(r, `${filePath} run ${i + 1}/${runs}`, wipeout);
             const degraded = reportDegraded(r, filePath);
             reportFullySkippedScorers(r, filePath); // advisory only
-            if (wipeout || degraded) anyFailing = true;
+            if (budgetStopped || wipeout || thinned || degraded) anyFailing = true;
           }
           if (anyFailing && !partial) failedFiles++;
         } else {
@@ -1042,13 +1251,17 @@ async function runEvalCommand(args: string[], signal: AbortSignal) {
           results.push(result);
 
           console.log('\n' + formatTable(result) + '\n');
-          // Total-wipeout guard (always) + scorer failure-rate gate (opt-in). They
-          // are mutually exclusive (a wipeout has no scored items, so no scorer can
-          // be degraded), but report both for clarity; either fails the file.
+          // Budget stop first and distinctly (contracts §11 Q10), then the
+          // total-wipeout guard (always), the item gate (default-on) and the
+          // scorer failure-rate gate (opt-in). Every failing reason is printed;
+          // any one of them exits non-zero. The artifact is written below
+          // regardless: gates govern the exit code, not persistence.
+          const budgetStopped = reportBudgetStop(result, filePath);
           const wipeout = reportTotalWipeout(result, filePath);
+          const thinned = reportItemErrorRate(result, filePath, wipeout);
           const degraded = reportDegraded(result, filePath);
           reportFullySkippedScorers(result, filePath); // advisory only
-          if (wipeout || degraded) failedFiles++;
+          if (budgetStopped || wipeout || thinned || degraded) failedFiles++;
         }
       } catch (err) {
         console.error(
@@ -1064,6 +1277,7 @@ async function runEvalCommand(args: string[], signal: AbortSignal) {
       await mkdir(outputDir, { recursive: true });
       await writeFileAsync(outputPath, JSON.stringify(output, null, 2), 'utf-8');
       console.log(`Results saved to ${outputPath}`);
+      await writeRequestSidecar(runtime, outputPath, results);
     }
   } finally {
     await runtime.shutdown().catch(() => {});

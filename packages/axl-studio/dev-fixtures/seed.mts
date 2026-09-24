@@ -449,6 +449,7 @@ export async function seedLive(runtime: AxlRuntime): Promise<void> {
     await seedRagEval(runtime);
     await seedPartialBatchEval(runtime);
     await seedConditionalScorerEval(runtime);
+    await seedAccountingEval(runtime);
   } catch (err) {
     // eslint-disable-next-line no-console
     console.warn('[axl-studio dev] seed failed:', err instanceof Error ? err.message : String(err));
@@ -886,4 +887,240 @@ async function seedConditionalScorerEval(runtime: AxlRuntime): Promise<void> {
     timestamp: Date.now() - 19 * 60 * 1000,
     data: candidate,
   });
+}
+
+// ── Accounting / budget / coverage demo ─────────────────────────────
+//
+// Hand-crafted rows covering the three readings of a spend figure — measured,
+// lower-bound, and repeated-from-a-legacy-artifact — plus a budget-stopped run
+// carrying four of the five item outcomes and a budget-skipped judge.
+// Hand-crafted rather than produced by `runEval` because the dev server has no
+// real provider: the point is to exercise the PRESENTATION of each state, and
+// every one of them should read differently in the panel.
+async function seedAccountingEval(runtime: AxlRuntime): Promise<void> {
+  const { randomUUID } = await import('node:crypto');
+
+  type Acc = NonNullable<EvalResult['accounting']>;
+  const acc = (over: Partial<Acc>): Acc =>
+    ({
+      version: 1,
+      currency: 'USD',
+      knownCost: 0,
+      completeness: 'complete',
+      reasons: {},
+      usage: {
+        inputTokens: 1200,
+        outputTokens: 400,
+        reasoningTokens: 0,
+        cachedTokens: 0,
+        cacheWriteTokens: 0,
+        audioSeconds: 0,
+      },
+      operations: { total: 4, settled: 4, unknown: 0, denied: 0, byKind: { chat: 4 } },
+      breakdown: { generation: 0, judging: 0, external: 0 },
+      provenance: {},
+      scope: 'run',
+      ...over,
+    }) as Acc;
+
+  const item = (
+    i: number,
+    outcome: NonNullable<EvalItem['outcome']>,
+    generation: number,
+    judging: number,
+    judgeOutcome: 'scored' | 'budget_skipped',
+    score: number | null,
+  ): EvalItem => ({
+    input: { question: `Accounting demo question ${i + 1}` },
+    output: outcome === 'budget_skipped' ? null : `Answer ${i + 1}`,
+    ...(outcome === 'budget_skipped'
+      ? { error: 'Budget exceeded' }
+      : outcome === 'budget_interrupted'
+        ? { error: 'Budget interrupted' }
+        : {}),
+    scores: { 'llm-judge': score },
+    scoreDetails: {
+      'llm-judge': {
+        score,
+        outcome: judgeOutcome,
+        ...(judgeOutcome === 'scored' ? { duration: 140 } : {}),
+        accounting: acc({
+          knownCost: judging,
+          breakdown: { generation: 0, judging, external: 0 },
+          operations: {
+            total: judgeOutcome === 'scored' ? 1 : 0,
+            settled: judgeOutcome === 'scored' ? 1 : 0,
+            unknown: 0,
+            denied: judgeOutcome === 'scored' ? 0 : 1,
+            byKind: {},
+          },
+        }),
+      },
+    },
+    outcome,
+    duration: 800,
+    cost: generation,
+    scorerCost: judging,
+    accounting: acc({
+      knownCost: generation + judging,
+      breakdown: { generation, judging, external: 0 },
+    }),
+    callerReport: { cost: 0.5 },
+  });
+
+  const summaryFor = (items: EvalItem[]): EvalSummary => {
+    const vals = items
+      .map((i) => i.scores['llm-judge'])
+      .filter((v): v is number => typeof v === 'number')
+      .sort((a, b) => a - b);
+    const stat = vals.length
+      ? {
+          mean: Math.round((vals.reduce((s, v) => s + v, 0) / vals.length) * 1000) / 1000,
+          min: vals[0],
+          max: vals[vals.length - 1],
+          p50: vals[Math.floor((vals.length - 1) * 0.5)],
+          p95: vals[Math.floor((vals.length - 1) * 0.95)],
+        }
+      : { mean: 0, min: 0, max: 0, p50: 0, p95: 0 };
+    return {
+      count: items.length,
+      failures: items.filter((i) => i.error).length,
+      coverage: {
+        items: {
+          completed: items.filter((i) => i.outcome === 'completed').length,
+          failed: items.filter((i) => i.outcome === 'failed').length,
+          cancelled: items.filter((i) => i.outcome === 'cancelled').length,
+          budget_skipped: items.filter((i) => i.outcome === 'budget_skipped').length,
+          budget_interrupted: items.filter((i) => i.outcome === 'budget_interrupted').length,
+        },
+        scorers: {
+          'llm-judge': {
+            scored: vals.length,
+            failed: 0,
+            skipped: 0,
+            cancelled: 0,
+            budget_skipped: items.filter(
+              (i) => i.scoreDetails?.['llm-judge']?.outcome === 'budget_skipped',
+            ).length,
+            budget_interrupted: 0,
+          },
+        },
+      },
+      scorers: {
+        'llm-judge': { ...stat, scored: vals.length, failed: 0, skipped: 0 },
+      },
+      timing: { mean: 800, min: 800, max: 800, p50: 800, p95: 800 },
+    };
+  };
+
+  const base = (items: EvalItem[], accounting: Acc): EvalResult => ({
+    id: randomUUID(),
+    dataset: 'accounting-demo-dataset',
+    metadata: {
+      workflows: ['accounting-demo-workflow'],
+      models: ['openai-responses:gpt-5.5'],
+      modelCounts: { 'openai-responses:gpt-5.5': items.length },
+      scorerTypes: { 'llm-judge': 'llm' },
+    },
+    timestamp: new Date().toISOString(),
+    totalCost: accounting.knownCost,
+    ...(accounting.completeness !== 'complete' ? { unpriced: true as const } : {}),
+    accounting,
+    duration: items.length * 800,
+    items,
+    summary: summaryFor(items),
+  });
+
+  const save = (result: EvalResult, minutesAgo: number): Promise<void> =>
+    runtime.saveEvalResult({
+      id: result.id,
+      eval: 'accounting-demo',
+      timestamp: Date.now() - minutesAgo * 60 * 1000,
+      data: result,
+    }) as Promise<void>;
+
+  // 1) Fully measured: every operation settled with a usable charge.
+  const measuredItems = [0, 1, 2].map((i) =>
+    item(i, 'completed', 0.2, 0.05, 'scored', 0.9 - i * 0.05),
+  );
+  await save(
+    base(
+      measuredItems,
+      acc({ knownCost: 0.75, breakdown: { generation: 0.6, judging: 0.15, external: 0 } }),
+    ),
+    12,
+  );
+
+  // 2) Incomplete: an unpriced model makes the total a LOWER BOUND. The old
+  //    presentation showed exactly this case as a confident `$0.00`.
+  await save(
+    base(
+      [0, 1].map((i) => item(i, 'completed', 0, 0, 'scored', 0.8)),
+      acc({
+        knownCost: 0,
+        completeness: 'incomplete',
+        reasons: { unpriced_model: 2 },
+        operations: { total: 2, settled: 0, unknown: 2, denied: 0, byKind: { chat: 2 } },
+      }),
+    ),
+    11,
+  );
+
+  // 3) Budget-stopped: two cases completed, one was interrupted mid-flight and
+  //    two never started. Their judges were denied, so they read "not run
+  //    (budget)" rather than zero, and the run is short by design.
+  await save(
+    base(
+      [
+        item(0, 'completed', 0.6, 0.15, 'scored', 0.88),
+        item(1, 'completed', 0.6, 0, 'budget_skipped', null),
+        item(2, 'budget_interrupted', 0.15, 0, 'budget_skipped', null),
+        item(3, 'budget_skipped', 0, 0, 'budget_skipped', null),
+        item(4, 'budget_skipped', 0, 0, 'budget_skipped', null),
+      ],
+      acc({
+        knownCost: 1.5,
+        breakdown: { generation: 1.35, judging: 0.15, external: 0 },
+        operations: { total: 5, settled: 5, unknown: 0, denied: 4, byKind: { chat: 5 } },
+        budget: {
+          limit: 1,
+          status: 'closed',
+          knownSpend: 1.5,
+          knownOvershoot: 0.5,
+          closedBy: 'case',
+        },
+        callerReported: { costItems: 5, costTotal: 2.5, metadataItems: 0 },
+      }),
+    ),
+    10,
+  );
+
+  // 4) Legacy artifact: no `accounting` block at all — reads `unverified`.
+  const legacy = base(measuredItems, acc({ knownCost: 0.75 }));
+  delete (legacy as { accounting?: unknown }).accounting;
+  legacy.totalCost = 0.42;
+  await save(legacy, 9);
+
+  // 5) A run that captured requests — which the dev server cannot actually
+  //    serve, and that is the point of seeding it.
+  //
+  //    The dev fixtures configure no `diagnostics.artifacts` store, so
+  //    `saveEvalResult` finds no artifact behind this manifest and rewrites it
+  //    to `status: 'unavailable'` with zeroed counters. The run therefore
+  //    renders the DOWNGRADED "Captured requests" block — reason shown,
+  //    download disabled, no record count — which is the state hardest to get
+  //    right and the one a dev is least likely to reproduce by hand. A block
+  //    with live records needs a real capture run against a configured
+  //    artifact store; see `docs/observability.md`.
+  const captured = base(measuredItems, acc({ knownCost: 0.75 }));
+  captured.diagnostics = {
+    version: 1,
+    artifactId: 'dev-fixture-artifact',
+    fidelity: 'runtime_request',
+    status: 'complete',
+    records: 6,
+    bytes: 24_576,
+    redaction: 'none',
+  };
+  await save(captured, 8);
 }

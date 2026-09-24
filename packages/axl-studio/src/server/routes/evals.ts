@@ -2,8 +2,28 @@ import { randomUUID } from 'node:crypto';
 import { Hono } from 'hono';
 import type { StudioEnv } from '../types.js';
 import type { ConnectionManager } from '../ws/connection-manager.js';
-import type { DegradedScorer, EvalResult, Scorer } from '@axlsdk/eval';
-import { redactEvalHistoryList, redactEvalResult, redactErrorMessage } from '../redact.js';
+import type {
+  DegradedScorer,
+  EvalComparison,
+  EvalResult,
+  ItemErrorRate,
+  Scorer,
+} from '@axlsdk/eval';
+import type { CapturedRequestRecord } from '@axlsdk/axl';
+import {
+  redactEvalComparison,
+  redactEvalHistoryList,
+  redactEvalResult,
+  redactErrorMessage,
+  redactRecordLine,
+} from '../redact.js';
+import {
+  importedAccountingIsTrustworthy,
+  isValidImportedCoverage,
+  isValidImportedItemErrorRate,
+  isValidImportedMultiRun,
+  stripAccounting,
+} from '../eval-import.js';
 
 export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => Promise<void>) {
   const app = new Hono<StudioEnv>();
@@ -77,6 +97,7 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
     let runs = 1;
     let stream = false;
     let captureTraces = false;
+    let captureRequests = false;
     try {
       const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
       if (typeof body.runs === 'number' && Number.isFinite(body.runs) && body.runs > 1) {
@@ -87,6 +108,12 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
       }
       if (body.captureTraces === true) {
         captureTraces = true;
+      }
+      // Boolean only. The byte bounds are runtime configuration, not something a
+      // request body gets to raise -- an unbounded capture requested over HTTP is
+      // a disk-exhaustion lever.
+      if (body.captureRequests === true) {
+        captureRequests = true;
       }
     } catch {
       // No body or invalid body — single run, synchronous
@@ -146,6 +173,7 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
                   metadata: { runGroupId, runIndex: r, batchAttempted: runs },
                   signal: ac.signal,
                   captureTraces,
+                  captureRequests,
                   onProgress: (event) => {
                     // Library-level `run_done` fires after every iteration with
                     // `{ totalItems, failures }`; Studio emits its own wire-level
@@ -239,6 +267,7 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
             const result = (await runtime.runRegisteredEval(name, {
               signal: ac.signal,
               captureTraces,
+              captureRequests,
               onProgress: (event) => {
                 // Drop library-level `run_done` — Studio's terminal signal for
                 // single-run streams is the `done` event below, which carries
@@ -286,6 +315,7 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
             const result = await runtime.runRegisteredEval(name, {
               metadata: { runGroupId, runIndex: r, batchAttempted: runs },
               captureTraces,
+              captureRequests,
             });
             results.push(result as EvalResult);
           } catch (err) {
@@ -313,11 +343,22 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
         // Mirrors the client's `buildMultiRunResult` so the sync (stream:false)
         // and streaming (stream:true, client-rebuilt) paths behave identically.
         const aggDegraded = unionDegradedScorers(results);
+        // The item gate is judged per run (as the CLI does), so the aggregate
+        // carries the worst run's rate, never run[0]'s — mirrors the client's
+        // `worstItemErrorRate`.
+        const worstItemRate = worstItemErrorRate(results);
+        // `modelTiming` is per-call distributions over ONE run, and the samples
+        // behind them are not persisted, so no group figure can be built. Omit
+        // it rather than present run[0]'s as the batch's; each run in
+        // `allRuns` keeps its own. Mirrors the client's `buildMultiRunResult`.
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        const { modelTiming: _runOneModelTiming, ...firstSummary } = first.summary;
         const result = {
           ...first,
           summary: {
-            ...first.summary,
+            ...firstSummary,
             ...(aggDegraded.length > 0 ? { degraded: aggDegraded } : {}),
+            ...(worstItemRate ? { itemErrorRate: worstItemRate } : {}),
           },
           _multiRun: {
             aggregate,
@@ -336,7 +377,10 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
         });
       } else {
         // Runtime persists eval result to history automatically
-        const result = (await runtime.runRegisteredEval(name, { captureTraces })) as EvalResult;
+        const result = (await runtime.runRegisteredEval(name, {
+          captureTraces,
+          captureRequests,
+        })) as EvalResult;
         return c.json({
           ok: true,
           data: redactEvalResult(result, redactOn),
@@ -350,6 +394,148 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
         400,
       );
     }
+  });
+
+  // ── Captured-request diagnostics ───────────────────────────────────
+  //
+  // Two endpoints, deliberately split: the manifest is small, cheap and safe to
+  // render in a list; the records can be megabytes and are streamed only when
+  // someone actually asks to read them.
+  //
+  // Both address the artifact by the owning HISTORY ID, never by artifact id
+  // from the client. A client that could name an artifact directly could read
+  // one whose owning run it is not looking at (or that belongs to another
+  // tenant's history row); resolving through history keeps authorization and
+  // lookup on the same key. `runtime.openDiagnosticArtifact` then applies the
+  // logical checks — owner still exists, expiry has not passed — so an artifact
+  // whose Redis row aged out while this process was offline 404s instead of
+  // serving bytes.
+
+  /** Locate a history entry and the artifact id it declares, if any. */
+  async function resolveDiagnostics(
+    runtime: StudioEnv['Variables']['runtime'],
+    id: string,
+  ): Promise<{ artifactId: string } | undefined> {
+    // By id: this runs on every diagnostics read, and materializing the whole
+    // history — every result's full `data` blob — to find one entry made the
+    // cost of reading one artifact proportional to the size of history.
+    const entry = await runtime.getEvalResult(id);
+    const artifactId = (entry?.data as EvalResult | undefined)?.diagnostics?.artifactId;
+    return typeof artifactId === 'string' && artifactId !== '' ? { artifactId } : undefined;
+  }
+
+  app.get('/evals/:id/diagnostics', async (c) => {
+    const runtime = c.get('runtime');
+    const id = c.req.param('id');
+    const resolved = await resolveDiagnostics(runtime, id);
+    if (!resolved) {
+      return c.json(
+        {
+          ok: false,
+          error: {
+            code: 'NOT_FOUND',
+            message: `Eval result "${id}" has no captured requests`,
+          },
+        },
+        404,
+      );
+    }
+    const opened = await runtime.openDiagnosticArtifact(resolved.artifactId);
+    if (!opened) {
+      return c.json(
+        {
+          ok: false,
+          error: {
+            code: 'NOT_FOUND',
+            message: `Captured requests for eval result "${id}" are no longer available`,
+          },
+        },
+        404,
+      );
+    }
+    // The manifest is structural throughout — counts, byte totals, a status, an
+    // expiry — so redaction has nothing to scrub here. `reason` is generated by
+    // Axl (a limit or a sink error), never echoed user content.
+    return c.json({
+      ok: true,
+      data: {
+        artifactId: opened.manifest.artifactId,
+        status: opened.manifest.status,
+        ...(opened.manifest.reason !== undefined ? { reason: opened.manifest.reason } : {}),
+        records: opened.manifest.records,
+        bytes: opened.manifest.bytes,
+        fidelity: opened.manifest.fidelity,
+        redaction: opened.manifest.redaction,
+        ...(opened.manifest.expiresAt !== undefined
+          ? { expiresAt: opened.manifest.expiresAt }
+          : {}),
+        ...(opened.manifest.copiedFrom !== undefined
+          ? { copiedFrom: opened.manifest.copiedFrom }
+          : {}),
+      },
+    });
+  });
+
+  app.get('/evals/:id/diagnostics/records', async (c) => {
+    const runtime = c.get('runtime');
+    const redactOn = runtime.isRedactEnabled();
+    const id = c.req.param('id');
+    const resolved = await resolveDiagnostics(runtime, id);
+    const opened = resolved ? await runtime.openDiagnosticArtifact(resolved.artifactId) : undefined;
+    if (!opened) {
+      return c.json(
+        {
+          ok: false,
+          error: {
+            code: 'NOT_FOUND',
+            message: `Captured requests for eval result "${id}" are not available`,
+          },
+        },
+        404,
+      );
+    }
+    // Streamed as JSONL rather than buffered into a JSON array: an artifact is
+    // allowed to be 16 MiB and materializing that as one string to serialize is
+    // how a diagnostics read takes the server down.
+    //
+    // The reader is held explicitly rather than driven by `for await`, because a
+    // consumer that vanishes mid-artifact (a closed tab, an aborted fetch) has
+    // to end the underlying read too. Without `cancel()` the loop keeps pulling
+    // lines off the disk for a stream nobody is attached to and enqueues into a
+    // closed controller, which throws where nothing is waiting to catch it.
+    let cancelled = false;
+    const lines = opened.lines[Symbol.asyncIterator]();
+    return new Response(
+      new ReadableStream<Uint8Array>({
+        async start(controller) {
+          const encoder = new TextEncoder();
+          try {
+            for (;;) {
+              const next = await lines.next();
+              if (next.done || cancelled) break;
+              controller.enqueue(encoder.encode(`${redactRecordLine(next.value, redactOn)}\n`));
+            }
+            if (!cancelled) controller.close();
+          } catch (error) {
+            if (!cancelled) controller.error(error);
+          } finally {
+            // Release the artifact's file handle. Abandoning it would hold a
+            // descriptor open for as long as the process lives.
+            await lines.return?.().catch(() => undefined);
+          }
+        },
+        cancel() {
+          cancelled = true;
+        },
+      }),
+      {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/x-ndjson; charset=utf-8',
+          'Cache-Control': 'no-store',
+        },
+      },
+    );
   });
 
   // Cancel an active streaming eval run.
@@ -373,7 +559,8 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
     const runtime = c.get('runtime');
     const redactOn = runtime.isRedactEnabled();
     const name = c.req.param('name');
-    const body = await c.req.json<{ resultId: string }>();
+    const body = await c.req.json<{ resultId: string; captureRequests?: unknown }>();
+    const captureRequests = body.captureRequests === true;
 
     if (!body.resultId || typeof body.resultId !== 'string') {
       return c.json(
@@ -390,8 +577,10 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
       );
     }
 
-    const history = await runtime.getEvalHistory();
-    const historyEntry = history.find((h) => h.id === body.resultId);
+    // By id, not a scan of the cached list: a rescore copies this row's items
+    // into a brand-new result with a brand-new retention window, so the source
+    // has to still exist in the store. `getEvalResult` confirms that.
+    const historyEntry = await runtime.getEvalResult(body.resultId);
     if (!historyEntry) {
       return c.json(
         { ok: false, error: { code: 'NOT_FOUND', message: `Result "${body.resultId}" not found` } },
@@ -406,6 +595,7 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
         historyEntry.data as EvalResult,
         config.scorers as Scorer[],
         runtime,
+        captureRequests ? { captureRequests: true } : undefined,
       );
       await runtime.saveEvalResult({
         id: result.id,
@@ -483,8 +673,17 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
       );
     }
 
-    const history = await runtime.getEvalHistory();
-    const byId = new Map(history.map((h) => [h.id, h.data as EvalResult]));
+    // Resolve every requested id through the by-id read, which confirms the row
+    // against the store's retention view. The cached history list outlives a
+    // Redis TTL or a delete made elsewhere, and compare serves whole results
+    // back in its response.
+    const idsOf = (v: string | string[]): string[] => (Array.isArray(v) ? v : [v]);
+    const requested = new Set([...idsOf(body.baselineId), ...idsOf(body.candidateId)]);
+    const byId = new Map<string, EvalResult>();
+    for (const id of requested) {
+      const entry = await runtime.getEvalResult(id);
+      if (entry) byId.set(id, entry.data as EvalResult);
+    }
 
     const missing: string[] = [];
     const resolveOne = (id: string): EvalResult | undefined => {
@@ -532,7 +731,10 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
     try {
       // `missing.length === 0` guarantees both are defined here.
       const result = await runtime.evalCompare(baseline!, candidate!, body.options);
-      return c.json({ ok: true, data: result });
+      return c.json({
+        ok: true,
+        data: redactEvalComparison(result as EvalComparison, redactOn),
+      });
     } catch (err) {
       return c.json(
         {
@@ -567,6 +769,7 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
     const body = await c.req.json<{
       result: unknown;
       eval?: string;
+      requests?: unknown;
     }>();
 
     const bad = (message: string) =>
@@ -650,6 +853,45 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
       trim((firstResult as { workflow?: unknown }).workflow) ??
       'imported';
 
+    // Stamp an accounting record on any artifact that lacks one, so a stored
+    // pre-0.24 import describes itself as `unverified` instead of looking like a
+    // measured run whose spend happened to be whatever `totalCost` said. Cost
+    // certification downstream then refuses it for a stated reason rather than
+    // silently trusting it. `@axlsdk/eval` stays an optional peer here (same as
+    // the aggregate/rescore routes): if it isn't installed we import the
+    // artifact unchanged, and readers synthesize the same `unverified` view.
+    let readAccounting: ((r: EvalResult) => unknown) | undefined;
+    let validateRequestSidecar:
+      | ((
+          text: unknown,
+        ) => { ok: true; lines: string[]; bytes: number } | { ok: false; reason: string })
+      | undefined;
+    try {
+      ({ readAccounting, validateRequestSidecar } = await import('@axlsdk/eval'));
+    } catch {
+      readAccounting = undefined;
+      validateRequestSidecar = undefined;
+    }
+
+    // Optional captured-request sidecar. It is validated in full BEFORE a
+    // single result is stored: a malformed sidecar is a bad request, not a
+    // half-imported run. Note what it cannot express -- a path, a URL, an
+    // artifact id of the exporter's choosing. Records are re-staged under a
+    // NEW artifact id owned by the NEW history row, so an imported reference
+    // can only ever resolve to bytes this runtime wrote itself.
+    let sidecarLines: string[] | undefined;
+    if (body.requests !== undefined && body.requests !== null) {
+      if (!validateRequestSidecar) {
+        return bad('importing captured requests requires @axlsdk/eval to be installed');
+      }
+      const validation = validateRequestSidecar(body.requests);
+      if (!validation.ok) return bad(validation.reason);
+      sidecarLines = validation.lines;
+    }
+    if (sidecarLines && validatedResults.length > 1) {
+      return bad('a requests sidecar can only accompany a single result');
+    }
+
     const timestamp = Date.now();
     const imported: Array<{ id: string; eval: string; timestamp: number }> = [];
     for (const r of validatedResults) {
@@ -665,6 +907,84 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
             ? (r.metadata as Record<string, unknown>)
             : {},
       };
+      // An imported artifact is the one result this runtime did not measure, so
+      // a DECLARED accounting record has to prove it is internally consistent
+      // before compare is allowed to certify a cost delta from it. A record that
+      // does not add up is replaced by the same `unverified` synthesis an
+      // artifact with no accounting receives -- the numbers stay readable, the
+      // certification does not survive. Which way it went is recorded rather
+      // than left to be inferred.
+      if (entry.accounting === undefined) {
+        // No accounting to certify, but `summary.coverage` is still an
+        // accounting-derived claim a reader turns into "N cases were never
+        // attempted". A malformed one reads as zeros, so it goes too.
+        if (
+          entry.summary?.coverage !== undefined &&
+          !isValidImportedCoverage(entry.summary.coverage)
+        ) {
+          delete entry.summary.coverage;
+          // Marked, not just dropped: a reader has to be able to tell "this
+          // artifact never had coverage" from "its coverage was refused".
+          entry.metadata.importedAccounting = 'invalid';
+        }
+        if (readAccounting) {
+          entry.accounting = readAccounting(entry) as EvalResult['accounting'];
+        }
+      } else if (importedAccountingIsTrustworthy(entry)) {
+        entry.metadata.importedAccounting = 'declared';
+      } else {
+        const stripped = stripAccounting(entry);
+        entry.accounting = readAccounting
+          ? (readAccounting(stripped) as EvalResult['accounting'])
+          : undefined;
+        entry.items = stripped.items;
+        // `summary` carries `coverage`, the other half of the budget-stopped
+        // verdict. Leaving it behind would badge this run budget-stopped on the
+        // strength of a record that just failed validation.
+        entry.summary = stripped.summary;
+        entry.metadata.importedAccounting = 'invalid';
+      }
+
+      // `summary.itemErrorRate` is a verdict the multi-run view promotes (worst
+      // run, runs exceeded), and unlike coverage it is not accounting, so a
+      // malformed one is dropped and marked on its own key rather than
+      // downgrading `importedAccounting`.
+      if (
+        entry.summary?.itemErrorRate !== undefined &&
+        !isValidImportedItemErrorRate(entry.summary.itemErrorRate)
+      ) {
+        delete entry.summary.itemErrorRate;
+        entry.metadata.importedItemErrorRate = 'invalid';
+      }
+
+      // `_multiRun` (a saved sync multi-run response) is walked run by run on
+      // every redacted history read. A shape that walk cannot follow is dropped
+      // and marked on its own key, like `itemErrorRate`. The top-level result
+      // still imports; only the nested block it cannot vouch for is refused.
+      const multiRun = (entry as { _multiRun?: unknown })._multiRun;
+      if (multiRun !== undefined && !isValidImportedMultiRun(multiRun)) {
+        delete (entry as { _multiRun?: unknown })._multiRun;
+        entry.metadata.importedMultiRun = 'invalid';
+      }
+
+      // Re-stage the sidecar under the NEW history id and rewrite the result's
+      // reference to the new artifact id. The exporter's artifact id is
+      // deliberately discarded: it names storage in a deployment this one knows
+      // nothing about.
+      if (sidecarLines) {
+        entry.diagnostics = await restageImportedRequests(runtime, id, sidecarLines);
+      } else if (entry.diagnostics) {
+        // A result that claims captured requests but arrived without them: keep
+        // the numbers, say plainly that the evidence is missing, and drop the
+        // dangling artifact id rather than letting a reader chase it.
+        entry.diagnostics = {
+          ...entry.diagnostics,
+          artifactId: '',
+          status: 'unavailable',
+          reason: 'imported without its captured-request sidecar',
+        };
+      }
+
       await runtime.saveEvalResult({ id, eval: evalName, timestamp, data: entry });
       imported.push({ id, eval: evalName, timestamp });
     }
@@ -678,12 +998,112 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
     return c.json({ ok: true, data: { imported } });
   });
 
+  /**
+   * Store an imported sidecar's records as a fresh artifact owned by `ownerId`.
+   *
+   * Deliberately NOT committed here: `runtime.saveEvalResult` is what commits an
+   * artifact, and it does so only after the history row it belongs to actually
+   * lands. Staging now and letting the save commit keeps imports on exactly the
+   * same two-phase path as a live run, including the rollback if the save fails.
+   *
+   * A storage failure yields an `unavailable` manifest rather than failing the
+   * import: the caller's numeric results are valid and worth keeping even when
+   * this deployment has nowhere to put the evidence.
+   */
+  async function restageImportedRequests(
+    runtime: StudioEnv['Variables']['runtime'],
+    ownerId: string,
+    lines: readonly string[],
+  ): Promise<EvalResult['diagnostics']> {
+    // Held outside the `try` so the degrade path can release it. Staging
+    // registers a lease-renewal timer the runtime clears only at finalize,
+    // rollback or delete, so an import that stages and then fails — a full or
+    // read-only volume under `sink.append`, a finalize whose artifact was
+    // already swept — would otherwise leave a directory renewing its lease
+    // until `maxHoldMs`, once per failed import. Same shape the eval runner
+    // and rescore guard.
+    let stagedId: string | undefined;
+    try {
+      const staged = await runtime.stageDiagnosticArtifact({ kind: 'eval', id: ownerId });
+      stagedId = staged.artifactId;
+      let bytes = 0;
+      // The bytes arrive already scrubbed or not; this deployment's own
+      // `trace.redact` says nothing about them. Reading it off the records is
+      // the only honest source — a manifest that claimed `'none'` over redacted
+      // records would tell a compliance reader the opposite of the truth, and
+      // one that claimed `'applied'` over raw ones is worse.
+      let allRedacted = lines.length > 0;
+      for (const line of lines) {
+        await staged.sink.append(line);
+        bytes += Buffer.byteLength(line, 'utf-8');
+        if (allRedacted) {
+          try {
+            allRedacted = (JSON.parse(line) as CapturedRequestRecord).captured?.redacted === true;
+          } catch {
+            allRedacted = false;
+          }
+        }
+      }
+      const manifest = await runtime.finalizeDiagnosticArtifact(
+        staged.artifactId,
+        'complete',
+        undefined,
+        allRedacted ? 'applied' : 'none',
+      );
+      return {
+        version: 1,
+        artifactId: manifest.artifactId,
+        fidelity: 'runtime_request',
+        status: manifest.status,
+        records: lines.length,
+        bytes,
+        redaction: manifest.redaction,
+      };
+    } catch (error) {
+      if (stagedId !== undefined) {
+        await runtime.rollbackDiagnosticArtifact(stagedId).catch(() => undefined);
+      }
+      return {
+        version: 1,
+        artifactId: '',
+        fidelity: 'runtime_request',
+        status: 'unavailable',
+        reason: `captured requests could not be stored: ${error instanceof Error ? error.message : String(error)}`,
+        records: 0,
+        bytes: 0,
+        redaction: 'none',
+      };
+    }
+  }
+
   function closeActiveRuns() {
     for (const ac of activeRuns.values()) ac.abort();
     activeRuns.clear();
   }
 
   return { app, closeActiveRuns };
+}
+
+/**
+ * The worst per-run `summary.itemErrorRate` in a multi-run group (highest
+ * `rate`; the first run wins a tie), stamped with `runsExceeded` — how many
+ * runs exceeded their limit. The CLI gates every run individually, so a pooled
+ * rate would let clean runs dilute a thinned one. `undefined` when no run had
+ * a failed item. `runsExceeded` is a client-facing extension, like
+ * `runsAffected` below. Mirrors the client's `worstItemErrorRate`.
+ */
+function worstItemErrorRate(
+  results: EvalResult[],
+): (ItemErrorRate & { runsExceeded: number }) | undefined {
+  let worst: ItemErrorRate | undefined;
+  let runsExceeded = 0;
+  for (const run of results) {
+    const r = run.summary?.itemErrorRate;
+    if (!r) continue;
+    if (r.exceeded) runsExceeded++;
+    if (!worst || r.rate > worst.rate) worst = r;
+  }
+  return worst ? { ...worst, runsExceeded } : undefined;
 }
 
 /**

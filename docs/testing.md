@@ -78,6 +78,8 @@ configured response delay is pending rejects with the signal's exact reason. Thi
 `stallTimeout` behavior testable without a real provider; it does not certify a vendor's
 network abort behavior. See the [API reference](./api-reference.md#ask-deadlines-cancellation-and-stalled-requests).
 
+> **Fake timers against a real adapter:** a suite that fakes `setTimeout` but not `Date` (for example `vi.useFakeTimers({ toFake: ['setTimeout'] })`) waits in real time on a rate-limit pause from any built-in chat provider, because the pause is measured with `Date.now()`; fake `Date` too, or set `rateLimit: { adaptive: false }`. See [Rate limiting](./providers.md#rate-limiting).
+
 ### Deterministic provider timing
 
 A mock response accepts an optional `timing` block ([`CallTiming`](./api-reference.md#calltiming)). `chat()` returns it on `ProviderResponse.timing` and `stream()` carries it on the terminal `done` chunk, so `agent_call_end.timing`, the `TimeoutError` breakdown, and the eval per-model rollup all become exact integers instead of measured deltas — no real clocks, no real transport.
@@ -417,6 +419,143 @@ Testing and [evaluation](../packages/axl-eval/README.md) are complementary but d
 
 Use testing to verify your workflow works correctly. Use evaluation to verify your prompts produce quality outputs — and to catch regressions when you change them.
 
+### What an eval run cost
+
+`EvalResult.totalCost` answers "what did this run spend?" from measurement, not from
+what a callback reported. It is a view of `EvalResult.accounting.knownCost`, so it is
+identical whether the run was traced, redacted, or captured — and a case that threw
+**after** a paid call still contributes that charge.
+
+```ts
+const result = await runEval(config, executeWorkflow, runtime);
+
+result.totalCost;                              // === accounting.knownCost
+result.accounting!.breakdown;                  // { generation, judging, external }
+result.items[0].accounting!.breakdown.judging; // what this item's judges cost
+result.summary.coverage!.items;                // completed / failed / cancelled / budget_*
+```
+
+Two consequences worth knowing before you assert on a number:
+
+- **A run whose spend could not be fully established says so.** `completeness` is
+  `'complete'` only when every operation settled with a usable charge — a genuinely free
+  call included. Otherwise `unpriced` is set and `accounting.reasons` counts why. `$0` and
+  "unknown" are different answers, and the runner never conflates them.
+- **An uninstrumented runtime measures nothing.** Passing a hand-rolled
+  `{} as AxlRuntime` yields `totalCost: 0` with `reasons.uninstrumented`, and any `cost`
+  your callback returned is preserved on `item.callerReport` rather than becoming a total.
+  Use a real `AxlRuntime` (with `MockProvider` registered) whenever a test asserts a cost.
+
+**Spend that Axl cannot see must be reported, not returned.** A scorer or tool that calls a
+vendor API directly (a hosted grader, a search API, an embedding service) is invisible to the
+runtime, and a `cost` returned from a scorer on an instrumented runtime is kept for inspection
+only — it is never added to `knownCost`, because a total assembled from self-reported numbers
+is not measurement. Wrap the external call instead:
+
+```ts
+import { externalOperation } from '@axlsdk/axl';
+
+const graded = scorer({
+  name: 'vendor-grade',
+  description: 'Grades with a hosted vendor grader',
+  async score(output) {
+    return externalOperation({ name: 'vendor-grade' }, async (report) => {
+      const res = await callVendor(output);
+      report.setCost(res.usd); // counted, and lands in accounting.breakdown.external
+      return res.score;
+    });
+  },
+});
+```
+
+An external operation that never calls `report.setCost` is counted as
+`reasons.external_unreported`, so the run reports "incomplete" rather than quietly
+under-reporting. Inside a workflow the `ctx.withExternalOperation` form is equivalent — see
+[`externalOperation`](./api-reference.md#externaloperationdescriptor-fn--ctxwithexternaloperationdescriptor-fn).
+
+To stop a run at a spend threshold, set `EvalConfig.budget` (or pass `--budget`). It is a
+threshold, not a reservation: cases already in flight are allowed to settle, so
+`accounting.budget.knownOvershoot` reports how far past the limit they carried the run.
+Cases that never started are `budget_skipped` and cases stopped mid-flight are
+`budget_interrupted` — neither is a workflow failure, and `summary.coverage` is the field
+to gate CI on (`summary.failures` keeps its older, broader "produced no output" meaning).
+
+### A thinned run does not pass
+
+Items whose **workflow** threw are `failed`. By default a run fails when more than 5% of its
+attempted items failed — `failed / (count − cancelled − budget_skipped − budget_interrupted)`,
+strictly greater than the limit — because its scores cover only the survivors. `runEval`
+records the verdict and returns normally; the CLI exits non-zero, and `axl-eval compare`
+refuses to certify a thinned side (legacy artifacts included).
+
+```ts
+const result = await runEval({ ...config, failOnItemErrorRate: 0.1 }, executeWorkflow, runtime);
+
+result.summary.itemErrorRate;
+// { failed: 12, attempted: 100, rate: 0.12, limit: 0.1, exceeded: true }
+// absent when no item failed; `1` disables the gate; an invalid value throws
+```
+
+Each failed item says why on `item.failure`, taken from the first `ProviderError` on the
+thrown value or its `cause` chain, and the CLI
+groups the failed items by it (`Failure causes: 5 × 429 (openai), 1 × other`):
+
+```ts
+result.items[0].failure;
+// { name: 'ProviderError', provider: 'openai', status: 429, retryable: true, requestId: 'req_…' }
+```
+
+`failure` never records `ProviderError.body`; `item.error` keeps the error message as before, which for some providers can include error-response text.
+
+To test the gate, have the workflow throw for chosen items — a `ProviderError` with
+`status: 429` reproduces a rate-limit storm without a provider. From the CLI,
+`--max-item-error-rate <0..1>` overrides the config for one invocation.
+
+### Seeing the request behind a score
+
+When a score is wrong, the question is what the model was actually asked. Traces
+tell you a call happened; [request capture](observability.md#captured-requests-opt-in)
+tells you what was in it — including the repaired message list on a retry turn
+and the prompt a judge built for itself.
+
+```ts
+const runtime = new AxlRuntime({
+  diagnostics: { artifacts: { root: '.axl/artifacts' } },
+});
+
+const result = await runEval(config, executeWorkflow, runtime, {
+  captureRequests: true,
+});
+
+// Which operations produced the worst-scoring item's answer?
+const worst = result.items.toSorted((a, b) => a.scores.quality! - b.scores.quality!)[0];
+worst.diagnostics?.operations;                  // generation calls
+worst.scoreDetails?.quality.diagnostics?.operations; // the judge's calls
+
+// Read them back (a saved run resolves through its history id).
+const opened = await runtime.openDiagnosticArtifact(result.diagnostics!.artifactId);
+for await (const line of opened!.lines) {
+  const record = JSON.parse(line);
+  if (record.phase === 'start') console.log(record.turn, record.request.messages);
+  if (record.correction) console.log('repair:', record.correction);
+}
+```
+
+From the CLI, `axl-eval --capture-requests --output result.json` writes the same
+records to `result.requests.jsonl`.
+
+Three things to know before asserting on capture in a test:
+
+- **It is off by default and requires storage.** Without `diagnostics.artifacts`
+  the run fails with `AxlError('DIAGNOSTICS_UNAVAILABLE')` *before* the dataset
+  is loaded — a deliberate early failure rather than a surprise at the end of a
+  paid run.
+- **Capture health is not run health.** A truncated, interrupted or unavailable
+  capture leaves `accounting` byte-identical; assert the two independently.
+- **Redaction applies.** With `trace.redact` on, message and response content in
+  the records is `'[redacted]'` and `captured.redacted` is `true`; structure,
+  counts and ids survive.
+
 ### Comparing model latency in an eval
 
 Eval callback metadata is additive: returning `{ output, metadata: { category: 'billing' } }`
@@ -433,16 +572,17 @@ the list and counts when reporting exact custom call counts. Cost and budget sem
 
 `runEval` therefore also rolls up per-model provider latency from `agent_call_end.timing`, on the default path as well as under `captureTraces`. Each item gets `item.timing[model] = { calls, queuedMs, retryMs, wireMs, firstTokenMs?, firstTokenCalls? }`, and the run gets `summary.modelTiming[model]`.
 
-Compare models on these four per-call distributions:
+Compare models on these four per-call distributions, plus one total:
 
 | Field | What it isolates |
 |---|---|
 | `wireMs` | The provider's own time per call. On streams with content it is always at least `firstTokenMs`, while post-yield consumer pauses are excluded |
 | `firstTokenMs` | Time to the first content delta. The figure that actually discriminates between models, since headers arrive at roughly one round trip regardless of model. Absent on a non-streaming run rather than `0` |
-| `queuedMs` | Wait on **your** rate limiter, not the provider's |
-| `retryMs` | Failed attempts and backoff — the provider's throttling that day, kept out of `wireMs` |
+| `queuedMs` | Wait on Axl's own governor, not the provider: your configured caps, plus the pause and pacing after a rate-limit 429 |
+| `retryMs` | Failed attempts and their `503`/`529`/network backoff, kept out of `wireMs`. Rate-limit waits are in `queuedMs` |
+| `rateLimitRetries` | Not a distribution: the total rate-limit 429s these calls absorbed and retried. Nonzero means the provider throttled the run, so lower `concurrency`. Successful calls only: a call that spent its whole rate-limit budget is a failed item with a `429` failure cause, not a count here, so a harder-throttled run can show a **lower** total. Read it beside the item error rate and `Failure causes`. The CLI adds `rate-limited N×` to the row when it is above 0 |
 
-Each is a `{ mean, min, max, p50, p95 }` over **per-call** values pooled across every successful item, so one provider call is one sample and `calls` is the sample size. An item that makes ten calls weighs ten times an item that makes one. That is the right weighting for judging a model — and deliberately different from the wall-clock `summary.timing`, which samples once per item because it describes the workflow. Read the two side by side; do not expect them to agree.
+Each is a `{ mean, min, max, p50, p95 }` over **per-call** values pooled across every successful call, including calls made by items that later failed, so one provider call is one sample and `calls` is the sample size. An item that makes ten calls weighs ten times an item that makes one. That is the right weighting for judging a model — and deliberately different from the wall-clock `summary.timing`, which samples once per item because it describes the workflow. Read the two side by side; do not expect them to agree.
 
 `firstTokenMs` runs over the streaming calls only, and `firstTokenCalls` says how many that was — a distribution carries no sample size of its own, so without it a model mixing streamed and non-streamed calls gives no way to tell a first-token figure drawn from one call from one drawn from all of them.
 

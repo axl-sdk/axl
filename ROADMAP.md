@@ -13,6 +13,33 @@
 
 ### Complete
 
+- **Trustworthy eval accounting, budgets, and attempt diagnostics** — Cost is
+  measured from operation settlement rather than trace events:
+  `runtime.trackOutcome()` returns an `Accounting` record whose `knownCost` is
+  a lower bound with an explicit `completeness` and reasons, so a known $0 is
+  never confused with an unknown charge. `AdmissionController` closes a
+  budget before the request leaves the process, checked again before every
+  fetch attempt; `EvalConfig.budget` / `axl-eval --budget` stop a run with
+  distinct `budget_skipped` / `budget_interrupted` outcomes, coverage counts,
+  and a CLI exit rule keyed to refused work, not to a closed controller.
+  Comparisons certify cost only on complete, like-for-like data. Opt-in
+  request capture writes attempt-level diagnostics to a managed artifact
+  store with leases, retention mirroring, writer-applied redaction, and
+  Studio import/export; Studio presents spend with its completeness
+  everywhere and keeps its client mirror pinned to the eval package by a
+  drift test. See [observability.md](docs/observability.md),
+  [testing.md](docs/testing.md), and
+  [migration/eval-accounting.md](docs/migration/eval-accounting.md).
+
+- **Adaptive rate governance and honest eval coverage (live verification pending)** — `axl-eval` fails a run
+  (and `compare` refuses to certify a side) that lost more than 5% of its items,
+  and every failed item records a structured `failure` cause (provider, status,
+  retryable, request id). Rate governors are pooled per runtime scope (family +
+  origin + credential + model). On every built-in chat provider, a rate-limit
+  429 pauses the whole scope and retries on its own budget, and the scope then
+  paces itself (AIMD on the grant rate), staying fully open until the first
+  429. On OpenAI and Anthropic's own endpoints a spend cap also fails fast. See
+  [providers.md](docs/providers.md) "Rate limiting".
 - **Completed-file transcription** — `ctx.transcribe()` is a dedicated,
   non-chat finite-recording operation with OpenAI, Gemini Interactions/Files,
   and catalog-capable OpenRouter STT adapters; paired safe lifecycle events,
@@ -68,6 +95,23 @@
 - **Stream-First Observation API (Phases 1–3, complete)** — `ctx.events` on every `WorkflowContext` exposes the same `AxlEvent` iterable + curated views as `AxlStream` (`.text`, `.lifecycle`, `.textByAsk`, plus `.partialObjects`). Bounded queues, strict overflow, explicit streaming mode, signal cleanup, retry-aware views, and event options span every execution surface. The obsolete `onToken`, `onToolCall`, and `onAgentStart` context callbacks are removed; `ctx.events`, `runtime.stream()`, and runtime trace listeners cover context, wire-execution, and cross-execution observation without listener exceptions acting as control flow. See [migration guide](docs/migration/stream-first-observation.md).
 
 ### Planned
+
+#### Pricing coverage gaps
+
+Live verification on 2026-09-17 found two kinds of spend that Axl records but cannot price.
+The run is correctly flagged `incomplete` / `unpriced_model`, but a budget cannot stop spend
+it cannot price. Both are documented as known gaps in the provider docs.
+
+- **DeepSeek model ID alias.** A request for `deepseek-v4-flash` comes back reporting
+  `deepseek-flash`, and the exact-match V4 table has no row for it, so DeepSeek calls go
+  unpriced. Before changing anything: confirm current DeepSeek pricing and aliases, then decide
+  whether to add the alias to the table or fall back to the requested ID when the reported ID
+  is unknown. The fallback is broader, but it could misprice a call the provider served on a
+  different model. See [providers — known gap](docs/providers.md#openai-compatible-providers--presets).
+- **Built-in transcription pricing.** `openai-transcription:gpt-transcribe` and
+  `gemini-transcription:gemini-3.5-transcribe` report usage without cost. Decide whether to
+  price them from published per-minute / per-token rates, and keep `unpriced` wherever a rate
+  cannot be verified. See [multimodal input — known gap](docs/multimodal-input.md#completed-file-transcription).
 
 #### Strict-mode native structured output
 
@@ -298,6 +342,14 @@ separate future product surfaces, not implied by today's `ModelInput` or
 
 Promote any item to Planned only when its user journey, lifecycle owner,
 provider scope, and live-verification budget are explicit.
+
+#### Rate governance follow-ups
+
+Each is gated on live evidence from the adaptive rate governance workstream:
+proactive token reservation (only if sustained utilization measures below 70%),
+a shareable cross-runtime governor pool, a header-driven pre-429 slowdown, and
+Gemini and OpenAI-compatible preset dialects (spend-cap classification and quota
+hints; those providers already brake, retry and pace without one).
 
 #### Realtime / Voice Agents
 

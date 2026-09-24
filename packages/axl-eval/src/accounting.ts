@@ -1,0 +1,329 @@
+/**
+ * Eval-side accounting helpers.
+ *
+ * The core owns measurement (`@axlsdk/axl`'s `Accounting`, `trackOutcome`,
+ * `AdmissionController`). This module owns the three things eval adds on top:
+ *
+ * - **Scope plumbing** — {@link trackScope} opens a core accounting scope when
+ *   the runtime has one, and produces an explicitly `uninstrumented` record
+ *   when it does not. An eval driven by a hand-rolled runtime therefore reports
+ *   "we measured nothing", never a confident `$0`.
+ * - **Reading** — {@link readAccounting} turns any `EvalResult`, including a
+ *   pre-0.24 artifact with no `accounting` at all, into an `EvalAccounting`.
+ *   An absent record reads `'unverified'` and is NEVER upgraded to `'complete'`.
+ * - **Union** — {@link aggregateAccounting} folds several records
+ *   conservatively: sums of known spend, unions of reasons, and the WORST
+ *   completeness of any input.
+ *
+ * Everything here is pure except `trackScope`, which only delegates.
+ */
+
+import { AxlError, isAdmissionDeniedError } from '@axlsdk/axl';
+import type {
+  Accounting,
+  AccountingReason,
+  AccountingUsage,
+  AxlEvent,
+  AxlRuntime,
+  CostProvenance,
+  ModelTimingRollup,
+  OperationKind,
+  TrackExecutionMetadata,
+  TrackOutcomeOptions,
+} from '@axlsdk/axl';
+
+import type { EvalAccounting, EvalCoverage, EvalResult } from './types.js';
+
+const USAGE_KEYS: (keyof AccountingUsage)[] = [
+  'inputTokens',
+  'outputTokens',
+  'reasoningTokens',
+  'cachedTokens',
+  'cacheWriteTokens',
+  'audioSeconds',
+];
+
+function zeroUsage(): AccountingUsage {
+  return {
+    inputTokens: 0,
+    outputTokens: 0,
+    reasoningTokens: 0,
+    cachedTokens: 0,
+    cacheWriteTokens: 0,
+    audioSeconds: 0,
+  };
+}
+
+/** A scope in which nothing paid could happen — structurally complete at $0. */
+export function emptyAccounting(): Accounting {
+  return {
+    version: 1,
+    currency: 'USD',
+    knownCost: 0,
+    completeness: 'complete',
+    reasons: {},
+    usage: zeroUsage(),
+    operations: { total: 0, settled: 0, unknown: 0, denied: 0, byKind: {} },
+    breakdown: { generation: 0, judging: 0, external: 0 },
+    provenance: {},
+  };
+}
+
+/**
+ * What a scope reports when the runtime cannot measure at all — no
+ * `trackOutcome`, so no operation was ever observed.
+ *
+ * Deliberately `'incomplete'` with reason `'uninstrumented'` rather than a
+ * confident `$0`: the work may well have spent money, we simply have no rail
+ * to see it on. Callers' own `cost` values land in `callerReport`, never here.
+ */
+export function uninstrumentedAccounting(): Accounting {
+  return { ...emptyAccounting(), completeness: 'incomplete', reasons: { uninstrumented: 1 } };
+}
+
+/** The outcome of {@link trackScope}: never a rejection, always an accounting. */
+export type ScopeOutcome<T> = (
+  | { status: 'fulfilled'; value: T }
+  | { status: 'rejected'; error: unknown }
+) & {
+  accounting: Accounting;
+  /** `false` when the runtime had no `trackOutcome` (see {@link uninstrumentedAccounting}). */
+  instrumented: boolean;
+  metadata?: TrackExecutionMetadata;
+  modelTiming?: ModelTimingRollup;
+  traces?: AxlEvent[];
+};
+
+/** `true` when this runtime can open a core accounting scope. */
+export function isInstrumented(runtime: AxlRuntime | undefined): boolean {
+  return typeof runtime?.trackOutcome === 'function';
+}
+
+/**
+ * Run `fn` inside a core accounting scope, or — on a runtime that has none —
+ * run it plainly and report {@link uninstrumentedAccounting}.
+ *
+ * Never throws: the thrown value comes back verbatim under `status: 'rejected'`
+ * so the caller can classify the outcome AND keep the spend that preceded it.
+ */
+export async function trackScope<T>(
+  runtime: AxlRuntime,
+  fn: () => Promise<T>,
+  options?: TrackOutcomeOptions,
+): Promise<ScopeOutcome<T>> {
+  if (!isInstrumented(runtime)) {
+    try {
+      return {
+        status: 'fulfilled',
+        value: await fn(),
+        accounting: uninstrumentedAccounting(),
+        instrumented: false,
+      };
+    } catch (error) {
+      return {
+        status: 'rejected',
+        error,
+        accounting: uninstrumentedAccounting(),
+        instrumented: false,
+      };
+    }
+  }
+  const outcome = await runtime.trackOutcome(fn, options);
+  return { ...outcome, instrumented: true };
+}
+
+/**
+ * Parse an `EvalConfig.budget` / `--budget` string into a USD limit.
+ *
+ * Strict by construction: `'$1'`, `'1'` and `'$1.00'` are the accepted forms.
+ * Anything else — `'free'`, `'$-1'`, `'$1.2.3'`, `'1e999'`, `''`, `'$ 1'` —
+ * throws `AxlError('INVALID_BUDGET')` rather than being coerced by
+ * `parseFloat`, which would happily read `'$1.2.3'` as `1.2` and run an eval
+ * against a limit the user never wrote.
+ */
+export function parseBudget(budget: string): number {
+  const match = typeof budget === 'string' ? budget.match(/^\$?(\d+(?:\.\d+)?)$/) : null;
+  if (!match) {
+    throw new AxlError(
+      'INVALID_BUDGET',
+      `Invalid budget "${String(budget)}": expected a non-negative USD amount like "$1" or "0.50".`,
+    );
+  }
+  const limit = Number(match[1]);
+  if (!Number.isFinite(limit)) {
+    throw new AxlError('INVALID_BUDGET', `Invalid budget "${budget}": not a finite amount.`);
+  }
+  return limit;
+}
+
+function usableCost(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+/**
+ * Is this thrown value the budget refusing to admit a paid operation?
+ *
+ * Deliberately **not** `err instanceof AdmissionDeniedError`. Both packages ship
+ * dual ESM+CJS, and `AxlRuntime.eval()` reaches this runner through a dynamic
+ * `import('@axlsdk/eval')`. A CJS consumer therefore gets the CJS core for its
+ * runtime and the ESM core inside the eval package — two copies, two distinct
+ * error classes, and an `instanceof` that is `false` for a genuine denial. The
+ * consequence is not a crash but something worse: a budget stop silently
+ * reclassified as a workflow failure or a judge defect, which is the one
+ * distinction the whole outcome taxonomy exists to preserve.
+ *
+ * The `code`/`name` pair is stable public surface, so it survives the copy
+ * boundary. Core owns that structural check (`isAdmissionDeniedError`) because
+ * the same hazard applies to any consumer; this re-export keeps eval's call
+ * sites on one predicate rather than a second copy of the rule that could drift
+ * from it.
+ */
+export function isAdmissionDenied(err: unknown): boolean {
+  return isAdmissionDeniedError(err);
+}
+
+/**
+ * Read the accounting of any `EvalResult`, including one written before this
+ * field existed.
+ *
+ * A legacy artifact reads `'unverified'`: its `totalCost` is repeated as
+ * `knownCost` for continuity, but no operation counts, no usage and no
+ * generation/judging split are invented, and it is never reported as
+ * `'complete'`. Turning an absent completeness into `'complete'` is exactly the
+ * bug that would let a legacy run certify a cost comparison.
+ *
+ * **The structural identities do not hold on a synthesized record.** For a live
+ * record (`'complete'` or `'incomplete'`) `provenance` sums to `knownCost` and
+ * `breakdown` splits it. A legacy artifact reports only a single total, so the
+ * synthesized record carries `knownCost` with an all-zero `breakdown` and
+ * `provenance` — inventing a generation/judging split from a number of unknown
+ * origin would be a fabrication. Consumers that render a breakdown must treat
+ * `'unverified'` as "no split available", not as "the split is zero"; the
+ * completeness field is what tells them which case they are in.
+ */
+export function readAccounting(result: EvalResult): EvalAccounting {
+  if (result?.accounting) return result.accounting;
+  const rescored = (result?.metadata as { rescored?: unknown } | undefined)?.rescored === true;
+  return {
+    ...emptyAccounting(),
+    knownCost: usableCost(result?.totalCost),
+    completeness: 'unverified',
+    scope: rescored ? 'rescore' : 'run',
+  };
+}
+
+/**
+ * How much work the budget actually refused: cases never started or stopped
+ * mid-flight, plus judges that never ran for the same reason.
+ *
+ * This is the quantity that makes a run short. Spend alone does not: a run can
+ * settle exactly on its limit having refused nothing. Missing coverage (a
+ * pre-0.24 artifact) reads `0` — an artifact that never recorded outcomes
+ * cannot be used to assert that work was refused — and so do missing or
+ * negative counts inside a malformed block.
+ */
+export function refusedWork(coverage: EvalCoverage | undefined): number {
+  if (!coverage) return 0;
+  return (
+    refusedIn(coverage.items) +
+    Object.values(coverage.scorers ?? {}).reduce((n, s) => n + refusedIn(s), 0)
+  );
+}
+
+/**
+ * The two refusal counts on one outcome block, read defensively.
+ *
+ * A persisted artifact reaches the browser through an unchecked cast and can be
+ * hand-edited, truncated or written by a third party, so a missing block reads
+ * `0` rather than throwing inside a render, and a negative count reads `0`
+ * rather than cancelling out a real refusal. The Studio server reducer applies
+ * exactly this rule to the same blob; agreement is asserted by the drift
+ * tripwire in `packages/axl-studio/src/__tests__/eval-accounting-drift.test.ts`.
+ */
+function refusedIn(counts: Partial<Record<string, number>> | undefined): number {
+  return atLeastZero(counts?.budget_skipped) + atLeastZero(counts?.budget_interrupted);
+}
+
+function atLeastZero(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+/**
+ * `true` when a run's budget both closed AND refused work — the one reading
+ * that entitles a consumer to call the run truncated.
+ *
+ * A closed controller alone is the NORMAL end state of a run whose final
+ * settlement lands exactly on its limit, which is exactly how `--budget` is
+ * used as a CI threshold. Reporting that as a stop fails a perfect run and
+ * prints a self-contradicting message ("0 never started, 0 stopped mid-flight,
+ * 2 completed … incomplete by design").
+ *
+ * The argument is structural rather than an `EvalResult` because the three
+ * consumers hold different things: the CLI has the result, the Studio server
+ * has a persisted blob it parses itself, and the Studio browser mirror has a
+ * client-side type. All three can produce `{ budget, coverage }`.
+ */
+export function isBudgetStopped(summary: {
+  budget?: { status?: string } | undefined;
+  coverage?: EvalCoverage | undefined;
+}): boolean {
+  if (summary.budget?.status !== 'closed') return false;
+  return refusedWork(summary.coverage) > 0;
+}
+
+function addUsage(target: AccountingUsage, source: AccountingUsage | undefined): void {
+  if (!source) return;
+  for (const key of USAGE_KEYS) {
+    const value = source[key];
+    if (typeof value === 'number' && Number.isFinite(value)) target[key] += value;
+  }
+}
+
+function addCounts<K extends string>(
+  target: Partial<Record<K, number>>,
+  source: Partial<Record<K, number>> | undefined,
+): void {
+  if (!source) return;
+  for (const [key, count] of Object.entries(source) as [K, unknown][]) {
+    if (typeof count === 'number' && Number.isFinite(count)) {
+      target[key] = (target[key] ?? 0) + count;
+    }
+  }
+}
+
+/**
+ * Fold several accounting records into one, conservatively.
+ *
+ * Numbers sum; reasons union with their counts; completeness takes the WORST
+ * of the inputs (`unverified` > `incomplete` > `complete`), so a group
+ * containing one legacy run is `unverified` as a whole and one incomplete run
+ * makes the group incomplete. Inheriting the first input's flags — the bug this
+ * exists to prevent — would report a group as complete because run 1 was.
+ */
+export function aggregateAccounting(inputs: readonly Accounting[]): Accounting {
+  const out = emptyAccounting();
+  let anyUnverified = false;
+  let anyIncomplete = false;
+
+  for (const input of inputs) {
+    if (!input) continue;
+    if (input.completeness === 'unverified') anyUnverified = true;
+    else if (input.completeness === 'incomplete') anyIncomplete = true;
+
+    out.knownCost += usableCost(input.knownCost);
+    addUsage(out.usage, input.usage);
+    addCounts<AccountingReason>(out.reasons, input.reasons);
+    addCounts<OperationKind>(out.operations.byKind, input.operations?.byKind);
+    addCounts<CostProvenance>(out.provenance, input.provenance);
+    out.operations.total += input.operations?.total ?? 0;
+    out.operations.settled += input.operations?.settled ?? 0;
+    out.operations.unknown += input.operations?.unknown ?? 0;
+    out.operations.denied += input.operations?.denied ?? 0;
+    out.breakdown.generation += usableCost(input.breakdown?.generation);
+    out.breakdown.judging += usableCost(input.breakdown?.judging);
+    out.breakdown.external += usableCost(input.breakdown?.external);
+  }
+
+  out.completeness = anyUnverified ? 'unverified' : anyIncomplete ? 'incomplete' : 'complete';
+  return out;
+}

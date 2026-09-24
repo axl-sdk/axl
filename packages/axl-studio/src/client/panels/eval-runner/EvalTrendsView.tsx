@@ -3,12 +3,15 @@ import { TrendingUp } from 'lucide-react';
 import { StatCard } from '../../components/shared/StatCard';
 import { EmptyState } from '../../components/shared/EmptyState';
 import { WindowSelector } from '../../components/shared/WindowSelector';
-import { CostBadge } from '../../components/shared/CostBadge';
+import { CostSparkLine } from './CostSparkLine';
+import { SpendBadge } from './SpendBadge';
+import { emptyAccounting, lowerBoundPrefix } from './accounting';
+import type { Accounting } from './types';
 import { LineChart, type LineSeries } from '../../components/shared/charts/LineChart';
-import { SparkLine } from '../../components/shared/charts/SparkLine';
 import { fetchEvalTrends } from '../../lib/api';
 import { useAggregate } from '../../hooks/use-aggregate';
 import { cn, formatCost, formatDuration } from '../../lib/utils';
+import type { EvalTrendCompleteness } from '../../lib/types';
 
 /** 3-tier score color: >=0.8 green, >=0.5 amber, <0.5 red */
 function scoreColor(score: number): string {
@@ -19,6 +22,19 @@ function scoreColor(score: number): string {
 
 function formatScore(score: number): string {
   return score.toFixed(3);
+}
+
+/**
+ * The completeness sentence that travels with every spend figure on this view.
+ *
+ * An absent flag means the payload came from a server that predates measured
+ * accounting, which is read as `'unverified'` — the conservative direction, and
+ * never silently as "complete".
+ */
+function completenessText(completeness: EvalTrendCompleteness | undefined): string {
+  if (completeness === 'complete') return 'complete';
+  if (completeness === 'incomplete') return 'incomplete (lower bound)';
+  return 'unverified (legacy)';
 }
 
 /** Deterministic color-per-scorer so the line colors are stable across renders. */
@@ -74,6 +90,13 @@ export function EvalTrendsView({
   }
 
   const evalNames = Object.keys(trends.byEval).sort();
+  // The whole payload's spend, in the same completeness-carrying shape every
+  // other eval spend render uses.
+  const windowTotalAccounting: Accounting = {
+    ...emptyAccounting(),
+    knownCost: trends.totalCost,
+    completeness: trends.totalCostCompleteness ?? 'unverified',
+  };
 
   return (
     <div className="flex-1 overflow-auto p-6 space-y-6">
@@ -90,7 +113,19 @@ export function EvalTrendsView({
           value={String(evalNames.length)}
           subtitle={evalNames.length === 1 ? 'eval' : 'evals'}
         />
-        <StatCard label="Total Cost" value={formatCost(trends.totalCost)} subtitle="all evals" />
+        <StatCard
+          label="Known Spend"
+          value={lowerBoundPrefix(windowTotalAccounting) + formatCost(trends.totalCost)}
+          // A window that contains one legacy or unpriced run cannot present a
+          // precise total, and a chart implying otherwise is the exact defect
+          // the completeness flag exists to prevent.
+          subtitle={`all evals · ${completenessText(trends.totalCostCompleteness)}`}
+          subtitleColor={
+            (trends.totalCostCompleteness ?? 'unverified') === 'complete'
+              ? undefined
+              : 'text-amber-600 dark:text-amber-400'
+          }
+        />
       </div>
 
       {/* View toggle: Scorer | Model | Duration */}
@@ -254,8 +289,24 @@ export function EvalTrendsView({
         const xMin = sortedRuns.length > 0 ? sortedRuns[0].timestamp : 0;
         const xMax = sortedRuns.length > 0 ? sortedRuns[sortedRuns.length - 1].timestamp : 1;
 
-        // Cost series for sparkline (always in header)
-        const costValues = sortedRuns.map((r) => r.cost);
+        // Cost series for the sparkline (always in header). Each point carries
+        // its own completeness: a lower bound or a legacy total may not be
+        // drawn as an ordinary point on the trend. See `CostSparkLine`.
+        const costPoints = sortedRuns.map((r) => ({
+          cost: r.cost,
+          completeness: r.completeness,
+        }));
+        const unmeasuredCostPoints = costPoints.filter(
+          (p) => (p.completeness ?? 'unverified') !== 'complete',
+        ).length;
+
+        // The window's own spend, read through the same completeness-carrying
+        // shape every other eval spend render uses.
+        const windowAccounting: Accounting = {
+          ...emptyAccounting(),
+          knownCost: entry.costTotal,
+          completeness: entry.costCompleteness ?? 'unverified',
+        };
 
         // Data availability for the active view. A chart needs at least one
         // series with >=2 points. A single point isn't a "trend."
@@ -281,21 +332,38 @@ export function EvalTrendsView({
                 </span>
               </div>
               <div className="flex items-center gap-3">
-                {costValues.length > 1 && (
-                  <div
-                    className="flex items-center gap-2 text-[10px] text-[hsl(var(--muted-foreground))]"
-                    title="Cost over time"
-                  >
+                {costPoints.length > 1 && (
+                  <div className="flex items-center gap-2 text-[10px] text-[hsl(var(--muted-foreground))]">
                     <span>cost</span>
-                    <SparkLine
-                      values={costValues}
-                      color="hsl(var(--primary))"
-                      width={80}
-                      height={22}
-                    />
+                    <CostSparkLine points={costPoints} width={80} height={22} />
+                    {unmeasuredCostPoints > 0 && (
+                      <span className="text-[9px] font-medium uppercase tracking-wide text-amber-600 dark:text-amber-400">
+                        {unmeasuredCostPoints} of {costPoints.length} not measured
+                      </span>
+                    )}
                   </div>
                 )}
-                <CostBadge cost={entry.costTotal} />
+                {/* The shared `CostBadge` is deliberately NOT used here: its
+                    hard-coded tooltip says "this ask used an unpriced model",
+                    which is the wrong vocabulary (an ask, not an eval window)
+                    and the wrong cause for a window whose only defect is one
+                    pre-0.24 artifact. `SpendBadge` states the actual
+                    completeness and is the one money renderer these panels
+                    use. */}
+                <span className="inline-flex items-center gap-1">
+                  <SpendBadge
+                    accounting={windowAccounting}
+                    label={`Known spend across ${entry.runCount} run${entry.runCount === 1 ? '' : 's'}`}
+                  />
+                  {(entry.budgetStoppedRuns ?? 0) > 0 && (
+                    <span
+                      className="text-[9px] font-medium uppercase tracking-wide text-amber-600 dark:text-amber-400"
+                      title={`${entry.budgetStoppedRuns} run(s) in this window stopped on budget`}
+                    >
+                      budget stopped
+                    </span>
+                  )}
+                </span>
               </div>
             </div>
 

@@ -311,9 +311,130 @@ const ctx = runtime.createContext({
 });
 ```
 
+### `runtime.trackOutcome(fn, options?)`
+
+Run `fn` and **always** return its outcome plus the authoritative `Accounting` for every paid operation inside it. Unlike `trackExecution` it never throws: the result is `({ status: 'fulfilled'; value } | { status: 'rejected'; error }) & { accounting, metadata, modelTiming?, traces? }`. The `error` is the **original thrown value** — primitives, frozen objects, `AbortError`, `ProviderError` and `BudgetExceededError` all come back `===` what was thrown.
+
+This is what makes "what did the failed run cost?" answerable: a workflow that threw after a paid call still reports that call's charge.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `purpose` | `'generation' \| 'judging'` | inherited, else `'generation'` | Classifies this scope's operations in `accounting.breakdown` |
+| `admission` | `AdmissionController` | — | Stops admitting new paid operations once known spend reaches the limit. Must be an `AdmissionController` instance (from any copy of `@axlsdk/axl`); an object without the internal settlement channel raises `AxlError('INCOMPATIBLE_ADMISSION_CONTROLLER')` rather than silently losing the charge. Use the exported `isAdmissionDeniedError(err)` to classify a refusal — it matches structurally, so it works across duplicate installs where `instanceof` does not |
+| `captureTraces` | `boolean` | `false` | As `trackExecution` |
+| `captureTimingSamples` | `boolean` | `false` | As `trackExecution` |
+
+```typescript
+const outcome = await runtime.trackOutcome(
+  () => runtime.execute('my-workflow', input),
+  { admission: new AdmissionController({ limit: 1.0 }) },
+);
+
+if (outcome.status === 'rejected') {
+  // The charge is still known, and the error is untouched.
+  console.log(`failed after $${outcome.accounting.knownCost}`, outcome.error);
+}
+```
+
+Scopes nest. An operation settled inside a child `trackOutcome` is counted **exactly once** in every enclosing scope, so a parent total is the sum of disjoint operations. Concurrent `trackOutcome` calls on one runtime are isolated — neither sees the other's operations, budget closure or spend.
+
+### `Accounting`
+
+The authoritative record of what a scope spent. It is derived from provider/tool settlement, **not** from trace events, so trace level, `captureTraces` and redaction change diagnostics and never the numbers.
+
+```typescript
+type Accounting = {
+  version: 1;
+  currency: 'USD';
+  knownCost: number;                 // settled, usable, disjoint charges
+  completeness: 'complete' | 'incomplete' | 'unverified';
+  reasons: Partial<Record<AccountingReason, number>>;
+  usage: AccountingUsage;
+  operations: {
+    total: number;                   // admitted and opened
+    settled: number;                 // terminal with a usable cost, including a known $0
+    unknown: number;                 // terminal without one — drives `completeness`
+    denied: number;                  // refused admission; never dispatched
+    byKind: Partial<Record<OperationKind, number>>;
+  };
+  breakdown: { generation: number; judging: number; external: number };
+  provenance: Partial<Record<CostProvenance, number>>;
+};
+```
+
+**Zero is never unknown.** A known $0 settles `complete`. Anything dispatched whose charge could not be established settles `unknown` with a reason, making `completeness: 'incomplete'` and `knownCost` an explicit **lower bound**.
+
+At finalization `operations.total === settled + unknown`. Denied operations are tracked separately and excluded from `total` (an operation refused at the transport check is retracted from it), because refused work contributes nothing anywhere.
+
+| `AccountingReason` | Meaning |
+|---|---|
+| `unpriced_model` | Usage was reported but no usable cost was (`undefined`, `NaN`, negative, `Infinity`) |
+| `usage_missing` | Dispatched, but the terminal outcome carried no usage — a failure, abort or stall |
+| `abandoned` | Dispatched and never settled before its scope finalized |
+| `external_unreported` | An external operation finished without calling `report.setCost()` |
+| `uninstrumented` | A consumer ran work with no accounting scope available. Core defines the name; no core producer emits it |
+
+| `CostProvenance` | Meaning |
+|---|---|
+| `provider_reported` | The vendor supplied the USD figure itself (e.g. OpenRouter `usage.cost`) |
+| `price_table_estimate` | An Axl/adapter price table was applied to reported usage |
+| `adapter_reported` | An adapter supplied a cost without declaring its basis |
+| `caller_reported` | `withExternalOperation` / tool / legacy caller value |
+
+`OperationKind` is `'chat' | 'stream' | 'embedding' | 'transcription' | 'tool' | 'external'`. `AccountingUsage` is `{ inputTokens, outputTokens, reasoningTokens, cachedTokens, cacheWriteTokens, audioSeconds }`; `reasoningTokens` / `cachedTokens` / `cacheWriteTokens` are counted once in their own bucket and `inputTokens` is the provider's already-folded prompt count, so cached tokens are **not** re-added to it.
+
+`completeness: 'unverified'` is reserved for readers of artifacts that carry no accounting at all (legacy eval results). A live scope never produces it.
+
+### `AdmissionController`
+
+A synchronous known-spend threshold for one invocation. Attach it to a scope with `trackOutcome(fn, { admission })`.
+
+```typescript
+class AdmissionController {
+  constructor(options: { limit: number });  // throws AxlError('INVALID_BUDGET') unless finite and >= 0
+  readonly limit: number;
+  get knownSpend(): number;
+  get status(): 'open' | 'closed';
+  get closed(): boolean;                    // knownSpend >= limit
+  get knownOvershoot(): number;             // max(0, knownSpend - limit)
+  admit(): { admitted: true } | { admitted: false; limit: number; knownSpend: number };
+  snapshot(): { limit; status; knownSpend; knownOvershoot };
+}
+```
+
+It closes at `knownSpend >= limit` on a raw float comparison, so a `limit` of `0` admits nothing. Unknown spend is **not** included in `knownSpend` — an unpriced model cannot be enforced against, which is why unknown work also marks the accounting incomplete.
+
+It is a **threshold, not a reservation**: a call admitted before a sibling settles may push known spend past the limit, and `knownOvershoot` reports how far. Never share one controller across unrelated invocations.
+
+Admission is checked at two points: when an operation opens (the provider facade, tool invocations, memory embeds, transcription, external operations), and again at transport dispatch for built-in adapters — see [dispatch admission](./providers.md#dispatch-admission). A refusal throws `AdmissionDeniedError`.
+
+### `AdmissionDeniedError`
+
+`extends AxlError`, `code: 'ADMISSION_DENIED'`, fields `{ limit, knownSpend, operation: { kind, model? } }`.
+
+Raised before the request leaves the process, so it never accompanies a charge. It is **never** wrapped in a `ProviderError` or a `TranscriptionOperationError`, never auto-retried by the transport, and never treated as an abort. It is distinct from `BudgetExceededError`, which is `ctx.budget()`'s own workflow-scoped policy and keeps its existing semantics.
+
+### `externalOperation(descriptor, fn)` / `ctx.withExternalOperation(descriptor, fn)`
+
+Declare paid work Axl cannot observe — a third-party API called from a tool, a vendor SDK, a custom scorer's own model call — so it joins the scope's accounting and its budget.
+
+```typescript
+const rows = await ctx.withExternalOperation({ name: 'vendor-search' }, async (report) => {
+  const res = await vendor.search(query);
+  report.setCost(res.billedUsd);       // finite, >= 0; explicit 0 means known-free
+  return res.rows;
+});
+```
+
+Admission is checked **before** `fn` runs. The operation finalizes on return, throw or abort, and a cost reported before a later throw is kept. Not calling `setCost` marks the scope incomplete with reason `external_unreported` — silence is never read as free. A non-finite/negative amount or a second `setCost` throws `AxlError('INVALID_COST_REPORT')`, so an invalid report can neither shrink nor poison a total.
+
+The amount must be **disjoint**: nested `ctx.ask` and other Axl operations account for themselves, and including them double-charges. `setCost(amount, usage?)` also accepts a partial `AccountingUsage`.
+
+`externalOperation` is the module-level equivalent for code without a `ctx`. Outside any accounting scope both still run `fn`, with a report that validates its argument but records nothing.
+
 ### `runtime.trackExecution(fn, options?)`
 
-Track cost and execution metadata across any runtime operations within `fn`. Returns `{ result, cost, unpriced, modelTiming?, metadata, traces? }` where `unpriced` is `true` when any tracked call was unpriced (making `cost` a **lower bound** — the aggregate counterpart of `ExecutionInfo.unpriced`), and `metadata` includes `models` (unique model URIs), `modelCallCounts`, `tokens` (input/output/reasoning sums — agent calls only, not embedder tokens), `agentCalls` count, `workflows` (insertion-ordered unique names), and `workflowCallCounts`. Uses `AsyncLocalStorage` for per-call scoping — correct with concurrent calls. Works with both `createContext()` and `execute()` inside `fn`.
+Throwing compatibility wrapper over [`trackOutcome`](#runtimetrackoutcomefn-options). Returns `{ result, cost, unpriced, accounting, modelTiming?, metadata, traces? }`. `cost` is `accounting.knownCost` and `unpriced` is `accounting.completeness !== 'complete'` (making `cost` a **lower bound**); both are compatibility views over the accounting rail rather than a sum over trace events. `cost` is unchanged wherever the trace sum was already right and higher where that rail lost a charge (a leaf that never settled). **`unpriced` is wider than the trace rail's**: it also flags a call that dispatched and returned neither usage nor a cost — a usage-omitting gateway, a custom adapter returning bare content, a $0 local adapter that does not declare `pricing: { kind: 'zero' }`, or a caught provider failure. `ctx.getBudgetStatus().unpriced` keeps the narrower rule (positive billable work with no price), so the two can disagree about the same run; see [the migration guide](./migration/eval-accounting.md). `metadata` includes `models` (unique model URIs), `modelCallCounts`, `tokens` (input/output/reasoning sums — agent calls only, not embedder tokens), `agentCalls` count, `workflows` (insertion-ordered unique names), and `workflowCallCounts`. Uses `AsyncLocalStorage` for per-call scoping — correct with concurrent calls. Works with both `createContext()` and `execute()` inside `fn`.
 
 **`modelTiming`** rolls up [`CallTiming`](#calltiming) from `agent_call_end` per model, keyed exactly like `metadata.modelCallCounts`: `Record<model, { calls, queuedMs, retryMs, wireMs, firstTokenMs?, firstTokenCalls? }>`. It is **absent** unless at least one tracked call reported timing, so "no instrumentation" stays distinguishable from "zero milliseconds". `calls` counts only the **successful timed** calls, which can be fewer than that model's `modelCallCounts` entry (a custom provider that returns no `timing`, or a failed call), so divide the sums by `calls`, never by the call count. **Failed calls are excluded**, even though a non-2xx response does carry `timing` on its `agent_call_end` — a rollup that blended answers with failures would describe neither, and a fast 429 would improve a model's apparent latency. Read the events themselves for failure latency. `firstTokenMs` is streaming-only, is summed across just the calls that reported it, and carries its own denominator in `firstTokenCalls` (the two are present or absent together) — dividing it by `calls` would report a first-token latency no call achieved on a model that mixes streamed and non-streamed calls. Sums are per call, so `wireMs` across concurrent calls can exceed the wall clock of `fn`. Under `captureTimingSamples` each bucket also carries `samples: CallTiming[]` — the raw per-call blocks behind the sums, in `agent_call_end` order, with `samples.length === calls`. Sums can yield a mean but no percentile that describes calls rather than aggregates, so a consumer that needs a real distribution (this is how `axl-eval` builds `summary.modelTiming`) reads `samples` instead. It is a working form, not something to persist per item, and the key is **absent** without the option so "not collected" never reads as "no calls".
 
@@ -350,6 +471,14 @@ const { result, cost } = await runtime.trackCost(async () => {
 ```
 
 The eval runner and CLI use `trackExecution` internally to capture cost and model metadata for each eval item.
+
+### `runtime.resolveProvider(uri)`
+
+Resolves a `provider:model` URI to `{ provider, model }`.
+
+**Breaking in 0.24:** the returned provider is a **scoped facade**, not the registered instance, so `resolveProvider(uri).provider === registeredInstance` is now `false`. Facade identity is stable per runtime per adapter, so caching a resolution still works. See [the migration guide](./migration/eval-accounting.md).
+
+The facade routes `chat`/`stream` through accounting and budget admission whenever a `trackOutcome` scope is active, and forwards everything else to the adapter: custom properties, accessors, class private-field methods, property writes, capability methods (`inputCapabilities`, `validateInput`, `nativeStructuredOutputSupport`, `realizesPromptCache`, `effortResolution`, `reportsRequestLifecycle`) and ordinary `instanceof`. Exotic reflection — a custom `Symbol.hasInstance`, identity-keyed maps — is not guaranteed. Outside a scope it delegates verbatim, with no admission check and no accounting. A `stream` resolves its scope at the **first `next()`**, not when the generator is built.
 
 ---
 
@@ -1727,10 +1856,42 @@ Eval results are automatically persisted when using `runRegisteredEval()`. Histo
 |--------|---------|-------------|
 | `runRegisteredEval(name, options?)` | `Promise<unknown>` | Run a registered eval by name. Automatically persists the result to eval history. `options` accepts `{ metadata?, onProgress?, signal?, captureTraces? }` — `metadata: Record<string, unknown>` injects custom metadata, `onProgress: (event: EvalProgressEventShape) => void` fires on `item_done` and `run_done` progress events, `signal: AbortSignal` cancels remaining items, `captureTraces: boolean` populates per-item `EvalItem.traces` on success and failure paths (forwarded to `runEval`) |
 | `getEvalHistory()` | `Promise<EvalHistoryEntry[]>` | All eval results, most recent first. Merges in-memory results with historical data from the state store |
-| `saveEvalResult(entry)` | `Promise<void>` | Manually save an eval result to history. Persists to the in-memory cache + `StateStore` and emits an `eval_result` event on the runtime's `EventEmitter` (load-bearing for Studio's live eval-trends aggregation — any custom consumer wanting live eval updates can subscribe via `runtime.on('eval_result', ...)`) |
+| `saveEvalResult(entry)` | `Promise<void>` | Manually save an eval result to history. Replaces any cached entry with the same id rather than shadowing it. Persists to the in-memory cache + `StateStore` and emits an `eval_result` event on the runtime's `EventEmitter` (load-bearing for Studio's live eval-trends aggregation — any custom consumer wanting live eval updates can subscribe via `runtime.on('eval_result', ...)`) |
 | `deleteEvalResult(id)` | `Promise<boolean>` | Remove a single eval history entry. Mutates the in-memory cache and delegates to `StateStore.deleteEvalResult?`. Returns `true` if the id existed |
 | `eval(config, options?)` | `Promise<unknown>` | Run an ad-hoc eval (not registered). Does **not** auto-persist to history. `options` accepts the same `{ onProgress?, signal?, captureTraces? }` as `runRegisteredEval` |
 | `evalCompare(baseline, candidate)` | `Promise<unknown>` | Compare two eval results for regressions/improvements |
+
+`runRegisteredEval` and `eval` also accept `captureRequests`, forwarded verbatim to `runEval`.
+
+Both types in that signature are exported from `@axlsdk/axl` itself —
+`RuntimeEvalConfigShape` (the `config` argument of `runtime.eval`) and
+`EvalProgressEventShape` (the `onProgress` event) — so a caller can type the
+call without importing the optional `@axlsdk/eval` peer dependency.
+
+### Diagnostic artifacts
+
+Storage for [captured requests](observability.md#captured-requests-opt-in), configured by `config.diagnostics.artifacts`:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `root` | `string?` | — | Directory for the built-in `FileDiagnosticArtifactStore`. One of `root` or `store` is required for capture |
+| `store` | `DiagnosticArtifactStore?` | — | A custom store. Takes precedence over `root` |
+| `sweepIntervalMs` | `number` | `60_000` | Reclamation cadence. The timer is `unref`'d and cleared by `runtime.shutdown()` |
+| `leaseMs` | `number` | `300_000` | How long a writer's lease survives without renewal before its staged artifact is treated as abandoned. Renewed automatically on a timer for as long as the writer holds the artifact, whether or not it is still writing; stopped at finalize/rollback |
+| `maxHoldMs` | `number` | `86_400_000` | Longest one artifact's lease is renewed before the runtime lets go, so a caller that never finalizes cannot pin it forever. Past this the lease expires and the next sweep reclaims it |
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `getEvalResult(id)` | `Promise<EvalHistoryEntry \| undefined>` | One history entry by id, without copying the whole history to find it. Confirmed against `StateStore.getEvalRetention` before it is served, so a row the store has expired or deleted comes back `undefined` and is dropped from the cache rather than republished by a rescore. Returns the cached entry itself, where `getEvalHistory()` returns a copied array — treat it as read-only. `getEvalHistory()` is still served unconfirmed from the cache |
+| `getDiagnosticArtifactStore()` | `DiagnosticArtifactStore \| undefined` | The configured store, or `undefined` when capture is not configured |
+| `stageDiagnosticArtifact(owner)` | `Promise<{ artifactId, sink }>` | Take a lease and open a bounded sink. Throws `AxlError('DIAGNOSTICS_UNAVAILABLE')` when capture is not configured |
+| `finalizeDiagnosticArtifact(id, status, reason?, redaction?)` | `Promise<ArtifactManifest>` | Declare what the writer managed to capture. `redaction` is what the WRITER applied — the store only ever sees already-scrubbed bytes and cannot infer it. It describes ALL the artifact's bytes: an artifact holding copied records may only claim `'applied'` when both halves are scrubbed |
+| `rollbackDiagnosticArtifact(id)` | `Promise<void>` | Discard a staged artifact whose history row never landed |
+| `copyDiagnosticArtifact(sourceId, owner, options?)` | `Promise<{ artifactId, truncated, bytes, redaction, sink } \| undefined>` | Copy records under a new owner, bounded by `maxBytes`, preserving original operation ids. The copy comes back **staged** and lease-held with a `sink`, so the new owner keeps writing its own calls into the same artifact. `redaction` is what the SOURCE said about the copied bytes |
+| `openDiagnosticArtifact(id)` | `Promise<{ manifest, lines } \| undefined>` | Read a **committed** artifact. Returns `undefined` when it is still staged, pending deletion, logically expired, or its owning history row is gone. Read a not-yet-committed artifact through `getDiagnosticArtifactStore()` instead |
+| `reconcileDiagnosticArtifacts()` | `Promise<{ removed: string[] }>` | Run a reclamation pass by hand (also runs at startup and on the sweep timer). Reclaiming a committed artifact also rewrites its owning history row's `diagnostics` to `unavailable` (with a `reason` naming the cause), so a stored result never points at bytes that are gone. The rewrite is persisted only while the store still holds the row, so it can never resurrect one that expired or was deleted |
+
+Lifecycle, retention and reclamation rules: [integration.md](integration.md#diagnostic-artifact-storage).
 
 `EvalHistoryEntry`:
 
@@ -1821,17 +1982,19 @@ const runtime3 = new AxlRuntime({
 | `baseUrl` | `string` | provider default | Override the API base URL (proxies, gateways) |
 | `dangerouslyAllowInsecureHttp` | `boolean` | `false` | Permit a non-loopback HTTP `baseUrl` for this provider block. Without it, built-in providers accept HTTPS plus literal loopback HTTP (`localhost`, IPv4 `127/8`, IPv6 `::1`) and reject all other HTTP before async credential callbacks or network I/O. Does not permit malformed/non-HTTP(S) URLs. `openai-responses` inherits it from `openai` only when its own block is absent |
 | `authHeader` | `AuthHeader` | profile default | OpenAI-compatible presets only: override the profile auth header shape. Use `providers.azure.authHeader: 'bearer'` with an Entra token callback; the Azure preset defaults to `'api-key'` for API-key auth |
-| `rateLimit` | `RateLimitConfig` | — | Opt-in client-side rate governor for this provider's chat calls. See below. `openai-responses` inherits the `openai` block (incl. `rateLimit`) when it has no config of its own — but as a **separate governor instance**, not a shared counter (using both adapters ⇒ effective concurrency is the sum) |
+| `rateLimit` | `RateLimitConfig` | — | Client-side rate governor for this provider's chat calls. See below. Every built-in chat provider has a governor even without this block, so a rate-limit 429 pauses the scope and retries on its own budget by default (`adaptive`); on first-party OpenAI and Anthropic (their default endpoint origins only) a spend-cap 429 fails fast. Governors are pooled per runtime, **one per scope** = provider family (`openai` for both `openai` and `openai-responses`) + base-URL origin + credential source + model. `openai-responses` inherits the `openai` block (incl. `rateLimit`) when it has no config of its own, and on the same key and origin both adapters share one governor per model. Two blocks reaching one scope use the strictest value per field, with one `console.warn` |
 
 **`RateLimitConfig`** — proactive pacing through the shared `fetchWithRetry` chokepoint (complementary to the automatic 429/503/529 backoff). Exported from `@axlsdk/axl` alongside the `RateLimiter` class.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `maxConcurrent` | `number` | Max requests in flight for this provider. Finite integer ≥ 1; invalid values disable the cap (with a `console.warn`). `1` serializes (a throughput floor, not a deadlock — permits aren't held across a nested `ctx.ask()`) |
+| `maxConcurrent` | `number` | Max requests in flight per scope (one model on one account, see above). Finite integer ≥ 1; invalid values disable the cap (with a `console.warn`). `1` serializes (a throughput floor, not a deadlock — permits aren't held across a nested `ctx.ask()`) |
 | `minIntervalMs` | `number` | Minimum ms between successive request *grants* (global spacing, no burst bucket) |
-| `acquireTimeoutMs` | `number` | If set, a call queued longer than this rejects (fail loud) instead of hanging on a misconfigured cap |
+| `acquireTimeoutMs` | `number` | If set, a call queued longer than this for its **first** permit rejects (fail loud) instead of hanging on a misconfigured cap. A call arriving during a rate-limit pause starts this clock only once the pause ends; a call already queued when a pause begins keeps its clock running through it. Once queued, the clock also counts adaptive-pacing waits and the time spent behind priority retriers (each spaced by the adaptive interval), so a tight value can reject calls that pacing is only delaying. A retry's re-acquire after a rate-limit 429 is exempt |
+| `adaptive` | `boolean` | Default `true` on every built-in chat provider. A rate-limit 429 pauses the scope for the exponential backoff (lengthened, never shortened, by `Retry-After`/`retry-after-ms`; clamped at 60 s), retries on `maxRateLimitRetries`, then paces the scope adaptively until it stops being throttled. Spend-cap 429s fail fast only on first-party OpenAI and Anthropic (their default origins); elsewhere every 429 counts as a rate limit. `false` restores the plain path: a 429 shares the transient budget and nothing pauses or paces. Two blocks on one scope: `true` wins. Ignored by a directly constructed `RateLimiter`. Details: [providers.md → Rate limiting](providers.md#rate-limiting) |
+| `maxRateLimitRetries` | `number` | Default `8`. Retries after a rate-limit 429 where `adaptive` applies, separate from the 2 transient (`503`/`529`/network) retries. Integer ≥ 0; invalid values warn and use the default. Two blocks on one scope: the smaller wins |
 
-> **Scope:** caps request *concurrency*, not token throughput (TPM) — a permit releases at response headers. Governs **chat calls only** (memory embedder calls are not governed in this version) and is **per provider instance / process** (not shared across processes on the same key). Full caveats in [providers.md → Rate limiting](providers.md#rate-limiting-opt-in).
+> **Scope:** caps request *concurrency*, not token throughput (TPM) — a permit releases at response headers. Governs **chat calls only** (transcription providers apply the same static caps through their own non-adaptive per-instance limiter; memory embedder calls are ungoverned) and is **per runtime and scope**: never shared across processes, and shared across runtimes only when one provider instance is registered in both. Full caveats in [providers.md → Rate limiting](providers.md#rate-limiting).
 
 ### `CallTiming`
 
@@ -1847,9 +2010,10 @@ valid, so treat every field as possibly absent.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `queuedMs` | `number` | Time parked in Axl's own opt-in `RateLimiter` (concurrency cap plus `minIntervalMs` spacing) before the request was allowed out. `0` when the provider has no `rateLimit`. Self-imposed wait, not provider latency |
-| `attempts` | `number` | `fetch` attempts made for this call, including the final one (≥ 1) |
-| `retryMs` | `number` | First attempt's dispatch → final attempt's dispatch: failed attempts plus their backoff sleeps. `0` for a single attempt |
+| `queuedMs` | `number` | Every wait Axl imposes on itself: the first permit (concurrency cap), `minIntervalMs` spacing, adaptive pacing after a rate-limit 429, a rate-limit pause on the scope, and the re-acquire after a rate-limit 429. `0` when nothing waited. Self-imposed wait, not provider latency |
+| `attempts` | `number` | Requests actually sent for this call, including the final one (≥ 1). A call held back by a pause before sending is not an attempt |
+| `rateLimitRetries` | `number?` | Rate-limit 429s this call received **and retried**. A returned 429 (spend cap, or the last one once the budget is spent) and `503`/`529`/network retries are not counted. Built-in adapters always set it (`0` when none) |
+| `retryMs` | `number` | First attempt's dispatch → final attempt's dispatch, **minus** the self-imposed waits inside that span (already in `queuedMs`): failed attempts plus their `503`/`529`/network backoff sleeps. Disjoint from `queuedMs`, so `queuedMs + retryMs` never exceeds the call's wall clock. `0` for a single attempt |
 | `ttfbMs` | `number` | Final dispatch → response headers |
 | `firstTokenMs` | `number?` | Final dispatch → first `text_delta`/`thinking_delta`, excluding consumer suspension after an earlier non-content chunk such as a tool delta. **Streaming only**, and absent on a stream that ends without a content delta. The model-discriminating figure — headers arrive at roughly one round trip regardless of model, first token does not |
 | `wireMs` | `number` | Time attributable to the provider. `chat()`: final dispatch → response body parsed. `stream()`: `ttfbMs` plus cumulative body-read waits, floored at `firstTokenMs` when content arrives. Thus `wireMs >= firstTokenMs`; parsing needed to deliver the first delta is included, while pauses after a yielded delta (event fan-out, tool-call buffering, a slow `ctx.events` consumer) remain excluded |
@@ -1857,7 +2021,7 @@ valid, so treat every field as possibly absent.
 `agent_call_end.duration` is unchanged and still measures the whole turn's wall clock,
 queue and retries included. `timing` sits beside it; it does not replace it. Nothing in core
 sums `timing` across the calls of one ask — a sum across parallel branches would exceed wall
-clock. See [providers.md → Rate limiting](providers.md#rate-limiting-opt-in) for what
+clock. See [providers.md → Rate limiting](providers.md#rate-limiting) for what
 `queuedMs` does and does not bound under streaming.
 
 ### MCP server configuration
@@ -2040,6 +2204,26 @@ class MyStore implements StateStore {
   // Required: implement all checkpoint, session, decision, and execution state methods
   // Optional: implement saveExecution/listExecutions for execution history,
   //           saveEvalResult/listEvalResults for eval history, etc.
+
+  // Optional, but REQUIRED to host captured-request artifacts: report whether
+  // an eval history row still exists and when it expires, so an artifact is
+  // never served — or retained — past its owner.
+  async getEvalRetention(id: string): Promise<{ exists: boolean; expiresAt?: number }> {
+    return { exists: await this.has(id) }; // omit expiresAt when rows never expire
+  }
+
+  // Optional. An UPDATE-ONLY, retention-neutral write: replace a row that is
+  // already there, return false rather than create one, and leave its expiry
+  // exactly as it was. The runtime writes every CORRECTION through this — a
+  // diagnostics sweep rewriting a row whose artifact it just reclaimed, a
+  // commit failure downgrading one — because such a write must never be able
+  // to resurrect a row deleted or expired since the correction was computed.
+  // Checking first and then saving does not close that window; only the store
+  // can, so implement it atomically (`SET ... XX KEEPTTL`, `UPDATE ... WHERE
+  // id = ?`). Omit it and corrections are simply not persisted.
+  async updateEvalResult(entry: EvalHistoryEntry): Promise<boolean> {
+    return (await this.replaceIfPresent(entry.id, entry)) ?? false;
+  }
 }
 
 const runtime = new AxlRuntime({ state: { store: new MyStore() } });
@@ -2401,8 +2585,9 @@ Configuration for `runEval()` and `runtime.eval()`.
 | `scorers` | `Scorer[]` | required | Scoring functions to apply to each output |
 | `concurrency` | `number` | `5` | Maximum parallel item executions |
 | `scorerConcurrency` | `number` | `5` | Maximum parallel scorers **within a single item**. Worst-case concurrent scorer calls is `concurrency × scorerConcurrency`; set to `1` for a serial judge phase. Cost/timing/ordering are preserved deterministically |
-| `budget` | `string` | — | Cost limit (e.g., `"$10.00"`). Stops processing when exceeded. With concurrent scorers it is a **soft** ceiling — the per-item check runs once before an item's scorers, so overshoot is bounded by `concurrency × scorerConcurrency × max-scorer-cost` |
+| `budget` | `string` | — | Known-spend limit (e.g. `"$10.00"` or `"0.50"`). Admission closes at `knownSpend >= limit`: later cases become `budget_skipped`, later LLM scorers are skipped, deterministic scorers still run, and a case whose next call is denied becomes `budget_interrupted` keeping its earlier charge. A **threshold, not a reservation** — calls admitted before a sibling settles can carry the run past the limit, and `accounting.budget.knownOvershoot` reports by how much. Unknown spend cannot be enforced against, so an unpriced model does not count toward the limit. An invalid or non-finite limit throws `AxlError('INVALID_BUDGET')` **before** the dataset is loaded |
 | `failOnScorerErrorRate` | `number` (0–1) | — | Opt-in **source-side** trust gate. When set, `runEval` marks the run `summary.degraded` (and the CLI exits non-zero) if a scorer's failure rate exceeds tolerance. **Type-aware**: deterministic scorers tolerate **0** failures (a deterministic scorer that throws is a bug); LLM scorers use this rate. Failure rate = `failed / (scored + failed)`; `0` means "any LLM failure degrades". Items a scorer's `applies` predicate skipped are in neither `scored` nor `failed`, so they're excluded from the denominator — the supported way to scope a conditional scorer without polluting the gate (do NOT return `NaN` for inapplicable items; the gate treats a non-finite score as a real failure). `runEval` never throws on this — it flags and returns, so the (still-useful) result is persisted and the consumer decides. An out-of-range value is **rejected at config load** by the CLI (`validateEvalConfig`, fails loud like `--max-scorer-error-rate`); a programmatic `runEval()` caller that bypasses that validation gets a `console.warn` and the gate is skipped. Catches the silent-thinned-sample trap: a `--fail-on-regression` gate computed over surviving scores can look green when half the judges 429'd. Distinct from the gate-side `axl-eval compare --max-scorer-error-rate` (which refuses to certify an already-thinned baseline/candidate). |
+| `failOnItemErrorRate` | `number` (0–1) | `0.05` | **Default-on** item coverage gate. `runEval` records `summary.itemErrorRate` whenever an item `failed`, marked `exceeded` when `coverage.items.failed / (count − cancelled − budget_skipped − budget_interrupted)` is **strictly greater** than this limit; the CLI then exits non-zero with `ITEM ERROR RATE EXCEEDED`. Cancelled and budget-stopped items leave the denominator (their own gates report them), and a run with nothing attempted never fires. `1` disables the gate; `null`/absent means the default, never "off". Overridden by the CLI `--max-item-error-rate <0..1>` flag. Unlike `failOnScorerErrorRate`, an invalid value **throws** `AxlError('INVALID_ITEM_ERROR_RATE')` from `runEval` before the dataset loads (and is rejected at CLI config load), because warn-and-skip would silently disable a default-on gate. The result artifact is still written when it trips. The unconditional total-wipeout guard (every item failed) still applies with the gate disabled. `rescore` does not apply it: its failed items are the source run's, and `axl-eval compare` re-applies the floor at consume time |
 | `metadata` | `Record<string, unknown>` | — | Arbitrary metadata attached to the result (e.g., model version, prompt variant) |
 
 ### `DatasetConfig`
@@ -2440,7 +2625,10 @@ Per-scorer data stored on each `EvalItem`, providing richer detail than the `sco
 | `score` | `number \| null` | Score value, or `null` if the scorer failed |
 | `metadata` | `Record<string, unknown>?` | Scorer metadata (e.g., reasoning from LLM scorers) |
 | `duration` | `number?` | Scorer execution time in ms. Absent on a skipped scorer (it never ran) |
-| `cost` | `number?` | LLM cost for this scorer invocation |
+| `cost` | `number?` | Known cost for this scorer invocation. When the scorer's accounting observed operations this is `accounting.knownCost`; on an uninstrumented runtime it falls back to a `cost` the scorer itself returned. **Never summed into a run total** |
+| `outcome` | `ScorerOutcome?` | `'scored'`, `'failed'`, `'skipped'` (`applies` returned `false`), `'cancelled'`, `'budget_skipped'` (an LLM judge the budget refused to start) or `'budget_interrupted'` (denied mid-flight). Absent on pre-0.24 artifacts |
+| `accounting` | `Accounting?` | This scorer's measured spend, present when its scope observed at least one operation. `purpose` is `'judging'` |
+| `diagnostics` | `{ operations: OperationRef[] }?` | Pointers to this scorer's [captured requests](observability.md#captured-requests-opt-in), present only when the run used `captureRequests`. Each `OperationRef` is `{ operationId, kind, turn?, attempt?, status }` where `status` is `'recorded'`, `'start_only'` (the call never returned), `'truncated'` or `'omitted'` |
 | `skipped` | `boolean?` | `true` when the scorer's `applies` predicate returned `false` for this item, so it was deliberately **not run** (`score` is `null`, no `duration`). Distinct from a ran-and-failed scorer (`null` score WITH a `duration`) and from cancellation (no marker, no duration). A skipped scorer is excluded from the mean AND from the failure-rate denominator — see `EvalSummary.scorers[].skipped` and `failOnScorerErrorRate` |
 
 ### `EvalItem`
@@ -2456,11 +2644,16 @@ Per-item result from an eval run. `scores` provides quick numeric access; `score
 | `scorerErrors` | `string[]?` | Scorer-level error messages (thrown exceptions or out-of-range scores) |
 | `scores` | `Record<string, number \| null>` | Quick numeric access to scores. `null` = scorer error (see `scorerErrors`) **or** a scorer skipped by its `applies` predicate — disambiguate via `scoreDetails[name].skipped` |
 | `duration` | `number?` | Workflow execution time in ms (set even when workflow errors) |
-| `cost` | `number?` | Workflow LLM cost |
-| `scorerCost` | `number?` | Total scorer cost for this item (sum of all `scoreDetails[*].cost`) |
+| `cost` | `number?` | Measured generation spend for this item — a view of `accounting.breakdown.generation`. A case that threw **after** a paid call still carries that charge. Not a caller-reported figure (see `callerReport`) |
+| `scorerCost` | `number?` | Measured judging spend for this item — a view of `accounting.breakdown.judging` |
+| `outcome` | `EvalItemOutcome?` | `'completed'`, `'failed'`, `'cancelled'`, `'budget_skipped'` (never started) or `'budget_interrupted'` (stopped mid-flight when its next call was denied). Absent on pre-0.24 artifacts, where it can be derived as `error ? 'failed' : 'completed'` |
+| `failure` | `EvalItemFailure?` | Structured cause of a `failed` item, captured before the thrown value is flattened to `error`: `{ name, provider?, status?, retryable?, requestId? }`. When a `ProviderError` is found (the thrown value, or the first one down its `cause` chain, walked to a bounded depth) every field comes from it; otherwise only the thrown value's `name`. Identified structurally (`code: 'PROVIDER_ERROR'` + `name: 'ProviderError'`) so a second loaded copy of `@axlsdk/axl` still matches. `failure` never records `ProviderError.body` (nor the message); `item.error` keeps the error message as before, which for some providers can include error-response text. Absent on other outcomes, on pre-0.24 artifacts, and for a thrown value with no `name`. Carried through `rescore` with the item's outcome. `EvalItemFailure` is exported from `@axlsdk/eval` |
+| `accounting` | `Accounting?` | This item's measured spend across generation **and** judging, with `breakdown` splitting the two. A child scope that finalizes with an operation still in flight records it `abandoned` locally while the run scope still receives the real settlement, so an item and its run can disagree about one operation — **do not reconcile by subtraction**; the run-level `knownCost` is authoritative |
+| `callerReport` | `{ cost?, metadata? }?` | What the `executeWorkflow` callback claimed, kept for inspection and **never** folded into any total. `cost` is the callback's returned number (invalid values are dropped with a warning); `metadata` holds reserved diagnostic keys (`models`, `tokens`, …) that would otherwise have overridden the runtime's own |
 | `scoreDetails` | `Record<string, ScorerDetail>?` | Rich per-scorer data — includes `metadata` (e.g., LLM reasoning), per-scorer `duration`, and `cost` |
 | `metadata` | `Record<string, unknown>?` | Tracked execution metadata (e.g., `models`, `tokens`, `agentCalls`) merged with callback metadata, independently of `captureTraces`. User keys win; nested objects are replaced, not deep-merged. Explicit `models`/`workflows` lists without corresponding call counts remove the inherited count map so roll-ups use the list fallback. Invalid non-plain-object metadata is ignored with a warning. Without runtime tracking, only callback metadata is available. |
 | `timing` | `Record<string, ItemModelTiming>?` | Per-model provider-call latency for this item, keyed by the full model URI like `metadata.modelCallCounts`. `ItemModelTiming` is `{ calls, queuedMs, retryMs, wireMs, firstTokenMs?, firstTokenCalls? }` — ms sums across the item's **successful timed** calls; divide by `calls` (or `firstTokenCalls` for first token). **Absent** when the item made no such call. `duration` is unchanged workflow wall clock. Per-call percentiles live on [`summary.modelTiming`](#modeltimingstats), which is computed from the raw calls, not from these sums. Exported from `@axlsdk/eval` |
+| `diagnostics` | `{ operations: OperationRef[] }?` | Pointers to this item's captured **generation** requests, present only when the run used `captureRequests`. A rescored item keeps the original run's refs — a rescore performs no generation |
 | `traces` | `AxlEvent[]?` | Per-item events. Populated only when the eval was run with `{ captureTraces: true }`. Includes events on the failure path (recovered from the `axlCapturedTraces` side-channel on thrown errors) |
 
 ### `EvalResult`
@@ -2473,7 +2666,10 @@ Full result from an eval run.
 | `dataset` | `string` | Dataset name. Definitional — `evalCompare` enforces matching datasets. |
 | `metadata` | `Record<string, unknown>` | User-provided metadata merged with runner-populated fields (see below) |
 | `timestamp` | `string` | ISO 8601 timestamp |
-| `totalCost` | `number` | Total LLM cost (workflow + LLM scorers) |
+| `totalCost` | `number` | **Compatibility view** of `accounting.knownCost` — the spend the runtime measured, workflow plus LLM scorers. Independent of trace level, redaction and `captureTraces` |
+| `unpriced` | `boolean?` | Present exactly when `accounting.completeness !== 'complete'`, i.e. `totalCost` is a lower bound. `accounting.reasons` says why |
+| `accounting` | `EvalAccounting?` | The authoritative record for the run (see below). Absent on pre-0.24 artifacts — use [`readAccounting`](#readaccountingresult) rather than reading the field directly |
+| `diagnostics` | `DiagnosticManifest?` | Present only when the run used `captureRequests`. `{ version: 1, artifactId, fidelity: 'runtime_request', status, reason?, records, bytes, redaction, expiresAt? }`, where `status` is `'complete'`, `'truncated'` (a byte bound was reached), `'interrupted'` (the writer died) or `'unavailable'` (the sink failed). Capture health never affects `accounting` |
 | `duration` | `number` | Wall-clock time in ms |
 | `items` | `EvalItem[]` | Per-item results |
 | `summary` | `EvalSummary` | Aggregate statistics |
@@ -2506,16 +2702,63 @@ Aggregate statistics across all items.
 | Field | Type | Description |
 |-------|------|-------------|
 | `count` | `number` | Total items |
-| `failures` | `number` | Items where the workflow threw an error |
+| `failures` | `number` | Items that produced no output. **Legacy meaning, unchanged**: it counts every item carrying an `error`, so since 0.24 it includes cancelled and budget-stopped cases. Gate CI on `coverage` instead — only it separates "the workflow broke" from "we stopped paying" |
+| `coverage` | `EvalCoverage?` | Counts per item outcome and per scorer outcome (see below). Absent on pre-0.24 artifacts |
 | `scorers` | `Record<string, { mean, min, max, p50, p95, scored?, failed?, skipped? }>` | Per-scorer aggregate stats (all score values 0-1). `scored` is the number of items that produced a valid numeric score — the sample size `mean` actually covers; `failed` is the number whose scorer **ran and failed** (threw / out-of-range); `skipped` is the number whose `applies` predicate returned `false` (deliberately not run). Neither a skipped nor a cancelled scorer is in `scored`/`failed`, so `scored + failed` is the honest "attempted" count and the failure rate excludes skips. A non-zero `failed` means `mean` rests on a thinned sample. All optional (absent on pre-0.18.0 artifacts → recompute from `items`) |
 | `timing` | `{ mean, min, max, p50, p95 }?` | Per-item **wall-clock** duration statistics in ms. Unchanged by the per-model rollup below — it still covers the whole workflow, queue and all |
-| `modelTiming` | `Record<string, ModelTimingStats>?` | Per-model provider-latency stats, present only when at least one item reported timing. Read alongside `timing`, never instead of it — they are weighted differently on purpose. `ModelTimingStats` is exported from `@axlsdk/eval` |
+| `modelTiming` | `Record<string, ModelTimingStats>?` | Per-model provider-latency stats, present only when at least one item reported timing. Read alongside `timing`, never instead of it — they are weighted differently on purpose. A rescore carries the source run's `modelTiming` unchanged, since it makes no provider calls for generation. `ModelTimingStats` is exported from `@axlsdk/eval` |
 | `degraded` | `DegradedScorer[]?` | Present only when `EvalConfig.failOnScorerErrorRate` is set **and** one or more scorers exceeded tolerance. Each entry is `{ scorer, rate, limit, type, scored, failed }`. `runEval` sets this and returns normally (it never throws); the CLI turns a non-empty `degraded` into a non-zero exit |
 | `DegradedScorer` | `{ scorer: string; rate: number; limit: number; type: 'llm' \| 'deterministic'; scored: number; failed: number }` | One scorer that tripped the failure-rate gate. `rate = failed / (scored + failed)`; `limit` is the tolerance exceeded (`0` for deterministic). Exported from `@axlsdk/eval` |
+| `itemErrorRate` | `ItemErrorRate?` | Present exactly when at least one item `failed`, so a clean run's summary is unchanged. `{ failed, attempted, rate, limit, exceeded }` — see `EvalConfig.failOnItemErrorRate`. `runEval` sets it and returns normally; the CLI turns `exceeded: true` into a non-zero exit. Absent on rescores and on pre-0.24 artifacts |
+| `ItemErrorRate` | `{ failed: number; attempted: number; rate: number; limit: number; exceeded: boolean }` | `failed` is `coverage.items.failed`; `attempted` is `count − cancelled − budget_skipped − budget_interrupted`; `rate` is `failed / attempted` (`0` when nothing was attempted); `limit` is the limit in force (config, CLI flag, or the `0.05` default); `exceeded` is `rate > limit` with something attempted. Exported from `@axlsdk/eval` |
+
+#### `EvalCoverage`
+
+On `EvalSummary.coverage`. Counts every item and every scorer decision by outcome, so a run that was truncated cannot be read as a clean one.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `items` | `Record<EvalItemOutcome, number>` | Item counts. Sums to `summary.count` |
+| `scorers` | `Record<string, Record<ScorerOutcome, number>>` | Per-scorer decision counts. The population is the items that produced an output to score — a case that failed or was never started gives every scorer nothing to decide, and is reported under `items` instead |
+
+`EvalItemOutcome` is `'completed' | 'failed' | 'cancelled' | 'budget_skipped' | 'budget_interrupted'`. `ScorerOutcome` is `'scored' | 'failed' | 'skipped' | 'cancelled' | 'budget_skipped' | 'budget_interrupted'`. Both are exported from `@axlsdk/eval`.
+
+#### `EvalAccounting`
+
+On `EvalResult.accounting`. An [`Accounting`](#accounting) record plus the eval-specific fields below.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `scope` | `'run' \| 'rescore'` | What the record covers. A `'rescore'` record covers judging only |
+| `budget` | `{ limit, knownSpend, knownOvershoot, status, closedBy? }?` | Present when the run configured a budget. `status` is `'open'` or `'closed'`; `knownOvershoot` is how far concurrently in-flight calls carried spend past `limit`; `closedBy` (`'case' \| 'scorer' \| 'operation'`) is what caused the crossing |
+| `source` | `{ runId, generation }?` | Rescore only. The original run's id and its accounting (`null` for a pre-0.24 artifact) |
+| `callerReported` | `{ costItems, costTotal, metadataItems }?` | A summary of what `executeWorkflow` callbacks claimed, for inspection only. **Never** part of `knownCost` |
+
+#### `readAccounting(result)`
+
+Returns `result.accounting`, or synthesizes an `unverified` record from `totalCost` for a pre-0.24 artifact. Use it instead of reading the field directly, so a legacy artifact is treated as an unmeasured total rather than a measured one. `unverified` propagates through `aggregateRuns`, through a rescore, and through a JSON round trip.
+
+> **The structural identities hold only for a live record.** When `completeness` is `'complete'` or `'incomplete'`, `provenance` sums to `knownCost` and `breakdown` splits it. A synthesized `'unverified'` record has only the single legacy total, with `breakdown` and `provenance` zeroed — those zeros mean "no split available", not "the split is zero". A consumer that renders a breakdown must special-case `'unverified'` rather than charting a legacy run as 100% generation.
+
+#### `aggregateAccounting(inputs)`
+
+Folds several `Accounting` records into one, conservatively: costs, usage and operation counts sum, reasons union, and the **worst** completeness wins (`unverified` > `incomplete` > `complete`). One unmeasured run therefore makes the whole group unverified, while its known spend still contributes as a lower bound. Backs `MultiRunSummary.accounting`.
+
+#### `refusedWork(coverage)`
+
+Counts the work a run's budget actually refused: `items.budget_skipped + items.budget_interrupted`, plus the same two counts for every scorer in `coverage.scorers`. A pre-0.24 artifact with no `coverage` block reads `0` — an artifact that never recorded outcomes cannot be used to assert that work was refused.
+
+Reads defensively, because a persisted artifact can be imported, hand-edited, or written by a third party and the consumers include a browser renderer with no schema in front of it: a missing `items` or `scorers` key contributes `0` rather than throwing, and a negative count contributes `0` rather than cancelling out a real refusal.
+
+#### `isBudgetStopped(summary)`
+
+`true` when a run's budget both **closed** and **refused work** — `summary.budget?.status === 'closed' && refusedWork(summary.coverage) > 0`. Takes `{ budget?, coverage? }` structurally, so the CLI (which holds an `EvalResult`), the Studio server (which parses a persisted blob) and the Studio browser mirror can all call the same rule.
+
+> **A closed controller alone is not a stop.** Setting `--budget` to a run's expected spend is the obvious way to use it as a CI threshold, and the final settlement then lands exactly on the limit: the controller closes with every case completed and every judge scored, having refused nothing. Nothing derived from that artifact may describe the run as partial. `budgetStopMessage`, the CLI exit code, and Studio's budget badges are all gated on this predicate.
 
 #### `ModelTimingStats`
 
-Per-model provider latency on `EvalSummary.modelTiming`. Every field is a distribution over **per-call** values pooled across the run's successful items, so one provider call is one sample and an item that makes ten calls weighs ten times an item that makes one.
+Per-model provider latency on `EvalSummary.modelTiming`. Every field is a distribution over **per-call** values pooled across every successful provider call the run made — including calls made by items that later failed or were stopped on budget, since those calls really happened and dropping them would bias exactly the models whose slowness caused the timeouts. One provider call is one sample, so an item that makes ten calls weighs ten times an item that makes one.
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -2523,6 +2766,7 @@ Per-model provider latency on `EvalSummary.modelTiming`. Every field is a distri
 | `wireMs` | `{ mean, min, max, p50, p95 }` | Per-call provider time, in ms. The primary model-comparison figure alongside `firstTokenMs` |
 | `queuedMs` | `{ mean, min, max, p50, p95 }` | Per-call wait on Axl's own rate limiter, in ms. Self-imposed, so it never distorts a comparison of the models themselves |
 | `retryMs` | `{ mean, min, max, p50, p95 }` | Per-call retry time (failed attempts + backoff), in ms. A model the provider throttled hard on the day of the run shows it here, which is what keeps `wireMs` an honest comparison |
+| `rateLimitRetries` | `number?` | Total [`CallTiming.rateLimitRetries`](#calltiming) over the same calls as `calls`, meaning the rate-limit 429s they absorbed and retried. A plain sum, not a distribution; a call without the field adds `0`. Nonzero means lower `concurrency`. Successful calls only: a call that spent its whole rate-limit budget is a failed item with a `429` `EvalItem.failure` cause, not a count here, so a harder-throttled run can show a **lower** total. Read it beside `itemErrorRate`. `runEval` always sets it, and artifacts written before it existed lack it |
 | `firstTokenMs` | `{ mean, min, max, p50, p95 }?` | Per-call time to the first content delta, over the **streaming** calls that reported one — non-streaming calls are excluded from the sample, not entered as `0`. **Absent** when no call reported one. This is the model-discriminating figure, since response headers arrive at roughly one round trip regardless of model |
 | `firstTokenCalls` | `number?` | How many calls the `firstTokenMs` sample covers, present exactly when it is. A distribution carries no sample size of its own, so on a model mixing streamed and non-streamed calls this is the only way to tell a figure drawn from one call from one drawn from all of them |
 
@@ -2581,7 +2825,7 @@ Result from `evalCompare()` comparing a baseline and candidate eval run.
 | `candidate` | `{ id, metadata, runCount, partial? }` | Candidate run identity. Same shape as `baseline` |
 | `scorers` | `Record<string, { baselineMean, candidateMean, delta, deltaPercent, ci?, significant?, pRegression?, pImprovement?, n?, baselineScored?, baselineFailed?, candidateScored?, candidateFailed?, baselineSkipped?, candidateSkipped? }>` | Per-scorer mean comparison. `ci` is `{ lower: number; upper: number }` (95% bootstrap CI on paired differences). `significant` is `true` when the CI excludes zero and \|delta\| exceeds the threshold. `pRegression`/`pImprovement` are bootstrap probability estimates. `n` is the **paired sample size** — items scored on BOTH sides — always populated (incl. `0`/`1`); the CI/`significant` are computed only when `n >= 2`. Note the asymmetry: `delta` is the difference of the two **independent** per-side means (each over `{baseline,candidate}Scored` items), whereas the CI is paired over `n`, so when `n` is much smaller than the per-side scored counts the two rest on different samples (Studio's compare view surfaces a "paired n" note). `{baseline,candidate}{Scored,Failed}` are per-side success/failure counts over the **same truncated pool** the means/CI use (raw counts; consumer divides) — a non-zero `*Failed` means that side's mean rests on a thinned sample, and `axl-eval compare --max-scorer-error-rate` refuses to certify when over tolerance. `{baseline,candidate}Skipped` are per-side `applies`-skipped (N/A) counts — excluded from both the mean and the failure-rate denominator; when the two sides differ, the means cover different applicable subsets (the CLI prints an advisory `NOTE`) |
 | `timing` | `{ baselineMean, candidateMean, delta, deltaPercent }?` | Per-item duration comparison |
-| `cost` | `{ baselineTotal, candidateTotal, delta, deltaPercent }?` | Total cost comparison |
+| `cost` | `{ baselineTotal, candidateTotal, delta, deltaPercent, certified, reason? }?` | Total cost comparison. `deltaPercent` is `number \| null` — `null` when the baseline total was `0`, since a percentage change from zero is undefined. `certified` is `true` only when both sides are `complete`, share an accounting `scope`, and covered the same cases and scorers; otherwise it is `false` and `reason` says why (unverified or incomplete accounting, a rescore total compared against a run total, or one side that did less work — a budget-truncated run is cheaper because it skipped cases, not because it is more efficient). **Both raw totals are always shown**: refusing to certify is not refusing to report. The block is emitted whenever either side carries accounting, **including when both totals are `$0`** — a free run still deserves an explicit certified/uncertified answer rather than a missing field |
 | `regressions` | `EvalRegression[]` | Items that got worse |
 | `improvements` | `EvalImprovement[]` | Items that got better |
 | `summary` | `string` | Human-readable summary |
@@ -2638,6 +2882,16 @@ Pure, side-effect-free decision for the gate-side scorer-failure-rate check (wha
 - Also refuses when a scorer produced **zero scored items** on a side (a mean over an empty sample can't be certified).
 - Reads the per-side `scored`/`failed` counts on `EvalComparison.scorers[name]`, computed over the same truncated pool as the means/CI.
 
+### `evaluateItemErrorRateGate(baseline, candidate, maxItemErrorRate?)`
+
+Pure decision for the consume-time item coverage floor that `axl-eval compare` runs **by default** (`maxItemErrorRate` defaults to `0.05`; the CLI's `--max-item-error-rate <0..1>` overrides it and `1` disables it). Returns a refusal reason `string` naming coverage, the side and the run, or `null` to allow. Throws on a limit outside `[0, 1]`.
+
+- Uses the same rule as `runEval`'s `failOnItemErrorRate`, on each side's `summary.coverage`.
+- Gates every run **individually** over the same truncated pool `evalCompare` compares (the first `min(baseline, candidate)` runs), so clean runs cannot dilute a thinned one.
+- A pre-0.24 artifact with no `summary.coverage` is gated on a rate derived from its items with the legacy rule `outcome ?? (error ? 'failed' : 'completed')` — never skipped. A rescore artifact is gated on the source outcomes it carries.
+
+The CLI also warns (without failing) about any side that lost items but stayed within the limit, so accepting a thinned side is never silent.
+
 ### `evaluateScorerTolerance(scored, failed, type, limit)`
 
 The single shared pure helper backing **both** failure-rate gates (source-side `runEval` and gate-side `evaluateScorerErrorRateGate`). Returns a `ScorerToleranceVerdict`:
@@ -2679,11 +2933,16 @@ Options for `rescore()`.
 |-------|------|---------|-------------|
 | `concurrency` | `number` | `5` | Maximum parallel item rescores |
 | `scorerConcurrency` | `number` | `5` | Maximum parallel scorers within a single item (see `EvalConfig.scorerConcurrency`) |
+| `budget` | `string` | — | Known-spend limit for the **new judging only** (same semantics as `EvalConfig.budget`). The original run's generation spend is not re-counted and cannot consume it |
 | `signal` | `AbortSignal` | — | Cancels in-flight scorer LLM calls and short-circuits remaining items |
 
 ### `rescore(result, scorers, runtime, options?)`
 
-Re-run scorers on the saved outputs of an existing `EvalResult` without re-executing the workflow. Returns a new `EvalResult` with `rescored: true` and `originalId` set in metadata. Strips `runGroupId` and `runIndex` from inherited metadata (rescored results are independent evaluations). Only tracks scorer cost (no workflow cost).
+Re-run scorers on the saved outputs of an existing `EvalResult` without re-executing the workflow. Returns a new `EvalResult` with `rescored: true` and `originalId` set in metadata. Strips `runGroupId` and `runIndex` from inherited metadata (rescored results are independent evaluations).
+
+`RescoreOptions` accepts `budget`, `signal` and `captureRequests` (same shape as `RunEvalOptions`). With capture on, the new judging calls are recorded **and** the source run's captured generation requests are copied into the rescore's own artifact — bounded, with the original operation ids preserved so the copied refs still resolve. Both halves share one artifact and one `maxRunBytes` budget — the copied bytes count against it, so the artifact never grows to twice the bound you asked for, and the copy may use at most **three quarters** of it so the judging always has room. The manifest's `redaction` describes both halves: copying unredacted records into a redact-on rescore yields `'none'`, never `'applied'`. A source artifact that is gone or unreadable yields `diagnostics.status: 'unavailable'` with `artifactId: ''` rather than failing the rescore (and the per-item refs into it are dropped with it); a degraded rescore never names the source's artifact, so its lifecycle can never reach into the original run's evidence. A runtime that cannot host capture at all is the one case that **throws**, before any judging, exactly as `runEval` does.
+
+Its `accounting.scope` is `'rescore'` and covers **only the new judging** — the original generation spend is not re-counted. `accounting.source` records `{ runId, generation }`, where `generation` is the original run's accounting (or `null` for a pre-0.24 artifact, which keeps the whole chain `unverified`). Items that carry a pass-through error keep their original `outcome`. Because the scopes differ, `evalCompare` refuses to certify a rescore total against a full run total.
 
 ### `MultiRunSummary`
 
@@ -2719,6 +2978,7 @@ Run an evaluation. LLM scorer providers are auto-resolved from the runtime's pro
 | `onProgress` | `(event: EvalProgressEvent) => void` | — | Called synchronously on two events: `item_done` (after each dataset item finishes — success, failure, cancellation, or budget-exceeded) and `run_done` (once after all items finish and stats are computed). Useful for progress bars, live log streams, or WS broadcasts |
 | `signal` | `AbortSignal` | — | Checked before each item AND between scorers within an item. Remaining items are marked as cancelled in the result |
 | `captureTraces` | `boolean` | `false` | Wrap `executeWorkflow` in `runtime.trackExecution(..., { captureTraces: true })`. Per-item `EvalItem.traces` is populated on both success and failure (failure path reads the `axlCapturedTraces` side-channel on the thrown error) |
+| `captureRequests` | `boolean \| { maxRecordBytes?, maxRunBytes?, maxQueueBytes? }` | `false` | Record the request Axl submitted for every model call in the run — case turns, tool continuations, nested asks and LLM judges. Requires [`diagnostics.artifacts`](#diagnostic-artifacts); without it the run fails with `AxlError('DIAGNOSTICS_UNAVAILABLE')` **before** the dataset is loaded. Populates `EvalResult.diagnostics` plus per-item and per-scorer `diagnostics`. Defaults: 256 KiB per record, 16 MiB per run, 1 MiB pending queue. See [observability.md](observability.md#captured-requests-opt-in) |
 
 `EvalProgressEvent`:
 

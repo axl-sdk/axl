@@ -69,7 +69,7 @@ agent({ model: 'ollama:llama3' });                        // local — no key, $
 
 Presets: `openrouter`, `azure`, `xai`, `deepseek`, `mistral`, `groq`, `bedrock`, and self-hosted `ollama` / `vllm` / `lmstudio` / `llamacpp` / `sglang`. The unified `effort` knob and per-call cost tracking work across them. OpenAI Responses, Anthropic, Google, and OpenRouter accept image input, and OpenAI Chat Completions, Google, and OpenRouter accept general recorded-audio input, without hard-coding a model catalog; the selected upstream model remains authoritative. Completed-file transcription is a separate, narrower contract. Build your own compatible provider by cloning a `ProviderProfile`; see [provider details](../../docs/providers.md) and [multimodal input](../../docs/multimodal-input.md).
 
-Each provider also accepts an opt-in `rateLimit` (`{ maxConcurrent?, minIntervalMs?, acquireTimeoutMs? }`) for proactive client-side pacing on top of the automatic 429/503/529 backoff — useful when a large fan-out (e.g. an eval) shares one API key. It caps in-flight request concurrency (not token throughput) for that provider's chat calls. See [Providers → Rate limiting](../../docs/providers.md#rate-limiting-opt-in).
+On every built-in chat provider, a rate-limit 429 pauses every call on that account and model for an exponential backoff (lengthened by a longer `Retry-After`, never shortened), retries on its own budget and paces the scope adaptively until it stops being throttled. First-party OpenAI and Anthropic (their own endpoints, not a proxy `baseUrl`) also fail a spend-cap 429 fast; elsewhere every 429 is treated as a rate limit. `rateLimit: { adaptive: false }` turns this off. Each provider also accepts an opt-in `rateLimit` (`{ maxConcurrent?, minIntervalMs?, acquireTimeoutMs?, adaptive?, maxRateLimitRetries? }`) for proactive client-side pacing on top of the automatic 429/503/529 handling — useful when a large fan-out (e.g. an eval) shares one API key. It caps in-flight request concurrency (not token throughput) for that provider's chat calls. See [Providers → Rate limiting](../../docs/providers.md#rate-limiting).
 
 Built-in providers require HTTPS for remote endpoints and never follow redirects.
 Literal loopback HTTP remains automatic for local inference; Docker service names,
@@ -584,6 +584,18 @@ const relevant = await ctx.recall('knowledge-base', {
 ```
 
 Vector store implementations: `InMemoryVectorStore` (testing), `SqliteVectorStore` (production, requires `better-sqlite3`).
+
+**Captured requests (opt-in).** Configure `diagnostics.artifacts` with a `root`
+(or your own `DiagnosticArtifactStore`) and an eval run can record the
+provider-neutral request Axl submitted for every model call — including the
+repaired message list on a retry turn and the prompt a judge built for itself.
+It is off by default, bounded per record / run / queue, redacted when
+`trace.redact` is on, and strictly separate from accounting: a capture that
+fails or hits a limit changes no number. Artifacts are committed only after the
+eval history row that owns them is saved, deleted with it, and reclaimed by a
+startup pass plus a periodic sweep. See
+[observability.md](../../docs/observability.md#captured-requests-opt-in) and
+[integration.md](../../docs/integration.md#diagnostic-artifact-storage).
 
 **Embedder cost attribution.** `OpenAIEmbedder` reports `{ tokens, cost, model }` on every embed call — computed from the response's `prompt_tokens` and a pricing table (`text-embedding-3-small` $0.02/1M, `-large` $0.13/1M, `ada-002` $0.10/1M). The cost flows through `runtime.trackExecution()` the same way agent-call cost does, counts against `ctx.budget()`, and shows up in Studio's Cost Dashboard under "Memory (Embedder)". See [observability.md](../../docs/observability.md#event-types) for the trace-event shape.
 

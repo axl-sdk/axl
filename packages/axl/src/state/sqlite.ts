@@ -506,6 +506,19 @@ export class SQLiteStore implements StateStore {
       .run(entry.id, entry.eval, entry.timestamp, JSON.stringify(entry.data));
   }
 
+  /**
+   * Update-only write: see `StateStore.updateEvalResult`. `UPDATE ... WHERE id`
+   * touches nothing when the row is gone, where `INSERT OR REPLACE` would
+   * resurrect it — and SQLite history has no expiry, so a resurrection here is
+   * permanent.
+   */
+  async updateEvalResult(entry: EvalHistoryEntry): Promise<boolean> {
+    const result = this.db
+      .prepare('UPDATE eval_history SET eval_name = ?, timestamp = ?, data = ? WHERE id = ?')
+      .run(entry.eval, entry.timestamp, JSON.stringify(entry.data), entry.id);
+    return result.changes > 0;
+  }
+
   async listEvalResults(limit?: number): Promise<EvalHistoryEntry[]> {
     const sql = limit
       ? 'SELECT * FROM eval_history ORDER BY timestamp DESC LIMIT ?'
@@ -527,6 +540,12 @@ export class SQLiteStore implements StateStore {
   async deleteEvalResult(id: string): Promise<boolean> {
     const result = this.db.prepare('DELETE FROM eval_history WHERE id = ?').run(id);
     return result.changes > 0;
+  }
+
+  /** SQLite history has no automatic expiry — only existence is meaningful. */
+  async getEvalRetention(id: string): Promise<{ exists: boolean; expiresAt?: number }> {
+    const row = this.db.prepare('SELECT 1 FROM eval_history WHERE id = ?').get(id);
+    return { exists: row !== undefined };
   }
 
   // ── Sessions (Studio introspection) ────────────────────────────────────

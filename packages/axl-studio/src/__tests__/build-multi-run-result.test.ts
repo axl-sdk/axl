@@ -40,6 +40,33 @@ function makeRun(
 }
 
 describe('buildMultiRunResult', () => {
+  it("omits run[0]'s modelTiming from the aggregate summary; each run keeps its own", () => {
+    const stats = { mean: 5, min: 5, max: 5, p50: 5, p95: 5 };
+    const timed = (i: number, rateLimitRetries: number): EvalResultData => {
+      const run = makeRun(i);
+      run.summary.modelTiming = {
+        'openai:gpt-4o': {
+          calls: 2,
+          wireMs: stats,
+          queuedMs: stats,
+          retryMs: stats,
+          rateLimitRetries,
+        },
+      };
+      return run;
+    };
+    const result = buildMultiRunResult([timed(0, 3), timed(1, 0)])!;
+    expect('modelTiming' in result.summary).toBe(false);
+    expect(result._multiRun!.allRuns[0].summary.modelTiming).toEqual(
+      timed(0, 3).summary.modelTiming,
+    );
+    expect(result._multiRun!.allRuns[1].summary.modelTiming).toEqual(
+      timed(1, 0).summary.modelTiming,
+    );
+    // The rest of run[0]'s summary is still spread.
+    expect(result.summary.count).toBe(1);
+  });
+
   it('returns null on empty input', () => {
     expect(buildMultiRunResult([])).toBeNull();
   });
@@ -349,5 +376,53 @@ describe('buildMultiRunResult', () => {
     const result = buildMultiRunResult([makeRunWithDegraded(0, []), makeRunWithDegraded(1, [])]);
     expect(result!.summary.degraded).toBeUndefined();
     expect(getResultDegraded(result!)).toEqual([]);
+  });
+});
+
+// ── itemErrorRate across a group ─────────────────────────────────
+//
+// `summary.itemErrorRate` is run-level, and the CLI gates each run of a batch
+// individually. Spreading `...first.summary` would surface only run[0]'s rate,
+// so a group whose third run lost half its items would read as clean.
+describe('buildMultiRunResult — itemErrorRate', () => {
+  const rate = (failed: number, attempted: number, limit = 0.05) => ({
+    failed,
+    attempted,
+    rate: failed / attempted,
+    limit,
+    exceeded: failed / attempted > limit,
+  });
+  const withRate = (runIndex: number, r?: ReturnType<typeof rate>): EvalResultData => {
+    const run = makeRun(runIndex);
+    if (r) run.summary.itemErrorRate = r;
+    return run;
+  };
+
+  it('surfaces the worst run when run[0] is clean', () => {
+    const result = buildMultiRunResult([
+      withRate(0),
+      withRate(1, rate(1, 20)),
+      withRate(2, rate(10, 20)),
+    ]);
+    expect(result!.summary.itemErrorRate).toEqual({ ...rate(10, 20), runsExceeded: 1 });
+  });
+
+  it('keeps the worst rate, not run[0]’s, and counts every run over its limit', () => {
+    const result = buildMultiRunResult([
+      withRate(0, rate(2, 20)),
+      withRate(1, rate(8, 20)),
+      withRate(2, rate(4, 20)),
+    ]);
+    expect(result!.summary.itemErrorRate).toEqual({ ...rate(8, 20), runsExceeded: 3 });
+  });
+
+  it('reports runsExceeded 0 when items failed but every run stayed within its limit', () => {
+    const result = buildMultiRunResult([withRate(0, rate(1, 20)), withRate(1)]);
+    expect(result!.summary.itemErrorRate).toEqual({ ...rate(1, 20), runsExceeded: 0 });
+  });
+
+  it('adds no itemErrorRate when no run had a failed item', () => {
+    const result = buildMultiRunResult([withRate(0), withRate(1)]);
+    expect('itemErrorRate' in result!.summary).toBe(false);
   });
 });

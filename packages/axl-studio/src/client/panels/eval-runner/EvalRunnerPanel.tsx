@@ -30,7 +30,17 @@ import {
   formatModelName,
   getResultTokens,
   buildMultiRunResult,
+  aggregateGroupAccounting,
 } from './types';
+import {
+  completenessLabel,
+  isRunBudgetStopped,
+  lowerBoundPrefix,
+  readAccounting,
+} from './accounting';
+import { BudgetStoppedBadge } from './RunAccountingPanel';
+import { RunDiagnosticsPanel } from './RunDiagnosticsPanel';
+import { ScorerCoverageCaveat } from './ScorerCoverageCaveat';
 import { DroppedAnnotationKeysBanner } from './DroppedAnnotationKeysBanner';
 import { ScorerFilteredBanner } from './ScorerFilteredBanner';
 import { DegradedScorersBanner } from './DegradedScorersBanner';
@@ -536,7 +546,12 @@ export function EvalRunnerPanel() {
     );
   }, [multiRun]);
   const aggTotalDuration = multiRun ? multiRun.allRuns.reduce((sum, r) => sum + r.duration, 0) : 0;
-  const aggTotalCost = multiRun ? multiRun.allRuns.reduce((sum, r) => sum + r.totalCost, 0) : 0;
+  // Group spend is a UNION, not a sum of `totalCost`: one legacy or incomplete
+  // run makes the whole group's figure uncertifiable, and the card has to say so.
+  const aggAccounting = useMemo(
+    () => aggregateGroupAccounting(multiRun ? multiRun.allRuns : []),
+    [multiRun],
+  );
 
   // Sorted aggregate scorer entries — derive from multiRun directly for stable deps
   const sortedAggScorerEntries = useMemo(() => {
@@ -942,9 +957,19 @@ export function EvalRunnerPanel() {
                         subtitle="all runs combined"
                       />
                       <StatCard
-                        label="Total Cost"
-                        value={aggTotalCost > 0 ? formatCost(aggTotalCost) : '\u2014'}
-                        subtitle="all runs combined"
+                        label="Known Spend"
+                        // Same lower-bound vocabulary `SpendBadge` uses, so
+                        // the card and the badge cannot read as two different
+                        // claims about the same figure.
+                        value={
+                          lowerBoundPrefix(aggAccounting) + formatCost(aggAccounting.knownCost)
+                        }
+                        subtitle={`all runs combined \u00b7 ${completenessLabel(aggAccounting)}`}
+                        subtitleColor={
+                          aggAccounting.completeness === 'complete'
+                            ? undefined
+                            : 'text-amber-600 dark:text-amber-400'
+                        }
                       />
                       {(() => {
                         const allRuns = multiRun!.allRuns;
@@ -975,6 +1000,11 @@ export function EvalRunnerPanel() {
                           Per-Scorer Aggregate
                         </h3>
                       </div>
+                      {/* A budget-stopped judge lands in NO outcome bucket, by
+                          design, which shrinks each mean's denominator without
+                          saying so. This view renders no coverage block at all,
+                          so the caveat has to sit on the table itself. */}
+                      <ScorerCoverageCaveat coverage={currentResult?.summary.coverage} />
                       <div className="overflow-x-auto">
                         <table className="w-full text-xs">
                           <thead>
@@ -1240,21 +1270,51 @@ export function EvalRunnerPanel() {
                     <DroppedAnnotationKeysBanner result={displayResult} />
                     <ScorerFilteredBanner result={displayResult} />
                     <DegradedScorersBanner result={displayResult} />
+                    {isRunBudgetStopped(displayResult) && (
+                      <div className="mb-3 flex items-center gap-2 px-3 py-2 rounded-lg text-xs bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-900 text-amber-800 dark:text-amber-200">
+                        <BudgetStoppedBadge result={displayResult} />
+                        <span>
+                          This run stopped admitting spend at its budget, so it covers less than the
+                          whole dataset. That is not a model or scorer failure.
+                        </span>
+                      </div>
+                    )}
                     <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
-                      <StatCard
-                        label="Items"
-                        value={String(displayResult.summary.count)}
-                        subtitle={
-                          displayResult.summary.failures > 0
-                            ? `${displayResult.summary.failures} failed`
-                            : 'all passed'
-                        }
-                        subtitleColor={
-                          displayResult.summary.failures > 0
-                            ? 'text-red-600 dark:text-red-400'
-                            : 'text-emerald-600 dark:text-emerald-400'
-                        }
-                      />
+                      {(() => {
+                        // A budget-stopped run is short by design. Reading
+                        // `summary.failures` as "N failed" would report every
+                        // budget-skipped case as a broken model, so when
+                        // coverage is available the subtitle names the actual
+                        // outcomes instead of the legacy error count.
+                        const coverage = displayResult.summary.coverage?.items;
+                        const failures = displayResult.summary.failures;
+                        const stopped = coverage
+                          ? coverage.budget_skipped + coverage.budget_interrupted
+                          : 0;
+                        const subtitle = coverage
+                          ? stopped > 0
+                            ? `${coverage.completed} completed · ${stopped} stopped on budget`
+                            : coverage.failed > 0
+                              ? `${coverage.failed} failed`
+                              : 'all completed'
+                          : failures > 0
+                            ? `${failures} with errors`
+                            : 'all passed';
+                        return (
+                          <StatCard
+                            label="Items"
+                            value={String(displayResult.summary.count)}
+                            subtitle={subtitle}
+                            subtitleColor={
+                              stopped > 0
+                                ? 'text-amber-600 dark:text-amber-400'
+                                : (coverage?.failed ?? failures) > 0
+                                  ? 'text-red-600 dark:text-red-400'
+                                  : 'text-emerald-600 dark:text-emerald-400'
+                            }
+                          />
+                        );
+                      })()}
                       <StatCard
                         label="Mean Score"
                         value={scorerEntries.length > 0 ? overallMean.toFixed(3) : '\u2014'}
@@ -1275,15 +1335,24 @@ export function EvalRunnerPanel() {
                             : 'total'
                         }
                       />
-                      <StatCard
-                        label="Cost"
-                        value={
-                          displayResult.totalCost > 0
-                            ? formatCost(displayResult.totalCost)
-                            : '\u2014'
-                        }
-                        subtitle="total"
-                      />
+                      {(() => {
+                        // Known spend, never a bare `totalCost`: the subtitle
+                        // carries the completeness so a $0 that means
+                        // "unpriced" can't read as "free".
+                        const accounting = readAccounting(displayResult);
+                        return (
+                          <StatCard
+                            label="Known Spend"
+                            value={lowerBoundPrefix(accounting) + formatCost(accounting.knownCost)}
+                            subtitle={completenessLabel(accounting)}
+                            subtitleColor={
+                              accounting.completeness === 'complete'
+                                ? undefined
+                                : 'text-amber-600 dark:text-amber-400'
+                            }
+                          />
+                        );
+                      })()}
                       {(() => {
                         const tokens = getResultTokens(displayResult);
                         const totalTokens = tokens.input + tokens.output + tokens.reasoning;
@@ -1328,12 +1397,26 @@ export function EvalRunnerPanel() {
                           </div>
                         ) : (
                           <div className="p-6 space-y-6">
-                            <EvalSummaryTable
-                              summary={displayResult.summary}
-                              items={displayResult.items}
-                              totalCost={displayResult.totalCost}
-                              scorerTypes={scorerTypes}
-                            />
+                            <EvalSummaryTable result={displayResult} scorerTypes={scorerTypes} />
+
+                            {/* Its own block, deliberately not inside the
+                                accounting footer: capture is diagnostics and
+                                must never move a spend or coverage figure.
+                                Per run only: the aggregate view's result is
+                                `buildMultiRunResult`'s output, whose
+                                `diagnostics` is run 1's. Keyed on the run so
+                                no view state outlives the run it describes. */}
+                            {!isAggregateView && (
+                              <RunDiagnosticsPanel
+                                key={displayResult.id}
+                                result={displayResult}
+                                evalName={
+                                  history.find((h) => h.id === displayResult.id)?.eval ||
+                                  selectedEval ||
+                                  undefined
+                                }
+                              />
+                            )}
 
                             <ScoreDistribution
                               items={displayResult.items}

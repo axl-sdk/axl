@@ -305,7 +305,7 @@ describe('Eval E2E', () => {
     expect(result.items[0].scorerErrors).toBeUndefined();
   });
 
-  it('per-item duration and cost are captured', async () => {
+  it('per-item duration is captured, and an uninstrumented cost stays a caller report', async () => {
     const ds = dataset({
       name: 'timing-ds',
       schema: z.object({ q: z.string() }),
@@ -328,7 +328,16 @@ describe('Eval E2E', () => {
     expect(item.duration).toBeDefined();
     expect(typeof item.duration).toBe('number');
     expect(item.duration!).toBeGreaterThanOrEqual(0);
-    expect(item.cost).toBe(0.005);
+    // `mockRuntime` is `{} as AxlRuntime` — it measures nothing, so the run has
+    // no basis to call anything spent. The callback's claim is preserved where
+    // a reader can see it came from the caller, and the run is marked
+    // incomplete rather than reporting $0.005 it never observed.
+    expect(item.cost).toBe(0);
+    expect(item.callerReport).toEqual({ cost: 0.005 });
+    expect(result.totalCost).toBe(0);
+    expect(result.accounting!.completeness).toBe('incomplete');
+    expect(result.accounting!.reasons.uninstrumented).toBe(1);
+    expect(result.accounting!.callerReported).toMatchObject({ costItems: 1, costTotal: 0.005 });
   });
 
   it('scoreDetails are populated with metadata for LLM scorers through runtime.eval()', async () => {

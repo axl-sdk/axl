@@ -4,56 +4,23 @@ description: Comprehensive adversarial white-box review of the session's net dif
 disable-model-invocation: true
 ---
 
-Review the session's net change, not isolated commits or remembered intent. The
-root lead owns scope, risk classification, cross-review triage, fixes, and final
-judgment.
+Review the session's net diff by following
+`.claude/skills/session-review/references/procedure.md` (read it now). Honor
+any base ref or scope note in the user's request; otherwise default to the
+session's diff. This file binds the procedure's lanes to Claude Code.
 
-## Pin scope
+## Lane bindings
 
-Resolve the session base and head and define one concrete diff. Pass that exact
-range, raw requirements, and relevant plan documents to every reviewer. Avoid
-persuasive implementation rationale that could anchor independent judgment.
+| Lane                 | Agent                                                                                                              |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| Review, composite    | `reviewer` with the composite charter                                                                              |
+| Review, focused seam | `senior-reviewer` with the focused seam charter                                                                    |
+| Cross-platform pass  | a Codex `senior-reviewer` for consequential seams, run by the owner; this session records and triages its findings |
+| Implementation       | `implementer` for established contracts; `senior-implementer` for consequential seams                              |
+| Hard problems        | `senior-implementer` for uncertain diagnosis and consequential fixes                                               |
+| Live-API pass        | the lead, via `/live-api-verification` with the checklist path                                                     |
 
-## Choose the review wave
+## Platform mechanics
 
-Use the smallest wave that covers the risk deeply. A comprehensive session
-review always needs at least two independent perspectives; single-reviewer
-coverage is for ordinary milestone checks inside `/tackle-plan`.
-
-- **Small, low-risk:** two `pragmatic-code-reviewer` agents with disjoint
-  correctness/journey and boundary/test/edge-case charters.
-- **Moderate:** two pragmatic reviewers covering correctness/lifecycle/journeys
-  and architecture/types/boundaries/tests/silent failures.
-- **High-risk:** those two plus one focused `adversarial-code-reviewer` for
-  provider semantics, state/data loss, streaming/redaction, security,
-  concurrency, usage/cost, lifecycle, performance, or compatibility.
-
-Add another premium reviewer only in a later wave for a concrete unresolved
-high-consequence question. Assign reviewers read-only and avoid overlapping
-charters. Treat platform isolation as defense in depth because the host may
-override it: reviewer instructions must prohibit edits and artifact-writing
-commands, and the lead must confirm the wave did not mutate the working tree.
-Each finding must include `REAL BUG`, `NOT A BUG`,
-`NEEDS-LIVE-API-VERIFICATION`, or `ESCALATE-ADVERSARIAL` with file-backed
-evidence.
-
-## Triage and close
-
-1. De-duplicate findings and assign severity.
-2. Verify every claim before editing; avoid address-all churn.
-3. Fix confirmed defects and high-value, low-risk adjacent issues. Log larger
-   improvements instead of ballooning the review.
-4. Run targeted verification. Consolidate provider-only findings into the
-   plan's one live-API checklist, or one review-local checklist, and close it
-   with `/live-api-verification`. If live verification changes code, rerun the
-   affected targeted checks before continuing.
-5. Re-pin the final net diff and the review-fix delta, then run at least one
-   focused independent regression review. Use a premium reviewer for new consequential behavior, changed invariants,
-   or unresolved consequential risk. Narrow fixes on an already premium-reviewed
-   seam may use a pragmatic re-check when behavior and invariants are unchanged. If that pass requires material fixes, repeat
-   steps 4–5 on the new final diff.
-6. Commit only after the final-diff review is clean. Keep unrelated fixes in
-   separate logical commits.
-
-Be comprehensive about real risk, economical about redundant review, and
-willing to ship when evidence supports it.
+- Reviewers are read-only subagents; no worktree isolation is needed for them.
+- Resume with `SendMessage`; named agents deliver their report to `team-lead` with `SendMessage`.

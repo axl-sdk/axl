@@ -5,61 +5,20 @@ description: Create a living Axl plan or design doc grounded in developer journe
 
 # Plan Doc
 
-Create the requested living plan. The root lead owns product decisions,
-architecture, acceptance criteria, and final synthesis. When model selection is
-available, follow `CLAUDE.md` Agent routing: Sol/medium for settled synthesis,
-Astra/medium when unresolved architecture or contracts make the lead the primary
-reasoner. Preserve explicit user choices and verify host-resolved settings when
-available; these instructions do not switch the running model.
+Create the living plan requested by the user by following
+`.claude/skills/plan-doc/references/procedure.md` (also linked as
+`references/procedure.md` beside this file; read it now). This file binds the
+procedure's lanes to Codex.
 
-Use `repo-explorer` (Luna/medium) for bounded read-only discovery with a precise
-question and file-backed evidence. Ask discovery questions rather than design
-questions and verify negative claims before they enter the plan under
-`.claude/rules/discovery-evidence.md`. Do not delegate plan authorship or
-trivial discovery.
+## Lane bindings
 
-Default location:
-`.internal/plans/<product-area>/active/<name>/plan.md`. Choose the narrowest
-durable product owner using `.internal/README.md`, and keep reviews or other
-supporting artifacts in the same workstream directory. Public `docs/` are
-lasting references. Add the workstream to the active index in
-`.internal/plans/README.md`. Never force-add `.internal/` content.
+| Lane                  | Agent                                                                                |
+| --------------------- | ------------------------------------------------------------------------------------ |
+| Discovery             | `Explore`                                                                            |
+| Review, plan charter  | `reviewer` for established architecture; `senior-reviewer` for consequential changes |
+| Blind analyst, opt-in | `senior-reviewer` with the blind-analyst charter                                     |
 
-## Required flow
+## Platform mechanics
 
-1. **Developer journeys and scenarios** — define J1, J2, edge cases, and failure
-   or recovery paths first.
-2. **Product and functional requirements** — tag requirements to journeys.
-3. **Acceptance criteria** — make completion explicit and testable per journey.
-4. **Architecture** — ground the design in actual files, public types, schemas,
-   package boundaries, state/event paths, and provider contracts.
-5. **Implementation phases** — map work to independently reviewable commits;
-   each phase should leave a working product when possible.
-6. **Parallelization** — identify only disjoint scopes. Land core/shared-type
-   work before dependent packages and follow `.claude/rules/parallel-agents.md`.
-7. **In progress** — track completed, active, live-provider-gated, and deferred
-   work.
-
-For Studio UI phases, include a dev-server iteration pass. Maintain one live-API
-checklist with scenario, provider/model, expected behavior, and evidence.
-
-Before asking for approval on a plan that changes public contracts, structured
-output or provider mapping, streaming/events/redaction, durable state,
-concurrency, usage/cost accounting, or Axl-owned runtime prompts, give the named
-plan artifact to one `pragmatic-code-reviewer`. Charter architecture,
-production reachability of every proposed path, and unresolved product forks.
-Fold confirmed findings into the plan. A blind `behavioral-test-analyst` pass is
-optional for product-heavy behavior; it is not a default plan-review tax.
-
-Mark durable versus ephemeral content. At completion, fold lasting internal
-design into `.internal/spec/` and user-facing material into public `docs/`, then
-move the complete workstream directory from `active/` to `graduated/`. Preserve
-useful execution and review evidence there; remove redundant scratch material.
-Remove it from the active index in `.internal/plans/README.md`. Update
-`CHANGELOG.md` for user-visible changes. Use `paused/` only for accepted work
-with a documented reason and resume condition.
-
-Resolve questions through source inspection or research. Ask only about real
-product forks, include a recommendation, and record architecture-changing
-assumptions. In plan mode, present the full proposal for approval before writing;
-in normal mode, write it directly.
+- Start reviewers and blind analysts in fresh context (`fork_turns="none"` when the host exposes that option). Supply raw requirements and artifacts, not the implementation conversation or persuasive rationale. A blind analyst receives only requirements and public behavior until its matrices are frozen.
+- Plan mode: present the full document through the available plan-approval workflow; write to `.internal/plans/` only after approval.

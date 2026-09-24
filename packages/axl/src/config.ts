@@ -1,3 +1,4 @@
+import type { DiagnosticArtifactStore } from './diagnostics/artifact-store.js';
 import type { RateLimitConfig } from './providers/rate-limiter.js';
 import type { ApiKeySource } from './providers/types.js';
 import type { AuthHeader } from './providers/openai-compatible.js';
@@ -18,12 +19,18 @@ export type ProviderConfig = {
   /** OpenAI-compatible presets only: override the profile auth header shape. */
   authHeader?: AuthHeader;
   /**
-   * Opt-in client-side rate governor for this provider's HTTP calls (see
-   * {@link RateLimitConfig}). Bounds in-flight request concurrency (and,
-   * optionally, request spacing) through the shared `fetchWithRetry` chokepoint.
-   * Omitted ⇒ no governor (behavior unchanged). Caveat: governs **chat** calls
-   * through this provider instance only — NOT memory-embedder calls (constructed
-   * outside the registry) and NOT other processes sharing the same API key.
+   * Client-side rate governor for this provider's chat calls (see
+   * {@link RateLimitConfig}), through the shared `fetchWithRetry` chokepoint.
+   * Omitted ⇒ no static caps (no concurrency bound, no spacing), but the
+   * adaptive brake and pacing still apply after a rate-limit 429; turn them
+   * off with `{ adaptive: false }`. Governors are pooled per runtime, one per
+   * scope: provider family (`openai` covers `openai-responses`) + base-URL
+   * origin + credential source + model. Two blocks reaching one scope use the
+   * strictest value per field. Caveats: the pooled, adaptive governor covers
+   * **chat** calls only. Transcription providers apply the same static caps
+   * through their own per-instance, non-adaptive limiter; memory-embedder
+   * calls, other runtimes (unless they share a provider instance) and other
+   * processes are not governed.
    */
   rateLimit?: RateLimitConfig;
 };
@@ -135,6 +142,50 @@ export type DiagnosticsConfig = {
    * `AXL_DIAGNOSTICS_SILENT=true`.
    */
   silent?: boolean;
+  /**
+   * Where opt-in captured-request artifacts are stored, and how their lifecycle
+   * is reclaimed. Managed capture (`runEval({ captureRequests: true })`) is
+   * UNAVAILABLE until this is configured — Axl never silently writes captured
+   * prompts to a process temp folder.
+   *
+   * Supply exactly one of `root` (use the built-in
+   * {@link DiagnosticArtifactStore} filesystem backend) or `store` (your own
+   * backend — required when eval history lives in Redis, whose server-side TTL
+   * cannot notify a local filesystem).
+   *
+   * The configured `StateStore` must implement `getEvalRetention` so an
+   * artifact's logical expiry can follow its owning history row; a custom store
+   * without it is rejected when the runtime is constructed, not after a run has
+   * already spent money.
+   */
+  artifacts?: DiagnosticArtifactsConfig;
+};
+
+/** Artifact storage + reclamation settings. See {@link DiagnosticsConfig.artifacts}. */
+export type DiagnosticArtifactsConfig = {
+  /** A host-supplied backend. Takes precedence over `root`. */
+  store?: DiagnosticArtifactStore;
+  /** Directory for the built-in filesystem backend. Ignored when `store` is set. */
+  root?: string;
+  /** Reconciliation sweep period in ms. Default `60_000`. The timer is unref'd
+   *  and cleared by `runtime.shutdown()`. */
+  sweepIntervalMs?: number;
+  /** How long a staged (actively written) artifact is protected from the
+   *  sweeper before it counts as abandoned. Default `300_000`. */
+  leaseMs?: number;
+  /**
+   * Longest a single artifact's lease is renewed before the runtime lets go.
+   * Default `86_400_000` (24 h).
+   *
+   * The lease renewal is a timer, and a caller that never finalizes or rolls
+   * back its artifact would otherwise pin it forever — a leak with no
+   * self-healing path, because the sweeper only reclaims a lease that expired.
+   * Past this bound the runtime stops renewing, the lease runs out, and the
+   * artifact is reclaimed on the next sweep like any abandoned writer's. Set it
+   * above the longest run you expect; a run that outlives it keeps working and
+   * only loses its captured requests.
+   */
+  maxHoldMs?: number;
 };
 
 import type { TelemetryConfig } from './telemetry/types.js';
@@ -231,28 +282,21 @@ export function resolveConfig(config: AxlConfig): AxlConfig {
     };
   }
 
-  // Standard API key env vars — create provider entry if it doesn't exist
-  if (process.env.OPENAI_API_KEY) {
-    if (!resolved.providers) resolved.providers = {};
-    resolved.providers.openai = {
-      ...(resolved.providers.openai ?? {}),
-      apiKey: process.env.OPENAI_API_KEY,
-    };
-  }
-  if (process.env.ANTHROPIC_API_KEY) {
-    if (!resolved.providers) resolved.providers = {};
-    resolved.providers.anthropic = {
-      ...(resolved.providers.anthropic ?? {}),
-      apiKey: process.env.ANTHROPIC_API_KEY,
-    };
-  }
-
-  const googleKey = process.env.GOOGLE_API_KEY ?? process.env.GEMINI_API_KEY;
-  if (googleKey) {
-    if (!resolved.providers) resolved.providers = {};
-    resolved.providers.google = {
-      ...(resolved.providers.google ?? {}),
-      apiKey: googleKey,
+  // Standard API key env vars are a FALLBACK: they fill a provider's `apiKey`
+  // (creating the provider entry if needed) only when the config sets none.
+  // A configured key or key callback always wins, so an ambient env var can
+  // never silently swap one tenant's credential for another.
+  const envKeys: Array<[provider: string, key: string | undefined]> = [
+    ['openai', process.env.OPENAI_API_KEY],
+    ['anthropic', process.env.ANTHROPIC_API_KEY],
+    ['google', process.env.GOOGLE_API_KEY ?? process.env.GEMINI_API_KEY],
+  ];
+  for (const [provider, envKey] of envKeys) {
+    if (!envKey || resolved.providers?.[provider]?.apiKey !== undefined) continue;
+    // Copy on write: never mutate the caller's `providers` map or blocks.
+    resolved.providers = {
+      ...resolved.providers,
+      [provider]: { ...resolved.providers?.[provider], apiKey: envKey },
     };
   }
 

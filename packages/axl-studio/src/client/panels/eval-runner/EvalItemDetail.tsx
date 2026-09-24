@@ -1,9 +1,9 @@
 import { useState } from 'react';
 import { JsonViewer } from '../../components/shared/JsonViewer';
 import { TraceEventList } from '../../components/shared/TraceEventList';
-import { cn, formatCost, formatDuration } from '../../lib/utils';
+import { cn, formatDuration } from '../../lib/utils';
 import type { AxlEvent } from '../../lib/types';
-import type { EvalItem } from './types';
+import type { EvalItem, EvalItemFailure } from './types';
 import {
   scoreColorClass,
   scoreTextColor,
@@ -13,6 +13,15 @@ import {
   getItemTokens,
   getItemAgentCalls,
 } from './types';
+import {
+  itemOutcome,
+  readItemAccounting,
+  readScorerAccounting,
+  scorerDidNotRun,
+  scorerOutcome,
+} from './accounting';
+import { ItemOutcomeBadge, ScorerOutcomeBadge } from './OutcomeBadge';
+import { SpendBadge } from './SpendBadge';
 
 type Props = {
   item: EvalItem;
@@ -89,16 +98,46 @@ function ItemTraces({ traces }: { traces: AxlEvent[] }) {
   );
 }
 
+/**
+ * One line naming why a failed item failed: `Cause: ProviderError · openai ·
+ * HTTP 429 · retryable · request req_…`, or just the thrown name when no
+ * provider error was found. Status `0` is a network-level failure. The record
+ * never carries the provider's response body, so there is nothing to scrub.
+ */
+function FailureCause({ failure }: { failure: EvalItemFailure }) {
+  const parts: string[] = [];
+  if (failure.provider) parts.push(failure.provider);
+  if (failure.status !== undefined) {
+    parts.push(failure.status === 0 ? 'network' : `HTTP ${failure.status}`);
+  }
+  if (failure.retryable !== undefined) {
+    parts.push(failure.retryable ? 'retryable' : 'not retryable');
+  }
+  if (failure.requestId) parts.push(`request ${failure.requestId}`);
+  return (
+    <div
+      data-testid="item-failure-cause"
+      className="text-xs font-mono text-red-700 dark:text-red-300"
+    >
+      <span className="font-sans font-medium">Cause: </span>
+      {[failure.name, ...parts].join(' · ')}
+    </div>
+  );
+}
+
 export function EvalItemDetail({ item, itemIndex, scorerNames, onBack }: Props) {
   const scorerErrors = item.scorerErrors ?? [];
   const models = getItemModels(item);
   const tokens = getItemTokens(item);
   const agentCalls = getItemAgentCalls(item);
 
-  // Compute total cost line
-  const workflowCost = item.cost ?? 0;
-  const scorerCost = item.scorerCost ?? 0;
-  const totalItemCost = workflowCost + scorerCost;
+  // Measured spend for this item. `breakdown` splits generation from judging;
+  // the whole record travels with its completeness so neither half can be read
+  // as exact when it isn't.
+  const accounting = readItemAccounting(item);
+  const generationAccounting = { ...accounting, knownCost: accounting.breakdown.generation };
+  const judgingAccounting = { ...accounting, knownCost: accounting.breakdown.judging };
+  const outcome = itemOutcome(item);
 
   return (
     <div className="space-y-5">
@@ -113,7 +152,8 @@ export function EvalItemDetail({ item, itemIndex, scorerNames, onBack }: Props) 
           </button>
           <span className="text-[hsl(var(--muted-foreground))]">/</span>
           <span className="font-medium">Item #{itemIndex + 1}</span>
-          {item.error && (
+          <ItemOutcomeBadge outcome={outcome} className="ml-1" />
+          {outcome == null && item.error && (
             <span className="ml-1 inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-950/30">
               Error
             </span>
@@ -141,7 +181,7 @@ export function EvalItemDetail({ item, itemIndex, scorerNames, onBack }: Props) 
             <span title={`${agentCalls} agent calls for this item`}>{agentCalls} calls</span>
           )}
           {item.duration != null && <span>{formatDuration(item.duration)}</span>}
-          {totalItemCost > 0 && <span>{formatCost(totalItemCost)}</span>}
+          <SpendBadge accounting={accounting} label={`Item ${itemIndex + 1} known spend`} />
         </div>
       </div>
 
@@ -172,6 +212,8 @@ export function EvalItemDetail({ item, itemIndex, scorerNames, onBack }: Props) 
                       {score.toFixed(2)}
                     </span>
                   </div>
+                ) : scorerDidNotRun(item.scoreDetails?.[name]) ? (
+                  <ScorerOutcomeBadge outcome={scorerOutcome(item.scoreDetails?.[name])} />
                 ) : skipped ? (
                   <span
                     className="text-xs text-[hsl(var(--muted-foreground))] font-mono"
@@ -189,9 +231,10 @@ export function EvalItemDetail({ item, itemIndex, scorerNames, onBack }: Props) 
       )}
 
       {/* ── Error ─────────────────────────────────────── */}
-      {item.error && (
-        <div className="p-3 rounded-xl bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-800 text-red-700 dark:text-red-300 text-xs font-mono">
-          {item.error}
+      {(item.error || item.failure) && (
+        <div className="p-3 rounded-xl bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-800 text-red-700 dark:text-red-300 text-xs font-mono space-y-1.5">
+          {item.failure && <FailureCause failure={item.failure} />}
+          {item.error && <div>{item.error}</div>}
         </div>
       )}
 
@@ -204,16 +247,33 @@ export function EvalItemDetail({ item, itemIndex, scorerNames, onBack }: Props) 
         <DataCard label="Expected (Annotations)" data={item.annotations} />
       )}
 
-      {/* ── Cost breakdown ────────────────────────────── */}
-      {totalItemCost > 0 && workflowCost > 0 && scorerCost > 0 && (
-        <div className="flex items-center gap-3 text-xs text-[hsl(var(--muted-foreground))] font-mono">
-          <span>Workflow: {formatCost(workflowCost)}</span>
-          <span>+</span>
-          <span>Scoring: {formatCost(scorerCost)}</span>
-          <span>=</span>
-          <span className="font-medium text-[hsl(var(--foreground))]">
-            {formatCost(totalItemCost)}
-          </span>
+      {/* ── Spend breakdown ───────────────────────────── */}
+      <div className="flex items-center gap-3 text-xs text-[hsl(var(--muted-foreground))] flex-wrap">
+        <span className="flex items-center gap-1.5">
+          Generation:
+          <SpendBadge accounting={generationAccounting} label="Generation spend" />
+        </span>
+        <span>+</span>
+        <span className="flex items-center gap-1.5">
+          Judging:
+          <SpendBadge accounting={judgingAccounting} label="Judging spend" />
+        </span>
+        <span>=</span>
+        <span className="flex items-center gap-1.5 font-medium text-[hsl(var(--foreground))]">
+          <SpendBadge accounting={accounting} label="Item known spend" />
+        </span>
+      </div>
+
+      {/* Caller-reported values are shown, and shown as NOT part of the total.
+          A workflow callback that returns its own `cost` is making a claim Axl
+          did not observe; folding it in would overwrite a measurement with an
+          assertion, and dropping it silently would lose the user's own data. */}
+      {item.callerReport?.cost != null && (
+        <div
+          className="text-xs text-[hsl(var(--muted-foreground))] font-mono"
+          title="Returned by the executeWorkflow callback. Kept for inspection; never summed into known spend."
+        >
+          ${item.callerReport.cost.toFixed(2)} — caller-reported (not counted)
         </div>
       )}
 
@@ -255,7 +315,11 @@ export function EvalItemDetail({ item, itemIndex, scorerNames, onBack }: Props) 
                       {score.toFixed(3)}
                     </span>
                   )}
-                  {score == null && skipped && (
+                  {/* The judge's own outcome, when recorded. It is what
+                      separates "scored 0" from "never ran", and the six values
+                      each read differently. */}
+                  <ScorerOutcomeBadge outcome={scorerOutcome(detail)} />
+                  {score == null && skipped && scorerOutcome(detail) == null && (
                     <span
                       className="px-2 py-0.5 rounded-full text-xs font-mono bg-[hsl(var(--muted))] text-[hsl(var(--muted-foreground))]"
                       title="Skipped — the scorer's `applies` predicate returned false for this item (excluded from the mean and failure rate)"
@@ -263,7 +327,7 @@ export function EvalItemDetail({ item, itemIndex, scorerNames, onBack }: Props) 
                       N/A
                     </span>
                   )}
-                  {score == null && !skipped && !scorerError && (
+                  {score == null && !skipped && !scorerError && scorerOutcome(detail) == null && (
                     <span className="px-2 py-0.5 rounded-full text-xs font-mono bg-[hsl(var(--secondary))] text-[hsl(var(--muted-foreground))]">
                       null
                     </span>
@@ -274,10 +338,12 @@ export function EvalItemDetail({ item, itemIndex, scorerNames, onBack }: Props) 
                         {formatDuration(detail.duration)}
                       </span>
                     )}
-                    {detail?.cost != null && detail.cost > 0 && (
-                      <span className="text-xs font-mono text-[hsl(var(--muted-foreground))]">
-                        {formatCost(detail.cost)}
-                      </span>
+                    {(detail?.accounting || detail?.cost != null) && (
+                      <SpendBadge
+                        accounting={readScorerAccounting(detail)}
+                        label={`${name} judging spend`}
+                        className="text-xs text-[hsl(var(--muted-foreground))]"
+                      />
                     )}
                   </div>
                 </div>

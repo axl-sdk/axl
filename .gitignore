@@ -12,6 +12,7 @@ coverage/
 !.claude/agents/
 !.claude/rules/
 !.claude/skills/
+!.claude/references/
 .vscode/
 GEMINI.md
 axl.config.*

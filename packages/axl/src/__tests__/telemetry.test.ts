@@ -295,7 +295,7 @@ describe('OTelSpanManager', () => {
     wireMs: 2400,
   };
 
-  function timedProvider(timing?: typeof TIMING) {
+  function timedProvider(timing?: typeof TIMING & { rateLimitRetries?: number }) {
     return {
       name: 'mock',
       chat: async () => ({
@@ -342,6 +342,15 @@ describe('OTelSpanManager', () => {
     expect(span.attributes['axl.agent.prompt_tokens']).toBe(10);
   });
 
+  it('sets rate_limit_retries when the call reported it, and omits it when not', async () => {
+    const reported = await askWithSpan(timedProvider({ ...TIMING, rateLimitRetries: 3 }));
+    expect(reported.attributes['axl.agent.rate_limit_retries']).toBe(3);
+    // Optional on CallTiming: a custom provider that omits it must not read as 0.
+    exporter.reset();
+    const omitted = await askWithSpan(timedProvider(TIMING));
+    expect('axl.agent.rate_limit_retries' in omitted.attributes).toBe(false);
+  });
+
   it('omits first_token_ms when the call reported none', async () => {
     // A non-streamed call has no content delta to time. Zero would read as an
     // instantaneous first token, which no call achieved.
@@ -362,6 +371,7 @@ describe('OTelSpanManager', () => {
       'axl.agent.queued_ms',
       'axl.agent.retry_ms',
       'axl.agent.attempts',
+      'axl.agent.rate_limit_retries',
       'axl.agent.ttfb_ms',
       'axl.agent.wire_ms',
       'axl.agent.first_token_ms',

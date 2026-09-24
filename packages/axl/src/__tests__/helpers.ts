@@ -1,4 +1,4 @@
-import { expect } from 'vitest';
+import { expect, vi } from 'vitest';
 import { ProviderRegistry } from '../providers/registry.js';
 import { WorkflowContext } from '../context.js';
 import { randomUUID } from 'node:crypto';
@@ -110,4 +110,28 @@ export function expectWindow(
   const message = `${label}: expected ${lo}..${hi}ms, got ${String(actual)}ms`;
   expect(actual, message).toBeGreaterThanOrEqual(lo);
   expect(actual, message).toBeLessThanOrEqual(hi);
+}
+
+/**
+ * Clear every provider credential and base-URL env var for the current test.
+ *
+ * The unit vitest config loads the repo-root `.env`, and every provider with
+ * no configured `apiKey` or `baseUrl` falls back to `OPENAI_API_KEY` /
+ * `ANTHROPIC_API_KEY` / `GOOGLE_API_KEY` / `*_BASE_URL`. A transport test that
+ * asserts on credentials, scopes or origins must therefore not see the
+ * developer's environment, or it passes in a key-less worktree, fails in a
+ * checkout with `.env`, and prints the real key in the failure diff. Pair it with `vi.unstubAllEnvs()` in `afterEach`;
+ * `vi.restoreAllMocks()` does not restore env.
+ */
+export function isolateProviderEnv(): void {
+  for (const name of [
+    'OPENAI_API_KEY',
+    'OPENAI_BASE_URL',
+    'ANTHROPIC_API_KEY',
+    'ANTHROPIC_BASE_URL',
+    'GOOGLE_API_KEY',
+    'GEMINI_API_KEY',
+  ]) {
+    vi.stubEnv(name, undefined);
+  }
 }

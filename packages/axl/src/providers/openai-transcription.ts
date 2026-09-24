@@ -1,3 +1,4 @@
+import { currentDispatchAdmission } from '../accounting.js';
 import { InvalidTranscriptionInputError, UnsupportedTranscriptionInputError } from '../errors.js';
 import { assertSafeProviderBaseUrl } from '../http-transport.js';
 import type { ApiKeySource } from './types.js';
@@ -118,7 +119,7 @@ export class OpenAITranscriptionProvider implements TranscriptionProvider {
         body: form,
         signal: request.signal,
       },
-      { governor: this.governor, provider: this.name },
+      { governor: this.governor, provider: this.name, admission: currentDispatchAdmission() },
     );
     if (!res.ok) {
       const body = await res.text();

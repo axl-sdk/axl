@@ -737,6 +737,30 @@ describe('redactStreamEvent', () => {
     expect(out.duration).toBe(100);
     expect(out.data.turn).toBe(1);
   });
+
+  it('preserves agent_call_end.timing, including rateLimitRetries, under redaction', () => {
+    const timing = {
+      queuedMs: 3000,
+      attempts: 3,
+      rateLimitRetries: 2,
+      retryMs: 10,
+      ttfbMs: 40,
+      wireMs: 90,
+    };
+    const event: AxlEvent = {
+      ...baseEvent(),
+      ...askScoped(),
+      type: 'agent_call_end',
+      agent: 'a1',
+      model: 'mock:gpt-4o',
+      duration: 3100,
+      timing,
+      data: { response: 'sensitive completion', turn: 1 },
+    };
+    const out = redactStreamEvent(event, true) as Extract<AxlEvent, { type: 'agent_call_end' }>;
+    expect(out.data.response).toBe('[redacted]');
+    expect(out.timing).toEqual(timing);
+  });
 });
 
 describe('redactEvalResult', () => {
@@ -815,6 +839,156 @@ describe('redactEvalResult', () => {
     expect(out.items[0].scorerErrors).toEqual(['[redacted]']);
   });
 
+  it('keeps the structural failure cause while masking the error message', () => {
+    // `failure` is provider/status/retryable/requestId/name — diagnostics, no
+    // content — so it survives redact mode; the message beside it does not.
+    const failure = {
+      name: 'ProviderError',
+      provider: 'openai',
+      status: 429,
+      retryable: true,
+      requestId: 'req_1',
+    };
+    const result = makeResult([
+      makeItem({ error: 'openai API error (429): echo of john@acme.com', failure }),
+    ]);
+    const out = redactEvalResult(result, true);
+    expect(out.items[0].error).toBe('[redacted]');
+    expect(out.items[0].failure).toEqual(failure);
+  });
+
+  it('projects failure to its five known keys, dropping anything else an import carried', () => {
+    // Import stores items verbatim, so `failure` can hold keys no Axl writer
+    // produces — a response body, a message — that must not ride through.
+    const result = makeResult([
+      makeItem({
+        error: 'boom',
+        failure: {
+          name: 'ProviderError',
+          provider: 'openai',
+          status: 429,
+          retryable: true,
+          requestId: 'req_1',
+          body: 'SENTINEL_BODY echo of john@acme.com',
+          message: 'SENTINEL_MESSAGE',
+        },
+      }),
+    ]);
+    const out = redactEvalResult(result, true);
+    expect(out.items[0].failure).toEqual({
+      name: 'ProviderError',
+      provider: 'openai',
+      status: 429,
+      retryable: true,
+      requestId: 'req_1',
+    });
+    expect(JSON.stringify(out)).not.toContain('SENTINEL');
+  });
+
+  it('drops failure fields of the wrong type, and a failure with no string name', () => {
+    const result = makeResult([
+      makeItem({
+        failure: {
+          name: 'ProviderError',
+          provider: { leaked: 'SENTINEL_PROVIDER' },
+          status: 'SENTINEL_STATUS',
+          retryable: 'yes',
+          requestId: 42,
+        },
+      }),
+      makeItem({ failure: { name: { leaked: 'SENTINEL_NAME' }, status: 429 } }),
+      makeItem({ failure: 'SENTINEL_STRING_FAILURE' }),
+    ]);
+    const out = redactEvalResult(result, true);
+    expect(out.items[0].failure).toEqual({ name: 'ProviderError' });
+    expect('failure' in out.items[1]).toBe(false);
+    expect('failure' in out.items[2]).toBe(false);
+    expect(JSON.stringify(out)).not.toContain('SENTINEL');
+  });
+
+  describe('malformed stored shapes (never throw, never forward)', () => {
+    // History rows are whatever import or an older writer stored. The redacted
+    // read must neither fail the whole list nor pass an unreadable part through:
+    // like `redactRecordLine`, anything it cannot walk is replaced.
+    const withMultiRun = (multiRun: unknown) =>
+      ({ ...makeResult(), _multiRun: multiRun }) as unknown as EvalResult;
+    const served = (result: EvalResult) => {
+      let out: EvalResult | undefined;
+      expect(() => {
+        out = redactEvalResult(result, true);
+      }).not.toThrow();
+      expect(JSON.stringify(out)).not.toContain('SENTINEL');
+      return out as unknown as { items: unknown[]; _multiRun?: { allRuns?: unknown } };
+    };
+
+    it('replaces a nested run that has no items array', () => {
+      const out = served(
+        withMultiRun({
+          allRuns: [
+            { id: 'x', note: 'SENTINEL_NO_ITEMS' },
+            'SENTINEL_STRING_RUN',
+            null,
+            { items: { 0: 'SENTINEL_ITEMS_OBJECT' } },
+          ],
+        }),
+      );
+      expect(out._multiRun?.allRuns).toEqual([
+        '[redacted]',
+        '[redacted]',
+        '[redacted]',
+        '[redacted]',
+      ]);
+    });
+
+    it('replaces allRuns that is not an array, and a _multiRun that is not an object', () => {
+      expect(served(withMultiRun({ allRuns: 'SENTINEL_ALLRUNS' }))._multiRun?.allRuns).toBe(
+        '[redacted]',
+      );
+      expect(served(withMultiRun('SENTINEL_MULTIRUN'))._multiRun).toBe('[redacted]');
+    });
+
+    it('replaces an item that is not an object, at top level and nested', () => {
+      const out = served(
+        withMultiRun({
+          allRuns: [{ ...makeResult(), items: [null, 'SENTINEL_NESTED_ITEM', makeItem()] }],
+        }),
+      );
+      const nested = (out._multiRun?.allRuns as Array<{ items: unknown[] }>)[0].items;
+      expect(nested.slice(0, 2)).toEqual(['[redacted]', '[redacted]']);
+      expect((nested[2] as { input: unknown }).input).toBe('[redacted]');
+
+      const top = served(makeResult([null, 'SENTINEL_TOP_ITEM', 42]));
+      expect(top.items).toEqual(['[redacted]', '[redacted]', '[redacted]']);
+    });
+
+    it('replaces a top-level items value that is not an array', () => {
+      const result = { ...makeResult(), items: 'SENTINEL_ITEMS' } as unknown as EvalResult;
+      expect(served(result).items).toBe('[redacted]');
+    });
+
+    it('replaces malformed per-item scorerErrors, callerReport and scoreDetails entries', () => {
+      const out = served(
+        makeResult([
+          makeItem({
+            scorerErrors: 'SENTINEL_SCORER_ERRORS',
+            callerReport: null,
+            scoreDetails: {
+              a: null,
+              b: 'SENTINEL_DETAIL',
+              c: { score: 0.5, metadata: 'SENTINEL_META' },
+            },
+          }),
+          makeItem({ scoreDetails: 'SENTINEL_DETAILS' }),
+        ]),
+      );
+      const [first, second] = out.items as Array<Record<string, unknown>>;
+      expect(first.scorerErrors).toBe('[redacted]');
+      expect(first.callerReport).toBe('[redacted]');
+      expect(first.scoreDetails).toEqual({ a: '[redacted]', b: '[redacted]', c: { score: 0.5 } });
+      expect(second.scoreDetails).toBe('[redacted]');
+    });
+  });
+
   it('scrubs scoreDetails[*].metadata but keeps score/duration/cost', () => {
     const result = makeResult([
       makeItem({
@@ -860,6 +1034,141 @@ describe('redactEvalResult', () => {
     const result = makeResult([]);
     const out = redactEvalResult(result, true);
     expect(out.items).toEqual([]);
+  });
+
+  it('drops callerReport.metadata, which is raw callback output', () => {
+    // `callerReport` carries whatever the workflow callback returned. Its
+    // `metadata` is user content of exactly the same kind as `output`, so it
+    // must not survive a compliance-mode read; the numeric `cost` beside it may.
+    const result = makeResult([
+      makeItem({
+        callerReport: {
+          cost: 0.002,
+          metadata: { prompt: 'patient john@acme.com asked about his results' },
+        },
+      }),
+    ]);
+
+    const out = redactEvalResult(result, true);
+    const report = out.items[0].callerReport!;
+    expect(report.metadata).toBeUndefined();
+    expect(report.cost).toBe(0.002);
+    expect(JSON.stringify(out)).not.toContain('john@acme.com');
+  });
+
+  it('preserves the structural accounting surface a compliance reader needs', () => {
+    // Counts and classifications describe the RUN, not the data. Scrubbing them
+    // would leave a redacted artifact unable to say why a run cost what it did
+    // or why a judge produced no score.
+    const accounting = {
+      version: 1,
+      currency: 'USD',
+      knownCost: 0.25,
+      completeness: 'incomplete',
+      reasons: { unpriced_model: 1 },
+      usage: {
+        inputTokens: 10,
+        outputTokens: 5,
+        reasoningTokens: 0,
+        cachedTokens: 0,
+        cacheWriteTokens: 0,
+        audioSeconds: 0,
+      },
+      operations: { total: 1, settled: 1, unknown: 0, denied: 0, byKind: { chat: 1 } },
+      breakdown: { generation: 0.25, judging: 0, external: 0 },
+      provenance: { adapter_reported: 0.25 },
+    };
+    const result = makeResult([
+      makeItem({
+        outcome: 'budget_interrupted',
+        accounting,
+        scoreDetails: {
+          accuracy: {
+            score: null,
+            outcome: 'budget_skipped',
+            accounting,
+            metadata: { reasoning: 'never ran' },
+          },
+        },
+      }),
+    ]);
+
+    const out = redactEvalResult(result, true);
+    expect(out.items[0].outcome).toBe('budget_interrupted');
+    expect(out.items[0].accounting).toEqual(accounting);
+    const detail = out.items[0].scoreDetails!.accuracy;
+    expect(detail.outcome).toBe('budget_skipped');
+    expect(detail.accounting).toEqual(accounting);
+    // ...while the judge's reasoning is still gone.
+    expect(detail.metadata).toBeUndefined();
+  });
+
+  // A16.16
+  it('survives the RUN-level accounting, budget and coverage blocks intact', () => {
+    // Studio reads these to say what a run cost and how much of the dataset it
+    // covered. Losing them under redaction would make every compliance-mode
+    // artifact read `unverified (legacy)` — a measured run indistinguishable
+    // from a pre-0.24 one, and a budget-truncated run indistinguishable from a
+    // complete one. None of these fields is user content.
+    const accounting = {
+      version: 1,
+      currency: 'USD',
+      knownCost: 1.5,
+      completeness: 'complete',
+      reasons: {},
+      usage: {
+        inputTokens: 10,
+        outputTokens: 5,
+        reasoningTokens: 0,
+        cachedTokens: 0,
+        cacheWriteTokens: 0,
+        audioSeconds: 0,
+      },
+      operations: { total: 3, settled: 3, unknown: 0, denied: 2, byKind: { chat: 3 } },
+      breakdown: { generation: 1.2, judging: 0.3, external: 0 },
+      provenance: { adapter_reported: 1.5 },
+      scope: 'run',
+      budget: {
+        limit: 1,
+        status: 'closed',
+        knownSpend: 1.5,
+        knownOvershoot: 0.5,
+        closedBy: 'case',
+      },
+      callerReported: { costItems: 1, costTotal: 0.002, metadataItems: 1 },
+    };
+    const coverage = {
+      items: {
+        completed: 1,
+        failed: 0,
+        cancelled: 0,
+        budget_skipped: 1,
+        budget_interrupted: 1,
+      },
+      scorers: {
+        accuracy: {
+          scored: 1,
+          failed: 0,
+          skipped: 0,
+          cancelled: 0,
+          budget_skipped: 2,
+          budget_interrupted: 0,
+        },
+      },
+    };
+    const base = makeResult();
+    const result = {
+      ...base,
+      accounting,
+      unpriced: false,
+      summary: { ...base.summary, coverage },
+    } as unknown as EvalResult;
+
+    const out = redactEvalResult(result, true) as unknown as Record<string, unknown>;
+    expect(out.accounting).toEqual(accounting);
+    expect((out.summary as { coverage?: unknown }).coverage).toEqual(coverage);
+    // The item content around them is still scrubbed.
+    expect(JSON.stringify(out)).not.toContain('sensitive');
   });
 });
 

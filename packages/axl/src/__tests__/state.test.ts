@@ -436,6 +436,33 @@ describe('MemoryStore', () => {
       expect(list[0].id).toBe('ev2');
     });
 
+    it('updateEvalResult refuses to create a row that is not there', async () => {
+      const store = new MemoryStore();
+      // The whole point of the update-only write: a correction must never be
+      // able to bring back a row somebody deleted between the read and the
+      // write. `saveEvalResult` would recreate it, permanently, on a store with
+      // no expiry to age it back out.
+      expect(await store.updateEvalResult({ id: 'gone', eval: 't', timestamp: 1, data: {} })).toBe(
+        false,
+      );
+      expect(await store.listEvalResults()).toEqual([]);
+
+      await store.saveEvalResult({ id: 'ev1', eval: 't', timestamp: 1, data: { v: 1 } });
+      expect(
+        await store.updateEvalResult({ id: 'ev1', eval: 't', timestamp: 1, data: { v: 2 } }),
+      ).toBe(true);
+      expect((await store.listEvalResults())[0].data).toEqual({ v: 2 });
+    });
+
+    it('re-saving an eval result does not give it an expiry', async () => {
+      const store = new MemoryStore();
+      await store.saveEvalResult({ id: 'ev1', eval: 'test', timestamp: 1000, data: { v: 1 } });
+      await store.saveEvalResult({ id: 'ev1', eval: 'test', timestamp: 1000, data: { v: 2 } });
+      // In-memory history never expires, so a re-save has no retention to
+      // extend — the same contract Redis now holds by carrying PTTL forward.
+      expect(await store.getEvalRetention('ev1')).toEqual({ exists: true });
+    });
+
     it('deleteEvalResult removes the entry and returns true', async () => {
       const store = new MemoryStore();
       await store.saveEvalResult({ id: 'ev1', eval: 'test', timestamp: 1000, data: {} });
@@ -898,6 +925,31 @@ describe('SQLiteStore', () => {
       store.close();
     });
 
+    it('updateEvalResult refuses to create a row that is not there', async () => {
+      const store = createStore();
+      expect(await store.updateEvalResult({ id: 'gone', eval: 't', timestamp: 1, data: {} })).toBe(
+        false,
+      );
+      expect(await store.listEvalResults()).toEqual([]);
+
+      await store.saveEvalResult({ id: 'ev1', eval: 't', timestamp: 1, data: { v: 1 } });
+      expect(
+        await store.updateEvalResult({ id: 'ev1', eval: 't', timestamp: 1, data: { v: 2 } }),
+      ).toBe(true);
+      expect((await store.listEvalResults())[0].data).toEqual({ v: 2 });
+      store.close();
+    });
+
+    it('re-saving an eval result does not give it an expiry', async () => {
+      const store = createStore();
+      await store.saveEvalResult({ id: 'ev1', eval: 'test', timestamp: 1000, data: { v: 1 } });
+      await store.saveEvalResult({ id: 'ev1', eval: 'test', timestamp: 1000, data: { v: 2 } });
+      // SQLite history has no automatic expiry, so a re-save has no retention
+      // to extend — the same contract Redis now holds by carrying PTTL forward.
+      expect(await store.getEvalRetention('ev1')).toEqual({ exists: true });
+      store.close();
+    });
+
     it('deleteEvalResult removes the row and returns true', async () => {
       const store = createStore();
       await store.saveEvalResult({ id: 'ev1', eval: 'test', timestamp: 1000, data: {} });
@@ -942,10 +994,12 @@ describe('RedisStore', () => {
     type QueuedOp = () => unknown;
     const queue: QueuedOp[] = [];
     const chain = {
-      set(key: string, value: string, options?: { EX?: number }) {
+      set(key: string, value: string, options?: { EX?: number; PX?: number }) {
         queue.push(() => {
           data.set(key, value);
+          // The side map is in seconds; PX arrives in milliseconds.
           if (options?.EX !== undefined) ttls.set(key, options.EX);
+          else if (options?.PX !== undefined) ttls.set(key, options.PX / 1000);
           else ttls.delete(key);
           return 'OK';
         });
@@ -1104,8 +1158,14 @@ describe('RedisStore', () => {
     const ttls = new Map<string, number>();
     // Lists for streaming-event persistence (RPUSH / LRANGE).
     const listData = new Map<string, string[]>();
+    // node-redis exposes an open socket as `isOpen` and rejects a QUIT on a
+    // closed client; a real Redis run proved it, so the mock reproduces it.
+    let clientOpen = true;
 
     const mockClient = {
+      get isOpen() {
+        return clientOpen;
+      },
       hSet: vi.fn(async (key: string, field: string, value: string) => {
         if (!hashData.has(key)) hashData.set(key, new Map());
         hashData.get(key)!.set(field, value);
@@ -1143,12 +1203,24 @@ describe('RedisStore', () => {
       // on a side-map so tests can assert "TTL was set with the right value"
       // without simulating real wall-clock expiration (which would make tests
       // flaky and slow).
-      set: vi.fn(async (key: string, value: string, options?: { EX?: number }) => {
-        data.set(key, value);
-        if (options?.EX !== undefined) ttls.set(key, options.EX);
-        else ttls.delete(key); // SET without EX clears any existing TTL
-        return 'OK';
-      }),
+      set: vi.fn(
+        async (
+          key: string,
+          value: string,
+          options?: { EX?: number; PX?: number; XX?: boolean; KEEPTTL?: boolean },
+        ) => {
+          // XX: only overwrite an existing key. Redis returns null and writes
+          // nothing when the key is absent.
+          if (options?.XX === true && !data.has(key)) return null;
+          data.set(key, value);
+          // KEEPTTL leaves whatever TTL the key already had.
+          if (options?.KEEPTTL === true) return 'OK';
+          if (options?.EX !== undefined) ttls.set(key, options.EX);
+          else if (options?.PX !== undefined) ttls.set(key, options.PX / 1000);
+          else ttls.delete(key); // SET without EX clears any existing TTL
+          return 'OK';
+        },
+      ),
       // EXPIRE applies a TTL to an existing key. With `mode: 'NX'`, only
       // sets if no TTL exists (used for fixed-window hash-backed data).
       // Without mode, always (re)sets — used for sliding-window memory.
@@ -1302,8 +1374,20 @@ describe('RedisStore', () => {
       // MULTI/EXEC is all-or-nothing, but our mock isn't simulating that
       // — it just guarantees the queued ops run together without other
       // mock interleaving (which is what callers actually care about).
+      // PTTL in milliseconds, with Redis's two sentinel values: -2 (no such
+      // key) and -1 (key exists, no TTL). The mock stores TTLs in seconds on a
+      // side map, so convert; `getEvalRetention` distinguishes all three.
+      pTTL: vi.fn(async (key: string) => {
+        const exists = data.has(key) || hashData.has(key) || listData.has(key);
+        if (!exists) return -2;
+        const seconds = ttls.get(key);
+        return seconds === undefined ? -1 : seconds * 1000;
+      }),
       multi: vi.fn(() => createMockMulti(data, hashData, setData, zsetData, ttls, listData)),
-      quit: vi.fn(async () => undefined),
+      quit: vi.fn(async () => {
+        if (!clientOpen) throw new Error('The client is closed');
+        clientOpen = false;
+      }),
     };
 
     // Bypass the private constructor and inject the mock client.
@@ -1477,6 +1561,19 @@ describe('RedisStore', () => {
       const { store, mockClient } = createRedisStoreWithMockClient();
 
       await store.close();
+
+      expect(mockClient.quit).toHaveBeenCalledOnce();
+    });
+
+    it('closes idempotently, so a caller may close a store its runtime already closed', async () => {
+      const { store, mockClient } = createRedisStoreWithMockClient();
+
+      // `runtime.shutdown()` closes the state store it was handed. A caller
+      // that also closes its own store is doing the ordinary thing, and it
+      // must not be punished for it — MemoryStore and better-sqlite3 both
+      // treat a second close as a no-op.
+      await store.close();
+      await expect(store.close()).resolves.toBeUndefined();
 
       expect(mockClient.quit).toHaveBeenCalledOnce();
     });
@@ -1944,6 +2041,41 @@ describe('RedisStore', () => {
       const { store } = createRedisStoreWithMockClient();
       expect(await store.deleteEvalResult('does-not-exist')).toBe(false);
     });
+
+    /**
+     * `getEvalRetention` drives diagnostic-artifact reclamation: an artifact
+     * whose owning row has expired is deleted, so misreading PTTL either leaks
+     * bytes forever (-2 read as "alive") or destroys evidence the user still
+     * owns (-1 read as "expired now").
+     */
+    describe('getEvalRetention (A13.10)', () => {
+      it('reports a missing row as absent', async () => {
+        const { store } = createRedisStoreWithMockClient();
+        expect(await store.getEvalRetention('nope')).toEqual({ exists: false });
+      });
+
+      it('reports a row with no TTL as alive and never-expiring', async () => {
+        const { store } = createRedisStoreWithMockClient();
+        await store.saveEvalResult({ id: 'ev1', eval: 'test', timestamp: 1, data: {} });
+        // PTTL -1: the row exists forever. An `expiresAt` here would schedule a
+        // deletion that must never happen.
+        expect(await store.getEvalRetention('ev1')).toEqual({ exists: true });
+      });
+
+      it('converts a live TTL into an absolute expiry', async () => {
+        const { store } = createRedisStoreWithMockClient('axl:', { evalHistory: 600 });
+        await store.saveEvalResult({ id: 'ev1', eval: 'test', timestamp: 1, data: {} });
+
+        const before = Date.now();
+        const retention = await store.getEvalRetention('ev1');
+
+        expect(retention.exists).toBe(true);
+        // Absolute, not relative: the artifact manifest is read by a sweep that
+        // may run in a different process at a much later time.
+        expect(retention.expiresAt!).toBeGreaterThanOrEqual(before + 600_000 - 50);
+        expect(retention.expiresAt!).toBeLessThanOrEqual(Date.now() + 600_000);
+      });
+    });
   });
 
   describe('sorted-set perf (ZSET fast path + legacy fallback + backfill)', () => {
@@ -2373,6 +2505,110 @@ describe('RedisStore', () => {
         });
         await store.saveEvalResult({ id: 'ev1', eval: 't', timestamp: 0, data: {} });
         expect(ttls.get('axl:eval-history:ev1')).toBe(60 * 60 * 24 * 7);
+      });
+
+      it('updateEvalResult writes SET XX KEEPTTL and never creates a row', async () => {
+        const { store, data, ttls, mockClient } = createRedisStoreWithMockClient(undefined, {
+          evalHistory: 120,
+        });
+        const key = 'axl:eval-history:ev-upd';
+
+        // A row that is not there stays not there. `XX` is what makes this
+        // atomic: no check-then-write window a delete can slip through.
+        expect(
+          await store.updateEvalResult({ id: 'ev-upd', eval: 't', timestamp: 0, data: { v: 1 } }),
+        ).toBe(false);
+        expect(data.has(key)).toBe(false);
+
+        await store.saveEvalResult({ id: 'ev-upd', eval: 't', timestamp: 0, data: { v: 1 } });
+        ttls.set(key, 30);
+        expect(
+          await store.updateEvalResult({ id: 'ev-upd', eval: 't', timestamp: 0, data: { v: 2 } }),
+        ).toBe(true);
+        // KEEPTTL: the correction carries no retention decision of its own.
+        expect(ttls.get(key)).toBe(30);
+        expect(JSON.parse(data.get(key)!).data).toEqual({ v: 2 });
+
+        const setCalls = (mockClient.set as unknown as { mock: { calls: unknown[][] } }).mock.calls;
+        const conditional = setCalls.filter((c) => c[0] === key);
+        expect(conditional.length).toBeGreaterThan(0);
+        for (const call of conditional) {
+          expect(call[2]).toMatchObject({ XX: true, KEEPTTL: true });
+        }
+      });
+
+      it('updateEvalResult names the Redis version floor when KEEPTTL is rejected', async () => {
+        // Redis < 6.0 has no KEEPTTL and answers an unknown SET option with a
+        // plain syntax error. Left as-is it reaches the runtime as an ordinary
+        // failed write, is swallowed by a best-effort catch, and no correction
+        // is ever persisted without anyone being told why.
+        const { store, mockClient } = createRedisStoreWithMockClient(undefined, {
+          evalHistory: 120,
+        });
+        const set = mockClient.set as unknown as {
+          mockRejectedValueOnce: (v: unknown) => void;
+        };
+
+        set.mockRejectedValueOnce(new Error('ERR syntax error'));
+        await expect(
+          store.updateEvalResult({ id: 'ev-old', eval: 't', timestamp: 0, data: {} }),
+        ).rejects.toMatchObject({ code: 'REDIS_VERSION_UNSUPPORTED' });
+
+        // Everything else is still an ordinary write failure.
+        set.mockRejectedValueOnce(new Error('READONLY replica'));
+        await expect(
+          store.updateEvalResult({ id: 'ev-old', eval: 't', timestamp: 0, data: {} }),
+        ).rejects.toThrow('READONLY replica');
+      });
+
+      it('re-saving a deliberately untimed eval row leaves it untimed', async () => {
+        const { store, ttls, mockClient } = createRedisStoreWithMockClient(undefined, {
+          evalHistory: 120,
+        });
+        const key = 'axl:eval-history:ev-persist';
+        await store.saveEvalResult({ id: 'ev-persist', eval: 't', timestamp: 0, data: {} });
+
+        // An operator ran PERSIST, or the row predates the TTL setting. PTTL
+        // reports -1: the key is there and deliberately has no expiry. Stamping
+        // the configured window on it SHORTENS its retention to finite.
+        ttls.delete(key);
+        (
+          mockClient.pTTL as unknown as { mockResolvedValue: (v: number) => void }
+        ).mockResolvedValue(-1);
+        await store.saveEvalResult({ id: 'ev-persist', eval: 't', timestamp: 0, data: {} });
+        expect(ttls.get(key)).toBeUndefined();
+      });
+
+      it('re-saving an existing eval result never extends its retention', async () => {
+        const { store, ttls, mockClient } = createRedisStoreWithMockClient(undefined, {
+          evalHistory: 120,
+        });
+        const key = 'axl:eval-history:ev-keep';
+
+        await store.saveEvalResult({ id: 'ev-keep', eval: 't', timestamp: 0, data: { v: 1 } });
+        // A genuinely new key gets the configured window.
+        expect(ttls.get(key)).toBe(120);
+
+        // Time passes; the row has 30s left. A re-save — the diagnostics sweep
+        // correcting a downgraded row, say — must not hand it a fresh 120s
+        // window. Retention is what the operator configured, not something a
+        // background correction quietly renews.
+        ttls.set(key, 30);
+        await store.saveEvalResult({ id: 'ev-keep', eval: 't', timestamp: 0, data: { v: 2 } });
+        expect(ttls.get(key)).toBe(30);
+
+        // The remaining window was carried explicitly. A bare SET would clear
+        // the TTL outright, which is worse than extending it: the row would
+        // never expire at all.
+        const calls = (mockClient.pTTL as unknown as { mock: { calls: unknown[][] } }).mock.calls;
+        expect(calls.some((c) => c[0] === key)).toBe(true);
+      });
+
+      it('a re-saved eval row with no TTL configured stays untimed', async () => {
+        const { store, ttls } = createRedisStoreWithMockClient(undefined, { evalHistory: null });
+        await store.saveEvalResult({ id: 'ev-none', eval: 't', timestamp: 0, data: {} });
+        await store.saveEvalResult({ id: 'ev-none', eval: 't', timestamp: 0, data: {} });
+        expect(ttls.get('axl:eval-history:ev-none')).toBeUndefined();
       });
 
       it('saveExecutionState applies TTL via SET ... EX (refreshes on overwrite)', async () => {

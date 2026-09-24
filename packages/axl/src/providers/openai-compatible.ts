@@ -19,7 +19,8 @@ import {
 import { fetchWithRetry } from './retry.js';
 import { CallTimingRecorder, withCallTiming, withChatTiming } from './call-timing.js';
 import { buildProviderError, ProviderError } from './errors.js';
-import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
+import type { RateLimitConfig } from './rate-limiter.js';
+import { AdapterGovernors, type ScopeGovernor } from './governor-pool.js';
 import { isBuiltinTablePricingEligible } from './builtin-table-pricing.js';
 import { assertSafeProviderBaseUrl } from '../http-transport.js';
 import type { InputAudioPart, InputContentPart, InputMediaSource, ModelInput } from '../input.js';
@@ -678,7 +679,12 @@ export class OpenAICompatibleProvider implements Provider {
   /** A key string, or a resolver invoked per request (expiring tokens). */
   protected readonly apiKeySource: ApiKeySource;
   protected readonly authHeader?: AuthHeader;
-  protected readonly governor?: RateLimiter;
+  /**
+   * Namespaced so it cannot collide with a member a downstream subclass
+   * declares. A plain property (not `#private` or a WeakMap keyed by `this`)
+   * so a caller's own Proxy around the adapter still reaches it.
+   */
+  private readonly axlRateGovernors: AdapterGovernors;
 
   constructor(options: OpenAICompatibleOptions) {
     const p = options.profile;
@@ -695,7 +701,16 @@ export class OpenAICompatibleProvider implements Provider {
       `${p.label ?? p.name} provider`,
       options.dangerouslyAllowInsecureHttp,
     );
-    this.governor = options.rateLimit ? new RateLimiter(options.rateLimit) : undefined;
+    this.axlRateGovernors = new AdapterGovernors(
+      this,
+      {
+        family: p.name,
+        baseUrl: this.baseUrl,
+        apiKeySource: this.apiKeySource,
+        adapterName: p.name,
+      },
+      options.rateLimit,
+    );
 
     const label = p.label ?? p.name;
     if (p.requireExplicitBaseUrl && explicitBase === undefined) {
@@ -712,6 +727,16 @@ export class OpenAICompatibleProvider implements Provider {
       const env = p.envApiKey ?? 'the API key env var';
       throw new Error(`${label} API key is required. Set ${env} or pass apiKey in options.`);
     }
+  }
+
+  /**
+   * The rate governor for one call to `model` (the effective wire model), from
+   * the runtime's per-scope pool. Every scope has one (with no `rateLimit` it
+   * caps nothing until a rate-limit 429). Subclasses that issue their own
+   * `fetchWithRetry` pass this as `governor`.
+   */
+  protected governorFor(model: string): ScopeGovernor {
+    return this.axlRateGovernors.governorFor(model);
   }
 
   /** Resolve the API key for one request, validating against allowMissingApiKey. */
@@ -732,6 +757,7 @@ export class OpenAICompatibleProvider implements Provider {
     const body = this.buildRequestBody(messages, options, false);
 
     const recorder = new CallTimingRecorder(options.requestLifecycle);
+    const governor = this.governorFor(this.requestModel(body, options.model));
     const res = await fetchWithRetry(
       `${this.baseUrl}/chat/completions`,
       {
@@ -740,7 +766,12 @@ export class OpenAICompatibleProvider implements Provider {
         body: JSON.stringify(body),
         signal: options.signal,
       },
-      { governor: this.governor, provider: this.name, timing: recorder.observer },
+      {
+        governor,
+        provider: this.name,
+        timing: recorder.observer,
+        admission: options.dispatchAdmission,
+      },
     );
 
     if (!res.ok) {
@@ -767,6 +798,7 @@ export class OpenAICompatibleProvider implements Provider {
     const body = this.buildRequestBody(messages, options, true);
 
     const recorder = new CallTimingRecorder(options.requestLifecycle);
+    const governor = this.governorFor(this.requestModel(body, options.model));
     const res = await fetchWithRetry(
       `${this.baseUrl}/chat/completions`,
       {
@@ -775,7 +807,12 @@ export class OpenAICompatibleProvider implements Provider {
         body: JSON.stringify(body),
         signal: options.signal,
       },
-      { governor: this.governor, provider: this.name, timing: recorder.observer },
+      {
+        governor,
+        provider: this.name,
+        timing: recorder.observer,
+        admission: options.dispatchAdmission,
+      },
     );
 
     if (!res.ok) {
@@ -1125,9 +1162,11 @@ export class OpenAICompatibleProvider implements Provider {
       request,
       response: json,
     });
+    const costProvenance = this.costProvenance(cost);
 
     return {
       content,
+      costProvenance,
       thinking_content: thinking || undefined,
       tool_calls: message.tool_calls?.map((tc) => ({
         id: tc.id,
@@ -1138,6 +1177,19 @@ export class OpenAICompatibleProvider implements Provider {
       cost,
       providerMetadata: this.roundTripMetadata(roundTrip),
     };
+  }
+
+  /**
+   * How this profile's `computeCost` derived its figure. `'from-response'`
+   * profiles (OpenRouter, xAI) echo a vendor-supplied USD amount and are
+   * authoritative; table and zero pricing are Axl estimates. Native subclasses
+   * that override `computeCost` override this alongside it.
+   */
+  protected costProvenance(cost: number | undefined): ProviderResponse['costProvenance'] {
+    if (cost === undefined) return undefined;
+    return this.profile.pricing.kind === 'from-response'
+      ? 'provider_reported'
+      : 'price_table_estimate';
   }
 
   private roundTripMetadata(
@@ -1230,18 +1282,20 @@ export class OpenAICompatibleProvider implements Provider {
           };
         }
       }
+      const cost = this.computeCost(
+        pricingResponse?.model ?? model,
+        usage,
+        this.reportedCost(usageData),
+        {
+          request,
+          response: pricingResponse,
+        },
+      );
       return {
         type: 'done',
         usage,
-        cost: this.computeCost(
-          pricingResponse?.model ?? model,
-          usage,
-          this.reportedCost(usageData),
-          {
-            request,
-            response: pricingResponse,
-          },
-        ),
+        cost,
+        costProvenance: this.costProvenance(cost),
         providerMetadata,
       };
     };

@@ -34,16 +34,16 @@ and the rule differ.
 ## Shared skills and roles
 
 Claude project skills live under `.claude/skills/`. Codex discovers repository
-skills through `.agents/skills`, which points to `.codex/skills`. The shared
+skills through `.agents/skills`, which points to `.codex/skills`. The
 `live-api-verification` and `prompt-iteration` methodology skills are linked
-individually from `.codex/skills` back to `.claude/skills`; Codex-specific
-orchestration variants
-(`plan-doc`, `tackle-plan`, `session-review`, and `scenario-review`) live as
-native files under `.codex/skills` because they route named Codex agents and
-model tiers. Update both platform variants only when shared orchestration
-semantics change.
+individually from `.codex/skills` back to `.claude/skills`. The orchestration
+workflows (`plan-doc`, `tackle-plan`, `session-review`, and `scenario-review`)
+keep one shared procedure in `.claude/skills/<skill>/references/procedure.md`;
+each platform's `SKILL.md` only binds that procedure's lanes to its agents.
+Edit the procedure for a workflow change and the bindings for a roster change.
 
-Project-scoped Codex roles live in `.codex/agents/`; Claude-native roles live in
-`.claude/agents/`. Keep shared roles aligned on responsibilities and escalation
-outcomes while allowing platform model/tool instructions and platform-specific
-escalation lanes to differ.
+Agent behavior is also shared: `.claude/references/agents/` holds the common
+procedures referenced by both fleets (`.claude/agents/` and `.codex/agents/`).
+Agent entrypoints retain discovery descriptions, model/effort, platform
+controls, and report delivery. Edit the shared reference for behavior changes;
+do not duplicate its body in either platform's agent definition.

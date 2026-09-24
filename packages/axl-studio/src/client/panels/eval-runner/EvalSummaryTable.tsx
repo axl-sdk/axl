@@ -1,21 +1,25 @@
-import { cn, formatCost, formatDuration } from '../../lib/utils';
+import { cn, formatDuration } from '../../lib/utils';
 import { scoreBarColor, scoreTextColor, getScorerSampleCounts } from './types';
-import type { EvalItem, EvalResultData } from './types';
+import type { EvalResultData } from './types';
 import { ScorerSampleChips } from './ScorerSampleChips';
+import { RunAccountingPanel } from './RunAccountingPanel';
 
 type Props = {
-  summary: EvalResultData['summary'];
-  items: EvalItem[];
-  totalCost: number;
+  /** The whole run: the accounting footer needs the result, not just a number. */
+  result: EvalResultData;
   scorerTypes?: Record<string, string>;
 };
 
-export function EvalSummaryTable({ summary, items, totalCost, scorerTypes }: Props) {
+export function EvalSummaryTable({ result, scorerTypes }: Props) {
+  const summary = result.summary;
+  const items = result.items;
   const scorerEntries = summary.scorers ? Object.entries(summary.scorers) : [];
 
-  if (scorerEntries.length === 0 && !summary.timing && totalCost <= 0) {
-    return null;
-  }
+  // The accounting footer always renders: a run with no scorers and no timing
+  // still has a spend figure and a completeness to state, and a $0 that is only
+  // $0 because nothing could be priced is exactly the case the old
+  // `totalCost <= 0` bail-out used to hide.
+  const hasTable = scorerEntries.length > 0 || summary.timing != null;
 
   return (
     <div className="rounded-xl border border-[hsl(var(--border))] overflow-hidden">
@@ -24,7 +28,7 @@ export function EvalSummaryTable({ summary, items, totalCost, scorerTypes }: Pro
           Scorer Summary
         </h3>
       </div>
-      <div className="overflow-x-auto">
+      <div className={cn('overflow-x-auto', !hasTable && 'hidden')}>
         <table className="w-full text-xs">
           <thead>
             <tr className="border-b border-[hsl(var(--border))]">
@@ -128,13 +132,7 @@ export function EvalSummaryTable({ summary, items, totalCost, scorerTypes }: Pro
         </table>
       </div>
 
-      {totalCost > 0 && (
-        <div className="px-4 py-2 border-t border-[hsl(var(--border))] bg-[hsl(var(--muted))]/50">
-          <span className="text-xs text-[hsl(var(--muted-foreground))]">
-            Total cost: <span className="font-mono font-medium">{formatCost(totalCost)}</span>
-          </span>
-        </div>
-      )}
+      <RunAccountingPanel result={result} />
     </div>
   );
 }

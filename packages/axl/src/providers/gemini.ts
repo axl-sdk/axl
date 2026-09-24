@@ -1,3 +1,4 @@
+import { tableEstimate } from './cost-provenance.js';
 import type {
   EffortResolution,
   Provider,
@@ -16,7 +17,8 @@ import { resolveThinkingOptions, resolveApiKey, type ApiKeySource } from './type
 import { fetchWithRetry } from './retry.js';
 import { CallTimingRecorder, withCallTiming, withChatTiming } from './call-timing.js';
 import { buildProviderError, ProviderError } from './errors.js';
-import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
+import type { RateLimitConfig } from './rate-limiter.js';
+import { AdapterGovernors, type ScopeGovernor } from './governor-pool.js';
 import { assertSafeProviderBaseUrl } from '../http-transport.js';
 import type { InputContentPart, InputMediaSource } from '../input.js';
 import type { RecordedAudioSource } from '../transcription.js';
@@ -896,7 +898,12 @@ export class GeminiProvider implements Provider {
   private baseUrl: string;
   private apiKeySource: ApiKeySource;
   private callCounter = 0;
-  private governor?: RateLimiter;
+  /**
+   * Namespaced so it cannot collide with a member a downstream subclass
+   * declares. A plain property (not `#private` or a WeakMap keyed by `this`)
+   * so a caller's own Proxy around the adapter still reaches it.
+   */
+  private readonly axlRateGovernors: AdapterGovernors;
 
   constructor(
     options: {
@@ -917,13 +924,27 @@ export class GeminiProvider implements Provider {
       'Google provider',
       options.dangerouslyAllowInsecureHttp,
     );
-    this.governor = options.rateLimit ? new RateLimiter(options.rateLimit) : undefined;
+    this.axlRateGovernors = new AdapterGovernors(
+      this,
+      {
+        family: this.name,
+        baseUrl: this.baseUrl,
+        apiKeySource: this.apiKeySource,
+        adapterName: this.name,
+      },
+      options.rateLimit,
+    );
 
     // Eager validation for the string case; a function source is validated per
     // request in resolveKey().
     if (typeof this.apiKeySource === 'string' && !this.apiKeySource) {
       throw new Error('Google API key is required. Set GOOGLE_API_KEY or pass apiKey in options.');
     }
+  }
+
+  /** The rate governor for one call to `model`, from the runtime's per-scope pool. */
+  protected governorFor(model: string): ScopeGovernor {
+    return this.axlRateGovernors.governorFor(model);
   }
 
   /** Resolve the API key for one request (supports an expiring-token callback). */
@@ -955,7 +976,12 @@ export class GeminiProvider implements Provider {
         body: JSON.stringify(body),
         signal: options.signal,
       },
-      { governor: this.governor, provider: this.name, timing: recorder.observer },
+      {
+        governor: this.governorFor(pricingContext.model),
+        provider: this.name,
+        timing: recorder.observer,
+        admission: options.dispatchAdmission,
+      },
     );
 
     if (!res.ok) {
@@ -998,7 +1024,12 @@ export class GeminiProvider implements Provider {
         body: JSON.stringify(body),
         signal: options.signal,
       },
-      { governor: this.governor, provider: this.name, timing: recorder.observer },
+      {
+        governor: this.governorFor(pricingContext.model),
+        provider: this.name,
+        timing: recorder.observer,
+        admission: options.dispatchAdmission,
+      },
     );
 
     if (!res.ok) {
@@ -1039,7 +1070,12 @@ export class GeminiProvider implements Provider {
     const res = await fetchWithRetry(
       `${this.baseUrl}/interactions`,
       { method: 'POST', headers, body: JSON.stringify(body), signal: options.signal },
-      { governor: this.governor, provider: this.name, timing: recorder.observer },
+      {
+        governor: this.governorFor(pricingContext.model),
+        provider: this.name,
+        timing: recorder.observer,
+        admission: options.dispatchAdmission,
+      },
     );
     if (!res.ok) {
       const errorBody = await res.text();
@@ -1074,7 +1110,12 @@ export class GeminiProvider implements Provider {
     const res = await fetchWithRetry(
       `${this.baseUrl}/interactions?alt=sse`,
       { method: 'POST', headers, body: JSON.stringify(body), signal: options.signal },
-      { governor: this.governor, provider: this.name, timing: recorder.observer },
+      {
+        governor: this.governorFor(pricingContext.model),
+        provider: this.name,
+        timing: recorder.observer,
+        admission: options.dispatchAdmission,
+      },
     );
     if (!res.ok) {
       const errorBody = await res.text();
@@ -1291,25 +1332,27 @@ export class GeminiProvider implements Provider {
     }
     this.assertInteractionTerminalStatus(json.status, toolCalls.length);
     const normalized = normalizeInteractionUsage(json.usage);
+    const interactionCost = this.interactionCost({
+      normalized,
+      steps: json.steps,
+      responseTierEvidence: geminiResponseTierEvidence(
+        responseHeaders,
+        json.service_tier,
+        json.usage?.service_tier,
+      ),
+      effectiveModel: typeof json.model === 'string' ? json.model : pricingContext.model,
+      pricingContext,
+      // The whole body is in hand: every part is on `json.steps`, so there
+      // is nothing this path could have failed to materialize.
+      unmodeledOutput: false,
+    });
     return {
       content,
       thinking_content: thinkingContent || undefined,
       tool_calls: toolCalls.length ? toolCalls : undefined,
       usage: normalized?.usage,
-      cost: this.interactionCost({
-        normalized,
-        steps: json.steps,
-        responseTierEvidence: geminiResponseTierEvidence(
-          responseHeaders,
-          json.service_tier,
-          json.usage?.service_tier,
-        ),
-        effectiveModel: typeof json.model === 'string' ? json.model : pricingContext.model,
-        pricingContext,
-        // The whole body is in hand: every part is on `json.steps`, so there
-        // is nothing this path could have failed to materialize.
-        unmodeledOutput: false,
-      }),
+      cost: interactionCost,
+      costProvenance: tableEstimate(interactionCost),
       providerMetadata: json.steps?.length
         ? { geminiInteractionSteps: json.steps.filter(isGeminiInteractionStep) }
         : undefined,
@@ -1555,20 +1598,22 @@ export class GeminiProvider implements Provider {
               .sort(([a], [b]) => a - b)
               .map(([, step]) => step);
             const normalized = normalizeInteractionUsage(event.interaction?.usage);
+            const streamInteractionCost = this.interactionCost({
+              normalized,
+              steps: orderedSteps,
+              responseTierEvidence,
+              effectiveModel:
+                typeof event.interaction?.model === 'string'
+                  ? event.interaction.model
+                  : pricingContext.model,
+              pricingContext,
+              unmodeledOutput,
+            });
             yield {
               type: 'done',
               usage: normalized?.usage,
-              cost: this.interactionCost({
-                normalized,
-                steps: orderedSteps,
-                responseTierEvidence,
-                effectiveModel:
-                  typeof event.interaction?.model === 'string'
-                    ? event.interaction.model
-                    : pricingContext.model,
-                pricingContext,
-                unmodeledOutput,
-              }),
+              cost: streamInteractionCost,
+              costProvenance: tableEstimate(streamInteractionCost),
               providerMetadata: steps.size ? { geminiInteractionSteps: orderedSteps } : undefined,
             };
             return;
@@ -2169,6 +2214,7 @@ export class GeminiProvider implements Provider {
       tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
       usage: normalized?.usage,
       cost,
+      costProvenance: tableEstimate(cost),
       providerMetadata,
     };
   }
@@ -2272,20 +2318,22 @@ export class GeminiProvider implements Provider {
 
       const providerMetadata =
         accumulatedParts.length > 0 ? { geminiParts: accumulatedParts } : undefined;
+      const streamCost =
+        normalizedUsage?.pricingUsage &&
+        !normalizedUsage.hasUnmodeledBilledUsage &&
+        responseIsTextOnly &&
+        isEligibleGeminiPricing(
+          pricingContext,
+          hasDefinitiveStandardResponseTier,
+          hasInvalidResponseTier,
+        )
+          ? estimateGeminiCost(effectiveModel, normalizedUsage.pricingUsage)
+          : undefined;
       yield {
         type: 'done',
         usage: normalizedUsage?.usage,
-        cost:
-          normalizedUsage?.pricingUsage &&
-          !normalizedUsage.hasUnmodeledBilledUsage &&
-          responseIsTextOnly &&
-          isEligibleGeminiPricing(
-            pricingContext,
-            hasDefinitiveStandardResponseTier,
-            hasInvalidResponseTier,
-          )
-            ? estimateGeminiCost(effectiveModel, normalizedUsage.pricingUsage)
-            : undefined,
+        cost: streamCost,
+        costProvenance: tableEstimate(streamCost),
         providerMetadata,
       };
     } finally {

@@ -16,7 +16,7 @@ export type { LlmScorerConfig } from './llm-scorer.js';
 
 export { defineEval } from './define-eval.js';
 export { runEval } from './runner.js';
-export { evalCompare, evaluateScorerErrorRateGate } from './compare.js';
+export { evalCompare, evaluateScorerErrorRateGate, evaluateItemErrorRateGate } from './compare.js';
 export { evaluateScorerTolerance } from './utils.js';
 export type { ScorerToleranceVerdict } from './utils.js';
 export { pairedBootstrapCI } from './bootstrap.js';
@@ -26,10 +26,36 @@ export type { RescoreOptions } from './rescore.js';
 export { aggregateRuns } from './multi-run.js';
 export type { MultiRunSummary } from './multi-run.js';
 
+export { readAccounting, aggregateAccounting, refusedWork, isBudgetStopped } from './accounting.js';
+
+export {
+  DEFAULT_COPY_MAX_BYTES,
+  DEFAULT_SIDECAR_MAX_BYTES,
+  parseRequestRecords,
+  resolveCaptureLimits,
+  serializeRequestRecords,
+  toDiagnosticManifest,
+  unavailableManifest,
+  validateRequestSidecar,
+} from './diagnostics.js';
 export type {
+  CaptureRequestsOption,
+  DiagnosticManifest,
+  OperationRef,
+  RequestRecord,
+  SidecarValidation,
+} from './diagnostics.js';
+
+export type {
+  EvalAccounting,
+  EvalBudgetStatus,
+  EvalCoverage,
+  EvalItemOutcome,
+  ScorerOutcome,
   EvalConfig,
   EvalResult,
   EvalItem,
+  EvalItemFailure,
   EvalSummary,
   EvalComparison,
   EvalComparisonPartial,
@@ -40,6 +66,7 @@ export type {
   ItemModelTiming,
   ModelTimingStats,
   DegradedScorer,
+  ItemErrorRate,
   EvalProgressEvent,
   RunEvalOptions,
 } from './types.js';

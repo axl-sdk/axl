@@ -47,6 +47,23 @@ afterEach(() => {
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+/**
+ * Run `call` on a fake clock with jitter pinned to 1.0, so a retry's backoff
+ * (at least 1 s: a hint only ever lengthens it) costs no real time and every
+ * figure is exact.
+ */
+async function onFakeClock<T>(call: () => Promise<T>): Promise<T> {
+  vi.useFakeTimers();
+  vi.spyOn(Math, 'random').mockReturnValue(0.5);
+  try {
+    const p = call();
+    await vi.runAllTimersAsync();
+    return await p;
+  } finally {
+    vi.useRealTimers();
+  }
+}
+
 /** R-T2 specifies integer milliseconds. A float or a negative is a broken clock read. */
 function expectValueDomain(t: CallTiming): void {
   for (const [field, value] of Object.entries(t)) {
@@ -492,7 +509,13 @@ describe('CallTiming — permit lifetime', () => {
 // ---------------------------------------------------------------------------
 
 describe('CallTiming — adapter-level retry (A8)', () => {
-  const BACKOFF = 300; // Retry-After: 0.3 ⇒ jittered to 225..375ms
+  // `adaptive: false` keeps these on the plain retry path, where a 429's
+  // backoff is retry time. On an adaptive scope the same 429 brakes the scope
+  // and its wait is queue time instead (AC33, covered in rate-brake.test.ts).
+  const plain = () => new OpenAIProvider({ apiKey: 'k', rateLimit: { adaptive: false } });
+  // Retry-After: 0.3 is below the first retry's 1 s backoff floor, so the
+  // wait is the floor (jitter pinned to 1.0 by `onFakeClock`).
+  const BACKOFF = 1000;
   const WIRE = 150; // the successful attempt's own latency
 
   /** 429 with Retry-After, then a 200 whose headers take WIRE ms. */
@@ -534,29 +557,26 @@ describe('CallTiming — adapter-level retry (A8)', () => {
 
   it('chat(): retryMs holds the backoff and wireMs holds only the final attempt', async () => {
     mock429ThenOk(() => OPENAI_CHAT_JSON);
-    const res = await new OpenAIProvider({ apiKey: 'k' }).chat(messages, { model: 'gpt-4o' });
+    const res = await onFakeClock(() => plain().chat(messages, { model: 'gpt-4o' }));
 
     const t = res.timing!;
     expect(t.attempts).toBe(2);
-    expectWindow(t.retryMs, [BACKOFF * 0.75 - 40, BACKOFF * 1.25 + 120], 'retryMs');
-    // The decisive bound: wireMs must NOT contain the ~300ms backoff. An
-    // implementation anchoring on the first dispatch lands near 450.
-    expectWindow(t.wireMs, [WIRE - 60, WIRE + 150], 'wireMs excludes the backoff');
-    expect(t.wireMs).toBeLessThan(t.retryMs);
-    expectWindow(t.ttfbMs, [WIRE - 60, WIRE + 100], 'ttfbMs anchors on the final attempt');
+    expect(t.retryMs).toBe(BACKOFF);
+    // The decisive bound: wireMs must NOT contain the backoff. An
+    // implementation anchoring on the first dispatch lands at BACKOFF + WIRE.
+    expect(t.wireMs).toBe(WIRE);
+    expect(t.ttfbMs).toBe(WIRE);
     expectValueDomain(t);
   });
 
   it('stream(): same anchoring on the done chunk', async () => {
     mock429ThenOk(() => OPENAI_CHAT_JSON, true);
-    const chunks = await drain(
-      new OpenAIProvider({ apiKey: 'k' }).stream(messages, { model: 'gpt-4o' }),
-    );
+    const chunks = await onFakeClock(() => drain(plain().stream(messages, { model: 'gpt-4o' })));
 
     const t = doneChunk(chunks).timing!;
     expect(t.attempts).toBe(2);
-    expectWindow(t.retryMs, [BACKOFF * 0.75 - 40, BACKOFF * 1.25 + 120], 'retryMs');
-    expectWindow(t.wireMs, [WIRE - 60, WIRE + 150], 'wireMs excludes the backoff');
+    expect(t.retryMs).toBe(BACKOFF);
+    expect(t.wireMs).toBe(WIRE);
     // firstTokenMs is measured from the FINAL dispatch, so the backoff is not
     // inside it either.
     expect(t.firstTokenMs).toBeLessThan(t.retryMs);
@@ -751,7 +771,9 @@ for (const c of CASES) {
 }
 
 describe('CallTiming — error path, exhausted retries', () => {
-  const RETRY_AFTER_MS = 200;
+  // Retry-After: 0.2 is below the backoff floor, so the two sleeps are the
+  // 1 s and 2 s exponential backoff (jitter pinned to 1.0 by `onFakeClock`).
+  const BACKOFF_TOTAL_MS = 1000 + 2000;
 
   it('reports every attempt and the accumulated backoff on a 429 storm', async () => {
     let n = 0;
@@ -766,22 +788,24 @@ describe('CallTiming — error path, exhausted retries', () => {
       };
     }) as unknown as typeof fetch;
 
-    const err = await caught(() =>
-      new OpenAIProvider({ apiKey: 'k' }).chat(messages, { model: 'gpt-4o' }),
+    // `adaptive: false`: the plain path, where a 429 shares the transient
+    // budget. An adaptive scope retries a 429 on its own budget (AC19).
+    const err = await onFakeClock(() =>
+      caught(() =>
+        new OpenAIProvider({ apiKey: 'k', rateLimit: { adaptive: false } }).chat(messages, {
+          model: 'gpt-4o',
+        }),
+      ),
     );
 
     expect(err.status).toBe(429);
     expect(n).toBe(3); // transport default: 2 retries, 3 attempts
     const t = err.timing!;
     expect(t.attempts).toBe(3);
-    // Two jittered (±25%) Retry-After sleeps. An implementation reporting only
-    // the final attempt would land near 0 here — this is the figure that makes
-    // "the provider is throttling me" legible from a failure.
-    expectWindow(
-      t.retryMs,
-      [RETRY_AFTER_MS * 0.75 * 2 - 60, RETRY_AFTER_MS * 1.25 * 2 + 250],
-      'retryMs across exhausted retries',
-    );
+    // Both backoff sleeps. An implementation reporting only the final attempt
+    // would report 0 here — this is the figure that makes "the provider is
+    // throttling me" legible from a failure.
+    expect(t.retryMs).toBe(BACKOFF_TOTAL_MS);
     // ttfb/wire stay anchored on the FINAL attempt, so the backoff is not in
     // them — the same separation the success path guarantees.
     expect(t.ttfbMs).toBeLessThan(t.retryMs);

@@ -2,6 +2,55 @@
 
 > **Migrating from 0.15.x?** See the [unified event model migration guide](./migration/unified-event-model.md) for the full rename/move table (`TraceEvent`/`StreamEvent` → `AxlEvent`, `ExecutionInfo.steps` → `.events`, `AxlStream.steps` → `.lifecycle`, event tag renames, callback `meta` parameter, and the new ask-tree correlation model).
 
+## Two cost rails: accounting vs. traces
+
+Axl reports spend on two rails, and it matters which one you read.
+
+**The accounting rail is authoritative.** `runtime.trackOutcome(fn)` returns an
+[`Accounting`](./api-reference.md#accounting) record built from provider, tool, memory,
+transcription and declared-external settlement. It is independent of every observability knob:
+the same workload produces byte-identical accounting under `trace: false`, `trace.level: 'steps'`
+and `trace.level: 'full'`, with `captureTraces` on or off, with redaction on or off, and
+whether the workflow returned or threw. Turning tracing off changes what you can *see*, never
+what you are *charged*.
+
+**The trace rail is diagnostic.** `event.cost` on `agent_call_end` / `tool_call_end` /
+`memory_*` / `transcription_end` exists so a dashboard can attribute a charge to a specific
+step, and `ask_end` carries a per-ask rollup. It follows trace configuration, and a leaf that
+never settles simply never emits. Sum it for a chart; do not reconcile a bill with it.
+
+The two are fed by the same settlement producer, so they agree wherever both observe the same
+call. Do not add them together.
+
+### Completeness and reasons
+
+`knownCost` is the sum of charges Axl could actually establish. When it could not establish one,
+the scope says so rather than rounding the unknown down to zero:
+
+- `completeness: 'complete'` — every operation reached a terminal state with a usable charge,
+  **including a known $0**. A free call is complete, not unknown.
+- `completeness: 'incomplete'` — at least one operation did not. `knownCost` is a **lower
+  bound**, and `reasons` counts why: `unpriced_model` (usage reported, no usable cost — a
+  pricing-table miss, or a `NaN`/negative/`Infinity` from an adapter), `usage_missing`
+  (dispatched, but the terminal outcome carried no usage at all — a failure, an abort, a
+  refused retry, or a successful response from a usage-omitting adapter), `abandoned`
+  (dispatched and never settled before the scope finalized), `external_unreported` (a
+  `withExternalOperation` that never called `report.setCost`).
+- `completeness: 'unverified'` — only ever produced by readers of legacy artifacts that carry no
+  accounting at all. A live scope never emits it.
+
+This is coverage of Axl-observable operations, not invoice reconciliation. Arbitrary I/O inside
+your own tool handlers is invisible unless you declare it with
+[`ctx.withExternalOperation`](./api-reference.md#externaloperationdescriptor-fn--ctxwithexternaloperationdescriptor-fn).
+
+Operations refused admission by an [`AdmissionController`](./api-reference.md#admissioncontroller)
+are counted under `operations.denied` and contribute nothing — no charge, no reason, and no
+incompleteness. Refusing to spend is not the same as failing to measure.
+
+`accounting.provenance` splits `knownCost` by where each figure came from, so a vendor-reported
+total stays distinguishable from an Axl price-table estimate. See
+[cost provenance](./providers.md#cost-provenance).
+
 ## Trace Mode
 
 Every workflow execution produces a structured trace. In development, this is your primary debugging tool.
@@ -238,7 +287,8 @@ The same unknown-cost condition is surfaced on the budget rail. A [`ctx.budget()
 ### Per-call timing
 
 `agent_call_end.duration` is the whole turn's wall clock. Under an opt-in
-[`rateLimit`](providers.md#rate-limiting-opt-in) that number folds three unrelated things
+[`rateLimit`](providers.md#proactive-pacing-opt-in), or the default
+[rate-limit pause and adaptive pacing](providers.md#rate-limiting) on every built-in chat provider, that number folds three unrelated things
 together — the SDK's own queue wait, the provider's 429 backoff, and the model's actual
 latency — so it cannot answer "was the model slow, or was I pacing myself?".
 
@@ -724,7 +774,8 @@ The filter applies at three layers:
 | `GET /api/memory/:scope` / `:key` | `value` | `key` (programmer-chosen identifier, needed for navigation) |
 | `GET /api/sessions/:id` | `message.content`, `message.tool_calls[*].function.arguments`; `message.providerMetadata` is dropped entirely (opaque bag that may carry encoded reasoning / cache keys) | `role`, `name`, `tool_call_id`, `tool_calls[*].id`, `tool_calls[*].type`, `tool_calls[*].function.name`, `handoffHistory` (no content fields to scrub) |
 | `POST /api/sessions/:id/send` | `result` | response envelope |
-| `GET /api/evals/history`, `POST /api/evals/:name/run` (sync), `POST /api/evals/:name/rescore` | per-item `input`, `output`, `error`, `annotations`, `scorerErrors`, `scoreDetails[*].metadata` | per-item `scores`, `duration`, `cost`, `scorerCost`, `metadata` (models / tokens / workflows), `traces` (already scrubbed at emit time); result-level `summary`, `metadata`, `totalCost`, `duration`, `timestamp` |
+| `GET /api/evals/history`, `POST /api/evals/:name/run` (sync), `POST /api/evals/:name/rescore` | per-item `input`, `output`, `error`, `annotations`, `scorerErrors`, `scoreDetails[*].metadata`; `metadata.batchFailure`; every run in a multi-run `_multiRun.allRuns` (same rule) and `_multiRun.batchFailure` | per-item `scores`, `duration`, `cost`, `scorerCost`, `metadata` (models / tokens / workflows), `traces` (already scrubbed at emit time), `failure` (projected to `name` / `provider` / `status` / `retryable` / `requestId`; any other key is dropped); result-level `summary`, `metadata`, `totalCost`, `duration`, `timestamp`; `_multiRun.aggregate` |
+| `POST /api/evals/compare` | `regressions[*].input`, `improvements[*].input`; `baseline.metadata.batchFailure`, `candidate.metadata.batchFailure` | `itemIndex`, `scorer`, scores and deltas, per-scorer statistics, `timing`, `cost`, `summary` (built from scorer names and numbers), the rest of each side's `metadata` |
 | `GET /api/decisions` | `prompt`, `metadata` (replaced with `{ redacted: true }`) | `executionId`, `channel`, `createdAt` |
 | `POST /api/tools/:name/test` | `result` | tool name, input schema |
 | `POST /api/workflows/:name/execute` (sync) | `result` | — |
@@ -751,6 +802,136 @@ const runtime = new AxlRuntime({
   trace: { enabled: true, level: 'full', redact: true },
 });
 ```
+
+## Captured requests (opt-in)
+
+Traces answer *what happened*. Captured requests answer the question traces
+cannot: **what exactly did Axl send the model on that turn?** A retry loop
+rewrites the message list between attempts, tool results are appended verbatim,
+and a judge builds its own prompt — so "the request" is a runtime artifact
+nobody can reconstruct after the fact.
+
+Capture is **off by default**, opt-in per run, and lives on a different rail
+from accounting: a capture that fails, hits a limit or is redacted leaves
+`accounting` byte-identical.
+
+```ts
+const runtime = new AxlRuntime({
+  diagnostics: { artifacts: { root: '.axl/artifacts' } },
+});
+
+const result = await runtime.eval({ ...config }, { captureRequests: true });
+
+result.diagnostics;
+// { version: 1, artifactId, fidelity: 'runtime_request',
+//   status: 'complete', records: 42, bytes: 91_233, redaction: 'none' }
+```
+
+`axl-eval --capture-requests` does the same from the CLI; with `--output
+result.json` it also writes `result.requests.jsonl` beside the result.
+
+### What a record contains
+
+One JSONL line per phase of a model call, `v: 1`:
+
+| Phase | Carries |
+|---|---|
+| `start` | The request as submitted — messages, tools, schema and the allowlisted call options |
+| `attempt` | An additional **transport** attempt for the same logical call (a 429 retry is not an output repair) |
+| `end` | The response, or the error |
+
+An `end` record for a **stream** also carries a `termination` string when the
+stream did not simply finish — the consumer broke out of the loop, aborted it,
+the stream stopped without a `done` chunk, or it threw mid-iteration. Without
+it a sealed stream and a call that genuinely never came back are
+indistinguishable, since both leave a `start` with no response.
+
+Every record carries the identity needed to place it: `operationId`, `kind`,
+`provider`, `model`, `transportAttempts`, plus `executionId` / `askId` /
+`parentAskId` / `turn`, the `caseIndex` and `scorer` of the eval scope it ran
+in, and — on a repair turn — `retryReason` and a `correction`
+(`{ stage, reason, feedbackMessage }`) saying which gate rejected the previous
+answer and what the model was told about it.
+
+`EvalItem.diagnostics.operations` and `ScorerDetail.diagnostics.operations`
+point at the operations each owns, so you can go from a suspicious score
+straight to the request behind it.
+
+### Fidelity: `runtime_request`, not wire bytes
+
+`fidelity` is always `'runtime_request'`. What is captured is the
+**provider-neutral request Axl submitted** — the messages, tools, schema and
+options as the runtime built them — *not* the adapter's serialized HTTP body.
+No field claims wire bytes, because the adapter is free to reshape them.
+
+Deliberate omissions are named rather than silently dropped, in
+`captured.omitted`:
+
+- `media` — image/audio/file parts become descriptors (type, size, hash-free)
+- `providerOptionValues` — `providerOptions` contributes **keys only**, so a
+  credential parked there can never reach the artifact
+- `record` — the whole record exceeded the per-record byte bound and was
+  replaced by a stub carrying its size
+
+Signals, functions, callbacks and credentials are never captured.
+
+### Bounds
+
+Capture must never slow a provider call or exhaust a disk, so three byte bounds
+apply (all UTF-8 bytes, all overridable via `captureRequests: { … }`):
+
+| Bound | Default | On exceeding |
+|---|---|---|
+| `maxRecordBytes` | 256 KiB | The record becomes a stub (`captured.truncated`, `omitted: ['record']`) carrying `bytes`, the size of the record it replaced |
+| `maxRunBytes` | 16 MiB | Capture stops for the run; status `truncated` with a reason |
+| `maxQueueBytes` | 1 MiB | Capture stops rather than buffering behind a slow sink |
+
+A rescore shares one `maxRunBytes` budget across both halves of its artifact —
+the source records it copied in and the judge calls it makes — so the artifact
+never grows to twice the bound you asked for, and the copy may take at most
+three quarters of it so the judging always has room. When either half is cut the
+`reason` names which.
+
+A request or response that cannot be projected at all — a `responseFormat`
+schema holding a function, a content part no adapter names — costs that ONE
+record, not the run: it becomes the same stub the byte bound produces, and
+capture continues. `status: 'unavailable'` is reserved for a failure that really
+is run-wide, such as a sink that cannot be written to.
+
+The two stubs are told apart by which field they carry: an over-size record
+carries `bytes`, an un-projectable one carries `captured.reason`. The reason
+names the error's class, never its message — it is written straight to the sink
+rather than through redaction, so it must not be able to carry any of the call.
+A projection stub that is itself over-size keeps its reason through the
+re-stub.
+
+Writes are queued, never awaited by the provider path. A sink that throws stops
+capture with status `unavailable`. In every one of these cases the run
+completes normally and the numbers are unaffected — `EvalResult.diagnostics`
+reports the loss instead of hiding it.
+
+### Where the bytes live
+
+`diagnostics.artifacts` configures storage — see
+[integration.md](integration.md#diagnostic-artifact-storage) for the lifecycle,
+retention and reclamation rules, and
+[security.md](security.md#captured-requests) for what redaction does to a
+record.
+
+When the sweep reclaims a committed artifact — its expiry passed, or its owning
+row is gone — it rewrites that row's `diagnostics` to `unavailable` with zeroed
+counters and no `expiresAt`, and the `reason` names which of those it was. So a
+stored result is self-describing: nothing has to make a second call to discover
+the evidence is no longer there, and a reader that cannot make one — an export,
+a CLI listing, a client rendering a cached result — never publishes a promise of
+bytes nothing can serve.
+
+That correction is only written back **while the store still holds the row**.
+The history cache is process-global and outlives whatever the store decided — a
+Redis TTL that elapsed, a delete by another process, a right-to-be-forgotten
+request — so a blind write would resurrect a row's item inputs, outputs and
+scores and, on Redis, hand it a fresh full TTL. The store is asked first; when
+the answer is no, the cache entry is dropped instead.
 
 ## Execution Inspector
 
@@ -811,7 +992,7 @@ Every `ctx.*` primitive emits a span. Spans nest naturally: a workflow span cont
 | Span Name | Key Attributes |
 |-----------|------------|
 | `axl.workflow.execute` | `axl.workflow.name`, `axl.workflow.duration`, `axl.workflow.cost` |
-| `axl.agent.ask` | `axl.agent.name`, `axl.agent.model`, `axl.agent.prompt_tokens`, `axl.agent.completion_tokens`, `axl.agent.cost`, `axl.agent.duration`, and — when the last provider call of the ask reported [`timing`](api-reference.md#calltiming) — `axl.agent.queued_ms`, `axl.agent.retry_ms`, `axl.agent.attempts`, `axl.agent.ttfb_ms`, `axl.agent.wire_ms`, `axl.agent.first_token_ms` (streaming only) |
+| `axl.agent.ask` | `axl.agent.name`, `axl.agent.model`, `axl.agent.prompt_tokens`, `axl.agent.completion_tokens`, `axl.agent.cost`, `axl.agent.duration`, and — when the last provider call of the ask reported [`timing`](api-reference.md#calltiming) — `axl.agent.queued_ms`, `axl.agent.retry_ms`, `axl.agent.attempts`, `axl.agent.rate_limit_retries` (when reported), `axl.agent.ttfb_ms`, `axl.agent.wire_ms`, `axl.agent.first_token_ms` (streaming only) |
 | `axl.tool.call` | `axl.tool.name`, `axl.tool.duration`, `axl.tool.outcome`, `axl.tool.success`, `axl.tool.phase` (failed/cancelled) |
 | `axl.ctx.spawn` | `axl.spawn.count`, `axl.spawn.quorum`, `axl.spawn.completed` |
 | `axl.ctx.race` | `axl.race.participants`, `axl.race.winner` |

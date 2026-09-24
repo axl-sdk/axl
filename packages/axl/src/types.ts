@@ -1486,17 +1486,31 @@ export type ToolCallMessage = {
  */
 export type CallTiming = {
   /**
-   * Time parked in Axl's own opt-in `RateLimiter` (concurrency cap plus
-   * `minIntervalMs` spacing) before the request was allowed out. `0` when the
-   * provider has no `rateLimit` configured. This is self-imposed wait, not
-   * provider latency.
+   * Every wait Axl imposed on itself: the first permit (concurrency cap),
+   * `minIntervalMs` spacing, adaptive pacing after a rate-limit 429, a
+   * rate-limit pause on the scope, and the re-acquire after a rate-limit 429.
+   * `0` when nothing waited. This is
+   * self-imposed wait, not provider latency.
    */
   queuedMs: number;
-  /** `fetch` attempts made for this call, including the final one (≥ 1). */
+  /**
+   * Requests actually sent for this call, including the final one (≥ 1). A call
+   * held back by a rate-limit pause before sending is not an attempt.
+   */
   attempts: number;
   /**
-   * First attempt's dispatch → final attempt's dispatch, i.e. everything spent
-   * on failed attempts and their backoff sleeps. `0` for a single attempt.
+   * Rate-limit 429s this call received and retried: how often the provider
+   * throttled it. A 429 that is returned instead (a spend cap, or the last one
+   * once the retry budget is spent) is not counted, nor are 503/529/network
+   * retries. Built-in adapters always set it (`0` when none); optional so a
+   * custom `Provider` may omit it.
+   */
+  rateLimitRetries?: number;
+  /**
+   * First attempt's dispatch → final attempt's dispatch, minus the
+   * self-imposed waits inside that span (which are in `queuedMs`): failed
+   * attempts and their 503/529/network backoff sleeps. Disjoint from
+   * `queuedMs`. `0` for a single attempt.
    */
   retryMs: number;
   /** Final dispatch → response headers. Time to first byte. */
@@ -1542,6 +1556,14 @@ export type ProviderResponse = {
     audio_output_tokens?: number;
   };
   cost?: number;
+  /**
+   * How `cost` was derived, when the adapter can say. `'provider_reported'`
+   * means the vendor supplied the USD figure itself; `'price_table_estimate'`
+   * means the adapter priced reported usage from a table. Built-in adapters set
+   * it whenever they return a `cost`; a cost with no provenance is recorded as
+   * `'adapter_reported'`.
+   */
+  costProvenance?: 'provider_reported' | 'price_table_estimate';
   /** Provider-specific opaque metadata that needs to round-trip through conversation history. */
   providerMetadata?: Record<string, unknown>;
   /** Per-call latency breakdown. Absent on providers that don't instrument it. */

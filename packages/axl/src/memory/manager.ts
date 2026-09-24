@@ -8,6 +8,7 @@ import type {
   RecallOptions,
 } from './types.js';
 import type { StateStore } from '../state/types.js';
+import { openOperation } from '../accounting.js';
 
 /**
  * Result of a `MemoryManager.remember()` call.
@@ -73,6 +74,40 @@ function assertEmbedResult(result: unknown): asserts result is EmbedResult {
  * All key-value operations delegate to the StateStore.
  * Vector operations use the configured VectorStore + Embedder.
  */
+/**
+ * Run one embedder call as an accounting `'embedding'` operation.
+ *
+ * Admission is checked before the call, and the operation's dispatch hook is
+ * made ambient (`currentDispatchAdmission()`) so the built-in embedder
+ * transport re-checks the budget immediately before each fetch attempt — a
+ * queued or backing-off embed does not dispatch after the budget closes.
+ *
+ * Outside an accounting scope this is a transparent pass-through.
+ */
+async function embedAsOperation(
+  embedder: Embedder,
+  texts: string[],
+  signal: AbortSignal | undefined,
+): Promise<EmbedResult> {
+  const handle = openOperation({ kind: 'embedding' });
+  if (!handle) return embedder.embed(texts, signal);
+  try {
+    const raw = await handle.run(() => embedder.embed(texts, signal));
+    assertEmbedResult(raw);
+    handle.settle({
+      cost: raw.usage?.cost,
+      provenance: 'adapter_reported',
+      usage: typeof raw.usage?.tokens === 'number' ? { inputTokens: raw.usage.tokens } : undefined,
+    });
+    return raw;
+  } catch (error) {
+    // An embedder that threw may still have been billed, and nothing in the
+    // result channel can prove otherwise — stay conservative.
+    handle.settleFailure();
+    throw error;
+  }
+}
+
 export class MemoryManager {
   private vectorStore?: VectorStore;
   private embedder?: Embedder;
@@ -134,7 +169,7 @@ export class MemoryManager {
     // Optionally embed for semantic search (opt-in: embed must be explicitly true)
     if (options?.embed === true && this.vectorStore && this.embedder) {
       const text = typeof value === 'string' ? value : JSON.stringify(value);
-      const raw = await this.embedder.embed([text], signal);
+      const raw = await embedAsOperation(this.embedder, [text], signal);
       assertEmbedResult(raw);
       const { vectors, usage } = raw;
       // The embed API call already happened — the user has been billed.
@@ -187,7 +222,7 @@ export class MemoryManager {
   ): Promise<RecallResult> {
     // Semantic search mode
     if (options?.query && this.vectorStore && this.embedder) {
-      const raw = await this.embedder.embed([options.query], signal);
+      const raw = await embedAsOperation(this.embedder, [options.query], signal);
       assertEmbedResult(raw);
       const { vectors, usage } = raw;
       const topK = options?.topK ?? 5;

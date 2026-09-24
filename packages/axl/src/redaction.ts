@@ -42,6 +42,7 @@ import type {
   ToolLifecycleEventV2,
 } from './types.js';
 import { getEventSchemaVersion } from './event-schema.js';
+import type { CapturedRequestRecord } from './diagnostics/capture.js';
 
 export const REDACTED = '[redacted]';
 
@@ -431,4 +432,75 @@ export function redactHistoricalEvent(event: HistoricalAxlEvent): HistoricalAxlE
     return redactLegacyEvent(event as LegacyAxlEventV1);
   }
   return redactEvent(event as AxlEventV2);
+}
+
+// ── Captured requests (opt-in diagnostics) ──────────────────────────
+
+/**
+ * Scrub a captured request record before it reaches a diagnostics sink.
+ *
+ * The same policy `agent_call_start` / `agent_call_end` / the gate events
+ * already apply, expressed over the capture record's shape: prompts, responses,
+ * gate reasons and correction text are user/LLM content and become
+ * `[redacted]`; roles, tool NAMES, JSON-Schema parameters, option scalars,
+ * usage, cost, timing and the `providerOptions` key list are structural and
+ * survive, because a compliance-mode reader still has to be able to tell a
+ * tool-choice bug from a token-budget bug.
+ *
+ * Rich media never had bytes in the record to begin with (the projection in
+ * `diagnostics/capture.ts` replaces them with descriptors), but a descriptor's
+ * `locator` and `label` can name a file or a URL, so they are scrubbed here
+ * exactly as `redactInputDescriptor` scrubs them on the trace rail.
+ *
+ * Pure, like every other rule in this file: the caller decides whether
+ * redaction is on, and this function unconditionally scrubs when called.
+ */
+export function redactCapturedRequest(record: CapturedRequestRecord): CapturedRequestRecord {
+  const out: CapturedRequestRecord = {
+    ...record,
+    captured: { ...record.captured, redacted: true },
+  };
+  if (record.request) {
+    out.request = {
+      ...record.request,
+      messages: record.request.messages.map((message) => ({
+        ...message,
+        content: message.content === null ? null : REDACTED,
+        ...(message.input ? { input: redactInputDescriptor(message.input) } : {}),
+        ...(message.tool_calls
+          ? {
+              tool_calls: message.tool_calls.map((call) => ({
+                ...call,
+                function: { ...call.function, arguments: REDACTED },
+              })),
+            }
+          : {}),
+      })),
+    };
+  }
+  if (record.response) {
+    out.response = {
+      ...record.response,
+      content: REDACTED,
+      ...(record.response.tool_calls
+        ? {
+            tool_calls: record.response.tool_calls.map((call) => ({
+              ...call,
+              function: { ...call.function, arguments: REDACTED },
+            })),
+          }
+        : {}),
+    };
+  }
+  if (record.error) {
+    out.error = { ...record.error, message: REDACTED };
+  }
+  if (record.correction) {
+    out.correction = {
+      stage: record.correction.stage,
+      ...(record.correction.reason !== undefined ? { reason: REDACTED } : {}),
+      feedbackMessage: REDACTED,
+    };
+  }
+  return out;
 }

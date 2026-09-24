@@ -1,6 +1,89 @@
 import type { Dataset } from './dataset.js';
 import type { Scorer } from './scorer.js';
-import type { AxlEvent } from '@axlsdk/axl';
+import type { Accounting, AxlEvent } from '@axlsdk/axl';
+import type { CaptureRequestsOption, DiagnosticManifest, OperationRef } from './diagnostics.js';
+
+/**
+ * How one dataset item ended. Absent only on artifacts written before 0.24.
+ *
+ * The four non-`completed` values are deliberately NOT interchangeable: a
+ * model/workflow failure, a caller cancellation, a case never started because
+ * the budget had closed, and a case stopped mid-flight by a denied operation
+ * are four different facts about the run, and collapsing them makes a
+ * budget-truncated run look like a broken model.
+ */
+export type EvalItemOutcome =
+  /** Ran to completion (its scorers may still have been stopped). */
+  | 'completed'
+  /** The workflow threw — including a user `ctx.budget` block, which is user logic. */
+  | 'failed'
+  /** The caller's `AbortSignal` fired. */
+  | 'cancelled'
+  /** Never started: the run budget had already closed. No operations, no spend. */
+  | 'budget_skipped'
+  /** Started and charged, then a further operation was denied by the budget. */
+  | 'budget_interrupted';
+
+/** How one scorer ended for one item. See {@link EvalItemOutcome} for the rationale. */
+export type ScorerOutcome =
+  /** Produced a valid numeric score. */
+  | 'scored'
+  /** Ran and threw, or returned an out-of-range score. */
+  | 'failed'
+  /** Its `applies` predicate returned `false` — deliberately not run. */
+  | 'skipped'
+  /** The caller's `AbortSignal` fired before or during the call. */
+  | 'cancelled'
+  /** A paid judge that was never started because the budget had closed. */
+  | 'budget_skipped'
+  /** Started, then hit a denied operation. */
+  | 'budget_interrupted';
+
+/** The run budget's terminal state, persisted on {@link EvalAccounting}. */
+export type EvalBudgetStatus = {
+  /** The configured USD threshold. */
+  limit: number;
+  status: 'open' | 'closed';
+  /** Known spend observed under the controller — `accounting.knownCost`. */
+  knownSpend: number;
+  /**
+   * `max(0, knownSpend - limit)`. A threshold is not a reservation: work
+   * already dispatched when the limit was crossed still settles, so a run can
+   * legitimately end above its limit. This says by how much rather than
+   * clamping the reported total.
+   */
+  knownOvershoot: number;
+  /** Which scheduling decision first observed the closure. */
+  closedBy?: 'case' | 'scorer' | 'operation';
+};
+
+/**
+ * A run's authoritative accounting: the core {@link Accounting} record plus the
+ * eval-specific context needed to read it honestly.
+ */
+export type EvalAccounting = Accounting & {
+  /** `'run'` for `runEval`, `'rescore'` for `rescore` (judging-only spend). */
+  scope: 'run' | 'rescore';
+  /** Present exactly when a budget was configured. */
+  budget?: EvalBudgetStatus;
+  /**
+   * Rescore provenance: the source run and its UNMODIFIED generation
+   * accounting, or `null` when the source was a legacy artifact that carried
+   * none. The original spend is never added to the rescore's own total.
+   */
+  source?: { runId: string; generation: Accounting | null };
+  /**
+   * Legacy caller-reported values observed during the run. Inspection only —
+   * never summed into `knownCost`, which measures Axl-observed operations.
+   */
+  callerReported?: { costItems: number; costTotal: number; metadataItems: number };
+};
+
+/** Per-outcome counts for a run. Every key is present, including zeros. */
+export type EvalCoverage = {
+  items: Record<EvalItemOutcome, number>;
+  scorers: Record<string, Record<ScorerOutcome, number>>;
+};
 
 export type EvalConfig = {
   workflow: string;
@@ -15,6 +98,17 @@ export type EvalConfig = {
    * so lower `concurrency` if a rate-limited judge model needs a tighter ceiling.
    */
   scorerConcurrency?: number;
+  /**
+   * Known-spend threshold for the whole run, e.g. `'$1'`, `'1'`, `'0.50'`.
+   *
+   * Validated BEFORE the dataset is loaded — a malformed value throws
+   * `AxlError('INVALID_BUDGET')` before any item runs or any provider is
+   * called. Admission closes at `knownSpend >= limit` (so `'$0'` admits
+   * nothing), which stops new cases, new paid judges, and new instrumented
+   * operations inside cases that are already running. Work already dispatched
+   * settles and is still counted, so the final total can exceed the limit —
+   * `accounting.budget.knownOvershoot` says by how much.
+   */
   budget?: string;
   /**
    * Opt-in source-side trust gate. When set (0–1), `runEval` flags the run as
@@ -34,7 +128,45 @@ export type EvalConfig = {
    * other at consume/gate time (refuse to certify a thinned baseline/candidate).
    */
   failOnScorerErrorRate?: number;
+  /**
+   * Source-side coverage gate, **on by default** at `0.05`. `runEval` records
+   * `summary.itemErrorRate` whenever an item failed, and marks it `exceeded`
+   * when more than this fraction of the attempted items failed; the CLI then
+   * exits non-zero. It exists because a run that lost most of its items to
+   * throttling or an incident otherwise exits clean and is scored over the
+   * survivors.
+   *
+   * Rate = `coverage.items.failed / (count − cancelled − budget_skipped −
+   * budget_interrupted)`: cancelled and budget-stopped items are reported by
+   * their own gates and never count twice. Fires on strictly `>`, so `1`
+   * disables it (the CLI flag `--max-item-error-rate` overrides this value).
+   * A run with nothing attempted never fires.
+   *
+   * Unlike `failOnScorerErrorRate`, an invalid value (non-number, non-finite,
+   * `< 0` or `> 1`) makes `runEval` THROW `AxlError('INVALID_ITEM_ERROR_RATE')`
+   * before the dataset loads: warning and skipping would silently switch off a
+   * default-on gate.
+   */
+  failOnItemErrorRate?: number;
   metadata?: Record<string, unknown>;
+};
+
+/**
+ * A run's item error rate against its `failOnItemErrorRate` limit, on
+ * `EvalSummary.itemErrorRate`. See {@link EvalConfig.failOnItemErrorRate} for
+ * the definition.
+ */
+export type ItemErrorRate = {
+  /** Items whose workflow threw — `coverage.items.failed`. */
+  failed: number;
+  /** `count − cancelled − budget_skipped − budget_interrupted`. */
+  attempted: number;
+  /** `failed / attempted`; `0` when nothing was attempted. */
+  rate: number;
+  /** The limit in force for this run (config or CLI flag, default `0.05`). */
+  limit: number;
+  /** `rate > limit` with at least one attempted item. */
+  exceeded: boolean;
 };
 
 /**
@@ -83,9 +215,32 @@ export type EvalResult = {
    */
   metadata: Record<string, unknown>;
   timestamp: string;
+  /**
+   * Compatibility view of `accounting.knownCost` — the sum of settled, disjoint
+   * charges Axl observed. A caller-reported `cost` is NEVER part of it (read
+   * `accounting.callerReported` for those). Lower bound when `unpriced` is set.
+   */
   totalCost: number;
-  /** True when `totalCost` is a lower bound because at least one item used unpriced work. */
+  /** True when `totalCost` is a lower bound — present iff `accounting.completeness !== 'complete'`. */
   unpriced?: boolean;
+  /**
+   * The authoritative record `totalCost` / `unpriced` are derived from.
+   * Required on results this version produces; optional so a pre-0.24 artifact
+   * still types. Read it through `readAccounting()`, which reports an absent
+   * record as `'unverified'` instead of silently treating it as complete.
+   */
+  accounting?: EvalAccounting;
+  /**
+   * What this run captured of the requests it submitted, when
+   * `captureRequests` was on. Present only for a capturing run — the default
+   * artifact carries no `diagnostics` key at all.
+   *
+   * It is a POINTER plus a self-assessment, never content: `artifactId` names
+   * bytes owned by the runtime that saved this result, and `status`/`reason`
+   * say whether those bytes are complete, truncated, interrupted or
+   * unavailable. Numeric results stay readable when the artifact is gone.
+   */
+  diagnostics?: DiagnosticManifest;
   duration: number;
   items: EvalItem[];
   summary: EvalSummary;
@@ -95,7 +250,22 @@ export type ScorerDetail = {
   score: number | null;
   metadata?: Record<string, unknown>;
   duration?: number;
+  /**
+   * Compatibility view of `accounting.knownCost` for this scorer. Falls back to
+   * a scorer-returned `cost` ONLY when the runtime measured nothing at all
+   * (no `trackOutcome`); a caller value never overrides a measured one and is
+   * never summed into any total.
+   */
   cost?: number;
+  /** How this scorer ended for this item. Absent only on pre-0.24 artifacts. */
+  outcome?: ScorerOutcome;
+  /** This scorer's own operations for this item (judging spend, plus any
+   *  `externalOperation` it declared). Absent on pre-0.24 artifacts. */
+  accounting?: Accounting;
+  /** The captured operations this judge performed for this item. Present only
+   *  under `captureRequests`; references only, resolved through the run's
+   *  artifact. */
+  diagnostics?: { operations: OperationRef[] };
   /**
    * `true` when the scorer's `applies` predicate returned `false` for this item,
    * so the scorer was deliberately skipped (NOT run). Distinct from a `null`
@@ -149,11 +319,15 @@ type TimingStats = { mean: number; min: number; max: number; p50: number; p95: n
 /**
  * Per-model latency stats across a run, on `EvalSummary.modelTiming`.
  *
- * Every field here is a distribution over **per-call** values, pooled across all
- * of the run's successful items — the same population `calls` counts. One
- * provider call is one sample, so an item that makes ten calls weighs ten times
- * an item that makes one. That is the right weighting for a model comparison:
- * these numbers describe the model's latency, not the item's.
+ * Every field here is a distribution over **per-call** values, pooled across
+ * every successful provider call the run made — the same population `calls`
+ * counts. Since 0.24 that includes the calls made by items that later FAILED or
+ * were stopped on budget: those calls really happened and really took that long,
+ * and dropping them would bias the latency of exactly the models whose slowness
+ * caused the timeouts. One provider call is one sample, so an item that makes
+ * ten calls weighs ten times an item that makes one. That is the right
+ * weighting for a model comparison: these numbers describe the model's latency,
+ * not the item's.
  *
  * This is deliberately a different weighting from the wall-clock
  * `EvalSummary.timing`, which samples once per item because it describes the
@@ -176,6 +350,14 @@ export type ModelTimingStats = {
    *  throttled hard on the day of the run shows it here, which is what keeps
    *  `wireMs` an honest comparison. */
   retryMs: TimingStats;
+  /** Total `CallTiming.rateLimitRetries` over the same calls `calls` counts:
+   *  how many rate-limit 429s this model's calls absorbed and retried. A plain
+   *  sum, not a distribution; a call that did not report the field adds `0`.
+   *  Nonzero means the provider throttled the run, so lower `concurrency`
+   *  before calls start failing. `runEval` always sets it; optional because
+   *  artifacts written before it existed do not carry it, so treat absence as
+   *  "not recorded", not as `0`. */
+  rateLimitRetries?: number;
   /** Per-call time to first content delta (ms), over the STREAMING calls that
    *  reported one — non-streaming calls are excluded from the sample rather
    *  than entered as `0`. Absent when no call reported one. This is the
@@ -190,20 +372,70 @@ export type ModelTimingStats = {
   firstTokenCalls?: number;
 };
 
+/**
+ * Why an item's workflow failed, captured from the thrown value before it is
+ * flattened to `EvalItem.error`. Populated on `failed` items only.
+ *
+ * When a `ProviderError` is found — the thrown value itself or the first one
+ * down its `cause` chain — every field comes from it. Otherwise only the thrown
+ * value's `name` is recorded. This record never copies `ProviderError.body` or
+ * the message: the body can echo prompt text and is redaction-eligible.
+ * `EvalItem.error` keeps the error message as before, which for some providers
+ * (a non-JSON error response) embeds the response text — that is outside this
+ * record's guarantee.
+ */
+export type EvalItemFailure = {
+  /** `'ProviderError'` when one was found, else the thrown value's own `name`. */
+  name: string;
+  /** Adapter/profile name, e.g. `'openai'`. */
+  provider?: string;
+  /** HTTP status; `0` for a network-level failure. */
+  status?: number;
+  /** `ProviderError.retryable` — the semantic failover hint. */
+  retryable?: boolean;
+  /** Provider request id, when the response carried one. */
+  requestId?: string;
+};
+
 export type EvalItem = {
   input: unknown;
   annotations?: unknown;
   output: unknown;
   error?: string;
+  /**
+   * Structured cause of a `failed` item — see {@link EvalItemFailure}. Absent
+   * on every other outcome, on pre-0.24 artifacts, and when the thrown value
+   * carried no `name` (a thrown string, say).
+   */
+  failure?: EvalItemFailure;
   scorerErrors?: string[];
   scores: Record<string, number | null>;
   duration?: number;
+  /** Compatibility view of `accounting.breakdown.generation` — this item's
+   *  measured workflow spend. On a pre-0.24 artifact this is whatever the
+   *  caller reported instead. */
   cost?: number;
   /** True when `cost` is a lower bound because this item used unpriced work. */
   unpriced?: boolean;
+  /** Compatibility view of `accounting.breakdown.judging` — this item's judges. */
   scorerCost?: number;
   scoreDetails?: Record<string, ScorerDetail>;
-  /** Tracked metadata merged with user keys (user wins; list-only overrides clear paired counts). */
+  /** How this item ended. Absent only on pre-0.24 artifacts. */
+  outcome?: EvalItemOutcome;
+  /** Generation AND judging spend for this item; `breakdown` splits them.
+   *  Absent on pre-0.24 artifacts. */
+  accounting?: Accounting;
+  /**
+   * What the `executeWorkflow` callback claimed, kept for inspection and never
+   * used as a measurement. `cost` is the callback's own `cost` return;
+   * `metadata` holds the reserved keys (`models`, `modelCallCounts`,
+   * `workflows`, `workflowCallCounts`, `tokens`, `agentCalls`) that used to
+   * overwrite the measured ones. Non-reserved caller keys still merge into
+   * `metadata` below.
+   */
+  callerReport?: { cost?: number; metadata?: Record<string, unknown> };
+  /** Tracked metadata merged with the caller's NON-reserved keys (caller wins
+   *  on those). Reserved keys stay measured — see {@link EvalItem.callerReport}. */
   metadata?: Record<string, unknown>;
   /** Per-model provider-call latency for this item, rolled up from
    *  `agent_call_end.timing`. Absent when the item made no timed provider call
@@ -219,6 +451,9 @@ export type EvalItem = {
    *  sums and per-model totals from `item.timing`, but not the distribution.
    *  (`rescore` already reports no timing stats at all, so nothing regresses.) */
   timing?: Record<string, ItemModelTiming>;
+  /** The captured operations this item's workflow performed. Present only under
+   *  `captureRequests`; references only, resolved through the run's artifact. */
+  diagnostics?: { operations: OperationRef[] };
   /** Trace events captured during this item's execution. Only populated when
    *  `runEval` was called with `{ captureTraces: true }`. Verbose-mode
    *  `agent_call_start.data.messages` snapshots are stripped to keep memory bounded;
@@ -228,7 +463,18 @@ export type EvalItem = {
 
 export type EvalSummary = {
   count: number;
+  /**
+   * Items carrying an `error` string. UNCHANGED legacy meaning — it therefore
+   * still counts budget-stopped and cancelled items, which also carry one. Read
+   * {@link EvalSummary.coverage} to tell a model failure from a budget stop.
+   */
   failures: number;
+  /**
+   * Per-outcome counts for items and for each scorer. Every key of the outcome
+   * unions is present, including zeros, so a consumer can render "0 skipped"
+   * without inferring it from an absent key. Absent on pre-0.24 artifacts.
+   */
+  coverage?: EvalCoverage;
   scorers: Record<
     string,
     {
@@ -282,6 +528,15 @@ export type EvalSummary = {
    * tripped (either not configured or all scorers within tolerance).
    */
   degraded?: DegradedScorer[];
+  /**
+   * The item error rate against the run's `failOnItemErrorRate` limit.
+   * Present exactly when at least one item `failed` (so a clean run's summary
+   * is unchanged); `exceeded` says whether the gate tripped. Like `degraded`,
+   * `runEval` never throws on it — the CLI and consumers decide the exit code.
+   * Absent on rescores (the source run owns item failures) and on pre-0.24
+   * artifacts.
+   */
+  itemErrorRate?: ItemErrorRate;
 };
 
 /**
@@ -384,7 +639,20 @@ export type EvalComparison = {
     baselineTotal: number;
     candidateTotal: number;
     delta: number;
-    deltaPercent: number;
+    /** `null` when the baseline total is 0 — a percentage change from zero is
+     *  not a number, and reporting `0` or `Infinity` misleads. */
+    deltaPercent: number | null;
+    /**
+     * `true` only when the two sides are comparable as SPEND: both accountings
+     * `complete`, the same `scope`, and the same case/scorer coverage. A
+     * partial or budget-truncated run is cheaper because it did less work, so
+     * without this an incomplete candidate reads as a saving.
+     *
+     * Raw totals are reported either way, and quality comparison is unaffected.
+     */
+    certified: boolean;
+    /** Why certification was refused. Present exactly when `certified` is false. */
+    reason?: string;
   };
   regressions: EvalRegression[];
   improvements: EvalImprovement[];
@@ -444,4 +712,20 @@ export type RunEvalOptions = {
    * payload, subscribe to `runtime.on('trace', ...)` directly.
    */
   captureTraces?: boolean;
+  /**
+   * Capture the provider-neutral REQUESTS this run submits into a diagnostic
+   * artifact, so a failed case can be inspected after the process exits.
+   *
+   * Off by default and deliberately explicit to turn on: it requires
+   * `config.diagnostics.artifacts` on the runtime, and without it the run fails
+   * fast with `AxlError('DIAGNOSTICS_UNAVAILABLE')` BEFORE the dataset is
+   * loaded — a capture misconfiguration must never be discovered after the run
+   * has already spent money.
+   *
+   * Capture is diagnostics, never measurement: `accounting` is byte-identical
+   * with capture on, off, truncated, or failing outright. Pass an object to
+   * override the byte bounds (defaults 256 KiB per record, 16 MiB per run,
+   * 1 MiB pending queue).
+   */
+  captureRequests?: CaptureRequestsOption;
 };

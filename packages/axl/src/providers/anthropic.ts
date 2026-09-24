@@ -1,3 +1,4 @@
+import { tableEstimate } from './cost-provenance.js';
 import type {
   EffortResolution,
   Provider,
@@ -15,7 +16,9 @@ import { resolveThinkingOptions, resolveApiKey, type ApiKeySource } from './type
 import { fetchWithRetry } from './retry.js';
 import { CallTimingRecorder, withCallTiming, withChatTiming } from './call-timing.js';
 import { buildProviderError } from './errors.js';
-import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
+import type { RateLimitConfig } from './rate-limiter.js';
+import { ANTHROPIC_DEFAULT_BASE_URL } from './default-endpoints.js';
+import { AdapterGovernors, type ScopeGovernor } from './governor-pool.js';
 import { assertSafeProviderBaseUrl } from '../http-transport.js';
 import type { InputContentPart, InputMediaSource } from '../input.js';
 import { UnsupportedModelInputError } from '../errors.js';
@@ -874,7 +877,12 @@ export class AnthropicProvider implements Provider {
 
   private baseUrl: string;
   private apiKeySource: ApiKeySource;
-  private governor?: RateLimiter;
+  /**
+   * Namespaced so it cannot collide with a member a downstream subclass
+   * declares. A plain property (not `#private` or a WeakMap keyed by `this`)
+   * so a caller's own Proxy around the adapter still reaches it.
+   */
+  private readonly axlRateGovernors: AdapterGovernors;
 
   constructor(
     options: {
@@ -885,13 +893,22 @@ export class AnthropicProvider implements Provider {
     } = {},
   ) {
     this.apiKeySource = options.apiKey ?? process.env.ANTHROPIC_API_KEY ?? '';
-    this.baseUrl = (options.baseUrl ?? 'https://api.anthropic.com/v1').replace(/\/$/, '');
+    this.baseUrl = (options.baseUrl ?? ANTHROPIC_DEFAULT_BASE_URL).replace(/\/$/, '');
     assertSafeProviderBaseUrl(
       this.baseUrl,
       'Anthropic provider',
       options.dangerouslyAllowInsecureHttp,
     );
-    this.governor = options.rateLimit ? new RateLimiter(options.rateLimit) : undefined;
+    this.axlRateGovernors = new AdapterGovernors(
+      this,
+      {
+        family: this.name,
+        baseUrl: this.baseUrl,
+        apiKeySource: this.apiKeySource,
+        adapterName: this.name,
+      },
+      options.rateLimit,
+    );
 
     // Eager validation for the string case; a function source is validated per
     // request in resolveKey().
@@ -900,6 +917,11 @@ export class AnthropicProvider implements Provider {
         'Anthropic API key is required. Set ANTHROPIC_API_KEY or pass apiKey in options.',
       );
     }
+  }
+
+  /** The rate governor for one call to `model`, from the runtime's per-scope pool. */
+  protected governorFor(model: string): ScopeGovernor {
+    return this.axlRateGovernors.governorFor(model);
   }
 
   /** Resolve the API key for one request (supports an expiring-token callback). */
@@ -926,6 +948,7 @@ export class AnthropicProvider implements Provider {
     const pricingContext = pricingContextFromBody(body);
 
     const recorder = new CallTimingRecorder(options.requestLifecycle);
+    const governor = this.governorFor(pricingContext.model ?? options.model);
     const res = await fetchWithRetry(
       `${this.baseUrl}/messages`,
       {
@@ -934,7 +957,12 @@ export class AnthropicProvider implements Provider {
         body: JSON.stringify(body),
         signal: options.signal,
       },
-      { governor: this.governor, provider: this.name, timing: recorder.observer },
+      {
+        governor,
+        provider: this.name,
+        timing: recorder.observer,
+        admission: options.dispatchAdmission,
+      },
     );
 
     if (!res.ok) {
@@ -967,6 +995,7 @@ export class AnthropicProvider implements Provider {
     const pricingContext = pricingContextFromBody(body);
 
     const recorder = new CallTimingRecorder(options.requestLifecycle);
+    const governor = this.governorFor(pricingContext.model ?? options.model);
     const res = await fetchWithRetry(
       `${this.baseUrl}/messages`,
       {
@@ -975,7 +1004,12 @@ export class AnthropicProvider implements Provider {
         body: JSON.stringify(body),
         signal: options.signal,
       },
-      { governor: this.governor, provider: this.name, timing: recorder.observer },
+      {
+        governor,
+        provider: this.name,
+        timing: recorder.observer,
+        admission: options.dispatchAdmission,
+      },
     );
 
     if (!res.ok) {
@@ -1367,6 +1401,7 @@ export class AnthropicProvider implements Provider {
       tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
       usage: normalized?.usage,
       cost,
+      costProvenance: tableEstimate(cost),
       providerMetadata:
         thinkingBlocks.length > 0 && !hasFallbackBoundary
           ? { anthropicThinkingBlocks: thinkingBlocks }
@@ -1408,22 +1443,26 @@ export class AnthropicProvider implements Provider {
       pricingUsage = normalized?.pricingUsage;
     };
 
-    const doneChunk = (): Extract<StreamChunk, { type: 'done' }> => ({
-      type: 'done',
-      usage,
-      cost:
+    const doneChunk = (): Extract<StreamChunk, { type: 'done' }> => {
+      const cost =
         pricingUsage &&
         !pricingContext.hasRichInput &&
         !unpricedModifier &&
         !hasFallbackBoundary &&
         !refused
           ? estimateAnthropicCost(effectiveModel, pricingUsage)
-          : undefined,
-      providerMetadata:
-        thinkingBlocks.length > 0 && !hasFallbackBoundary && !hasFallbackIterationSignal
-          ? { anthropicThinkingBlocks: thinkingBlocks }
-          : undefined,
-    });
+          : undefined;
+      return {
+        type: 'done',
+        usage,
+        cost,
+        costProvenance: tableEstimate(cost),
+        providerMetadata:
+          thinkingBlocks.length > 0 && !hasFallbackBoundary && !hasFallbackIterationSignal
+            ? { anthropicThinkingBlocks: thinkingBlocks }
+            : undefined,
+      };
+    };
 
     try {
       while (true) {

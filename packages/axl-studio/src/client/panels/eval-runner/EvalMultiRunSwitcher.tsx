@@ -1,5 +1,6 @@
 import { ChevronLeft, ChevronRight } from 'lucide-react';
 import type { MultiRunAggregate } from './types';
+import { SpendBadge } from './SpendBadge';
 
 type Props = {
   currentIndex: number;
@@ -46,6 +47,26 @@ export function EvalMultiRunSwitcher({ currentIndex, totalRuns, aggregate, onInd
                 <div className="text-xs text-[hsl(var(--muted-foreground))]">
                   Overall mean: {overallMean.toFixed(3)} across {scorerValues.length} scorer
                   {scorerValues.length !== 1 ? 's' : ''}
+                  {/* The group's UNIONED spend, so switching to the aggregate
+                      view never upgrades a mixed group to run[0]'s confidence. */}
+                  {aggregate.accounting && (
+                    <span className="ml-2 inline-flex items-center gap-1">
+                      <span aria-hidden="true">·</span>
+                      {/* `SpendBadge` already renders the chip and carries the
+                          full completeness sentence in its accessible name;
+                          repeating it here printed "incomplete (incomplete:
+                          1 unpriced_model)" and a redundant "(complete)". */}
+                      <SpendBadge accounting={aggregate.accounting} label="Group known spend" />
+                      {(aggregate.budgetStoppedRuns ?? 0) > 0 && (
+                        <span
+                          className="text-[10px] font-medium text-amber-600 dark:text-amber-400"
+                          title={`${aggregate.budgetStoppedRuns} run(s) in this group stopped on budget`}
+                        >
+                          budget stopped
+                        </span>
+                      )}
+                    </span>
+                  )}
                 </div>
               );
             })()}

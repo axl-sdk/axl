@@ -271,6 +271,9 @@ npx axl-eval ./evals/ --config ./axl.config.ts      # use a specific runtime con
 npx axl-eval ./evals/ --conditions development      # add Node.js import conditions (monorepo source exports)
 npx axl-eval ./evals/qa.eval.ts --concurrency 10    # override item concurrency for this run
 npx axl-eval ./evals/qa.eval.ts --scorers accuracy  # run only named scorer(s) (single file)
+npx axl-eval ./evals/qa.eval.ts --capture-requests  # also record the requests Axl submitted
+npx axl-eval ./evals/qa.eval.ts --budget 2.50       # stop admitting paid work once known spend reaches $2.50
+npx axl-eval ./evals/qa.eval.ts --max-item-error-rate 0.1  # allow up to 10% of items to fail (default 5%; 1 disables)
 ```
 
 The CLI resolves a runtime automatically: `--config <path>` > auto-detect `axl.config.*` > bare `new AxlRuntime()` (providers from env vars). Use `--conditions` when your eval file imports from monorepo packages that use conditional exports (e.g., `"development"` condition for source TypeScript instead of compiled dist).
@@ -308,9 +311,31 @@ npx axl-eval compare base.json cand.json --fail-on-regression --max-scorer-error
 
 Building a custom CI gate? Both decisions are exported as pure functions — `evaluateScorerErrorRateGate` and `evaluateScorerTolerance` (see the [API reference](../../docs/api-reference.md)).
 
+#### Item error rate — on by default
+
+A run that loses items in the *workflow* (a rate-limit storm, an incident, a tool bug) is scored over the survivors, so its means can look healthy while most of the dataset never ran. `axl-eval` therefore fails a run by default when **more than 5%** of its attempted items failed:
+
+```
+  Items: 89 completed, 250 failed — item error rate 73.7% (limit 5%)
+  Failure causes: 250 × 429 (openai)
+[axl-eval] ITEM ERROR RATE EXCEEDED: qa.eval.ts — 250 of 339 attempted item(s) failed in the workflow (item error rate 73.7%), over the 5% limit; …
+```
+
+The rate is `failed / (count − cancelled − budget_skipped − budget_interrupted)`: a cancelled or budget-stopped item is reported by its own gate and never counts here, and the gate fires on strictly `>`. Under `--runs N` every run is gated on its own, and the failing run is named. The artifact is still written.
+
+| Knob | Where | Effect |
+|------|-------|--------|
+| `failOnItemErrorRate` (config field, default `0.05`) | **Source-side** — `runEval` | Sets the limit; `runEval` records `summary.itemErrorRate` whenever an item failed. An invalid value throws before the dataset loads. |
+| `--max-item-error-rate <0..1>` (run flag) | CLI | Overrides the config for this invocation. `1` disables the gate (the rate is still printed). |
+| `--max-item-error-rate <0..1>` (compare flag, default `0.05`) | **Gate-side** — `axl-eval compare` | Refuses to certify a side (any compared run) whose item error rate is over the limit, including legacy artifacts (rate derived from their items). Warns about a side that lost items within the limit. |
+
+Each failed item records **why** on `item.failure` — `{ name, provider, status, retryable, requestId }` taken from the first `ProviderError` on the thrown value or its `cause` chain, or just the thrown `name` otherwise — and the table groups them on the `Failure causes:` line (`network` is status `0`, `other` is a non-provider failure), so a rate-limit storm reads differently from a bug. `failure` never records `ProviderError.body`; `item.error` keeps the error message as before, which for some providers can include error-response text.
+
+`rescore` does not apply the gate — its failed items belong to the source run — and rejects the flag; `compare` re-applies the floor to a rescored artifact. Building your own gate? `evaluateItemErrorRateGate(baseline, candidate, limit?)` is exported.
+
 #### Total-workflow-wipeout guard
 
-Separate from the scorer signal above: if **every** item errored in the *workflow* (0 succeeded), the eval produced no scorable output, so `axl-eval` always exits non-zero with `FAILED: … all N item(s) errored in the workflow` — a fully-broken eval (bad provider URI, an exception in every run) can never go green in CI. This is non-configurable (a 0%-success eval is unambiguously broken) and distinct from `failOnScorerErrorRate` (which is about a flaky *scorer* and deliberately ignores a run with no scored items). Partial workflow-failure rates stay visible (`Failures: N/M` in the table) but non-gating.
+Separate from the gates above: if **every** item errored in the *workflow* (0 succeeded), the eval produced no scorable output, so `axl-eval` always exits non-zero with `FAILED: … all N item(s) errored in the workflow` — a fully-broken eval (bad provider URI, an exception in every run) can never go green in CI. This is non-configurable (a 0%-success eval is unambiguously broken) and still applies with the item gate disabled (`--max-item-error-rate 1`). It is distinct from `failOnScorerErrorRate` (which is about a flaky *scorer* and deliberately ignores a run with no scored items).
 
 ### Programmatic
 
@@ -381,7 +406,12 @@ const results = await runEval(
 );
 ```
 
-**Trust-boundary validation on workflow returns.** When your `executeWorkflow` callback returns `{ output, cost, metadata }`, the runner validates the untrusted fields before trusting them: `cost` must be a non-negative finite number, `metadata` must be a plain object (`Date`, `Map`, `Set`, class instances are rejected). Invalid values trigger a `console.warn` and fall back to trace-derived values from `runtime.trackExecution()`. A buggy workflow returning `{ cost: 'free' }` no longer silently NaN-poisons `totalCost`.
+**A returned `cost` is a claim, not a total.** Spend is measured by the runtime, so a
+`cost` your `executeWorkflow` callback returns never sets `item.cost` and never feeds
+`totalCost`. It is preserved verbatim on `item.callerReport.cost` (and summarized on
+`accounting.callerReported`) so you can still inspect it or compare it against what was
+actually measured. The value is still validated — a non-negative finite number, or it is
+dropped with a `console.warn` — so `{ cost: 'free' }` can poison nothing.
 
 **Additive item metadata.** Returning `{ output, metadata: { category: 'billing' } }`
 preserves tracked models, tokens, agent calls, and workflow attribution, with or without
@@ -435,8 +465,12 @@ console.log(results.summary.scorers['quality'].skipped); // 0  (items the applie
 console.log(results.summary.count);                     // 50 items
 console.log(results.summary.failures);                  // 2 workflow errors
 console.log(results.summary.timing);                    // { mean, min, max, p50, p95 } in ms — WORKFLOW wall clock
-console.log(results.summary.modelTiming);               // per model: { calls, wireMs, queuedMs, retryMs, firstTokenMs? } — PROVIDER latency, per-CALL distributions
-console.log(results.totalCost);                          // 0.42 (workflow + scorer LLM costs)
+console.log(results.summary.modelTiming);               // per model: { calls, wireMs, queuedMs, retryMs, firstTokenMs?, rateLimitRetries? } — PROVIDER latency, per-CALL distributions
+console.log(results.totalCost);                          // 0.42 — MEASURED spend (workflow + judges)
+console.log(results.unpriced);                            // true when that total is only a lower bound
+console.log(results.accounting.completeness);             // 'complete' | 'incomplete' | 'unverified'
+console.log(results.accounting.breakdown);                // { generation, judging, external }
+console.log(results.summary.coverage.items);              // { completed, failed, cancelled, budget_skipped, budget_interrupted }
 console.log(results.metadata.models);                    // ["openai:gpt-4o"] (sorted by usage)
 console.log(results.metadata.modelCounts);               // { "openai:gpt-4o": 48, "openai:gpt-4o-mini": 2 } (total LLM calls per model)
 
@@ -447,7 +481,7 @@ for (const item of results.items) {
   // Timing and cost
   console.log(item.duration);                            // workflow execution ms (tools, gates, queue and all)
   console.log(item.timing);                              // per model: { calls, queuedMs, retryMs, wireMs, firstTokenMs?, firstTokenCalls? } sums — absent if nothing was timed
-  console.log(item.cost);                                // workflow LLM cost
+  console.log(item.cost);                                // measured generation spend (kept even if the case later threw)
   console.log(item.scorerCost);                          // total scorer cost for this item
 
   // Execution metadata (models, tokens, agent calls — captured by AxlRuntime)
@@ -546,6 +580,7 @@ Compare two runs to detect regressions and improvements. Runs must use the same 
 npx axl-eval compare ./results/v1.json ./results/v2.json
 npx axl-eval compare v1.json v2.json --fail-on-regression  # exit 1 if significant regressions
 npx axl-eval compare v1.json v2.json --max-scorer-error-rate 0.05  # exit 1 if a scorer failed on >5% of the items it ran against (deterministic scorers: zero tolerance)
+npx axl-eval compare v1.json v2.json --max-item-error-rate 0.2     # accept a side that lost up to 20% of its items (default 5%, always on; 1 disables)
 ```
 
 ```
@@ -675,13 +710,56 @@ export async function executeWorkflow(input: { raw: string }) {
 
 ### Cost tracking
 
-Cost is tracked automatically — the runner wraps each item with `runtime.trackCost()`. LLM scorer costs are also included in `totalCost` and count toward the `budget` limit.
+Cost is measured automatically: the runner opens an accounting scope per run, per item,
+and per scorer, so `totalCost` is what the runtime observed rather than a sum over trace
+events. Judge costs are included and count toward the `budget` limit. Spend the runtime
+could not price is reported as unknown (`unpriced`, with `accounting.reasons`) rather
+than as zero — and because unknown spend cannot be enforced against, it does not consume
+a budget either.
 
-To override (e.g., exclude setup calls), return cost explicitly:
+### Captured requests (opt-in)
+
+When a score looks wrong, the next question is what the model was actually
+asked. `captureRequests` records the request Axl submitted for every model call
+in the run — case turns, tool continuations, nested asks and LLM judges — beside
+the result rather than inside it:
 
 ```typescript
+const runtime = new AxlRuntime({
+  diagnostics: { artifacts: { root: '.axl/artifacts' } },
+});
+
+const results = await runEval(config, executeWorkflow, runtime, {
+  captureRequests: true,
+});
+
+results.diagnostics;                                   // { status, records, bytes, redaction, … }
+results.items[0].diagnostics?.operations;              // the generation calls behind this item
+results.items[0].scoreDetails?.quality.diagnostics;    // the judge's own calls
+```
+
+```bash
+npx axl-eval ./evals/qa.eval.ts --capture-requests --output ./results/v1.json
+# also writes ./results/v1.requests.jsonl
+```
+
+Capture is **off** by default, requires a configured artifact store (a run that
+asks for it without one fails before the dataset loads), is bounded per record /
+per run / per pending queue, and never delays a provider call. It is on a
+different rail from accounting: a failing, truncated or redacted capture leaves
+the numbers byte-identical and reports the loss on `diagnostics.status`. See
+[observability.md](../../docs/observability.md#captured-requests-opt-in).
+
+A returned cost can no longer override that measurement — it would let a workflow
+understate what it spent. Report one anyway if it is useful to compare against:
+
+```typescript
+// Recorded on item.callerReport.cost; item.cost stays the measured figure.
 return { output, cost: ctx.totalCost };
 ```
+
+To genuinely exclude work from a run's spend, do it outside the eval — for example warm
+up a cache before calling `runEval` — rather than by subtracting after the fact.
 
 ### Common patterns
 
@@ -698,7 +776,17 @@ export default defineEval({
 });
 ```
 
-`scorerConcurrency` parallelizes the per-item judge phase — the dominant cost for evals with several `llmScorer`s. The worst-case number of simultaneous scorer calls is `concurrency × scorerConcurrency`, so a rate-limited judge model may need a lower value (set `scorerConcurrency: 1` for the old serial behavior). Because the per-item `budget` check runs once before an item's scorers, scorer-cost overshoot is bounded by `concurrency × scorerConcurrency × max-scorer-cost`.
+`scorerConcurrency` parallelizes the per-item judge phase — the dominant cost for evals with several `llmScorer`s. The worst-case number of simultaneous scorer calls is `concurrency × scorerConcurrency`, so a rate-limited judge model may need a lower value (set `scorerConcurrency: 1` for the old serial behavior).
+
+**`budget` is a threshold, not a reservation.** Admission closes once known spend reaches
+the limit: later cases become `budget_skipped`, later LLM scorers are skipped,
+deterministic scorers still run, and a case whose next call is refused becomes
+`budget_interrupted` while keeping the charge it already incurred. Calls already in
+flight are allowed to settle, so the run can end slightly over —
+`accounting.budget.knownOvershoot` says by how much, and the higher your `concurrency ×
+scorerConcurrency`, the larger that can be. An invalid limit throws before the dataset is
+even loaded. The CLI prints a distinct `[axl-eval] BUDGET STOPPED …` line and exits
+non-zero without counting the stop as a model failure.
 
 **Per-item budget** — cap cost for a single workflow execution:
 
@@ -755,7 +843,9 @@ const rescored = await rescore(originalResult, [updatedScorer, newScorer], runti
 
 console.log(rescored.metadata.rescored);    // true
 console.log(rescored.metadata.originalId);  // original result ID
-console.log(rescored.totalCost);            // scorer cost only
+console.log(rescored.totalCost);            // judging only — the original generation is not re-counted
+console.log(rescored.accounting.scope);     // 'rescore'
+console.log(rescored.accounting.source);    // { runId, generation } — the run this was scored from
 ```
 
 ## Multi-Run
@@ -837,6 +927,10 @@ const comparison = evalCompare(baselineRuns, candidateRuns);
 | Type | Description |
 |------|-------------|
 | `EvalConfig` | Eval definition (workflow, dataset, scorers, concurrency, scorerConcurrency, budget) |
+| `readAccounting(result)` | A result's accounting, or an `unverified` record synthesized from a pre-0.24 artifact's `totalCost` |
+| `aggregateAccounting(inputs)` | Fold several accounting records conservatively — sums known spend, unions reasons, worst completeness wins |
+| `EvalAccounting` / `EvalCoverage` | Run accounting (scope, budget, source, caller claims) and the item / scorer outcome counts |
+| `EvalItemOutcome` / `ScorerOutcome` | `completed \| failed \| cancelled \| budget_skipped \| budget_interrupted`, and the scorer equivalent with `scored` / `skipped` |
 | `EvalResult` | Full eval output (items, summary, cost, duration) |
 | `EvalItem` | Per-item result (input, output, scores, scoreDetails, metadata, traces?, `timing?`) |
 | `EvalSummary` | Aggregate statistics (count, failures, per-scorer stats incl. `scored`/`failed`/`skipped`, wall-clock `timing`, per-model `modelTiming?`) |

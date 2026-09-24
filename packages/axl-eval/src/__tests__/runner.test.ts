@@ -7,7 +7,14 @@ import type { Scorer } from '../scorer.js';
 import { llmScorer } from '../llm-scorer.js';
 import { runEval } from '../runner.js';
 import type { EvalProgressEvent } from '../types.js';
+import { askExecute, fixtureAgent, scriptedRuntime } from './accounting-helpers.js';
+import { agent as makeAgent, workflow as makeWorkflow } from '@axlsdk/axl';
 
+/**
+ * A runtime with no `trackOutcome`. Tests using it exercise the UNINSTRUMENTED
+ * path deliberately: nothing is measured, so `totalCost` is 0 with an explicit
+ * `uninstrumented` reason and any caller `cost` stays a caller report.
+ */
 const mockRuntime = {} as AxlRuntime;
 
 const testDataset = dataset({
@@ -641,25 +648,28 @@ describe('runEval()', () => {
     expect(result.items[0].scorerErrors![0]).toContain('Unknown provider');
   });
 
-  it('accumulates LLM scorer cost in totalCost', async () => {
-    const mockProvider = {
-      chat: async () => ({
-        content: JSON.stringify({ score: 0.9, reasoning: 'Good' }),
-        cost: 0.002,
-      }),
+  it('measures LLM scorer cost into totalCost and splits it from generation', async () => {
+    // Generation and judging both go through the runtime, so both are measured
+    // and the run can say which half the money went to.
+    const { runtime } = scriptedRuntime([{ cost: 0.001 }]);
+    let call = 0;
+    const provider = {
+      name: 'judge-provider',
+      chat: async () => {
+        call++;
+        return {
+          content: JSON.stringify({ score: 0.9, reasoning: 'Good' }),
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          cost: 0.002,
+        };
+      },
     };
-
-    const mockRuntimeWithResolver = {
-      resolveProvider: (uri: string) => ({
-        provider: mockProvider,
-        model: uri.includes(':') ? uri.split(':').slice(1).join(':') : uri,
-      }),
-    } as unknown as AxlRuntime;
+    runtime.registerProvider('judge', provider as never);
 
     const llmScore = llmScorer({
       name: 'judge',
       description: 'test',
-      model: 'mock:model',
+      model: 'judge:model',
       system: 'Rate it',
       schema: z.object({ score: z.number(), reasoning: z.string() }),
     });
@@ -672,33 +682,43 @@ describe('runEval()', () => {
 
     const result = await runEval(
       { workflow: 'test', dataset: ds, scorers: [llmScore] },
-      async () => ({ output: 'output', cost: 0.001 }),
-      mockRuntimeWithResolver,
+      askExecute({ callerCost: 0.001 }),
+      runtime,
     );
 
-    // 2 items × $0.001 workflow + 2 items × $0.002 scorer = $0.006
-    expect(result.totalCost).toBeCloseTo(0.006, 6);
+    expect(call).toBe(2);
+    // 2 generation calls at $0.001 + 2 judge calls at $0.002.
+    expect(result.totalCost).toBeCloseTo(0.006, 10);
+    expect(result.accounting!.breakdown.generation).toBeCloseTo(0.002, 10);
+    expect(result.accounting!.breakdown.judging).toBeCloseTo(0.004, 10);
+    // The caller also claimed $0.001 per item; it is recorded, not added.
+    expect(result.accounting!.callerReported).toEqual({
+      costItems: 2,
+      costTotal: 0.002,
+      metadataItems: 0,
+    });
+    for (const item of result.items) {
+      expect(item.cost).toBeCloseTo(0.001, 10);
+      expect(item.scorerCost).toBeCloseTo(0.002, 10);
+      expect(item.scoreDetails!.judge.accounting!.knownCost).toBeCloseTo(0.002, 10);
+    }
   });
 
-  it('LLM scorer cost counts toward budget', async () => {
-    const mockProvider = {
+  it('LLM scorer cost counts toward the budget', async () => {
+    const { runtime } = scriptedRuntime([{ cost: 0.001 }]);
+    runtime.registerProvider('judge', {
+      name: 'judge',
       chat: async () => ({
         content: JSON.stringify({ score: 0.9, reasoning: 'Good' }),
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
         cost: 0.003,
       }),
-    };
-
-    const mockRuntimeWithResolver = {
-      resolveProvider: (uri: string) => ({
-        provider: mockProvider,
-        model: uri.includes(':') ? uri.split(':').slice(1).join(':') : uri,
-      }),
-    } as unknown as AxlRuntime;
+    } as never);
 
     const llmScore = llmScorer({
       name: 'judge',
       description: 'test',
-      model: 'mock:model',
+      model: 'judge:model',
       system: 'Rate it',
       schema: z.object({ score: z.number(), reasoning: z.string() }),
     });
@@ -711,36 +731,40 @@ describe('runEval()', () => {
 
     const result = await runEval(
       { workflow: 'test', dataset: ds, scorers: [llmScore], budget: '$0.010', concurrency: 1 },
-      async () => ({ output: 'output', cost: 0.001 }),
-      mockRuntimeWithResolver,
+      askExecute(),
+      runtime,
     );
 
-    // Each item: $0.001 workflow + $0.003 scorer = $0.004
-    // After 3 items: $0.012 > $0.010 budget → remaining items budget-exceeded
-    const budgetExceeded = result.items.filter((i) => i.error === 'Budget exceeded');
-    expect(budgetExceeded.length).toBeGreaterThan(0);
-    expect(result.totalCost).toBeGreaterThan(0.008);
+    // Each item: $0.001 generation + $0.003 judge = $0.004. After item 3 known
+    // spend is $0.012, so the controller closes and item 4 never starts.
+    const budgetSkipped = result.items.filter((i) => i.outcome === 'budget_skipped');
+    expect(budgetSkipped.length).toBe(2);
+    expect(budgetSkipped.every((i) => i.error === 'Budget exceeded')).toBe(true);
+    expect(result.totalCost).toBeCloseTo(0.012, 10);
+    expect(result.accounting!.budget).toEqual({
+      limit: 0.01,
+      status: 'closed',
+      knownSpend: 0.012,
+      knownOvershoot: 0.002,
+      closedBy: 'scorer',
+    });
   });
 
-  it('accumulates LLM scorer cost even when scorer throws after LLM call', async () => {
-    const mockProvider = {
+  it('keeps a judge cost when the judge output fails to parse', async () => {
+    const { runtime } = scriptedRuntime([{ cost: 0.001 }]);
+    runtime.registerProvider('judge', {
+      name: 'judge',
       chat: async () => ({
         content: 'not valid json',
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
         cost: 0.005,
       }),
-    };
-
-    const mockRuntimeWithResolver = {
-      resolveProvider: (uri: string) => ({
-        provider: mockProvider,
-        model: uri.includes(':') ? uri.split(':').slice(1).join(':') : uri,
-      }),
-    } as unknown as AxlRuntime;
+    } as never);
 
     const llmScore = llmScorer({
       name: 'broken',
       description: 'test',
-      model: 'mock:model',
+      model: 'judge:model',
       system: 'Rate it',
       schema: z.object({ score: z.number(), reasoning: z.string() }),
     });
@@ -753,39 +777,46 @@ describe('runEval()', () => {
 
     const result = await runEval(
       { workflow: 'test', dataset: ds, scorers: [llmScore] },
-      async () => ({ output: 'output', cost: 0.001 }),
-      mockRuntimeWithResolver,
+      askExecute(),
+      runtime,
     );
 
-    // Scorer threw (invalid JSON) but the LLM call cost $0.005 was still incurred
+    // The judge threw on the parse, but the call it already paid for is kept —
+    // spend does not disappear because the work that followed it failed.
     expect(result.items[0].scores['broken']).toBeNull();
+    expect(result.items[0].scoreDetails!.broken.outcome).toBe('failed');
+    expect(result.items[0].scoreDetails!.broken.accounting!.knownCost).toBeCloseTo(0.005, 10);
     expect(result.items[0].scorerErrors).toBeDefined();
-    expect(result.totalCost).toBeCloseTo(0.006, 6); // $0.001 workflow + $0.005 scorer
+    expect(result.totalCost).toBeCloseTo(0.006, 10);
+    expect(result.accounting!.breakdown.judging).toBeCloseTo(0.005, 10);
   });
 
-  it('does not double-count LLM scorer cost when provider returns no cost', async () => {
+  it('does not carry a judge cost forward, and marks the unpriced judge call', async () => {
+    // Zero-cost generation isolates the judge rail; the second judge call
+    // reports usage but NO cost, which is unknown spend, never a silent $0.
+    const { runtime } = scriptedRuntime([{ cost: 0 }]);
     let callCount = 0;
-    const mockProvider = {
+    runtime.registerProvider('judge', {
+      name: 'judge',
       chat: async () => {
         callCount++;
-        // First call has cost, second call has no cost field
         return callCount === 1
-          ? { content: JSON.stringify({ score: 0.9, reasoning: 'Good' }), cost: 0.01 }
-          : { content: JSON.stringify({ score: 0.8, reasoning: 'OK' }) };
+          ? {
+              content: JSON.stringify({ score: 0.9, reasoning: 'Good' }),
+              usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+              cost: 0.01,
+            }
+          : {
+              content: JSON.stringify({ score: 0.8, reasoning: 'OK' }),
+              usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+            };
       },
-    };
-
-    const mockRuntimeWithResolver = {
-      resolveProvider: (uri: string) => ({
-        provider: mockProvider,
-        model: uri.includes(':') ? uri.split(':').slice(1).join(':') : uri,
-      }),
-    } as unknown as AxlRuntime;
+    } as never);
 
     const llmScore = llmScorer({
       name: 'judge',
       description: 'test',
-      model: 'mock:model',
+      model: 'judge:model',
       system: 'Rate it',
       schema: z.object({ score: z.number(), reasoning: z.string() }),
     });
@@ -798,13 +829,18 @@ describe('runEval()', () => {
 
     const result = await runEval(
       { workflow: 'test', dataset: ds, scorers: [llmScore], concurrency: 1 },
-      async () => ({ output: 'output' }),
-      mockRuntimeWithResolver,
+      askExecute(),
+      runtime,
     );
 
-    // Item 1: $0.01 scorer cost. Item 2: no scorer cost.
-    // Verify: provider with no cost on second call should not carry over first call's cost
-    expect(result.totalCost).toBeCloseTo(0.01, 6);
+    // Item 1's $0.01 is not carried into item 2, and item 2's unknown price is
+    // reported as unknown rather than folded in as zero.
+    expect(result.totalCost).toBeCloseTo(0.01, 10);
+    expect(result.items[1].scoreDetails!.judge.accounting!.knownCost).toBe(0);
+    expect(result.items[1].scoreDetails!.judge.accounting!.reasons.unpriced_model).toBe(1);
+    expect(result.unpriced).toBe(true);
+    expect(result.accounting!.completeness).toBe('incomplete');
+    expect(result.accounting!.reasons.unpriced_model).toBe(1);
   });
 
   it('passes annotations to scorer', async () => {
@@ -877,6 +913,7 @@ describe('runEval()', () => {
       score: () => 1,
     });
 
+    const { runtime, provider } = scriptedRuntime([{ cost: 0.003 }]);
     const result = await runEval(
       {
         workflow: 'test',
@@ -885,15 +922,25 @@ describe('runEval()', () => {
         budget: '$0.005',
         concurrency: 1,
       },
-      async () => ({ output: 'ok', cost: 0.003 }),
-      mockRuntime,
+      askExecute(),
+      runtime,
     );
 
-    // First two items cost $0.003 each = $0.006 which exceeds $0.005
-    // Remaining items should have 'Budget exceeded' error
-    const budgetExceeded = result.items.filter((i) => i.error === 'Budget exceeded');
-    expect(budgetExceeded.length).toBeGreaterThan(0);
-    expect(result.totalCost).toBeGreaterThan(0);
+    // Two items at $0.003 reach $0.006, at or past the $0.005 limit, so the
+    // remaining three are never started and the provider is never called again.
+    const skipped = result.items.filter((i) => i.outcome === 'budget_skipped');
+    expect(skipped).toHaveLength(3);
+    expect(skipped.every((i) => i.error === 'Budget exceeded')).toBe(true);
+    expect(provider.callCount).toBe(2);
+    expect(result.totalCost).toBeCloseTo(0.006, 10);
+    expect(result.accounting!.budget!.status).toBe('closed');
+    expect(result.summary.coverage!.items).toEqual({
+      completed: 2,
+      failed: 0,
+      cancelled: 0,
+      budget_skipped: 3,
+      budget_interrupted: 0,
+    });
   });
 
   it('one failing scorer does not prevent other scorers from running', async () => {
@@ -1099,8 +1146,10 @@ describe('runEval()', () => {
       expect(typeof item.duration).toBe('number');
       expect(item.duration!).toBeGreaterThanOrEqual(0);
     }
-    // executeWorkflow returns cost: 0.001 for all items
-    expect(result.items[0].cost).toBe(0.001);
+    // `executeWorkflow` returns `cost: 0.001`, but this runtime measured
+    // nothing — so the measured cost is 0 and the claim is reported separately.
+    expect(result.items[0].cost).toBe(0);
+    expect(result.items[0].callerReport).toEqual({ cost: 0.001 });
   });
 
   it('captures duration even on workflow error', async () => {
@@ -1175,9 +1224,11 @@ describe('runEval()', () => {
     const detail = result.items[0].scoreDetails!['judge'];
     expect(detail.score).toBe(0.9);
     expect(detail.metadata).toEqual({ reasoning: 'Good' });
+    // No runtime measurement rail here, so the judge's own reported cost is
+    // the compat view and the measured judging total is 0.
     expect(detail.cost).toBe(0.002);
     expect(typeof detail.duration).toBe('number');
-    expect(result.items[0].scorerCost).toBe(0.002);
+    expect(result.items[0].scorerCost).toBe(0);
   });
 
   it('computes summary.timing stats from item durations', async () => {
@@ -1288,29 +1339,38 @@ describe('runEval()', () => {
 
     const simpleScorer = scorer({ name: 'pass', description: 'Always passes', score: () => 1 });
 
+    const { runtime } = scriptedRuntime([{ cost: 0 }]);
     const result = await runEval(
       { workflow: 'test', dataset: ds, scorers: [simpleScorer] },
-      async () => ({
-        output: 'out',
-        cost: 0.001,
-        metadata: {
+      askExecute({
+        callerMetadata: {
+          // Reserved keys: the runtime measures these, so a caller claim about
+          // them is recorded rather than allowed to overwrite the measurement.
           models: ['openai:gpt-4o'],
           tokens: { input: 100, output: 50, reasoning: 0 },
-          agentCalls: 1,
+          agentCalls: 99,
+          // Anything else is the caller's own annotation and still merges.
+          team: 'billing',
         },
       }),
-      mockRuntime,
+      runtime,
     );
 
     for (const item of result.items) {
       expect(item.metadata).toBeDefined();
-      expect(item.metadata!.models).toEqual(['openai:gpt-4o']);
-      expect(item.metadata!.tokens).toEqual({ input: 100, output: 50, reasoning: 0 });
+      expect(item.metadata!.models).toEqual(['mock:m']);
       expect(item.metadata!.agentCalls).toBe(1);
+      expect(item.metadata!.team).toBe('billing');
+      expect(item.callerReport!.metadata).toEqual({
+        models: ['openai:gpt-4o'],
+        tokens: { input: 100, output: 50, reasoning: 0 },
+        agentCalls: 99,
+      });
     }
+    expect(result.accounting!.callerReported!.metadataItems).toBe(result.items.length);
   });
 
-  it('aggregates per-model call counts from modelCallCounts metadata', async () => {
+  it('aggregates per-model call counts from measured calls', async () => {
     const ds = dataset({
       name: 'ds',
       schema: z.object({ q: z.string() }),
@@ -1318,29 +1378,31 @@ describe('runEval()', () => {
     });
 
     const simpleScorer = scorer({ name: 'pass', description: 'pass', score: () => 1 });
+    const { runtime } = scriptedRuntime([{ cost: 0 }]);
+    const small = makeAgent({ name: 'small', model: 'mock:small', system: 's' });
+    const large = makeAgent({ name: 'large', model: 'mock:large', system: 'l' });
 
     const result = await runEval(
       { workflow: 'test', dataset: ds, scorers: [simpleScorer], concurrency: 1 },
-      async () => ({
-        output: 'out',
-        // Each item calls both models (like a classify-then-answer workflow)
-        metadata: {
-          models: ['openai:gpt-4o-mini', 'openai:gpt-4o'],
-          modelCallCounts: { 'openai:gpt-4o-mini': 1, 'openai:gpt-4o': 1 },
-          agentCalls: 2,
-        },
-      }),
-      mockRuntime,
+      // Each item classifies then answers — two models, one call each.
+      async (_input, rt) => {
+        const ctx = rt.createContext();
+        await ctx.ask(small, 'classify');
+        await ctx.ask(large, 'answer');
+        return { output: 'out' };
+      },
+      runtime,
     );
 
     const models = result.metadata.models as string[];
     expect(models).toHaveLength(2);
 
-    // modelCounts = total LLM calls per model across all items (3 items × 1 call each)
+    // modelCounts = total measured LLM calls per model across all items
+    // (3 items × 1 call to each of the two models).
     const counts = result.metadata.modelCounts as Record<string, number>;
     expect(counts).toBeDefined();
-    expect(counts['openai:gpt-4o-mini']).toBe(3);
-    expect(counts['openai:gpt-4o']).toBe(3);
+    expect(counts['mock:small']).toBe(3);
+    expect(counts['mock:large']).toBe(3);
   });
 
   it('aggregates models sorted by total calls descending', async () => {
@@ -1351,27 +1413,31 @@ describe('runEval()', () => {
     });
 
     const simpleScorer = scorer({ name: 'pass', description: 'pass', score: () => 1 });
+    const { runtime } = scriptedRuntime([{ cost: 0 }]);
+    const small = makeAgent({ name: 'small', model: 'mock:small', system: 's' });
+    const large = makeAgent({ name: 'large', model: 'mock:large', system: 'l' });
     let callIdx = 0;
 
     const result = await runEval(
       { workflow: 'test', dataset: ds, scorers: [simpleScorer], concurrency: 1 },
-      async () => {
-        // 2 items use gpt-4o, 1 uses claude — falls back to models array (no modelCallCounts)
-        const models = callIdx++ < 2 ? ['openai:gpt-4o'] : ['anthropic:claude-sonnet-4-6'];
-        return { output: 'out', metadata: { models } };
+      async (_input, rt) => {
+        // 2 items ask the small model, 1 asks the large one.
+        const ctx = rt.createContext();
+        await ctx.ask(callIdx++ < 2 ? small : large, 'go');
+        return { output: 'out' };
       },
-      mockRuntime,
+      runtime,
     );
 
     const models = result.metadata.models as string[];
     expect(models).toHaveLength(2);
-    expect(models[0]).toBe('openai:gpt-4o');
-    expect(models[1]).toBe('anthropic:claude-sonnet-4-6');
+    expect(models[0]).toBe('mock:small');
+    expect(models[1]).toBe('mock:large');
 
     const counts = result.metadata.modelCounts as Record<string, number>;
     expect(counts).toBeDefined();
-    expect(counts['openai:gpt-4o']).toBe(2);
-    expect(counts['anthropic:claude-sonnet-4-6']).toBe(1);
+    expect(counts['mock:small']).toBe(2);
+    expect(counts['mock:large']).toBe(1);
   });
 
   it('includes modelCounts even for single-model runs', async () => {
@@ -1383,16 +1449,17 @@ describe('runEval()', () => {
 
     const simpleScorer = scorer({ name: 'pass', description: 'pass', score: () => 1 });
 
+    const { runtime } = scriptedRuntime([{ cost: 0 }]);
     const result = await runEval(
       { workflow: 'test', dataset: ds, scorers: [simpleScorer] },
-      async () => ({ output: 'out', metadata: { models: ['openai:gpt-4o'] } }),
-      mockRuntime,
+      askExecute(),
+      runtime,
     );
 
-    expect(result.metadata.models).toEqual(['openai:gpt-4o']);
+    expect(result.metadata.models).toEqual(['mock:m']);
     const counts = result.metadata.modelCounts as Record<string, number>;
     expect(counts).toBeDefined();
-    expect(counts['openai:gpt-4o']).toBe(2);
+    expect(counts['mock:m']).toBe(2);
   });
 
   it('omits models from result metadata when no items have model info', async () => {
@@ -1427,18 +1494,24 @@ describe('runEval()', () => {
     });
     const simpleScorer = scorer({ name: 'pass', description: 'pass', score: () => 1 });
 
-    // config.workflow says 'configured-name' but the callback's trace metadata
-    // reports an entirely different workflow actually ran.
-    const result = await runEval(
-      { workflow: 'configured-name', dataset: ds, scorers: [simpleScorer] },
-      async () => ({
-        output: 'out',
-        metadata: { workflows: ['actual-workflow'], workflowCallCounts: { 'actual-workflow': 1 } },
+    // config.workflow says 'configured-name' but an entirely different
+    // workflow is the one that actually ran.
+    const { runtime } = scriptedRuntime([{ cost: 0 }]);
+    runtime.register(
+      makeWorkflow({
+        name: 'actual-workflow',
+        input: z.any(),
+        handler: async (ctx) => ctx.ask(fixtureAgent, 'go'),
       }),
-      mockRuntime,
     );
 
-    // Observed workflow wins over config.workflow. There is no top-level
+    const result = await runEval(
+      { workflow: 'configured-name', dataset: ds, scorers: [simpleScorer] },
+      async (input, rt) => ({ output: await rt.execute('actual-workflow', input) }),
+      runtime,
+    );
+
+    // The OBSERVED workflow wins over config.workflow. There is no top-level
     // workflow field anymore — consumers read metadata.workflows directly.
     expect(result.metadata.workflows).toEqual(['actual-workflow']);
     const counts = result.metadata.workflowCounts as Record<string, number>;
@@ -1453,19 +1526,26 @@ describe('runEval()', () => {
     });
     const simpleScorer = scorer({ name: 'pass', description: 'pass', score: () => 1 });
 
+    const { runtime } = scriptedRuntime([{ cost: 0 }]);
+    for (const name of ['wf-a', 'wf-b']) {
+      runtime.register(
+        makeWorkflow({
+          name,
+          input: z.any(),
+          handler: async (ctx) => ctx.ask(fixtureAgent, 'go'),
+        }),
+      );
+    }
+
     let callCount = 0;
     const result = await runEval(
-      { workflow: 'fallback', dataset: ds, scorers: [simpleScorer] },
-      async () => {
-        callCount++;
-        // Item 1 + 2 run wf-a, item 3 runs wf-b
-        const wf = callCount <= 2 ? 'wf-a' : 'wf-b';
-        return {
-          output: 'out',
-          metadata: { workflows: [wf], workflowCallCounts: { [wf]: 1 } },
-        };
+      { workflow: 'fallback', dataset: ds, scorers: [simpleScorer], concurrency: 1 },
+      async (input, rt) => {
+        // Items 1 + 2 run wf-a, item 3 runs wf-b.
+        const wf = ++callCount <= 2 ? 'wf-a' : 'wf-b';
+        return { output: await rt.execute(wf, input) };
       },
-      mockRuntime,
+      runtime,
     );
 
     // Both observed workflows appear in metadata.workflows, sorted by call
@@ -1483,21 +1563,32 @@ describe('runEval()', () => {
     });
     const simpleScorer = scorer({ name: 'pass', description: 'pass', score: () => 1 });
 
-    // One item, one callback call, but nested execution touched two workflows.
-    const result = await runEval(
-      { workflow: 'fallback', dataset: ds, scorers: [simpleScorer] },
-      async () => ({
-        output: 'out',
-        metadata: {
-          workflows: ['outer', 'inner'],
-          workflowCallCounts: { outer: 1, inner: 1 },
-        },
+    // One item, one callback call, but nested execution touches two workflows.
+    const { runtime } = scriptedRuntime([{ cost: 0 }]);
+    runtime.register(
+      makeWorkflow({
+        name: 'inner',
+        input: z.any(),
+        handler: async (ctx) => ctx.ask(fixtureAgent, 'inner'),
       }),
-      mockRuntime,
+    );
+    runtime.register(
+      makeWorkflow({
+        name: 'outer',
+        input: z.any(),
+        // Nested execution through the same runtime instance emits a second
+        // workflow_start, which is what the rollup observes.
+        handler: async (ctx) => runtime.execute('inner', ctx.input),
+      }),
     );
 
-    // Both nested workflows surface. Insertion order from the callback's
-    // metadata is preserved when call counts are equal.
+    const result = await runEval(
+      { workflow: 'fallback', dataset: ds, scorers: [simpleScorer] },
+      async (input, rt) => ({ output: await rt.execute('outer', input) }),
+      runtime,
+    );
+
+    // Both nested workflows surface, outermost first (first-seen order).
     expect(result.metadata.workflows).toEqual(['outer', 'inner']);
   });
 
@@ -1717,7 +1808,7 @@ describe('runEval: captureTraces', () => {
   );
 
   it.each([false, true])(
-    'keeps explicit metadata overrides shallow (captureTraces=%s)',
+    'records a caller override of measured metadata without applying it (captureTraces=%s)',
     async (captureTraces) => {
       const { runtime } = await buildTracingRuntime();
       const metadata = Object.freeze({ agentCalls: 9, tokens: Object.freeze({ input: 99 }) });
@@ -1728,10 +1819,17 @@ describe('runEval: captureTraces', () => {
         { captureTraces },
       );
       for (const item of result.items) {
-        expect(item.metadata?.agentCalls).toBe(9);
-        expect(item.metadata?.tokens).toEqual({ input: 99 });
+        // `agentCalls` and `tokens` are measured, so the caller's numbers do
+        // not replace them — one agent call really happened.
+        expect(item.metadata?.agentCalls).toBe(1);
+        expect(item.metadata?.tokens).toEqual({ input: 1, output: 1, reasoning: 0 });
         expect(item.metadata?.modelCallCounts).toEqual({ 'mock:test': 1 });
         expect(item.metadata).not.toBe(metadata);
+        // The claim is still readable, verbatim, beside the measurement.
+        expect(item.callerReport?.metadata).toEqual({
+          agentCalls: 9,
+          tokens: { input: 99 },
+        });
       }
     },
   );
@@ -1764,7 +1862,7 @@ describe('runEval: captureTraces', () => {
   );
 
   it.each([false, true])(
-    'honors list overrides in run roll-ups (captureTraces=%s)',
+    'keeps run roll-ups on measured lists, not caller-declared ones (captureTraces=%s)',
     async (captureTraces) => {
       const { runtime } = await buildTracingRuntime();
       for (const explicitCounts of [false, true]) {
@@ -1787,13 +1885,18 @@ describe('runEval: captureTraces', () => {
           { captureTraces },
         );
         expect(result.summary.failures).toBe(0);
-        expect(result.metadata.models).toEqual(['external:model']);
-        expect(result.metadata.workflows).toEqual(['external-workflow']);
-        expect(result.metadata.modelCounts).toEqual({ 'external:model': explicitCounts ? 6 : 3 });
-        expect(result.metadata.workflowCounts).toEqual({
-          'external-workflow': explicitCounts ? 6 : 3,
-        });
+        // A caller cannot rewrite which models or workflows the run touched —
+        // that is measured, and a declared list would silently misattribute a
+        // whole run's calls.
+        expect(result.metadata.models).toEqual(['mock:test']);
+        expect(result.metadata.workflows).toEqual(['ask']);
+        expect(result.metadata.modelCounts).toEqual({ 'mock:test': 3 });
+        expect(result.metadata.workflowCounts).toEqual({ ask: 3 });
         expect(result.items[0].metadata?.tokens).toEqual({ input: 1, output: 1, reasoning: 0 });
+        expect(result.items[0].callerReport?.metadata).toMatchObject({
+          models: ['external:model'],
+          workflows: ['external-workflow'],
+        });
       }
     },
   );
@@ -2164,8 +2267,13 @@ describe('runEval() — concurrent scorers', () => {
       mockRuntime,
     );
 
-    expect(result.items[0].scorerCost).toBeCloseTo(0.05, 10);
-    expect(result.totalCost).toBeCloseTo(0.05, 10);
+    // Both scorers ran and each REPORTED a cost. On an uninstrumented runtime
+    // those claims stay per-scorer and are never summed into a run total that
+    // would look like measured spend.
+    expect(result.items[0].scoreDetails!.a.cost).toBe(0.02);
+    expect(result.items[0].scoreDetails!.b.cost).toBe(0.03);
+    expect(result.items[0].scorerCost).toBe(0);
+    expect(result.totalCost).toBe(0);
   });
 
   it('keeps scores / scoreDetails / scorerErrors in scorer-array order regardless of completion', async () => {

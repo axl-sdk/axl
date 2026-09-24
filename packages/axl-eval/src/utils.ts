@@ -1,3 +1,5 @@
+import type { EvalItemOutcome, ItemErrorRate } from './types.js';
+
 export function computeStats(scores: number[]): {
   mean: number;
   min: number;
@@ -17,6 +19,39 @@ export function computeStats(scores: number[]): {
 
 export function round(n: number): number {
   return Math.round(n * 1000) / 1000;
+}
+
+/** `0.737 → '73.7%'`, `0.05 → '5%'` — one decimal, no trailing zero. */
+export function formatPercent(rate: number): string {
+  return `${Number((rate * 100).toFixed(1))}%`;
+}
+
+/** Default `failOnItemErrorRate`, shared by `runEval` and the compare floor. */
+export const DEFAULT_ITEM_ERROR_RATE_LIMIT = 0.05;
+
+/** `true` for a usable error-rate limit: a finite number in `[0, 1]`. */
+export function isErrorRateLimit(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1;
+}
+
+/**
+ * The single item-error-rate rule, shared by `runEval` (produce time) and
+ * `evaluateItemErrorRateGate` (compare time), so the two can never disagree.
+ *
+ * Cancelled and budget-stopped items leave the denominator: those runs are
+ * reported by their own gates, and counting them here would fail a run twice
+ * for one cause. Fires on strictly `>`, so a limit of `1` never fires, and a
+ * run with nothing attempted never fires (and reports a rate of `0`, not NaN).
+ */
+export function evaluateItemErrorRate(
+  items: Readonly<Record<EvalItemOutcome, number>>,
+  count: number,
+  limit: number,
+): ItemErrorRate {
+  const failed = items.failed;
+  const attempted = count - items.cancelled - items.budget_skipped - items.budget_interrupted;
+  const rate = attempted > 0 ? failed / attempted : 0;
+  return { failed, attempted, rate, limit, exceeded: attempted > 0 && rate > limit };
 }
 
 /**
@@ -48,7 +83,7 @@ export function scorerCounts(
   items: readonly {
     error?: string;
     scores: Record<string, number | null>;
-    scoreDetails?: Record<string, { duration?: number; skipped?: boolean }>;
+    scoreDetails?: Record<string, { duration?: number; skipped?: boolean; outcome?: string }>;
   }[],
   name: string,
 ): { scored: number; failed: number; skipped: number } {
@@ -57,9 +92,27 @@ export function scorerCounts(
   let skipped = 0;
   for (const i of items) {
     if (i.error) continue;
+    const detail = i.scoreDetails?.[name];
+    // `outcome` is the authoritative classification, so prefer it wherever it
+    // exists. The duration heuristic below reconstructs the same taxonomy from
+    // the shape of a pre-0.24 artifact, and it is only ever a reconstruction:
+    // it reads "no score and no duration" as "never ran", which is right for a
+    // cancellation and wrong for a judge the budget stopped mid-flight. Keeping
+    // two independent classifiers in the codebase means a later change to
+    // either — say, recording the duration a stopped judge actually spent —
+    // silently starts counting budget stops as scorer failures and trips the
+    // degradation gate on a run with no scorer defect.
+    if (detail?.outcome !== undefined) {
+      if (detail.outcome === 'scored') scored++;
+      else if (detail.outcome === 'failed') failed++;
+      else if (detail.outcome === 'skipped') skipped++;
+      // 'cancelled' / 'budget_skipped' / 'budget_interrupted' are in no bucket:
+      // they are not a sample of the scorer's reliability.
+      continue;
+    }
     if (i.scores[name] != null) scored++;
-    else if (i.scoreDetails?.[name]?.skipped === true) skipped++;
-    else if (i.scoreDetails?.[name]?.duration != null) failed++;
+    else if (detail?.skipped === true) skipped++;
+    else if (detail?.duration != null) failed++;
   }
   return { scored, failed, skipped };
 }

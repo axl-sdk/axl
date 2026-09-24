@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { z } from 'zod';
 import { MockProvider } from '@axlsdk/testing';
 import { dataset, scorer } from '@axlsdk/eval';
+import { MemoryStore, ProviderError } from '@axlsdk/axl';
 import { createTestServer } from '../helpers/setup.js';
 import { readJson } from '../helpers/json.js';
 
@@ -226,6 +227,34 @@ describe('Studio API: Evals', () => {
     expect(body.error.message).toContain('nonexistent-result-id');
   });
 
+  it('POST /api/evals/:name/rescore returns 404 once the store has dropped the row', async () => {
+    // A rescore copies its SOURCE row's items into a brand-new result with a
+    // brand-new retention window. Resolving that source out of the runtime's
+    // history cache — which outlives a Redis TTL or a delete made elsewhere —
+    // would republish an expired run's inputs and outputs indefinitely, one
+    // rescore at a time.
+    const provider = MockProvider.sequence([{ content: 'eval output' }]);
+    const stateStore = new MemoryStore();
+    const { app } = createTestServer(provider, { stateStore });
+
+    const resultId = (
+      await readJson(await app.request('/api/evals/test-eval/run', { method: 'POST' }))
+    ).data.id;
+
+    // Gone from the store, still in this process's cache.
+    await stateStore.deleteEvalResult(resultId);
+
+    const res = await app.request('/api/evals/test-eval/rescore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ resultId }),
+    });
+    expect(res.status).toBe(404);
+    const body = await readJson(res);
+    expect(body.error.code).toBe('NOT_FOUND');
+    expect(body.error.message).toContain(resultId);
+  });
+
   // --- Multi-run endpoint ---
 
   it('POST /api/evals/:name/run with runs > 1 returns _multiRun data', async () => {
@@ -442,12 +471,340 @@ describe('Studio API: Evals', () => {
     }
   });
 
+  it("POST /api/evals/:name/run multi-run omits run[0]'s modelTiming from the aggregate summary", async () => {
+    // Run 0's first call was throttled 3 times; later calls were not. The
+    // aggregate must not present run 0's per-model figures as the batch's.
+    const provider = MockProvider.fn((_messages, callIndex) => ({
+      content: 'ok',
+      timing: {
+        queuedMs: 0,
+        attempts: 1 + (callIndex === 0 ? 3 : 0),
+        rateLimitRetries: callIndex === 0 ? 3 : 0,
+        retryMs: 0,
+        ttfbMs: 1,
+        wireMs: 5,
+      },
+    }));
+    const { app } = createTestServer(provider);
+
+    const res = await app.request('/api/evals/test-eval/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ runs: 2 }),
+    });
+    expect(res.status).toBe(200);
+    const body = await readJson(res);
+
+    const [run0, run1] = body.data._multiRun.allRuns;
+    const total = (run: {
+      summary: { modelTiming: Record<string, { rateLimitRetries: number }> };
+    }) => Object.values(run.summary.modelTiming).reduce((s, m) => s + m.rateLimitRetries, 0);
+    // Each run keeps its own figures.
+    expect(total(run0)).toBe(3);
+    expect(total(run1)).toBe(0);
+    // The aggregate carries none rather than run 0's.
+    expect('modelTiming' in body.data.summary).toBe(false);
+  });
+
+  it("POST /api/evals/:name/run multi-run surfaces the worst run's itemErrorRate, not run[0]'s", async () => {
+    // Run 0 is clean and run 1 loses its only item to a 429. The CLI gates each
+    // run individually; the aggregate landing view must not inherit run[0]'s
+    // clean summary and hide run 1.
+    const provider = MockProvider.fn((_messages, callIndex) => {
+      if (callIndex === 1) {
+        throw new ProviderError({
+          provider: 'openai',
+          status: 429,
+          retryable: true,
+          requestId: 'req_run1',
+          message: 'Rate limit reached',
+        });
+      }
+      return { content: 'ok' };
+    });
+    const { app } = createTestServer(provider);
+
+    const res = await app.request('/api/evals/test-eval/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ runs: 2 }),
+    });
+    expect(res.status).toBe(200);
+    const body = await readJson(res);
+
+    const [run0, run1] = body.data._multiRun.allRuns;
+    expect('itemErrorRate' in run0.summary).toBe(false);
+    expect(run1.summary.itemErrorRate).toMatchObject({ failed: 1, attempted: 1, exceeded: true });
+    expect(run1.items[0].failure).toEqual({
+      name: 'ProviderError',
+      provider: 'openai',
+      status: 429,
+      retryable: true,
+      requestId: 'req_run1',
+    });
+    expect(body.data.summary.itemErrorRate).toEqual({
+      failed: 1,
+      attempted: 1,
+      rate: 1,
+      limit: 0.05,
+      exceeded: true,
+      runsExceeded: 1,
+    });
+  });
+
+  it('POST /api/evals/:name/run redacts every run of a sync multi-run response', async () => {
+    // `_multiRun.allRuns` carries each run's full items. Redacting only the
+    // top-level `items` (run[0]'s) left every run's input/output/error raw.
+    // Run 0 succeeds, run 1's only item fails with a content-echoing error, and
+    // run 2's dataset load fails, so the batch is partial with a batchFailure.
+    const provider = MockProvider.fn((_messages, callIndex) => {
+      if (callIndex === 1) throw new Error('SENTINEL_ITEM_ERROR john@acme.com');
+      return { content: 'SENTINEL_OUTPUT' };
+    });
+    const { app, runtime } = createTestServer(provider, { redact: true });
+
+    let getItemsCalls = 0;
+    const leakyDataset = dataset({
+      name: 'leaky-dataset',
+      schema: z.object({ message: z.string() }),
+      items: [{ input: { message: 'SENTINEL_INPUT' } }],
+    });
+    const originalGetItems = leakyDataset.getItems.bind(leakyDataset);
+    leakyDataset.getItems = async () => {
+      getItemsCalls++;
+      if (getItemsCalls === 3) throw new Error('SENTINEL_BATCH_FAILURE');
+      return originalGetItems();
+    };
+    runtime.registerEval('leaky-eval', {
+      workflow: 'test-wf',
+      dataset: leakyDataset,
+      scorers: [scorer({ name: 's', description: 's', score: () => 1 })],
+    });
+
+    const res = await app.request('/api/evals/leaky-eval/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ runs: 3 }),
+    });
+    expect(res.status).toBe(200);
+    const body = await readJson(res);
+    expect(body.ok).toBe(true);
+
+    const { allRuns } = body.data._multiRun;
+    expect(allRuns.length).toBe(2);
+    for (const run of allRuns) {
+      for (const item of run.items) {
+        expect(item.input).toBe('[redacted]');
+        expect(item.output).toBe('[redacted]');
+      }
+    }
+    expect(allRuns[1].items[0].outcome).toBe('failed');
+    expect(allRuns[1].items[0].error).toBe('[redacted]');
+    expect(body.data._multiRun.batchFailure).toBe('[redacted]');
+    // Structural fields still survive in each run.
+    expect(allRuns[0].items[0].scores.s).toBe(1);
+    expect(allRuns[1].summary.itemErrorRate).toMatchObject({ failed: 1, attempted: 1 });
+
+    const raw = JSON.stringify(body);
+    expect(raw).not.toContain('SENTINEL_INPUT');
+    expect(raw).not.toContain('SENTINEL_OUTPUT');
+    expect(raw).not.toContain('SENTINEL_ITEM_ERROR');
+    expect(raw).not.toContain('SENTINEL_BATCH_FAILURE');
+  });
+
+  it('GET /api/evals/history redacts an imported artifact that carries _multiRun.allRuns', async () => {
+    // A saved sync multi-run response has the same shape; import stores it
+    // verbatim, so the history read must scrub every nested run too.
+    const { app } = createTestServer(undefined, { redact: true });
+    const run = (input: string) => ({
+      id: 'r',
+      workflow: 'wf',
+      dataset: 'ds',
+      metadata: {},
+      timestamp: new Date().toISOString(),
+      totalCost: 0,
+      duration: 1,
+      items: [
+        { input, output: 'SENTINEL_NESTED_OUTPUT', error: 'SENTINEL_NESTED_ERROR', scores: {} },
+      ],
+      summary: { count: 1, failures: 1, scorers: {} },
+    });
+    const artifact = {
+      ...run('top'),
+      _multiRun: {
+        aggregate: { runCount: 2 },
+        allRuns: [run('SENTINEL_NESTED_INPUT_0'), run('SENTINEL_NESTED_INPUT_1')],
+        partial: true,
+        batchFailure: 'SENTINEL_NESTED_BATCH_FAILURE',
+      },
+    };
+    const imported = await app.request('/api/evals/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ result: artifact }),
+    });
+    expect(imported.status).toBe(200);
+
+    const body = await readJson(await app.request('/api/evals/history'));
+    const served = body.data[0].data;
+    expect(served._multiRun.allRuns[1].items[0].input).toBe('[redacted]');
+    expect(served._multiRun.aggregate.runCount).toBe(2);
+    expect(JSON.stringify(body)).not.toMatch(/SENTINEL_NESTED/);
+    expect(served.metadata.importedMultiRun).toBeUndefined();
+  });
+
+  it('POST /api/evals/import drops and marks a malformed _multiRun, and history still serves', async () => {
+    const { app } = createTestServer(undefined, { redact: true });
+    const base = {
+      workflow: 'wf',
+      dataset: 'ds',
+      metadata: {},
+      timestamp: new Date().toISOString(),
+      totalCost: 0,
+      duration: 1,
+      items: [{ input: 'in', output: 'out', scores: {} }],
+      summary: { count: 1, failures: 0, scorers: {} },
+    };
+    const malformed = [
+      { allRuns: [{ id: 'x', note: 'SENTINEL_A' }] },
+      { allRuns: ['SENTINEL_B'] },
+      { allRuns: [{ items: [null, 'SENTINEL_C'] }] },
+      { allRuns: 'SENTINEL_D' },
+      'SENTINEL_E',
+    ];
+    for (const _multiRun of malformed) {
+      const res = await app.request('/api/evals/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ result: { ...base, _multiRun } }),
+      });
+      expect(res.status).toBe(200);
+    }
+
+    const hist = await app.request('/api/evals/history');
+    expect(hist.status).toBe(200);
+    const body = await readJson(hist);
+    expect(body.data.length).toBe(malformed.length);
+    for (const entry of body.data) {
+      expect(entry.data._multiRun).toBeUndefined();
+      expect(entry.data.metadata.importedMultiRun).toBe('invalid');
+      // A refused _multiRun is not an accounting verdict.
+      expect(entry.data.metadata.importedAccounting).toBeUndefined();
+    }
+    expect(JSON.stringify(body)).not.toContain('SENTINEL');
+  });
+
+  it('GET /api/evals/history serves a stored row whose nested shapes are malformed', async () => {
+    // A row written before import validated `_multiRun` (or by any other
+    // writer) must not fail the whole redacted list, nor leak what it can't walk.
+    const { app, runtime } = createTestServer(undefined, { redact: true });
+    await runtime.saveEvalResult({
+      id: 'stored-malformed',
+      eval: 'stored',
+      timestamp: Date.now(),
+      data: {
+        id: 'stored-malformed',
+        workflow: 'wf',
+        dataset: 'ds',
+        metadata: {},
+        timestamp: new Date().toISOString(),
+        totalCost: 0,
+        duration: 1,
+        items: [null, 'SENTINEL_TOP_ITEM', { input: 'SENTINEL_INPUT', scores: {} }],
+        summary: { count: 3, failures: 0, scorers: {} },
+        _multiRun: { allRuns: [{ id: 'no-items', note: 'SENTINEL_RUN' }, 'SENTINEL_STRING_RUN'] },
+      } as never,
+    });
+
+    const hist = await app.request('/api/evals/history');
+    expect(hist.status).toBe(200);
+    const body = await readJson(hist);
+    const served = body.data[0].data;
+    expect(served.items).toEqual([
+      '[redacted]',
+      '[redacted]',
+      expect.objectContaining({ input: '[redacted]' }),
+    ]);
+    expect(served._multiRun.allRuns).toEqual(['[redacted]', '[redacted]']);
+    expect(JSON.stringify(body)).not.toContain('SENTINEL');
+  });
+
   // --- Compare endpoint (ID-based) ---
   //
   // Compare resolves baseline/candidate from runtime history by ID rather
   // than accepting full EvalResult payloads in the request body. Keeps the
   // wire payload tiny so host body-parser limits don't fire when Studio is
   // mounted as middleware behind Express/NestJS/Fastify.
+
+  describe('POST /api/evals/compare under trace.redact', () => {
+    // Compare returns the baseline item's `input` on every regression and
+    // improvement, and each side's result metadata. Both must meet the same
+    // scrub as GET /api/evals/history, or comparing two ids bypasses it.
+    async function compareImported(redact: boolean) {
+      const { app } = createTestServer(undefined, { redact });
+      const side = (scores: [number, number], metadata: Record<string, unknown>) => ({
+        workflow: 'wf',
+        dataset: 'ds',
+        metadata: { scorerTypes: { s: 'deterministic' }, ...metadata },
+        timestamp: new Date().toISOString(),
+        totalCost: 0,
+        duration: 1,
+        items: [
+          { input: 'SENTINEL_INPUT_0', output: 'o', scores: { s: scores[0] } },
+          { input: { q: 'SENTINEL_INPUT_1' }, output: 'o', scores: { s: scores[1] } },
+        ],
+        summary: {
+          count: 2,
+          failures: 0,
+          scorers: { s: { mean: 0.5, min: 0, max: 1, p50: 0.5, p95: 1 } },
+        },
+      });
+      const importOne = async (result: unknown) =>
+        (
+          await readJson(
+            await app.request('/api/evals/import', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ result }),
+            }),
+          )
+        ).data.id as string;
+      const baselineId = await importOne(side([1, 0], { batchFailure: 'SENTINEL_BATCH' }));
+      const candidateId = await importOne(side([0, 1], {}));
+      const res = await app.request('/api/evals/compare', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ baselineId, candidateId, options: { thresholds: 0 } }),
+      });
+      expect(res.status).toBe(200);
+      return readJson(res);
+    }
+
+    it('masks regression and improvement inputs and the side metadata batchFailure', async () => {
+      const body = await compareImported(true);
+      const { regressions, improvements, baseline, scorers } = body.data;
+      expect(regressions.length).toBeGreaterThan(0);
+      expect(improvements.length).toBeGreaterThan(0);
+      for (const r of [...regressions, ...improvements]) {
+        expect(r.input).toBe('[redacted]');
+        expect(typeof r.itemIndex).toBe('number');
+      }
+      expect(baseline.metadata.batchFailure).toBe('[redacted]');
+      // Structural results are untouched.
+      expect(baseline.metadata.scorerTypes).toEqual({ s: 'deterministic' });
+      expect(scorers.s.delta).toBe(0);
+      expect(JSON.stringify(body)).not.toContain('SENTINEL');
+    });
+
+    it('serves the inputs unchanged when redact is off', async () => {
+      const body = await compareImported(false);
+      const inputs = [...body.data.regressions, ...body.data.improvements].map(
+        (r: { input: unknown }) => r.input,
+      );
+      expect(inputs).toContainEqual('SENTINEL_INPUT_0');
+      expect(inputs).toContainEqual({ q: 'SENTINEL_INPUT_1' });
+    });
+  });
 
   it('POST /api/evals/compare compares two eval results by ID', async () => {
     const provider = MockProvider.sequence([
@@ -566,6 +923,33 @@ describe('Studio API: Evals', () => {
     expect(body.error.message).toContain('does-not-exist');
   });
 
+  it('POST /api/evals/compare returns 404 once the store has dropped a row', async () => {
+    // Compare serves whole results back in its response, so it must resolve
+    // each id against the store's retention view rather than the cache.
+    const provider = MockProvider.sequence([{ content: 'a' }, { content: 'b' }]);
+    const stateStore = new MemoryStore();
+    const { app } = createTestServer(provider, { stateStore });
+
+    const baselineId = (
+      await readJson(await app.request('/api/evals/test-eval/run', { method: 'POST' }))
+    ).data.id;
+    const candidateId = (
+      await readJson(await app.request('/api/evals/test-eval/run', { method: 'POST' }))
+    ).data.id;
+
+    await stateStore.deleteEvalResult(baselineId);
+
+    const res = await app.request('/api/evals/compare', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ baselineId, candidateId }),
+    });
+    expect(res.status).toBe(404);
+    const body = await readJson(res);
+    expect(body.error.code).toBe('NOT_FOUND');
+    expect(body.error.message).toContain(baselineId);
+  });
+
   it('POST /api/evals/compare returns 400 when IDs are missing', async () => {
     const { app } = createTestServer();
 
@@ -603,6 +987,79 @@ describe('Studio API: Evals', () => {
   });
 
   // --- Import endpoint ---
+
+  describe('POST /api/evals/import — summary.itemErrorRate', () => {
+    async function importWithRate(itemErrorRate: unknown) {
+      const { app } = createTestServer();
+      const result = {
+        workflow: 'wf',
+        dataset: 'ds',
+        metadata: {},
+        timestamp: new Date().toISOString(),
+        totalCost: 0,
+        duration: 1,
+        items: [{ input: 'in', output: 'out', scores: {} }],
+        summary: { count: 4, failures: 1, scorers: {}, itemErrorRate },
+      };
+      const res = await app.request('/api/evals/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ result }),
+      });
+      expect(res.status).toBe(200);
+      const hist = await readJson(await app.request('/api/evals/history'));
+      return hist.data[0].data;
+    }
+
+    it('keeps a consistent record unmarked', async () => {
+      const rate = { failed: 1, attempted: 4, rate: 0.25, limit: 0.05, exceeded: true };
+      const entry = await importWithRate(rate);
+      expect(entry.summary.itemErrorRate).toEqual(rate);
+      expect(entry.metadata.importedItemErrorRate).toBeUndefined();
+    });
+
+    it('keeps a zero-attempt record, which is never exceeded', async () => {
+      const rate = { failed: 0, attempted: 0, rate: 0, limit: 0, exceeded: false };
+      const entry = await importWithRate(rate);
+      expect(entry.summary.itemErrorRate).toEqual(rate);
+    });
+
+    it.each([
+      ['a non-numeric rate', { failed: 1, attempted: 4, rate: 'x', limit: 0.05, exceeded: true }],
+      [
+        'a fractional count',
+        { failed: 1.5, attempted: 4, rate: 0.375, limit: 0.05, exceeded: true },
+      ],
+      [
+        'more failures than attempts',
+        { failed: 5, attempted: 4, rate: 1.25, limit: 0.05, exceeded: true },
+      ],
+      [
+        'a limit outside [0, 1]',
+        { failed: 1, attempted: 4, rate: 0.25, limit: 2, exceeded: false },
+      ],
+      [
+        'a rate that disagrees with its counts',
+        { failed: 1, attempted: 4, rate: 0, limit: 0.05, exceeded: false },
+      ],
+      [
+        'an exceeded flag that disagrees with the rate',
+        { failed: 0, attempted: 4, rate: 0, limit: 0.05, exceeded: true },
+      ],
+      ['a missing exceeded flag', { failed: 1, attempted: 4, rate: 0.25, limit: 0.05 }],
+      ['a non-object', 'SENTINEL'],
+    ])('drops and marks %s', async (_label, rate) => {
+      const entry = await importWithRate(rate);
+      // Dropped so a forged verdict cannot inflate the multi-run runsExceeded
+      // or pose as the worst run; marked so a reader can tell "refused" from
+      // "never had one".
+      expect(entry.summary.itemErrorRate).toBeUndefined();
+      expect(entry.metadata.importedItemErrorRate).toBe('invalid');
+      // A refused verdict is not refused accounting: the cost certification
+      // must not be downgraded alongside it.
+      expect(entry.metadata.importedAccounting).toBeUndefined();
+    });
+  });
 
   it('POST /api/evals/import stores a CLI artifact in history', async () => {
     const { app } = createTestServer();
@@ -654,6 +1111,53 @@ describe('Studio API: Evals', () => {
     expect(entry.data.id).toBe(body.data.id); // result.id was rewritten too
     expect(entry.data.items.length).toBe(1);
   });
+
+  it.each([false, true])(
+    'POST /api/evals/import keeps summary.modelTiming.rateLimitRetries and accepts artifacts without it (redact %s)',
+    async (redact) => {
+      const { app } = createTestServer(undefined, { redact });
+      const stats = { mean: 10, min: 10, max: 10, p50: 10, p95: 10 };
+      const fakeResult = {
+        id: 'cli-id',
+        workflow: 'imported-wf',
+        dataset: 'imported-ds',
+        metadata: {},
+        timestamp: new Date().toISOString(),
+        totalCost: 0,
+        duration: 10,
+        items: [{ input: 'in', output: 'out', scores: { 'always-pass': 1 } }],
+        summary: {
+          count: 1,
+          failures: 0,
+          scorers: { 'always-pass': { mean: 1, min: 1, max: 1, p50: 1, p95: 1 } },
+          modelTiming: {
+            'openai:gpt-4o': {
+              calls: 3,
+              wireMs: stats,
+              queuedMs: stats,
+              retryMs: stats,
+              rateLimitRetries: 4,
+            },
+            // Written before the field existed.
+            'anthropic:claude': { calls: 1, wireMs: stats, queuedMs: stats, retryMs: stats },
+          },
+        },
+      };
+      const res = await app.request('/api/evals/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ result: fakeResult }),
+      });
+      expect(res.status).toBe(200);
+      const id = (await readJson(res)).data.id;
+
+      const hist = await readJson(await app.request('/api/evals/history'));
+      const entry = hist.data.find((e: { id: string }) => e.id === id);
+      const modelTiming = entry.data.summary.modelTiming;
+      expect(modelTiming['openai:gpt-4o'].rateLimitRetries).toBe(4);
+      expect('rateLimitRetries' in modelTiming['anthropic:claude']).toBe(false);
+    },
+  );
 
   it('POST /api/evals/import derives eval name from metadata.workflows first', async () => {
     // Modern CLI artifacts (post-0.14) carry workflow names in metadata.workflows

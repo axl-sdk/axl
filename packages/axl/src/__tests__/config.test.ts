@@ -103,6 +103,8 @@ describe('resolveConfig()', () => {
     delete process.env.AXL_TRACE_LEVEL;
     delete process.env.OPENAI_API_KEY;
     delete process.env.ANTHROPIC_API_KEY;
+    delete process.env.GOOGLE_API_KEY;
+    delete process.env.GEMINI_API_KEY;
   });
 
   afterEach(() => {
@@ -146,12 +148,36 @@ describe('resolveConfig()', () => {
     expect(resolved.trace?.level).toBe('full');
   });
 
-  it('merges OPENAI_API_KEY when openai provider is configured', () => {
+  it('keeps a configured openai apiKey over OPENAI_API_KEY (env is only a fallback)', () => {
     process.env.OPENAI_API_KEY = 'sk-from-env';
     const resolved = resolveConfig({
       providers: { openai: { apiKey: 'sk-original' } },
     });
-    expect(resolved.providers?.openai?.apiKey).toBe('sk-from-env');
+    expect(resolved.providers?.openai?.apiKey).toBe('sk-original');
+  });
+
+  it('keeps a configured apiKey callback over the env var', () => {
+    process.env.ANTHROPIC_API_KEY = 'ant-from-env';
+    const rotate = () => 'ant-rotated';
+    const resolved = resolveConfig({ providers: { anthropic: { apiKey: rotate } } });
+    expect(resolved.providers?.anthropic?.apiKey).toBe(rotate);
+  });
+
+  it('fills a configured provider block that has no apiKey from the env var', () => {
+    process.env.OPENAI_API_KEY = 'sk-from-env';
+    const resolved = resolveConfig({ providers: { openai: { baseUrl: 'https://x.test/v1' } } });
+    expect(resolved.providers?.openai).toEqual({
+      baseUrl: 'https://x.test/v1',
+      apiKey: 'sk-from-env',
+    });
+  });
+
+  it("does not mutate the caller's config", () => {
+    process.env.OPENAI_API_KEY = 'sk-from-env';
+    const config = { providers: { anthropic: { apiKey: 'ant-original' } } };
+    const snapshot = structuredClone(config);
+    resolveConfig(config);
+    expect(config).toEqual(snapshot);
   });
 
   it('creates openai provider entry from OPENAI_API_KEY when not pre-configured', () => {
@@ -160,12 +186,19 @@ describe('resolveConfig()', () => {
     expect(resolved.providers?.openai?.apiKey).toBe('sk-from-env');
   });
 
-  it('merges ANTHROPIC_API_KEY when anthropic provider is configured', () => {
+  it('keeps a configured anthropic apiKey over ANTHROPIC_API_KEY', () => {
     process.env.ANTHROPIC_API_KEY = 'ant-from-env';
     const resolved = resolveConfig({
       providers: { anthropic: { apiKey: 'ant-original' } },
     });
-    expect(resolved.providers?.anthropic?.apiKey).toBe('ant-from-env');
+    expect(resolved.providers?.anthropic?.apiKey).toBe('ant-original');
+  });
+
+  it('keeps a configured google apiKey over GOOGLE_API_KEY / GEMINI_API_KEY', () => {
+    process.env.GOOGLE_API_KEY = 'g-from-env';
+    process.env.GEMINI_API_KEY = 'gem-from-env';
+    const resolved = resolveConfig({ providers: { google: { apiKey: 'g-original' } } });
+    expect(resolved.providers?.google?.apiKey).toBe('g-original');
   });
 
   it('merges multiple env overrides simultaneously', () => {

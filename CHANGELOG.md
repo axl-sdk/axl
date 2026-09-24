@@ -484,6 +484,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Breaking (security): a configured `apiKey` now beats the environment.**
+  `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` and `GOOGLE_API_KEY`/`GEMINI_API_KEY`
+  used to overwrite a provider's configured `apiKey`, including a rotating-key
+  callback, whenever the variable was set. That could send one tenant's calls
+  on another credential. The variables are now only a fallback for a provider
+  with no `apiKey`, as `docs/api-reference.md` already documented.
+  `resolveConfig` also no longer mutates the caller's `providers` object.
 - **Retried provider responses no longer leak their connection.** When the
   transport retries a 429, 503 or 529, it now cancels the discarded response's
   body before backing off, instead of leaving it open until garbage collection.

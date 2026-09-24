@@ -281,28 +281,21 @@ export function resolveConfig(config: AxlConfig): AxlConfig {
     };
   }
 
-  // Standard API key env vars — create provider entry if it doesn't exist
-  if (process.env.OPENAI_API_KEY) {
-    if (!resolved.providers) resolved.providers = {};
-    resolved.providers.openai = {
-      ...(resolved.providers.openai ?? {}),
-      apiKey: process.env.OPENAI_API_KEY,
-    };
-  }
-  if (process.env.ANTHROPIC_API_KEY) {
-    if (!resolved.providers) resolved.providers = {};
-    resolved.providers.anthropic = {
-      ...(resolved.providers.anthropic ?? {}),
-      apiKey: process.env.ANTHROPIC_API_KEY,
-    };
-  }
-
-  const googleKey = process.env.GOOGLE_API_KEY ?? process.env.GEMINI_API_KEY;
-  if (googleKey) {
-    if (!resolved.providers) resolved.providers = {};
-    resolved.providers.google = {
-      ...(resolved.providers.google ?? {}),
-      apiKey: googleKey,
+  // Standard API key env vars are a FALLBACK: they fill a provider's `apiKey`
+  // (creating the provider entry if needed) only when the config sets none.
+  // A configured key or key callback always wins, so an ambient env var can
+  // never silently swap one tenant's credential for another.
+  const envKeys: Array<[provider: string, key: string | undefined]> = [
+    ['openai', process.env.OPENAI_API_KEY],
+    ['anthropic', process.env.ANTHROPIC_API_KEY],
+    ['google', process.env.GOOGLE_API_KEY ?? process.env.GEMINI_API_KEY],
+  ];
+  for (const [provider, envKey] of envKeys) {
+    if (!envKey || resolved.providers?.[provider]?.apiKey !== undefined) continue;
+    // Copy on write: never mutate the caller's `providers` map or blocks.
+    resolved.providers = {
+      ...resolved.providers,
+      [provider]: { ...resolved.providers?.[provider], apiKey: envKey },
     };
   }
 

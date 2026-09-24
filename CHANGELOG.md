@@ -520,6 +520,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sustained throttling. Previously a short `Retry-After` (for example `1` on
   a later retry) was used as-is. `ProviderError.retryAfterMs` still carries
   the raw, unclamped value.
+- **A 503/529 retry never sleeps past 60 s.** A huge `Retry-After` was clamped to
+  60 s before the ±25% jitter was applied, so the wait could reach 75 s. The
+  clamp now applies after jitter as well.
 - **Retried provider responses no longer leak their connection.** When the
   transport retries a 429, 503 or 529, it now cancels the discarded response's
   body before backing off, instead of leaving it open until garbage collection.

@@ -434,8 +434,9 @@ export async function fetchWithRetry(
 
       // Delay: the exponential backoff, lengthened by a longer provider hint
       // (shared parser, single source of truth in errors.ts) and clamped so a
-      // hostile/huge header can't stall the loop. As before, the whole sleep
-      // is jittered. `ProviderError.retryAfterMs` still carries the RAW value.
+      // hostile/huge header can't stall the loop. The whole sleep is jittered,
+      // and the clamp applies after jitter too, so no sleep exceeds 60 s.
+      // `ProviderError.retryAfterMs` still carries the RAW value.
       const baseDelay = retryWaitMs(
         parseRetryAfter(res.headers),
         BASE_DELAY_MS * 2 ** transientRetries,
@@ -446,7 +447,7 @@ export async function fetchWithRetry(
       // The loop continues with a new request, so this response is discarded:
       // release its connection now rather than when it is garbage-collected.
       discardBody(res);
-      await sleep(jitter(baseDelay), signal);
+      await sleep(Math.min(jitter(baseDelay), MAX_BACKOFF_MS), signal);
     }
   } finally {
     if (acquired) governor!.release();

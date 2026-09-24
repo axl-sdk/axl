@@ -742,6 +742,17 @@ describe('retry hints are floored at the exponential backoff', () => {
     expect((await r).ok).toBe(true);
     expect(net.of('call-a').map((d) => d.at - T0)).toEqual([0, 2500]);
   });
+
+  it('transient path: jitter never pushes a clamped wait past 60 s', async () => {
+    vi.spyOn(Math, 'random').mockReturnValue(0.999); // jitter factor ≈ 1.25
+    const net = stubFetch((d) =>
+      d.attempt === 1 ? { status: 503, headers: { 'retry-after': '3600' } } : { status: 200 },
+    );
+    const r = outcome(ask(providerFor('openai'), 'call-a'));
+    await vi.runAllTimersAsync();
+    expect((await r).ok).toBe(true);
+    expect(net.of('call-a').map((d) => d.at - T0)).toEqual([0, 60_000]);
+  });
 });
 
 // ---------------------------------------------------------------------------

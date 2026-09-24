@@ -1803,6 +1803,44 @@ describe('CallTiming.rateLimitRetries', () => {
     expect(await run(503)).toMatchObject({ attempts: 2, rateLimitRetries: 0 });
   });
 
+  it.each<[string, Reply[]]>([
+    [
+      '429 → network error → 200',
+      [{ status: 429 }, { status: 0, throws: new TypeError('fetch failed') }, { status: 200 }],
+    ],
+    [
+      'network error → 429 → 200',
+      [{ status: 0, throws: new TypeError('fetch failed') }, { status: 429 }, { status: 200 }],
+    ],
+  ])(
+    'plain path (adaptive: false), %s: counts the 429 once, never the network retry',
+    async (_l, replies) => {
+      stubFetch((d) => replies[d.attempt - 1]!);
+      const provider = providerFor('openai', { adaptive: false });
+      const t = (await settle(ask(provider, 'call-a'))).timing!;
+      expect({ attempts: t.attempts, rateLimitRetries: t.rateLimitRetries }).toEqual({
+        attempts: 3,
+        rateLimitRetries: 1,
+      });
+    },
+  );
+
+  it('plain path (adaptive: false): a 429 returned because the signal aborted after it arrived is not counted', async () => {
+    const controller = new AbortController();
+    stubFetch((d) => {
+      // The second response lands after the caller aborted: the loop must
+      // return it instead of retrying, and must not count it.
+      if (d.attempt === 2) controller.abort();
+      return { status: 429 };
+    });
+    const provider = providerFor('openai', { adaptive: false });
+    const r = await settle(outcome(ask(provider, 'call-a', { signal: controller.signal })));
+    const err = (r as { error: ProviderError }).error;
+    expect(err).toBeInstanceOf(ProviderError);
+    expect(err.status).toBe(429);
+    expect(err.timing).toMatchObject({ attempts: 2, rateLimitRetries: 1 });
+  });
+
   it.each<Family>(['openai', 'openai-responses', 'anthropic', 'google', 'groq'])(
     '%s: a call with no 429 reports rateLimitRetries 0 (present, not absent)',
     async (family) => {

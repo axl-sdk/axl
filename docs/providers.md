@@ -529,29 +529,21 @@ part of the application's trust boundary. See
 
 ### Rate limiting
 
-#### Rate-limit 429s on OpenAI and Anthropic (on by default)
+#### Rate-limit 429s (on by default)
 
-First-party OpenAI (`openai:` and `openai-responses:`) and Anthropic (`anthropic:`)
-are the only providers with a **quota dialect**: Axl can tell a rate-limit `429` from
-a spend-cap `429` in their error bodies. "First-party" means the vendor's own default
-endpoint: the origin of `https://api.openai.com/v1` or `https://api.anthropic.com/v1`
-(an explicit `baseUrl` with that origin counts). On those scopes (see "one governor per
-scope" below) a `429` is handled differently from other providers, with no
-configuration:
+Every built-in chat provider (OpenAI, OpenAI Responses, Anthropic, Gemini, and every
+OpenAI-compatible preset such as Azure, OpenRouter or Groq, at any `baseUrl`) handles
+a `429` the same way, with no configuration. On each scope (see "one governor per
+scope" below):
 
-- **A spend cap fails fast.** Anthropic's `enforced_spend_limit_reached`, and OpenAI's
-  `insufficient_quota` and its billing codes (`credit_balance_exhausted`,
-  `organization_spend_limit_exceeded`, `project_spend_limit_exceeded`,
-  `organization_usage_limit_exceeded`) are returned at once as a `ProviderError`
-  with `status: 429` and the raw body. They are not retried and hold up no other call,
-  because waiting cannot fix them.
-- **A rate limit brakes the whole scope.** Any other `429` (including one whose body
-  can't be read) pauses **every** call on that scope until its `Retry-After`, clamped
-  at 60 s. Without `Retry-After` the pause is the usual backoff: 1 s, then 2 s, doubling
-  for each further 429 the same call receives. During the pause nothing on the scope is sent: not
-  calls queued for a permit, and not calls waking from a `503` backoff. The call that
-  hit the 429 gives its permit back while it waits and retries first once the pause
-  ends, ahead of calls that have not been sent yet.
+- **A rate limit brakes the whole scope.** A `429` pauses **every** call on that scope
+  until its `Retry-After` (or `retry-after-ms`), clamped at 60 s. Without one the
+  pause is the usual backoff: 1 s, then 2 s, doubling for each further 429 the same
+  call receives. Gemini sends its retry hint in the error body rather than a header,
+  so a Gemini 429 always uses this backoff. During the pause nothing on the scope is
+  sent: not calls queued for a permit, and not calls waking from a `503` backoff. The
+  call that hit the 429 gives its permit back while it waits and retries first once
+  the pause ends, ahead of calls that have not been sent yet.
 - **Rate limits have their own retry budget,** `maxRateLimitRetries` (default 8),
   separate from the 2 retries for `503`/`529`/network errors. A call against a
   saturated account can therefore take several minutes (up to about 8 × 60 s), without
@@ -564,18 +556,33 @@ configuration:
   there is no cap, no spacing and no warning; calls go out exactly as before. Request
   size doesn't matter (a large base64 image or a cached prompt is not estimated or
   charged), and quota headers alone never slow a scope that has not been throttled.
+  `503`/`529` and network errors keep their usual retries.
+
+**Spend caps (first-party OpenAI and Anthropic only).** First-party OpenAI (`openai:`
+and `openai-responses:`) and Anthropic (`anthropic:`) are the only providers with a
+**quota dialect**: Axl reads their `429` bodies to tell a rate limit from a spend cap,
+and their quota headers to hold recovery (below). "First-party" means the vendor's own
+default endpoint: the origin of `https://api.openai.com/v1` or
+`https://api.anthropic.com/v1` (an explicit `baseUrl` with that origin counts). There,
+Anthropic's `enforced_spend_limit_reached`, and OpenAI's `insufficient_quota` and its
+billing codes (`credit_balance_exhausted`, `organization_spend_limit_exceeded`,
+`project_spend_limit_exceeded`, `organization_usage_limit_exceeded`), are returned at
+once as a `ProviderError` with `status: 429` and the raw body. They are not retried and
+hold up no other call, because waiting cannot fix them.
+
+Every other scope, including an `openai`, `openai-responses` or `anthropic` block whose
+`baseUrl` points at a proxy, an LLM gateway or a self-hosted server, has **no**
+dialect: its 429 bodies and quota headers are that server's, not the vendor's, so Axl
+never reads them. Every `429` there is treated as a rate limit. **The tradeoff:** a
+spend-cap or daily-quota `429` (for example Gemini's `RESOURCE_EXHAUSTED` quota
+errors) brakes the scope and fails only once `maxRateLimitRetries` is spent (about
+3 minutes with no `Retry-After`) instead of at once. It still fails with the same
+`ProviderError`; no item is lost to a transient rate limit on the way.
 
 Set `rateLimit: { adaptive: false }` to turn all of this off for a provider (the pause,
 the separate budget and the adaptive pacing): a `429` then shares the transient budget
-and holds up no other call, as on every other provider. Other
-providers (Gemini, OpenAI-compatible presets such as Azure or OpenRouter, custom
-adapters) are unchanged.
-
-An `openai`, `openai-responses` or `anthropic` block whose `baseUrl` points anywhere
-else (a proxy, an LLM gateway, a self-hosted compatible server) has **no** dialect: its
-429s and quota headers are that server's, not the vendor's. It behaves exactly as
-before: no governor unless you set `rateLimit`, no pause, and `429`s on the shared
-transient budget. Opting such an endpoint in is not supported yet.
+(3 attempts) and holds up no other call, exactly as before this feature. Custom
+adapters that pass their own `RateLimiter` to `fetchWithRetry` are never adaptive.
 
 The spend-cap body shapes come from the providers' documentation and have not yet been
 checked against live spend-cap responses. A spend-cap 429 whose body Axl does not
@@ -602,11 +609,13 @@ open to **paced**: it grants at most `rate` requests per second, spacing every g
   few requests per second per 30 s, so a fan-out that starts later isn't stuck crawling
   for minutes. Paused time doesn't count, and neither does idle time beyond the scope's
   own spacing, so a quiet scope can't build up credit and then burst.
-  While the latest successful response's quota headers (`x-ratelimit-remaining-*` /
-  `anthropic-ratelimit-*-remaining`) show the account nearly exhausted, `rate` holds.
-  Quota headers only ever stop growth; they never admit more.
+  On a first-party OpenAI or Anthropic scope, while the latest successful response's
+  quota headers (`x-ratelimit-remaining-*` / `anthropic-ratelimit-*-remaining`) show
+  the account nearly exhausted, `rate` holds. Quota headers only ever stop growth;
+  they never admit more. Scopes with no dialect recover on success alone.
 - **It reopens on its own.** Once `rate` has stayed well above the busiest second of
-  recent traffic for a sustained period, with no 429 and healthy quota headers, the
+  recent traffic for a sustained period, with no 429 (and, where they are read, healthy
+  quota headers), the
   scope drops pacing and is fully open again. A bursty workload whose bursts still fill
   a second at the current `rate` stays paced, so its next burst doesn't start another
   round of 429s.
@@ -652,7 +661,7 @@ export default defineConfig({
 | `maxConcurrent` | `number` | Max requests in flight for this provider. Must be a finite integer ≥ 1 (invalid values disable the cap with a warning). `1` serializes all requests (a throughput floor, not a deadlock — see below). |
 | `minIntervalMs` | `number` | Minimum ms between successive request *grants* (global spacing, no burst bucket). |
 | `acquireTimeoutMs` | `number` | If set, a call that waits longer than this in the queue for its **first** permit rejects (fail loud) instead of hanging on a misconfigured cap. A call that arrives during a rate-limit pause waits the pause out before this clock starts; a call already queued when a pause begins keeps its clock running. Once queued, the clock also runs through adaptive pacing after a rate-limit 429 and behind the retries that go first, each spaced by the adaptive interval, so a tight value can reject calls that pacing is only delaying; size it for that or leave it unset. A retry after a rate-limit 429 is exempt. |
-| `adaptive` | `boolean` | Default `true` on OpenAI and Anthropic, where a rate-limit 429 pauses the scope, then paces it adaptively until it reopens, and a spend-cap 429 fails fast (above). `false` restores the plain retry with no pause and no pacing. No effect on other providers. |
+| `adaptive` | `boolean` | Default `true` on every built-in chat provider: a rate-limit 429 pauses the scope, then paces it adaptively until it reopens (above). On first-party OpenAI and Anthropic a spend-cap 429 fails fast; elsewhere every 429 is a rate limit. `false` restores the plain retry with no pause and no pacing. |
 | `maxRateLimitRetries` | `number` | Retries after a rate-limit 429 where `adaptive` applies. Default `8`; an integer ≥ 0 (invalid values warn and use the default). Separate from the `503`/`529` budget. |
 
 **Scope & caveats:**
@@ -660,10 +669,12 @@ export default defineConfig({
 - **Caps request concurrency, not token throughput (TPM).** A permit is released at
   response *headers*, so streaming responses don't hold a permit for their whole
   lifetime. This bounds requests/min pressure, not tokens/min.
-- **Chat calls only.** The governor wraps provider `chat`/`stream` calls. Memory
-  **embedder** calls (e.g. `ctx.remember({ embed: true })`) are constructed outside
-  the provider registry and are **not** governed in this version — they can still
-  count against a shared key's limit.
+- **Chat calls only.** The pooled, adaptive governor wraps provider `chat`/`stream`
+  calls. Transcription providers apply the same block's static caps through their own
+  per-instance limiter, with no pause, pacing or separate budget. Memory **embedder**
+  calls (e.g. `ctx.remember({ embed: true })`) are constructed outside the provider
+  registry and are **not** governed in this version — they can still count against a
+  shared key's limit.
 - **One governor per scope, per runtime.** A scope is provider family + base-URL
   origin + credential source + model:
   - **Family:** `openai:` and `openai-responses:` are one family, because they
@@ -856,7 +867,8 @@ runs inside the call's held permit, so it applies backpressure to other queued c
 rather than letting them pile on a struggling provider. The body of each discarded
 response is cancelled before the sleep, so its connection is released.
 
-On OpenAI and Anthropic a rate-limit `429` instead retries up to `maxRateLimitRetries`
+Wherever `adaptive` applies (every built-in chat provider by default) a rate-limit
+`429` instead retries up to `maxRateLimitRetries`
 (default 8) times, each after a scope-wide pause of up to 60 s, **without** holding a
 permit during the pause (see [Rate limiting](#rate-limiting)). A `503` sleeper that
 wakes during such a pause gives its permit back before waiting. An abort during any

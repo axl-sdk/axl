@@ -111,8 +111,9 @@ export type FetchWithRetryOptions = {
    * Optional rate governor. On the plain path (see {@link fetchWithRetry}) the
    * whole retry loop, including backoff sleeps, runs inside ONE acquired
    * permit, so backoff naturally applies backpressure to other waiters. On the
-   * adaptive path (a pooled governor for an OpenAI or Anthropic scope) a
-   * rate-limit 429 releases the permit, brakes the scope and re-acquires. Either
+   * adaptive path (a pooled governor from a built-in chat adapter, unless its
+   * scope set `adaptive: false`) a rate-limit 429 releases the permit, brakes
+   * the scope and re-acquires. Either
    * way the permit is released exactly once, gated on whether it is held.
    * Undefined ⇒ behavior is byte-identical to no governor.
    *
@@ -214,10 +215,12 @@ function isAbortError(err: unknown, signal?: AbortSignal): boolean {
  * throughout, and 429/503/529 share one budget (`maxRetries`). A
  * pre-aborted/rejected acquire throws before any permit is taken.
  *
- * **Adaptive path** (a pooled `ScopeGovernor` whose scope has a quota dialect,
- * `adaptive` not `false`): a 429 is classified from a byte-capped clone of
- * its body before anything else happens.
- * - A spend cap is returned at once with its body intact: no retry, no brake.
+ * **Adaptive path** (a pooled `ScopeGovernor` with `adaptive` not `false`): on
+ * a scope with a quota dialect, a 429 is first classified from a byte-capped
+ * clone of its body; a scope without one never reads or clones the body and
+ * treats every 429 as a rate limit.
+ * - A spend cap (dialect scopes only) is returned at once with its body
+ *   intact: no retry, no brake.
  * - Anything else is a rate limit. It brakes the whole scope for `Retry-After`
  *   (else the exponential backoff), clamped at {@link MAX_BACKOFF_MS}, and
  *   retries on its own budget (`maxRateLimitRetries`), releasing its permit
@@ -367,7 +370,9 @@ export async function fetchWithRetry(
 
       if (scope && res.status === 429) {
         // Classify BEFORE braking: a spend cap must not hold up the scope.
-        const kind = await classifySafely(scope.dialect!, res);
+        // Without a dialect nothing can tell a spend cap apart, so the body is
+        // left untouched and the 429 is a rate limit.
+        const kind = scope.dialect ? await classifySafely(scope.dialect, res) : 'unknown';
         if (kind === 'spend_cap') {
           reportComplete();
           return res;

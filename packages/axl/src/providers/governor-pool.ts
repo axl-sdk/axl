@@ -44,7 +44,7 @@ import type { ApiKeySource } from './types.js';
 export const DEFAULT_MAX_RATE_LIMIT_RETRIES = 8;
 
 /**
- * Tuning of the adaptive rate (rate-space AIMD) on a dialect scope. Internal
+ * Tuning of the adaptive rate (rate-space AIMD) on an adapting scope. Internal
  * and never config: the only contract is "slower is always safe". Exported so
  * tests derive their expectations from these values instead of restating them.
  */
@@ -81,13 +81,18 @@ export const ADAPTIVE_RATE = Object.freeze({
  * The governor for one scope. A {@link RateLimiter} whose limits can be
  * tightened in place when a second provider block reaches the same account.
  *
- * On a scope with a quota dialect and `adaptive` not `false`
- * ({@link ScopeGovernor.adapts}), it is also the scope's **fleet brake**:
- * `fetchWithRetry` calls {@link brake} after classifying a rate-limit 429, and
- * from then until `brakeUntil` no call on the scope is granted a permit or
- * dispatches. `braked()`, `awaitClear()` and `pump()` share one predicate,
- * `Date.now() < brakeUntil`. A scope that does not adapt never brakes, so it
- * behaves exactly as a plain `RateLimiter`.
+ * Unless `adaptive` is `false` ({@link ScopeGovernor.adapts}), it is also the
+ * scope's **fleet brake**: `fetchWithRetry` calls {@link brake} after a
+ * rate-limit 429, and from then until `brakeUntil` no call on the scope is
+ * granted a permit or dispatches. `braked()`, `awaitClear()` and `pump()`
+ * share one predicate, `Date.now() < brakeUntil`. A scope that does not adapt
+ * never brakes, so it behaves exactly as a plain `RateLimiter`.
+ *
+ * Adapting needs no quota dialect. A dialect (first-party OpenAI and Anthropic
+ * at the vendor origin, see `quota.ts`) adds only two vendor-specific extras:
+ * spend-cap classification of a 429 body, and the 2xx quota hint that holds
+ * recovery. Without one, every 429 is treated as a rate limit and the hint is
+ * never read, so recovery and reopening proceed as if the account were healthy.
  */
 export class ScopeGovernor extends RateLimiter {
   // `RateLimiter`'s constructor runs the overridden `pump()` and
@@ -129,7 +134,8 @@ export class ScopeGovernor extends RateLimiter {
 
   /**
    * @param limits already sanitized (see `sanitizeRateLimitConfig`).
-   * @param dialect the scope's quota dialect; `undefined` for a dialect-less scope.
+   * @param dialect the scope's quota dialect, or `undefined` when the vendor
+   *   has none (no spend-cap classification, no quota hint).
    * @param family the provider family, only to name the scope in a warning.
    */
   constructor(
@@ -150,7 +156,7 @@ export class ScopeGovernor extends RateLimiter {
 
   /** Whether this scope brakes and retries rate-limit 429s on their own budget. */
   get adapts(): boolean {
-    return this.dialect !== undefined && this.adaptive;
+    return this.adaptive;
   }
 
   /** The rate-limit retry budget (`maxRateLimitRetries`). */
@@ -351,13 +357,14 @@ export class ScopeGovernor extends RateLimiter {
   }
 
   /**
-   * On a 2xx: read the quota hint, then advance recovery. Total: a throwing
-   * dialect warns once and is ignored (the hint is then treated as healthy).
+   * On a 2xx: read the quota hint (if the scope has a dialect), then advance
+   * recovery. Total: a throwing dialect warns once and is ignored (the hint is
+   * then treated as healthy). Without a dialect `lastHint` stays `undefined`.
    */
   override observe(res: Response): void {
     if (!this.adapts || !res.ok) return;
     try {
-      this.lastHint = this.dialect!.hint(res.headers);
+      this.lastHint = this.dialect?.hint(res.headers);
     } catch {
       this.lastHint = undefined;
       if (!this.warnedHint) {
@@ -516,7 +523,7 @@ export class AccountScope {
     if (limits === undefined) return;
     if (this.limits === undefined) {
       this.limits = { ...limits };
-      // A dialect scope has governors before any block sets `rateLimit`.
+      // Governors exist before any block sets `rateLimit`; adopt it in place.
       for (const governor of this.governors.values()) governor.reconfigure(this.limits);
       return;
     }
@@ -542,17 +549,12 @@ export class AccountScope {
   /**
    * The governor for `model`, created on first use and memoized.
    *
-   * A scope with a quota dialect (first-party OpenAI, Anthropic) always has
-   * one, so its fleet brake works with no configuration; with no `rateLimit`
-   * it applies no cap and no spacing, so nothing waits before the first
-   * rate-limit 429. A dialect-less scope returns `undefined` while no block
-   * reaching this account configured `rateLimit`, so it takes
-   * `fetchWithRetry`'s no-governor path, byte-identical to before pooling.
-   * Re-evaluated on every call: a block contributing `rateLimit` later governs
-   * every adapter on the account from its next call on.
+   * Every scope has one, so its fleet brake works with no configuration; with
+   * no `rateLimit` it applies no cap and no spacing, so nothing waits before
+   * the first rate-limit 429. A block contributing `rateLimit` later
+   * reconfigures the existing governors in place (see {@link contribute}).
    */
-  governorFor(model: string): ScopeGovernor | undefined {
-    if (this.limits === undefined && this.dialect === undefined) return undefined;
+  governorFor(model: string): ScopeGovernor {
     let governor = this.governors.get(model);
     if (!governor) {
       governor = new ScopeGovernor(this.limits ?? {}, this.dialect, this.family);
@@ -650,8 +652,8 @@ export class AdapterGovernors {
     return this.account;
   }
 
-  /** The governor for a call to `model`, or `undefined` when the scope is ungoverned. */
-  governorFor(model: string): ScopeGovernor | undefined {
+  /** The governor for a call to `model`. */
+  governorFor(model: string): ScopeGovernor {
     const account = this.account ?? this.join(new GovernorPool());
     return account.governorFor(model);
   }

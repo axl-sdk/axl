@@ -35,10 +35,10 @@
   (and `compare` refuses to certify a side) that lost more than 5% of its items,
   and every failed item records a structured `failure` cause (provider, status,
   retryable, request id). Rate governors are pooled per runtime scope (family +
-  origin + credential + model). On OpenAI and Anthropic's own endpoints, a
-  rate-limit 429 pauses the whole scope and retries on its own budget, a spend
-  cap fails fast, and the scope then paces itself (AIMD on the grant rate),
-  staying fully open until the first 429. See
+  origin + credential + model). On every built-in chat provider, a rate-limit
+  429 pauses the whole scope and retries on its own budget, and the scope then
+  paces itself (AIMD on the grant rate), staying fully open until the first
+  429. On OpenAI and Anthropic's own endpoints a spend cap also fails fast. See
   [providers.md](docs/providers.md) "Rate limiting".
 - **Completed-file transcription** — `ctx.transcribe()` is a dedicated,
   non-chat finite-recording operation with OpenAI, Gemini Interactions/Files,
@@ -348,7 +348,8 @@ provider scope, and live-verification budget are explicit.
 Each is gated on live evidence from the adaptive rate governance workstream:
 proactive token reservation (only if sustained utilization measures below 70%),
 a shareable cross-runtime governor pool, a header-driven pre-429 slowdown, and
-Gemini and OpenAI-compatible preset dialects.
+Gemini and OpenAI-compatible preset dialects (spend-cap classification and quota
+hints; those providers already brake, retry and pace without one).
 
 #### Realtime / Voice Agents
 

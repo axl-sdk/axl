@@ -267,7 +267,7 @@ export class OpenAIResponsesProvider implements Provider {
   }
 
   /** The rate governor for one call to `model`, from the runtime's per-scope pool. */
-  protected governorFor(model: string): ScopeGovernor | undefined {
+  protected governorFor(model: string): ScopeGovernor {
     return this.axlRateGovernors.governorFor(model);
   }
 

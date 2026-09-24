@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { AxlRuntime } from '../runtime.js';
+import { isolateProviderEnv } from './helpers.js';
 import { ADAPTIVE_RATE, ScopeGovernor } from '../providers/governor-pool.js';
 import type { RateLimitConfig } from '../providers/rate-limiter.js';
 import type { ChatMessage, ChatOptions, Provider, ProviderResponse } from '../providers/types.js';
@@ -165,6 +166,7 @@ function launchWave(provider: Provider): Promise<Outcome>[] {
 const originalFetch = globalThis.fetch;
 let warn: ReturnType<typeof vi.spyOn>;
 beforeEach(() => {
+  isolateProviderEnv();
   vi.useFakeTimers();
   vi.setSystemTime(T0);
   vi.spyOn(Math, 'random').mockReturnValue(0.5);
@@ -174,6 +176,7 @@ afterEach(() => {
   globalThis.fetch = originalFetch;
   vi.useRealTimers();
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
 });
 
 // ---------------------------------------------------------------------------
@@ -719,10 +722,71 @@ describe('AC38: return to fully open', () => {
 });
 
 // ---------------------------------------------------------------------------
-// AC32 / AC21 — no adaptation without a dialect or with the kill switch.
+// AC21 (amended, J5 reversal) — a scope with no dialect cuts and paces like a
+// dialect scope; it only never reads a quota hint.
 // ---------------------------------------------------------------------------
 
-describe('AC32 / AC21 (guards): nothing adapts without a dialect or with adaptive: false', () => {
+const PROXY = 'https://llm-gateway.example.com/v1';
+
+describe('AC21: dialect-less scopes pace adaptively and ignore quota headers', () => {
+  it.each<[string, Parameters<typeof providerFor>[0], string]>([
+    ['OpenAI behind a proxy', { baseUrl: PROXY }, 'gpt-4o'],
+    ['groq (OpenAI-compatible preset)', { family: 'groq' }, 'llama-3.3-70b'],
+  ])(
+    '%s, no rateLimit: the 429 wave cuts once to BETA × demand and the retriers leave spaced',
+    async (_l, options, model) => {
+      const net = stubFetch((d) =>
+        isWaveFirstAttempt(d) ? { status: 429, headers: { 'retry-after': '1' } } : { status: 200 },
+      );
+      const provider = providerFor(options);
+      const gov = governorOf(provider, model);
+      const wave = Array.from({ length: WAVE }, (_, k) => ask(provider, `call-w${k}`, { model }));
+      await at(11);
+      const r1 = BETA * WAVE;
+      expect(gov.currentRate).toBe(r1);
+      await vi.runAllTimersAsync();
+      expect((await Promise.all(wave)).every((r) => r.ok)).toBe(true);
+      const retries = net.times((d) => d.attempt === 2);
+      expect(retries[0]).toBe(1010); // brake end
+      const span = retries.at(-1)! - retries[0]!;
+      const fastest = 1000 / (r1 + (alphaFor(r1) * span) / 1000);
+      for (const gap of gaps(retries)) {
+        expect(gap).toBeGreaterThanOrEqual(Math.floor(fastest));
+        expect(gap).toBeLessThanOrEqual(Math.ceil(1000 / r1));
+      }
+    },
+  );
+
+  it('OpenAI behind a proxy: low quota headers never hold growth, so light load reopens', async () => {
+    // At the vendor origin this exact traffic never reopens (AC38's low-hint
+    // case); behind a proxy the headers are not the vendor's and are not read.
+    stubFetch((d) =>
+      isWaveFirstAttempt(d)
+        ? { status: 429, headers: { 'retry-after': '1' } }
+        : { status: 200, headers: LOW },
+    );
+    const provider = providerFor({ baseUrl: PROXY });
+    const gov = governorOf(provider);
+    const wave = launchWave(provider);
+    await vi.runAllTimersAsync();
+    await Promise.all(wave);
+    expect(gov.currentRate).toBeDefined();
+    for (let t = 4000; t <= 40_000; t += 1000) {
+      await at(t);
+      const light = ask(provider, `call-l${t}`);
+      await at(t + 100);
+      await light;
+      expect(gov.lastHint).toBeUndefined();
+    }
+    expect(gov.currentRate).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AC32 — the kill switch turns adaptation off on every scope.
+// ---------------------------------------------------------------------------
+
+describe('AC32 (guard): nothing adapts with adaptive: false', () => {
   it.each<[string, Parameters<typeof providerFor>[0], string]>([
     [
       'adaptive: false on OpenAI',
@@ -730,13 +794,13 @@ describe('AC32 / AC21 (guards): nothing adapts without a dialect or with adaptiv
       'gpt-4o',
     ],
     [
-      'OpenAI behind a proxy',
-      { rateLimit: { maxConcurrent: WAVE }, baseUrl: 'https://llm-gateway.example.com/v1' },
+      'adaptive: false on OpenAI behind a proxy',
+      { rateLimit: { adaptive: false, maxConcurrent: WAVE }, baseUrl: PROXY },
       'gpt-4o',
     ],
     [
-      'groq (dialect-less)',
-      { family: 'groq', rateLimit: { maxConcurrent: WAVE } },
+      'adaptive: false on groq',
+      { family: 'groq', rateLimit: { adaptive: false } },
       'llama-3.3-70b',
     ],
   ])(

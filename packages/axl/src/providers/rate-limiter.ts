@@ -66,18 +66,24 @@ export type RateLimitConfig = {
    */
   acquireTimeoutMs?: number;
   /**
-   * Feedback-driven pacing on scopes with a quota dialect: first-party OpenAI
-   * (`openai:` and `openai-responses:`) and Anthropic at the vendor's default
-   * endpoint origin (not a proxy or gateway `baseUrl`). Default `true` there;
-   * it has no effect anywhere else. When on, a rate-limit 429 brakes every
-   * call on the scope for its `Retry-After` (clamped at 60 s) and the call
-   * retries on its own budget (`maxRateLimitRetries`), and the scope then
-   * paces its grants adaptively (a rate seeded from recent demand, recovered
-   * linearly on success, dropped once traffic stays well below it; tuning is
-   * internal) until it reopens; a spend-cap 429 fails fast. `false` restores
-   * the plain behavior: a 429 shares the transient retry budget, holds up no
-   * other call, and nothing is paced. Ignored by a directly constructed
-   * `RateLimiter`, which is never adaptive.
+   * Feedback-driven pacing on every built-in chat provider. Default `true`.
+   * When on, a rate-limit 429 brakes every call on the scope for its
+   * `Retry-After` (clamped at 60 s; without one, the exponential backoff) and
+   * the call retries on its own budget (`maxRateLimitRetries`), and the scope
+   * then paces its grants adaptively (a rate seeded from recent demand,
+   * recovered linearly on success, dropped once traffic stays well below it;
+   * tuning is internal) until it reopens. Nothing waits before the first 429.
+   *
+   * Only first-party OpenAI (`openai:`, `openai-responses:`) and Anthropic at
+   * the vendor's default endpoint origin read the 429 body: there a spend-cap
+   * 429 fails fast, and a low quota header holds recovery. Everywhere else
+   * (Gemini, OpenAI-compatible presets, a proxy or gateway `baseUrl`) every
+   * 429 is a rate limit, so a spend-cap or daily-quota 429 fails only once
+   * `maxRateLimitRetries` is spent.
+   *
+   * `false` restores the plain behavior: a 429 shares the transient retry
+   * budget, holds up no other call, and nothing is paced. Ignored by a
+   * directly constructed `RateLimiter`, which is never adaptive.
    */
   adaptive?: boolean;
   /**

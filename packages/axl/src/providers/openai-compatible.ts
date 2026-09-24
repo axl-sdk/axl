@@ -731,11 +731,11 @@ export class OpenAICompatibleProvider implements Provider {
 
   /**
    * The rate governor for one call to `model` (the effective wire model), from
-   * the runtime's per-scope pool. `undefined` when no `rateLimit` governs the
-   * scope. Subclasses that issue their own `fetchWithRetry` pass this as
-   * `governor`.
+   * the runtime's per-scope pool. Every scope has one (with no `rateLimit` it
+   * caps nothing until a rate-limit 429). Subclasses that issue their own
+   * `fetchWithRetry` pass this as `governor`.
    */
-  protected governorFor(model: string): ScopeGovernor | undefined {
+  protected governorFor(model: string): ScopeGovernor {
     return this.axlRateGovernors.governorFor(model);
   }
 

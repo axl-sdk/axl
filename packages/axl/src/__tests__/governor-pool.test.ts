@@ -789,21 +789,26 @@ describe('AC15: two rateLimit blocks on one scope merge strictest', () => {
 // ---------------------------------------------------------------------------
 
 describe('no rateLimit anywhere', () => {
-  // A dialect scope (first-party OpenAI, Anthropic) has a governor even with no
-  // `rateLimit`, so its fleet brake works with zero configuration (F1). Before
-  // any 429 it applies no cap, no spacing and no warning.
+  // Every built-in chat scope has a governor even with no `rateLimit`, so its
+  // fleet brake works with zero configuration (F1, AC21 as amended by the J5
+  // reversal). Before any 429 it applies no cap, no spacing and no warning.
   it.each([
-    ['openai', 'gpt-4o'],
-    ['openai-responses', 'gpt-4o'],
-    ['anthropic', 'claude-sonnet-4'],
+    ['openai', 'gpt-4o', undefined],
+    ['openai-responses', 'gpt-4o', undefined],
+    ['anthropic', 'claude-sonnet-4', undefined],
+    ['google', 'gemini-2.5-flash', undefined],
+    ['groq', 'llama-3.3-70b', undefined],
+    ['openai', 'gpt-4o', 'https://llm-gateway.example.com/v1'],
   ])(
-    '%s: a governor that admits everything at once, queuedMs 0, no warning',
-    async (name, model) => {
+    '%s (%s, baseUrl %s): a governor that admits everything at once, queuedMs 0, no warning',
+    async (name, model, baseUrl) => {
       vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
       const acquire = vi.spyOn(RateLimiter.prototype, 'acquire');
       const tryAcquire = vi.spyOn(ScopeGovernor.prototype, 'tryAcquire');
       const net = stubFetch();
-      const runtime = new AxlRuntime({ providers: { [name]: { apiKey: 'k' } } });
+      const runtime = new AxlRuntime({
+        providers: { [name]: { apiKey: 'k', ...(baseUrl ? { baseUrl } : {}) } },
+      });
       const { provider } = resolveVia(runtime, `${name}:${model}`);
       const calls = [chat(provider, model), chat(provider, model), chat(provider, model)];
       await settle();
@@ -817,26 +822,6 @@ describe('no rateLimit anywhere', () => {
       expect(warn).not.toHaveBeenCalled();
     },
   );
-
-  // A dialect-less scope keeps no governor at all, as before pooling (AC21).
-  it.each([
-    ['google', 'gemini-2.5-flash'],
-    ['groq', 'llama-3.3-70b'],
-  ])('%s never touches a RateLimiter and reports queuedMs 0', async (name, model) => {
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
-    const acquire = vi.spyOn(RateLimiter.prototype, 'acquire');
-    const net = stubFetch();
-    const runtime = new AxlRuntime({ providers: { [name]: { apiKey: 'k' } } });
-    const { provider } = resolveVia(runtime, `${name}:${model}`);
-    const calls = [chat(provider, model), chat(provider, model), chat(provider, model)];
-    await settle();
-    expect(net.inFlight).toBe(3);
-    net.releaseAll();
-    const results = await Promise.all(calls);
-    expect(acquire).not.toHaveBeenCalled();
-    for (const r of results) expect(r.timing?.queuedMs).toBe(0);
-    expect(warn).not.toHaveBeenCalled();
-  });
 });
 
 // ---------------------------------------------------------------------------

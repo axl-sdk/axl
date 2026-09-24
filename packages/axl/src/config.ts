@@ -19,17 +19,18 @@ export type ProviderConfig = {
   /** OpenAI-compatible presets only: override the profile auth header shape. */
   authHeader?: AuthHeader;
   /**
-   * Opt-in client-side rate governor for this provider's HTTP calls (see
-   * {@link RateLimitConfig}). Bounds in-flight request concurrency (and,
-   * optionally, request spacing) through the shared `fetchWithRetry` chokepoint.
-   * Omitted ⇒ no static caps. On OpenAI's and Anthropic's own endpoints the
-   * adaptive brake and pacing still apply (turn them off with
-   * `{ adaptive: false }`); every other provider gets no governor. Governors are pooled per
-   * runtime, one per scope: provider family (`openai` covers `openai-responses`)
-   * + base-URL origin + credential source + model. Two blocks reaching one
-   * scope use the strictest value per field. Caveat: governs **chat** calls
-   * only — NOT memory-embedder calls (constructed outside the registry) and NOT
-   * other runtimes (unless they share a provider instance) or processes.
+   * Client-side rate governor for this provider's chat calls (see
+   * {@link RateLimitConfig}), through the shared `fetchWithRetry` chokepoint.
+   * Omitted ⇒ no static caps (no concurrency bound, no spacing), but the
+   * adaptive brake and pacing still apply after a rate-limit 429; turn them
+   * off with `{ adaptive: false }`. Governors are pooled per runtime, one per
+   * scope: provider family (`openai` covers `openai-responses`) + base-URL
+   * origin + credential source + model. Two blocks reaching one scope use the
+   * strictest value per field. Caveats: the pooled, adaptive governor covers
+   * **chat** calls only. Transcription providers apply the same static caps
+   * through their own per-instance, non-adaptive limiter; memory-embedder
+   * calls, other runtimes (unless they share a provider instance) and other
+   * processes are not governed.
    */
   rateLimit?: RateLimitConfig;
 };

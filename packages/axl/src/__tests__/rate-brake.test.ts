@@ -84,6 +84,14 @@ const ANTHROPIC_SPEND_CAP = JSON.stringify({
   },
   request_id: 'req_1',
 });
+// Gemini's quota-exhausted 429 shape (no dialect reads it).
+const GEMINI_QUOTA_EXHAUSTED = JSON.stringify({
+  error: {
+    code: 429,
+    message: 'You exceeded your current quota, please check your plan and billing details.',
+    status: 'RESOURCE_EXHAUSTED',
+  },
+});
 const RATE_LIMIT_BODY = JSON.stringify({
   error: { message: 'Rate limit reached', type: 'rate_limit_error', code: 'rate_limit_exceeded' },
 });
@@ -671,24 +679,164 @@ describe('AC20: brake duration', () => {
 });
 
 // ---------------------------------------------------------------------------
-// AC21 (guard) — dialect-less scopes keep today's transport behavior.
+// AC21 (amended 2026-09-24, J5 reversal) — a scope with no quota dialect
+// (Gemini, an OpenAI-compatible preset, a first-party vendor behind a proxy)
+// adapts too: every 429 brakes the scope and retries on `maxRateLimitRetries`,
+// with no body classification and no quota hint. 200 and 503 paths add no
+// wait, and `adaptive: false` restores the plain path.
 // ---------------------------------------------------------------------------
 
-describe('AC21 (guard): dialect-less scopes are unchanged', () => {
-  it.each<[Family]>([['google'], ['groq']])(
-    '%s: a 429 holds no sibling and shares the transient budget',
-    async (family) => {
+const PROXY = 'https://llm-gateway.example.com/v1';
+
+type Scope = { label: string; family: Family; baseUrl?: string };
+const DIALECT_LESS: Scope[] = [
+  { label: 'google', family: 'google' },
+  { label: 'groq (OpenAI-compatible preset)', family: 'groq' },
+  { label: 'openai at a proxy origin', family: 'openai', baseUrl: PROXY },
+  { label: 'openai-responses at a proxy origin', family: 'openai-responses', baseUrl: PROXY },
+  { label: 'anthropic at a proxy origin', family: 'anthropic', baseUrl: PROXY },
+];
+
+/** Dispatch times of a call whose every 429 carries no Retry-After: the exponential backoff, clamped. */
+function backoffSchedule(dispatches: number): number[] {
+  const times = [0];
+  for (let n = 0; times.length < dispatches; n++) {
+    times.push(times.at(-1)! + Math.min(1000 * 2 ** n, 60_000));
+  }
+  return times;
+}
+
+describe('AC21: dialect-less built-in scopes brake and retry on the rate-limit budget', () => {
+  it.each(DIALECT_LESS)(
+    '$label, no rateLimit: a 429 holds a sibling through the brake, and the call outlives 3 attempts',
+    async ({ family, baseUrl }) => {
       const model = MODEL[family];
+      // call-a draws four 429s in a row: more than the 3-attempt transient budget allows.
       const net = stubFetch((d) =>
-        d.tag === 'call-a' ? { status: 429, headers: { 'retry-after': '1' } } : { status: 200 },
+        d.tag === 'call-a' && d.attempt <= 4
+          ? { status: 429, headers: { 'retry-after': '1' } }
+          : { status: 200 },
       );
-      const provider = providerFor(family, { maxConcurrent: 2 });
+      const provider = providerFor(family, undefined, baseUrl);
       const a = outcome(ask(provider, 'call-a', {}, model));
       await at(1);
       const b = outcome(ask(provider, 'call-b', {}, model));
       await vi.runAllTimersAsync();
-      const ra = await a;
-      expect((ra as { error: ProviderError }).error.status).toBe(429);
+      const [ra, rb] = await Promise.all([a, b]);
+      expect(ra.ok && rb.ok).toBe(true);
+      expect((ra as { value: ProviderResponse }).value.timing?.attempts).toBe(5);
+      // b arrived at T0+1, inside a's brake. Each time a brake ends, a's
+      // retry goes first (AC27) and its 429 brakes again, so b leaves only
+      // after a's first success.
+      expect(net.log.map((d) => [d.tag, d.at - T0])).toEqual([
+        ['call-a', 0],
+        ['call-a', 1000],
+        ['call-a', 2000],
+        ['call-a', 3000],
+        ['call-a', 4000],
+        ['call-b', 4000],
+      ]);
+      // The engagement notice names the family only, never the origin.
+      const messages = warn.mock.calls.map((c) => String(c[0]));
+      expect(messages).toEqual([expect.stringContaining('Rate governor')]);
+      expect(messages[0]).not.toContain('llm-gateway');
+    },
+  );
+
+  it.each(DIALECT_LESS)(
+    '$label, no rateLimit: a 200 goes out at once with queuedMs exactly 0 (F1, real timers)',
+    async ({ family, baseUrl }) => {
+      vi.useRealTimers();
+      // Every clock read advances, so any bracket around a wait that never
+      // happened would show up as queue time.
+      let now = T0;
+      vi.spyOn(Date, 'now').mockImplementation(() => (now += 5));
+      stubFetch(() => ({ status: 200 }));
+      const provider = providerFor(family, undefined, baseUrl);
+      const model = MODEL[family];
+      const res = await ask(provider, 'call-a', {}, model);
+      expect(res.timing?.attempts).toBe(1);
+      expect(res.timing?.queuedMs).toBe(0);
+      // Governed (so a 429 would brake), yet nothing waited.
+      expect(governorOf(provider, model).adapts).toBe(true);
+    },
+  );
+
+  it.each(DIALECT_LESS)(
+    '$label: a 503 retries on the transient budget and holds no sibling',
+    async ({ family, baseUrl }) => {
+      const model = MODEL[family];
+      const net = stubFetch((d) => (d.tag === 'call-a' ? { status: 503 } : { status: 200 }));
+      const provider = providerFor(family, undefined, baseUrl);
+      const a = outcome(ask(provider, 'call-a', {}, model));
+      await at(1);
+      const b = outcome(ask(provider, 'call-b', {}, model));
+      await vi.runAllTimersAsync();
+      expect(((await a) as { error: ProviderError }).error.status).toBe(503);
+      expect((await b).ok).toBe(true);
+      expect(net.log.map((d) => [d.tag, d.at - T0])).toEqual([
+        ['call-a', 0],
+        ['call-b', 1],
+        ['call-a', 1000],
+        ['call-a', 3000],
+      ]);
+      expect(warn).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each<[string, Family, string]>([
+    ['openai at a proxy origin, insufficient_quota', 'openai', OPENAI_SPEND_CAP],
+    ['anthropic at a proxy origin, enforced_spend_limit_reached', 'anthropic', ANTHROPIC_SPEND_CAP],
+    ['google, RESOURCE_EXHAUSTED', 'google', GEMINI_QUOTA_EXHAUSTED],
+  ])(
+    '%s: never classified — brakes, spends maxRateLimitRetries, returns the last 429 with its body',
+    async (_label, family, body) => {
+      const model = MODEL[family];
+      const clone = vi.spyOn(Response.prototype, 'clone');
+      const net = stubFetch((d) => (d.tag === 'call-a' ? { status: 429, body } : { status: 200 }));
+      const provider = providerFor(family, undefined, family === 'google' ? undefined : PROXY);
+      const a = outcome(ask(provider, 'call-a', {}, model));
+      await at(1);
+      const b = outcome(ask(provider, 'call-b', {}, model));
+      await vi.runAllTimersAsync();
+      const err = ((await a) as { error: ProviderError }).error;
+      expect(err).toBeInstanceOf(ProviderError);
+      expect(err.status).toBe(429);
+      expect(err.body).toBe(body);
+      const dispatches = DEFAULT_MAX_RATE_LIMIT_RETRIES + 1;
+      expect(err.timing?.attempts).toBe(dispatches);
+      // No Retry-After: each brake is the exponential backoff, clamped at 60 s.
+      expect(net.of('call-a').map((d) => d.at - T0)).toEqual(backoffSchedule(dispatches));
+      // The sibling that arrived during the first brake was held through
+      // every brake, including the one the final, returned 429 still set.
+      expect(net.of('call-b').map((d) => d.at - T0)).toEqual([
+        backoffSchedule(dispatches + 1).at(-1),
+      ]);
+      expect((await b).ok).toBe(true);
+      // The body was never cloned for classification; discarded 429s were
+      // cancelled, the returned one was left for the adapter to read.
+      expect(clone).not.toHaveBeenCalled();
+      const attempts = net.of('call-a');
+      expect(attempts.slice(0, -1).every(bodyCancelled)).toBe(true);
+      expect(bodyCancelled(attempts.at(-1)!)).toBe(false);
+    },
+  );
+
+  it.each(DIALECT_LESS)(
+    '$label, adaptive: false: a 429 holds no sibling and shares the 3-attempt transient budget',
+    async ({ family, baseUrl }) => {
+      const model = MODEL[family];
+      const net = stubFetch((d) =>
+        d.tag === 'call-a' ? { status: 429, headers: { 'retry-after': '1' } } : { status: 200 },
+      );
+      const provider = providerFor(family, { adaptive: false }, baseUrl);
+      const a = outcome(ask(provider, 'call-a', {}, model));
+      await at(1);
+      const b = outcome(ask(provider, 'call-b', {}, model));
+      await vi.runAllTimersAsync();
+      const err = ((await a) as { error: ProviderError }).error;
+      expect(err.status).toBe(429);
+      expect(err.timing?.attempts).toBe(3);
       expect((await b).ok).toBe(true);
       expect(net.log.map((d) => [d.tag, d.at - T0])).toEqual([
         ['call-a', 0],
@@ -697,11 +845,11 @@ describe('AC21 (guard): dialect-less scopes are unchanged', () => {
         ['call-a', 2000],
       ]);
       expect(warn).not.toHaveBeenCalled();
+      expect(governorOf(provider, model).adapts).toBe(false);
     },
   );
 
   it('a directly constructed RateLimiter is never adaptive, even for an OpenAI URL', async () => {
-    const { RateLimiter } = await import('../providers/rate-limiter.js');
     const gov = new RateLimiter({ maxConcurrent: 2 });
     const net = stubFetch(() => ({ status: 429, headers: { 'retry-after': '1' } }));
     const p = fetchWithRetry(
@@ -715,118 +863,32 @@ describe('AC21 (guard): dialect-less scopes are unchanged', () => {
   });
 });
 
-describe('AC21 (guard): a first-party family behind a proxy is dialect-less', () => {
-  const PROXY = 'https://llm-gateway.example.com/v1';
-  const families: [Family][] = [['openai'], ['openai-responses'], ['anthropic']];
-
-  it.each(families)('%s at a proxy origin: a 200 goes out with no governor', async (family) => {
-    const model = MODEL[family];
-    const net = stubFetch(() => ({ status: 200 }));
-    const provider = providerFor(family, undefined, PROXY);
-    const r = await outcome(ask(provider, 'call-a', {}, model));
-    expect(r.ok).toBe(true);
-    expect(
-      net.log.map((d) => [d.tag, d.url.startsWith('https://llm-gateway.example.com/')]),
-    ).toEqual([['call-a', true]]);
-    expect(governorOf(provider, model)).toBeUndefined();
-  });
-
-  it.each(families)(
-    '%s at a proxy origin: a 429 holds no sibling and shares the transient budget',
-    async (family) => {
-      const model = MODEL[family];
-      const net = stubFetch((d) =>
-        d.tag === 'call-a' ? { status: 429, headers: { 'retry-after': '1' } } : { status: 200 },
-      );
-      const provider = providerFor(family, undefined, PROXY);
-      const a = outcome(ask(provider, 'call-a', {}, model));
-      await at(1);
-      const b = outcome(ask(provider, 'call-b', {}, model));
-      await vi.runAllTimersAsync();
-      const ra = await a;
-      expect((ra as { error: ProviderError }).error.status).toBe(429);
-      expect((await b).ok).toBe(true);
-      expect(net.log.map((d) => [d.tag, d.at - T0])).toEqual([
-        ['call-a', 0],
-        ['call-b', 1],
-        ['call-a', 1000],
-        ['call-a', 2000],
-      ]);
-      expect(warn).not.toHaveBeenCalled();
-    },
-  );
-
-  it.each(families)(
-    '%s at a proxy origin: a 503 retries on the shared budget and holds no sibling',
-    async (family) => {
-      const model = MODEL[family];
-      const net = stubFetch((d) => (d.tag === 'call-a' ? { status: 503 } : { status: 200 }));
-      const provider = providerFor(family, undefined, PROXY);
-      const a = outcome(ask(provider, 'call-a', {}, model));
-      await at(1);
-      const b = outcome(ask(provider, 'call-b', {}, model));
-      await vi.runAllTimersAsync();
-      expect(((await a) as { error: ProviderError }).error.status).toBe(503);
-      expect((await b).ok).toBe(true);
-      expect(net.log.map((d) => [d.tag, d.at - T0])).toEqual([
-        ['call-a', 0],
-        ['call-b', 1],
-        ['call-a', 1000],
-        ['call-a', 3000],
-      ]);
-    },
-  );
-
-  it.each(families)(
-    '%s at a proxy origin with rateLimit: the governor paces but never brakes',
-    async (family) => {
-      const model = MODEL[family];
-      const net = stubFetch((d) =>
-        d.tag === 'call-a' ? { status: 429, headers: { 'retry-after': '1' } } : { status: 200 },
-      );
-      const provider = providerFor(family, { maxConcurrent: 2 }, PROXY);
-      const a = outcome(ask(provider, 'call-a', {}, model));
-      await at(1);
-      const b = outcome(ask(provider, 'call-b', {}, model));
-      await vi.runAllTimersAsync();
-      expect(((await a) as { error: ProviderError }).error.status).toBe(429);
-      expect((await b).ok).toBe(true);
-      expect(net.log.map((d) => [d.tag, d.at - T0])).toEqual([
-        ['call-a', 0],
-        ['call-b', 1],
-        ['call-a', 1000],
-        ['call-a', 2000],
-      ]);
-      expect(governorOf(provider, model).adapts).toBe(false);
-    },
-  );
-
-  it.each<[Family, string]>([
-    ['openai', OPENAI_DEFAULT_BASE_URL],
+describe('the dialect (spend-cap classification) applies only at the vendor default origin', () => {
+  it.each<[Family, string, string]>([
+    ['openai', OPENAI_DEFAULT_BASE_URL, OPENAI_SPEND_CAP],
     // A spelling variant of the default: upper-case host, explicit :443, trailing slash.
     [
       'openai-responses',
       `${OPENAI_DEFAULT_BASE_URL.replace('api.', 'API.').replace('.com', '.com:443')}/`,
+      OPENAI_SPEND_CAP,
     ],
-    ['anthropic', ANTHROPIC_DEFAULT_BASE_URL],
-  ])('%s with baseUrl %s (the default origin) still brakes', async (family, baseUrl) => {
+    ['anthropic', ANTHROPIC_DEFAULT_BASE_URL, ANTHROPIC_SPEND_CAP],
+  ])('%s with baseUrl %s: a spend-cap 429 fails fast', async (family, baseUrl, body) => {
     const model = MODEL[family];
-    const net = stubFetch((d) =>
-      d.tag === 'call-a' && d.attempt === 1
-        ? { status: 429, headers: { 'retry-after': '1' } }
-        : { status: 200 },
-    );
+    const net = stubFetch((d) => (d.tag === 'call-a' ? { status: 429, body } : { status: 200 }));
     const provider = providerFor(family, undefined, baseUrl);
     const a = outcome(ask(provider, 'call-a', {}, model));
     await at(1);
     const b = outcome(ask(provider, 'call-b', {}, model));
     await vi.runAllTimersAsync();
-    await Promise.all([a, b]);
+    const err = ((await a) as { error: ProviderError }).error;
+    expect(err.status).toBe(429);
+    expect(err.body).toBe(body);
     expect(net.log.map((d) => [d.tag, d.at - T0])).toEqual([
       ['call-a', 0],
-      ['call-a', 1000],
-      ['call-b', 1000],
+      ['call-b', 1],
     ]);
+    expect((await b).ok).toBe(true);
   });
 });
 

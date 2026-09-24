@@ -3,10 +3,13 @@
  * why it returned a 429.
  *
  * Only first-party OpenAI (the `openai` family, which covers both
- * `openai:` and `openai-responses:`) and Anthropic have a dialect. Every other
- * scope (Gemini, OpenAI-compatible presets such as Azure or OpenRouter, custom
- * adapters) has none and keeps today's transport behavior. A preset gets a
- * dialect only after live evidence for its headers and 429 bodies.
+ * `openai:` and `openai-responses:`) and Anthropic at the vendor's default
+ * origin have a dialect. Every other scope (Gemini, OpenAI-compatible presets
+ * such as Azure or OpenRouter, a first-party vendor behind a proxy) has none.
+ * It still adapts (fleet brake, rate-limit retry budget, adaptive pacing; see
+ * `governor-pool.ts`), but treats every 429 as a rate limit without reading
+ * its body and never reads a quota hint. A preset gets a dialect only after
+ * live evidence for its headers and 429 bodies.
  *
  * A dialect answers two questions:
  *
@@ -30,7 +33,8 @@ import { ANTHROPIC_DEFAULT_BASE_URL, OPENAI_DEFAULT_BASE_URL } from './default-e
 
 /**
  * Why a 429 was returned. `'unknown'` means the body did not identify either
- * cause; callers on a dialect scope treat it as a rate limit.
+ * cause; the transport treats it as a rate limit, as it does every 429 on a
+ * scope with no dialect.
  */
 export type QuotaClass = 'rate_limit' | 'spend_cap' | 'unknown';
 

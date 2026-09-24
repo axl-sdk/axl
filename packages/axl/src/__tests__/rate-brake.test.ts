@@ -810,6 +810,39 @@ describe('AC21: dialect-less built-in scopes brake and retry on the rate-limit b
   );
 
   it.each(DIALECT_LESS)(
+    '$label, maxConcurrent 2 (adaptive default): brakes, frees its permit, re-acquires first, count stays exact',
+    async ({ family, baseUrl }) => {
+      const model = MODEL[family];
+      const net = stubFetch((d) => {
+        if (d.tag === 'call-a' && d.attempt <= 4) {
+          return { status: 429, headers: { 'retry-after': '1' }, after: 5 };
+        }
+        return { status: 200, after: d.tag === 'call-b' ? 100 : 5 };
+      });
+      const provider = providerFor(family, { maxConcurrent: 2 }, baseUrl);
+      const gov = governorOf(provider, model);
+      const a = outcome(ask(provider, 'call-a', {}, model));
+      const b = outcome(ask(provider, 'call-b', {}, model));
+      await at(10);
+      const c = outcome(ask(provider, 'call-c', {}, model));
+      await at(50);
+      // a gave its permit back for the brake; only b (in flight) holds one,
+      // and c, arriving during the brake, has not left.
+      expect(activePermits(gov)).toBe(1);
+      expect(net.of('call-c')).toEqual([]);
+      await vi.runAllTimersAsync();
+      const [ra, rb, rc] = await Promise.all([a, b, c]);
+      expect(ra.ok && rb.ok && rc.ok).toBe(true);
+      expect((ra as { value: ProviderResponse }).value.timing?.attempts).toBe(5);
+      // Every brake is the backoff floor (1, 2, 4, 8 s) after the 429 lands.
+      expect(net.of('call-a').map((d) => d.at - T0)).toEqual([0, 1005, 3010, 7015, 15_020]);
+      // c was held at least through the first brake.
+      expect(net.of('call-c')[0]!.at - T0).toBeGreaterThanOrEqual(1005);
+      expect(activePermits(gov)).toBe(0);
+    },
+  );
+
+  it.each(DIALECT_LESS)(
     '$label, no rateLimit: a 200 goes out at once with queuedMs exactly 0 (F1, real timers)',
     async ({ family, baseUrl }) => {
       vi.useRealTimers();

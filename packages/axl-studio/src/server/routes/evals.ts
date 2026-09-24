@@ -347,10 +347,16 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
         // carries the worst run's rate, never run[0]'s — mirrors the client's
         // `worstItemErrorRate`.
         const worstItemRate = worstItemErrorRate(results);
+        // `modelTiming` is per-call distributions over ONE run, and the samples
+        // behind them are not persisted, so no group figure can be built. Omit
+        // it rather than present run[0]'s as the batch's; each run in
+        // `allRuns` keeps its own. Mirrors the client's `buildMultiRunResult`.
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        const { modelTiming: _runOneModelTiming, ...firstSummary } = first.summary;
         const result = {
           ...first,
           summary: {
-            ...first.summary,
+            ...firstSummary,
             ...(aggDegraded.length > 0 ? { degraded: aggDegraded } : {}),
             ...(worstItemRate ? { itemErrorRate: worstItemRate } : {}),
           },

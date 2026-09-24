@@ -473,6 +473,10 @@ export type EvalResultData = {
     /** Present when an item failed — see {@link ItemErrorRate}. On a multi-run
      *  aggregate, the worst run's rate with `runsExceeded`. */
     itemErrorRate?: ItemErrorRate;
+    /** Per-model provider latency (`@axlsdk/eval`'s `ModelTimingStats`). Not
+     *  rendered here; typed so the multi-run aggregate can omit it. Absent on a
+     *  multi-run aggregate, since it describes a single run. */
+    modelTiming?: Record<string, unknown>;
   };
   _multiRun?: {
     aggregate: MultiRunAggregate;
@@ -724,6 +728,15 @@ export function buildMultiRunResult(allRuns: EvalResultData[]): EvalResultData |
   // Same reasoning for the item gate: it is judged per run, so the aggregate
   // carries the worst run's rate (and how many runs exceeded), never run[0]'s.
   const worstItemRate = worstItemErrorRate(allRuns);
+  // `modelTiming` describes ONE run (per-call distributions whose samples are
+  // not persisted), so no group figure exists. Omit it rather than present
+  // run[0]'s as the group's; each run in `allRuns` keeps its own. Mirrors the
+  // server's sync multi-run response. `first.summary` is read defensively
+  // above (`first.summary?.scorers`), and destructuring, unlike the spread it
+  // replaces, would throw on a missing one.
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const { modelTiming: _runOneModelTiming, ...firstSummary } =
+    first.summary ?? ({} as EvalResultData['summary']);
   return {
     ...first,
     // Override the spread run[0] spend fields with the group union — see
@@ -733,7 +746,7 @@ export function buildMultiRunResult(allRuns: EvalResultData[]): EvalResultData |
     totalCost: groupAccounting.knownCost,
     ...(groupAccounting.completeness !== 'complete' ? { unpriced: true as const } : {}),
     summary: {
-      ...first.summary,
+      ...firstSummary,
       ...(groupCoverage ? { coverage: groupCoverage } : {}),
       ...(aggDegraded.length > 0 ? { degraded: aggDegraded } : {}),
       ...(worstItemRate ? { itemErrorRate: worstItemRate } : {}),

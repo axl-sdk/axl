@@ -40,6 +40,33 @@ function makeRun(
 }
 
 describe('buildMultiRunResult', () => {
+  it("omits run[0]'s modelTiming from the aggregate summary; each run keeps its own", () => {
+    const stats = { mean: 5, min: 5, max: 5, p50: 5, p95: 5 };
+    const timed = (i: number, rateLimitRetries: number): EvalResultData => {
+      const run = makeRun(i);
+      run.summary.modelTiming = {
+        'openai:gpt-4o': {
+          calls: 2,
+          wireMs: stats,
+          queuedMs: stats,
+          retryMs: stats,
+          rateLimitRetries,
+        },
+      };
+      return run;
+    };
+    const result = buildMultiRunResult([timed(0, 3), timed(1, 0)])!;
+    expect('modelTiming' in result.summary).toBe(false);
+    expect(result._multiRun!.allRuns[0].summary.modelTiming).toEqual(
+      timed(0, 3).summary.modelTiming,
+    );
+    expect(result._multiRun!.allRuns[1].summary.modelTiming).toEqual(
+      timed(1, 0).summary.modelTiming,
+    );
+    // The rest of run[0]'s summary is still spread.
+    expect(result.summary.count).toBe(1);
+  });
+
   it('returns null on empty input', () => {
     expect(buildMultiRunResult([])).toBeNull();
   });

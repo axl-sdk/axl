@@ -481,6 +481,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Studio no longer presents run 1's `modelTiming` as a multi-run
+  aggregate.** The aggregate summary of a multi-run eval (the sync response
+  and the Eval Runner's rebuilt group) spread run 1's per-model latency and
+  rate-limit totals as if they covered the batch. It now omits
+  `modelTiming`. Each run in `_multiRun.allRuns` keeps its own.
 - **`rescore` keeps `summary.modelTiming`.** A rescored result dropped the
   source run's per-model provider latency. A rescore makes no generation
   calls, so it now carries the original `modelTiming` forward unchanged.

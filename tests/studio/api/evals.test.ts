@@ -471,6 +471,41 @@ describe('Studio API: Evals', () => {
     }
   });
 
+  it("POST /api/evals/:name/run multi-run omits run[0]'s modelTiming from the aggregate summary", async () => {
+    // Run 0's first call was throttled 3 times; later calls were not. The
+    // aggregate must not present run 0's per-model figures as the batch's.
+    const provider = MockProvider.fn((_messages, callIndex) => ({
+      content: 'ok',
+      timing: {
+        queuedMs: 0,
+        attempts: 1 + (callIndex === 0 ? 3 : 0),
+        rateLimitRetries: callIndex === 0 ? 3 : 0,
+        retryMs: 0,
+        ttfbMs: 1,
+        wireMs: 5,
+      },
+    }));
+    const { app } = createTestServer(provider);
+
+    const res = await app.request('/api/evals/test-eval/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ runs: 2 }),
+    });
+    expect(res.status).toBe(200);
+    const body = await readJson(res);
+
+    const [run0, run1] = body.data._multiRun.allRuns;
+    const total = (run: {
+      summary: { modelTiming: Record<string, { rateLimitRetries: number }> };
+    }) => Object.values(run.summary.modelTiming).reduce((s, m) => s + m.rateLimitRetries, 0);
+    // Each run keeps its own figures.
+    expect(total(run0)).toBe(3);
+    expect(total(run1)).toBe(0);
+    // The aggregate carries none rather than run 0's.
+    expect('modelTiming' in body.data.summary).toBe(false);
+  });
+
   it("POST /api/evals/:name/run multi-run surfaces the worst run's itemErrorRate, not run[0]'s", async () => {
     // Run 0 is clean and run 1 loses its only item to a 429. The CLI gates each
     // run individually; the aggregate landing view must not inherit run[0]'s

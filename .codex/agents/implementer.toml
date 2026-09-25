@@ -1,7 +1,7 @@
 name = "implementer"
 description = "Implements bounded, well-specified Axl changes using established contracts and patterns: SDK and Studio features, option wiring, repetitive refactors, known-cause fixes, and tests against a frozen matrix. Owns local engineering decisions and focused verification. Returns unresolved contracts, consequential seam changes (public types/Zod, provider mapping, streaming/redaction, state durability, usage/cost, concurrency), uncertain causes, and stagnant diagnosis to the lead for senior-implementer. Product and policy decisions stay with the lead."
-model = "gpt-5.6-terra"
-model_reasoning_effort = "medium"
+model = "gpt-6-luna"
+model_reasoning_effort = "xhigh"
 nickname_candidates = ["Builder", "Implementer", "Patchmaker"]
 
 developer_instructions = """

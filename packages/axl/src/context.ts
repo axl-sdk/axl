@@ -29,7 +29,7 @@ import type {
   ObservationStatus,
 } from './types.js';
 import {
-  AdmissionDeniedError,
+  isAdmissionDeniedError,
   AxlError,
   VerifyError,
   QuorumNotMet,
@@ -5684,7 +5684,7 @@ export class WorkflowContext<TInput = unknown> {
         // A budget stop is not a provider failure. Wrapping it in
         // `TranscriptionOperationError` would erase the caller's ability to
         // tell "we stopped spending" from "the vendor broke".
-        if (error instanceof AdmissionDeniedError) {
+        if (isAdmissionDeniedError(error)) {
           transcriptionOperation?.settleFailure();
           throw error;
         }

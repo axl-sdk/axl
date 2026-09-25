@@ -633,7 +633,9 @@ export type OperationHandle = {
  * @internal
  */
 export function openOperation(descriptor: OperationDescriptor): OperationHandle | undefined {
-  const guard = sharedGuard.storage.getStore();
+  const inheritedGuard = sharedGuard.storage.getStore();
+  const guard =
+    inheritedGuard && (inheritedGuard.isActive?.() ?? true) ? inheritedGuard : undefined;
   if (guard && guard.contextId !== sharedContext.id) {
     guard.markUninstrumented();
     warnCrossCopy(guard.owner, false);
@@ -762,7 +764,9 @@ export async function runInAccountingScope<T>(
     purpose: options.purpose ?? parent?.purpose ?? 'generation',
     admission: options.admission,
   });
-  const enclosingGuard = sharedGuard.storage.getStore();
+  const inheritedGuard = sharedGuard.storage.getStore();
+  const enclosingGuard =
+    inheritedGuard && (inheritedGuard.isActive?.() ?? true) ? inheritedGuard : undefined;
   if (enclosingGuard)
     warnCrossCopy(enclosingGuard.owner, enclosingGuard.contextId === sharedContext.id);
   if (enclosingGuard && enclosingGuard.contextId !== sharedContext.id) {
@@ -790,9 +794,17 @@ export async function runInAccountingScope<T>(
       current = current.parent;
     }
   };
+  const isActive = (): boolean => {
+    let current: AccountingScope | undefined = scope;
+    while (current) {
+      if (!current.isFinalized) return true;
+      current = current.parent;
+    }
+    return false;
+  };
   try {
     const value = await sharedGuard.storage.run(
-      { contextId: sharedContext.id, owner: thisCopy, markUninstrumented },
+      { contextId: sharedContext.id, owner: thisCopy, markUninstrumented, isActive },
       () => accountingStorage.run(scope, fn),
     );
     scope.finalize();

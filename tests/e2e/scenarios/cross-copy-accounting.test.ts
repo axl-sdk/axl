@@ -144,12 +144,38 @@ describe('two loaded builds share accounting', () => {
     expect(b.accounting.operations.total).toBe(1);
   });
 
-  it('refuses work and marks its parent incomplete when two protocols cannot join', () => {
-    // A fresh process lets a conflicting protocol claim the registry before
-    // either build loads. The stable guard still crosses their local contexts.
+  it('does not retry a tool after a denial from the other copy', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const outer = new esm.AxlRuntime();
+    const paid = paidRuntime(cjs);
+    let attempts = 0;
+    const retrying = esm.tool({
+      name: 'retrying',
+      description: 'Cross-copy denial regression',
+      input: z.object({}),
+      retry: { attempts: 3, backoff: 'none' },
+      handler: async () => {
+        attempts++;
+        const inner = await paid.runtime.trackOutcome(() => paid.runtime.execute('ask', {}), {
+          admission: new cjs.AdmissionController({ limit: 0 }),
+        });
+        if (inner.status === 'rejected') throw inner.error;
+        return inner.value;
+      },
+    });
+    const result = await outer.trackOutcome(() => retrying.run({ log() {} } as never, {}));
+    expect(result.status).toBe('rejected');
+    if (result.status === 'rejected') expect(esm.isAdmissionDeniedError(result.error)).toBe(true);
+    expect(attempts).toBe(1);
+    expect(paid.calls()).toBe(0);
+  });
+
+  it('keeps compatible copies joined when another protocol loads first, and refuses a foreign active guard', () => {
+    // The other protocol occupies its own slot. A synthetic foreign guard
+    // models the actual boundary where an incompatible copy owns a scope.
     const script = `
       import { createRequire } from 'node:module';
-      globalThis[Symbol.for('axl.accounting.context')] = { protocol: 2 };
+      globalThis[Symbol.for('axl.accounting.context.v2')] = { protocol: 2 };
       const esm = await import('@axlsdk/axl');
       const cjs = createRequire(import.meta.url)('@axlsdk/axl');
       let calls = 0;
@@ -161,19 +187,44 @@ describe('two loaded builds share accounting', () => {
       });
       const facade = worker.resolveProvider('fixture:m').provider;
       const outer = new esm.AxlRuntime();
-      const direct = await outer.trackOutcome(() => facade.chat([], { model: 'm' }));
-      const nested = await outer.trackOutcome(() => worker.trackOutcome(() => facade.chat([], { model: 'm' })));
+      const joined = await outer.trackOutcome(() => facade.chat([], { model: 'm' }));
+      const denied = await outer.trackOutcome(() => facade.chat([], { model: 'm' }), {
+        admission: new esm.AdmissionController({ limit: 0 })
+      });
+      const storage = globalThis[Symbol.for('axl.accounting.scopeGuard')].storage;
+      const foreign = (parent) => ({
+        contextId: Symbol('protocol2'),
+        owner: { path: '/fixture/protocol2/index.js', version: '2.0.0' },
+        markUninstrumented: () => parent.markUninstrumented(),
+        isActive: () => parent.isActive()
+      });
+      const direct = await outer.trackOutcome(() => {
+        const parent = storage.getStore();
+        return storage.run(foreign(parent), () => facade.chat([], { model: 'm' }));
+      });
+      const nested = await outer.trackOutcome(() => {
+        const parent = storage.getStore();
+        return storage.run(foreign(parent), () => worker.trackOutcome(() => facade.chat([], { model: 'm' })));
+      });
       const afterChild = await outer.trackOutcome(async () => {
         let release;
         const gate = new Promise((resolve) => { release = resolve; });
         let late;
         await outer.trackOutcome(async () => {
-          late = (async () => { await gate; return facade.chat([], { model: 'm' }); })();
+          const parent = storage.getStore();
+          late = storage.run(foreign(parent), async () => { await gate; return facade.chat([], { model: 'm' }); });
         });
         release();
         await late.catch(() => undefined);
       });
-      console.log(JSON.stringify({ calls, direct: { status: direct.status, code: direct.error?.code,
+      let staleGuard;
+      await outer.trackOutcome(async () => { staleGuard = foreign(storage.getStore()); });
+      const afterAll = await storage.run(staleGuard, () => facade.chat([], { model: 'm' }));
+      const newScope = await storage.run(staleGuard, () => worker.trackOutcome(() => facade.chat([], { model: 'm' })));
+      console.log(JSON.stringify({ calls,
+        joined: joined.accounting, denied: { status: denied.status, code: denied.error?.code },
+        afterAll: afterAll.content, newScope: newScope.accounting,
+        direct: { status: direct.status, code: direct.error?.code,
         accounting: direct.accounting }, nested: { status: nested.status,
         accounting: nested.accounting, inner: nested.value?.accounting, innerCode: nested.value?.error?.code },
         afterChild: afterChild.accounting }));
@@ -185,6 +236,10 @@ describe('two loaded builds share accounting', () => {
     expect(child.status).toBe(0);
     const result = JSON.parse(child.stdout) as {
       calls: number;
+      joined: { knownCost: number; completeness: string };
+      denied: { status: string; code: string };
+      afterAll: string;
+      newScope: { knownCost: number; completeness: string };
       direct: {
         status: string;
         code: string;
@@ -199,7 +254,11 @@ describe('two loaded builds share accounting', () => {
       afterChild: { completeness: string; reasons: { uninstrumented?: number } };
     };
     expect(result).toMatchObject({
-      calls: 0,
+      calls: 3,
+      joined: { knownCost: 0.5, completeness: 'complete' },
+      denied: { status: 'rejected', code: 'ADMISSION_DENIED' },
+      afterAll: 'ok',
+      newScope: { knownCost: 0.5, completeness: 'complete' },
       direct: {
         status: 'rejected',
         code: 'INCOMPATIBLE_ACCOUNTING_SCOPE',
@@ -213,7 +272,7 @@ describe('two loaded builds share accounting', () => {
       },
       afterChild: { completeness: 'incomplete', reasons: { uninstrumented: 1 } },
     });
-    expect(child.stderr).toContain('index.js');
+    expect(child.stderr).toContain('/fixture/protocol2/index.js');
     expect(child.stderr).toContain('index.cjs');
   });
 

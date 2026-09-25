@@ -1,5 +1,5 @@
 import {
-  AdmissionDeniedError,
+  isAdmissionDeniedError,
   isEventStreamOverflowError,
   rethrowEventStreamOverflow,
   ToolFailure,
@@ -466,7 +466,7 @@ export async function executeAcceptedTool(options: {
     // A budget stop is not a tool failure: it must escape the agent loop with
     // its own identity rather than being fed back to the model as an error
     // result and prompting yet another turn.
-    if (error instanceof AdmissionDeniedError) throw error;
+    if (isAdmissionDeniedError(error)) throw error;
     const abort = cancellationError(signal, error);
     if (abort !== undefined) return cancellation('handler', abort);
     return failed('handler', error, { attempts });

@@ -15,8 +15,9 @@ GPT-6, Claude Opus 5.5, and Gemini 3.8 Flash contracts were checked on September
 Exact known
 IDs receive their documented parameter and pricing behavior. Other IDs may pass
 through to the provider but remain unpriced and do not inherit model-specific
-behavior. See the [catalog verification](./verification/latest-provider-models-2026-08-03.md)
-and [native image refresh](./verification/native-image-catalog-2026-09-02.md).
+behavior. See the [catalog verification](./verification/latest-provider-models-2026-08-03.md),
+[native image refresh](./verification/native-image-catalog-2026-09-02.md), and
+[frontier refresh verification](./verification/frontier-model-refresh-2026-09-25.md).
 
 ## OpenAI — Responses API (preferred)
 

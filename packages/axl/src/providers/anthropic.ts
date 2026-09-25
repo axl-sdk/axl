@@ -12,6 +12,7 @@ import type {
   ProviderInputValidationRequest,
   ProviderInputValidationResult,
 } from './types.js';
+import type { ReasoningContextReset } from '../types.js';
 import { resolveThinkingOptions, resolveApiKey, type ApiKeySource } from './types.js';
 import { fetchWithRetry } from './retry.js';
 import { CallTimingRecorder, withCallTiming, withChatTiming } from './call-timing.js';
@@ -21,7 +22,7 @@ import { ANTHROPIC_DEFAULT_BASE_URL } from './default-endpoints.js';
 import { AdapterGovernors, type ScopeGovernor } from './governor-pool.js';
 import { assertSafeProviderBaseUrl } from '../http-transport.js';
 import type { InputContentPart, InputMediaSource } from '../input.js';
-import { UnsupportedModelInputError } from '../errors.js';
+import { UnsupportedModelInputError, UnsupportedModelOptionError } from '../errors.js';
 import { firstRichPart, type RichModality } from './rich-input.js';
 
 function anthropicBase64(source: Extract<InputMediaSource, { type: 'bytes' | 'base64' }>): string {
@@ -90,6 +91,59 @@ function anthropicImageBlocks(
 
 const ANTHROPIC_API_VERSION = '2023-06-01';
 const ANTHROPIC_FILES_BETA = 'files-api-2025-04-14';
+const ANTHROPIC_THINKING_BINDING_BETA = 'thinking-binding-controls-2026-08-01';
+const BOUND_THINKING_MODELS = new Set(['claude-opus-5-5', 'claude-fable-5-1']);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function hasReplayedThinking(body: Record<string, unknown>): boolean {
+  return (
+    Array.isArray(body.messages) &&
+    body.messages.some(
+      (message: unknown) =>
+        isRecord(message) &&
+        Array.isArray(message.content) &&
+        message.content.some(
+          (block: unknown) =>
+            isRecord(block) && (block.type === 'thinking' || block.type === 'redacted_thinking'),
+        ),
+    )
+  );
+}
+
+function hasFinalFileImage(body: Record<string, unknown>): boolean {
+  return (
+    Array.isArray(body.messages) &&
+    body.messages.some(
+      (message: unknown) =>
+        isRecord(message) &&
+        Array.isArray(message.content) &&
+        message.content.some(
+          (block: unknown) =>
+            isRecord(block) &&
+            block.type === 'image' &&
+            isRecord(block.source) &&
+            block.source.type === 'file',
+        ),
+    )
+  );
+}
+
+function normalizeThinkingDrops(value: unknown): ReasoningContextReset | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const reasons: ReasoningContextReset['reasons'] = {};
+  let droppedBlocks = 0;
+  for (const entry of value) {
+    if (!isRecord(entry) || entry.type !== 'thinking_dropped') continue;
+    if (entry.reason !== 'prefix_binding_mismatch' && entry.reason !== 'model_binding_mismatch')
+      continue;
+    reasons[entry.reason] = (reasons[entry.reason] ?? 0) + 1;
+    droppedBlocks++;
+  }
+  return droppedBlocks > 0 ? { droppedBlocks, reasons } : undefined;
+}
 
 function hasAnthropicProviderFileImage(messages: readonly ChatMessage[]): boolean {
   return messages.some(
@@ -129,6 +183,12 @@ type ClaudeCapability = {
 };
 
 const CLAUDE_CAPABILITIES: Record<string, ClaudeCapability> = {
+  'claude-opus-5-5': {
+    thinking: 'adaptive-always-on',
+    effortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
+    manualBudget: false,
+    stripTemperature: true,
+  },
   'claude-fable-5-1': {
     thinking: 'adaptive-always-on',
     effortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
@@ -239,8 +299,8 @@ type AnthropicRate = {
   input: number;
   output: number;
   /**
-   * Cache-hit price as a fraction of base input. 0.1x on every model except
-   * Claude Fable 5.1 / Mythos 5.1, which read cache at 0.025x.
+   * Cache-hit price as a fraction of base input. 0.1x on most models;
+   * Opus 5.5 is 0.05x and Fable 5.1 / Mythos 5.1 are 0.025x.
    */
   cacheReadMultiplier?: number;
 };
@@ -249,6 +309,7 @@ type AnthropicRate = {
 const DEFAULT_CACHE_READ_MULTIPLIER = 0.1;
 
 const ANTHROPIC_RATES: Record<string, AnthropicRate> = {
+  'claude-opus-5-5': { input: 4e-6, output: 20e-6, cacheReadMultiplier: 0.05 },
   'claude-fable-5-1': { input: 10e-6, output: 50e-6, cacheReadMultiplier: 0.025 },
   'claude-fable-5': { input: 10e-6, output: 50e-6 },
   // Limited availability (Glasswing). Priced from the public pricing table; no
@@ -940,11 +1001,12 @@ export class AnthropicProvider implements Provider {
   // ---------------------------------------------------------------------------
 
   async chat(messages: ChatMessage[], options: ChatOptions): Promise<ProviderResponse> {
+    const body = this.buildRequestBody(messages, options, false);
     const headers = this.buildHeaders(
       await this.resolveKey(),
-      hasAnthropicProviderFileImage(messages),
+      hasAnthropicProviderFileImage(messages) || hasFinalFileImage(body),
+      this.requiresBindingBeta(body),
     );
-    const body = this.buildRequestBody(messages, options, false);
     const pricingContext = pricingContextFromBody(body);
 
     const recorder = new CallTimingRecorder(options.requestLifecycle);
@@ -987,11 +1049,12 @@ export class AnthropicProvider implements Provider {
   // ---------------------------------------------------------------------------
 
   async *stream(messages: ChatMessage[], options: ChatOptions): AsyncGenerator<StreamChunk> {
+    const body = this.buildRequestBody(messages, options, true);
     const headers = this.buildHeaders(
       await this.resolveKey(),
-      hasAnthropicProviderFileImage(messages),
+      hasAnthropicProviderFileImage(messages) || hasFinalFileImage(body),
+      this.requiresBindingBeta(body),
     );
-    const body = this.buildRequestBody(messages, options, true);
     const pricingContext = pricingContextFromBody(body);
 
     const recorder = new CallTimingRecorder(options.requestLifecycle);
@@ -1039,12 +1102,88 @@ export class AnthropicProvider implements Provider {
   // Internal: request building
   // ---------------------------------------------------------------------------
 
-  private buildHeaders(apiKey: string, requiresFilesBeta = false): Record<string, string> {
+  private buildHeaders(
+    apiKey: string,
+    requiresFilesBeta = false,
+    requiresBindingBeta = false,
+  ): Record<string, string> {
+    const betas = [
+      ...(requiresFilesBeta ? [ANTHROPIC_FILES_BETA] : []),
+      ...(requiresBindingBeta ? [ANTHROPIC_THINKING_BINDING_BETA] : []),
+    ];
     return {
       'Content-Type': 'application/json',
       'x-api-key': apiKey,
       'anthropic-version': ANTHROPIC_API_VERSION,
-      ...(requiresFilesBeta ? { 'anthropic-beta': ANTHROPIC_FILES_BETA } : {}),
+      ...(betas.length > 0 ? { 'anthropic-beta': betas.join(',') } : {}),
+    };
+  }
+
+  private requiresBindingBeta(body: Record<string, unknown>): boolean {
+    const thinking = body.thinking;
+    return (
+      BOUND_THINKING_MODELS.has(String(body.model)) &&
+      (hasReplayedThinking(body) || (isRecord(thinking) && thinking.block_binding !== undefined))
+    );
+  }
+
+  private validateAndBindFinalBody(body: Record<string, unknown>): void {
+    const model = typeof body.model === 'string' ? body.model : '';
+    if (!BOUND_THINKING_MODELS.has(model)) return;
+    const reject = (option: string, remediation: string): never => {
+      throw new UnsupportedModelOptionError({ provider: this.name, model, option, remediation });
+    };
+    const toolChoice = body.tool_choice;
+    if (isRecord(toolChoice) && (toolChoice.type === 'any' || toolChoice.type === 'tool')) {
+      reject('forced tool choice', "Use toolChoice: 'auto' or 'none' on this model.");
+    }
+    if (
+      body.thinking !== undefined &&
+      (!isRecord(body.thinking) ||
+        body.thinking.type !== 'adaptive' ||
+        body.thinking.budget_tokens !== undefined)
+    ) {
+      reject(
+        'manual or disabled thinking',
+        "Use thinking: { type: 'adaptive' } and output_config.effort.",
+      );
+    }
+    const outputConfig = body.output_config;
+    if (
+      outputConfig !== undefined &&
+      (!isRecord(outputConfig) ||
+        (outputConfig.effort !== undefined &&
+          !['low', 'medium', 'high', 'xhigh', 'max'].includes(String(outputConfig.effort))))
+    ) {
+      reject('output_config.effort', 'Use low, medium, high, xhigh, or max effort.');
+    }
+    if (body.temperature !== undefined && body.temperature !== 1) {
+      reject('temperature', 'Omit temperature or use the default value 1.');
+    }
+    if (
+      body.top_p !== undefined &&
+      (typeof body.top_p !== 'number' || body.top_p < 0.99 || body.top_p > 1)
+    ) {
+      reject('top_p', 'Omit top_p or use a value from 0.99 to 1.');
+    }
+    if (body.top_k !== undefined) {
+      reject('top_k', 'Omit top_k on this model.');
+    }
+    const replayed = hasReplayedThinking(body);
+    if (!replayed) return;
+    const thinking = isRecord(body.thinking) ? body.thinking : { type: 'adaptive' };
+    const binding = thinking.block_binding;
+    if (
+      binding !== undefined &&
+      (!isRecord(binding) ||
+        (binding.prefix_mismatch_behavior !== 'error' &&
+          binding.prefix_mismatch_behavior !== 'drop_block'))
+    ) {
+      reject('thinking.block_binding', "Use prefix_mismatch_behavior: 'error' or 'drop_block'.");
+    }
+    body.thinking = {
+      ...thinking,
+      block_binding: binding ?? { prefix_mismatch_behavior: 'drop_block' },
     };
   }
 
@@ -1180,6 +1319,8 @@ export class AnthropicProvider implements Provider {
     if (options.providerOptions) {
       Object.assign(body, options.providerOptions);
     }
+
+    this.validateAndBindFinalBody(body);
 
     return body;
   }
@@ -1379,6 +1520,7 @@ export class AnthropicProvider implements Provider {
     }
 
     const normalized = json.usage ? normalizeAnthropicUsage(json.usage) : undefined;
+    const reasoningContextReset = normalizeThinkingDrops(json.input_transformations);
     const effectiveModel = typeof json.model === 'string' ? json.model : pricingContext.model;
     if (hasFallbackBoundary) {
       throw new Error(
@@ -1406,6 +1548,7 @@ export class AnthropicProvider implements Provider {
         thinkingBlocks.length > 0 && !hasFallbackBoundary
           ? { anthropicThinkingBlocks: thinkingBlocks }
           : undefined,
+      ...(reasoningContextReset ? { diagnostics: { reasoningContextReset } } : {}),
     };
   }
 
@@ -1436,6 +1579,7 @@ export class AnthropicProvider implements Provider {
     let hasFallbackBoundary = false;
     let hasFallbackIterationSignal = false;
     let refused = false;
+    let reasoningContextReset: ReasoningContextReset | undefined;
 
     const finalizeUsage = () => {
       const normalized = rawUsage ? normalizeAnthropicUsage(rawUsage) : undefined;
@@ -1461,6 +1605,7 @@ export class AnthropicProvider implements Provider {
           thinkingBlocks.length > 0 && !hasFallbackBoundary && !hasFallbackIterationSignal
             ? { anthropicThinkingBlocks: thinkingBlocks }
             : undefined,
+        ...(reasoningContextReset ? { diagnostics: { reasoningContextReset } } : {}),
       };
     };
 
@@ -1568,6 +1713,7 @@ export class AnthropicProvider implements Provider {
                 rawUsage = mergeAnthropicUsage(rawUsage, event.message.usage);
               }
               if (typeof event.message?.model === 'string') effectiveModel = event.message.model;
+              reasoningContextReset = normalizeThinkingDrops(event.message?.input_transformations);
               const messageFallback = hasFallbackIteration(event.message?.usage?.iterations);
               if (
                 isAnthropicResponseModifier(
@@ -1592,6 +1738,12 @@ export class AnthropicProvider implements Provider {
             }
 
             case 'message_delta': {
+              // A serving-model fallback can replace the initial transformations.
+              const finalTransformations =
+                event.input_transformations ?? event.delta?.input_transformations;
+              if (finalTransformations !== undefined) {
+                reasoningContextReset = normalizeThinkingDrops(finalTransformations);
+              }
               // message_delta arrives near the end with output token counts
               if (event.usage) {
                 rawUsage = mergeAnthropicUsage(rawUsage, event.usage);
@@ -1704,6 +1856,7 @@ type AnthropicMessageResponse = {
   >;
   stop_reason: string | null;
   usage: AnthropicUsage;
+  input_transformations?: unknown;
 };
 
 type AnthropicUsage = {
@@ -1744,6 +1897,7 @@ type AnthropicStreamEvent = {
     speed?: string;
     inference_geo?: string;
     usage?: AnthropicUsage;
+    input_transformations?: unknown;
   };
   content_block?: {
     type?: 'text' | 'thinking' | 'redacted_thinking' | 'tool_use' | 'fallback' | 'refusal';
@@ -1762,6 +1916,8 @@ type AnthropicStreamEvent = {
     signature?: string;
     partial_json?: string;
     stop_reason?: string;
+    input_transformations?: unknown;
   };
   usage?: AnthropicUsage;
+  input_transformations?: unknown;
 };

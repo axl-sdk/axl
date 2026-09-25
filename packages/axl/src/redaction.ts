@@ -240,9 +240,9 @@ const LEGACY_REDACTION_RULES: { [K in LegacyEventType]: LegacyRuleFor<K> } = {
   // which is user content or PII (field paths are schema-shape, preserved like
   // `string_delta.path`). Passthrough, as an explicit reviewed decision.
   schema_diagnostic: passthrough as unknown as LegacyRuleFor<'schema_diagnostic'>,
-  // `provider_diagnostic` carries only provider capability metadata — a provider
-  // name, a model id, and two effort level strings. No application data or user
-  // content ever reaches it. Passthrough, as an explicit reviewed decision.
+  // `provider_diagnostic` carries only provider/model metadata, effort levels,
+  // and bounded dropped-thinking reason counts. Raw transformation paths and
+  // signed thinking never enter this event. Passthrough is reviewed here.
   provider_diagnostic: passthrough as unknown as LegacyRuleFor<'provider_diagnostic'>,
   log: (e) => {
     if (!e.data || typeof e.data !== 'object' || Array.isArray(e.data)) return e;

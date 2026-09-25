@@ -665,16 +665,31 @@ export type SchemaDiagnosticData =
  * The union is `kind`-discriminated so later provider cliffs can join without a
  * new event type.
  */
-export type ProviderDiagnosticData = {
-  kind: 'effort_clamped';
-  /** Provider name (`provider.name`), when the adapter exposes one. */
-  provider?: string;
-  /** The model the request is actually sent to (after any `providerOptions.model`). */
-  model: string;
-  requested: Effort;
-  effective: string;
-  cause: string;
+export type ReasoningContextReset = {
+  /** Number of thinking blocks the provider dropped from this call's input. */
+  droppedBlocks: number;
+  /** Only documented Anthropic reasons; no block paths or signed content. */
+  reasons: Partial<Record<'prefix_binding_mismatch' | 'model_binding_mismatch', number>>;
 };
+
+export type ProviderDiagnosticData =
+  | {
+      kind: 'effort_clamped';
+      /** Provider name (`provider.name`), when the adapter exposes one. */
+      provider?: string;
+      /** The model the request is actually sent to (after any `providerOptions.model`). */
+      model: string;
+      requested: Effort;
+      effective: string;
+      cause: string;
+    }
+  | {
+      kind: 'reasoning_context_reset';
+      provider?: string;
+      model: string;
+      droppedBlocks: number;
+      reasons: ReasoningContextReset['reasons'];
+    };
 
 /** Data shape for legacy `guardrail` events. Replaced by `pipeline` in PR 2. */
 export type GuardrailData = {
@@ -1566,6 +1581,8 @@ export type ProviderResponse = {
   costProvenance?: 'provider_reported' | 'price_table_estimate';
   /** Provider-specific opaque metadata that needs to round-trip through conversation history. */
   providerMetadata?: Record<string, unknown>;
+  /** Safe per-call provider diagnostics, excluding raw provider content. */
+  diagnostics?: { reasoningContextReset?: ReasoningContextReset };
   /** Per-call latency breakdown. Absent on providers that don't instrument it. */
   timing?: CallTiming;
 };

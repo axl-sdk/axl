@@ -737,6 +737,7 @@ deduped `console.warn`:
 | `data.kind` | Fires when | Fields |
 |---|---|---|
 | `effort_clamped` | The provider sent a different native level than the requested `effort` | `requested`, `effective` (provider-native string), `cause`, `model`, `provider?` |
+| `reasoning_context_reset` | Anthropic dropped replayed thinking from one completed provider call | `droppedBlocks`, counts by `prefix_binding_mismatch` and/or `model_binding_mismatch` in `reasons`, `model`, `provider?` |
 
 ```ts
 for await (const event of stream.lifecycle) {
@@ -753,6 +754,10 @@ for await (const event of stream.lifecycle) {
 - The warning is deduped per distinct clamp and silenced by `AxlConfig.diagnostics.silent`
   or `AXL_DIAGNOSTICS_SILENT=true`. The event is never silenced.
 - Redaction passes the event through unchanged; it carries no prompt or response content.
+- `reasoning_context_reset` is emitted after each affected provider call, including
+  repeated calls within one tool loop. Direct adapter responses and terminal
+  stream chunks carry the same safe counts in `diagnostics.reasoningContextReset`.
+  Transformation paths, signed blocks, and raw provider bodies are never included.
 - A provider whose `effortResolution()` throws or reports a malformed clamp fails the ask
   with that error.
 

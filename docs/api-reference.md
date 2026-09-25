@@ -194,10 +194,10 @@ const myAgent = agent({
 | `temperature` | `number` | provider default | LLM sampling temperature |
 | `maxTokens` | `number` | `4096` | Maximum tokens in the LLM response |
 | `effort` | `Effort` | — | Unified effort level: `'none'` \| `'low'` \| `'medium'` \| `'high'` \| `'xhigh'` \| `'max'`. Exact model and endpoint capabilities determine whether a tier is sent, clamped, or omitted. GPT-5.6 supports native `'max'` on Responses; Chat sends `'xhigh'` and reports the clamp via a `provider_diagnostic` event. Claude 5 supports native `'max'`; earlier families keep their documented caps |
-| `thinkingBudget` | `number` | — | Explicit thinking token budget (advanced). Overrides effort-based allocation. Set to `0` to disable thinking while keeping effort |
+| `thinkingBudget` | `number` | — | Explicit thinking token budget (advanced). Overrides effort-based allocation. On models that allow it, `0` disables thinking while keeping effort; Claude Opus 5.5 and Fable 5.1 instead use adaptive thinking at the low floor. |
 | `promptCache` | `boolean` | `false` | Opt in to caching the agent's stable prefix (system prompt + tool definitions). Anthropic: one `cache_control` breakpoint on the first system block, so runtime-injected summaries and the user turn are never cached. OpenAI and Gemini cache automatically — no-op there. Off by default because a prefix that changes every call (a `system` built from `ctx.metadata`) pays the write premium with no reads. See [providers.md#prompt-caching](providers.md#prompt-caching) |
 | `includeThoughts` | `boolean` | — | Return reasoning summaries in responses. Supported on OpenAI Responses API and Gemini |
-| `toolChoice` | `'auto' \| 'none' \| 'required' \| { type: 'function', function: { name } }` | — | Tool choice strategy: `'auto'` lets the model decide, `'none'` forbids tool use, `'required'` forces at least one tool call, or specify a function name to force a specific tool |
+| `toolChoice` | `'auto' \| 'none' \| 'required' \| { type: 'function', function: { name } }` | — | Tool choice strategy: `'auto'` lets the model decide, `'none'` forbids tool use, `'required'` forces at least one tool call, or specify a function name to force a specific tool. Claude Opus 5.5 and Fable 5.1 reject forced choices before dispatch. |
 | `stop` | `string[]` | — | Stop sequences — generation stops when any sequence is encountered. Not supported by the `openai-responses` provider (silently ignored) |
 | `providerOptions` | `Record<string, unknown>` | — | Provider-specific options shallow-merged into the raw API request body via `Object.assign`. Not portable across providers. See [shallow merge caveat](providers.md#provideroptions) |
 | `maxTurns` | `number` | `25` | Maximum tool-call loop iterations before throwing `MaxTurnsError`. **A "turn" in axl is one provider call inside a single `ctx.ask()`** — not a user↔assistant exchange. Schema/validate/guardrail retries also consume turns. See [Sessions → Turns vs. Exchanges](#turns-vs-exchanges) |
@@ -2085,6 +2085,14 @@ Anthropic cache creation is included in
 each bucket at its actual multiplier. Aggregate-only cache-write usage remains observable but
 is deliberately unpriced.
 
+`ProviderResponse.diagnostics?.reasoningContextReset` and the terminal stream
+`done.diagnostics` field carry the same optional Anthropic dropped-thinking
+summary: `droppedBlocks` and counts for documented
+`prefix_binding_mismatch` / `model_binding_mismatch` reasons. They never contain
+the signed block, transformation path, or raw response. Custom providers can
+omit `diagnostics`; the runtime emits a `reasoning_context_reset` event only
+when a completed call reports dropped blocks.
+
 `audio_input_tokens` / `audio_output_tokens` are the audio share of
 `prompt_tokens` / `completion_tokens`, populated on every lane that reports the
 split — `openai:` and `openrouter:` from `prompt_tokens_details.audio_tokens` /
@@ -2311,7 +2319,7 @@ import type { AxlEvent, AxlEventType, AxlEventOf, AskScoped } from '@axlsdk/axl'
 | `string_delta` | `AskScoped` | `attempt: number`, `data: StringDeltaData` (`{ path: string, delta: string }`) | Per-chunk character-level deltas inside string VALUES of progressive structured output. Same gating as `partial_object` (schema set, no tools, root is `ZodObject`). **Important:** `handoffs: [...]` configured on an agent registers as tools internally, so a router agent never emits `string_delta` — only the handoff target (or any leaf agent with no tools and a schema) does. `path` is an RFC 6901 JSON Pointer to the string field (`/summary`, `/sources/0/title`); `delta` is the unescaped chars added in this chunk. Designed for chat-style typewriter rendering of long string fields — see `AxlStream.stringStream` / `AxlEventBus.stringStream` view helpers below. Stream-only; never persisted to `ExecutionInfo.events` |
 | `verify` | `AskScoped` | `data: VerifyData` | `ctx.verify()` completes (pass or fail) |
 | `schema_diagnostic` | `AskScoped` | `data: SchemaDiagnosticData` (`kind`-discriminated) | A silent structured-output cliff was detected (oversized appended/tool schema, dropped `.refine()`s, streaming disabled, or `schemaPrompt:'none'` with no guidance). One per ask per cliff. Threshold + silencing via `AxlConfig.diagnostics`. See [observability.md#schema-diagnostics](./observability.md#schema-diagnostics) |
-| `provider_diagnostic` | `AskScoped` | `data: ProviderDiagnosticData` (`kind`-discriminated) | The resolved provider could not honor a portable request knob verbatim. First kind: `effort_clamped` (`requested`, provider-native `effective`, `cause`, `model`, `provider?`). One per ask, emitted before the ask's first `agent_call_start`; `agent_call_start` keeps reporting the *requested* effort. Silencing via `AxlConfig.diagnostics` suppresses only the paired `console.warn`. See [observability.md#provider-diagnostics](./observability.md#provider-diagnostics) |
+| `provider_diagnostic` | `AskScoped` | `data: ProviderDiagnosticData` (`kind`-discriminated) | `effort_clamped` reports requested and effective effort once per ask before dispatch. `reasoning_context_reset` reports safe dropped-thinking reason counts once per affected Anthropic provider call after completion. Silencing via `AxlConfig.diagnostics` suppresses only the paired effort warning. See [observability.md#provider-diagnostics](./observability.md#provider-diagnostics) |
 | `guardrail` / `schema_check` / `validate` | `Partial<AskScoped>` | `data: GuardrailData/SchemaCheckData/ValidateData` | Per-gate retry events emitted alongside `pipeline` |
 | `log` | `Partial<AskScoped>` | `data: unknown` | `ctx.log()` user event |
 | `memory_remember` / `memory_recall` / `memory_forget` | `Partial<AskScoped>` | `data: MemoryEventData` | Memory ops audit |

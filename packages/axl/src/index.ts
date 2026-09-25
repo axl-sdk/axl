@@ -211,6 +211,7 @@ export type {
   SchemaCheckData,
   SchemaDiagnosticData,
   ProviderDiagnosticData,
+  ReasoningContextReset,
   ValidateData,
   StringDeltaData,
   AskOptions,

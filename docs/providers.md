@@ -171,6 +171,7 @@ documents text and image inputs only. Neither ever falls back to transcription.
 
 ```
 anthropic:claude-fable-5-1      # Highest-capability Claude; thinking always on
+anthropic:claude-opus-5-5       # Opus 5.5; adaptive thinking always on
 anthropic:claude-fable-5        # Previous Fable; thinking always on
 anthropic:claude-opus-5         # Claude 5 flagship; thinking on by default
 anthropic:claude-sonnet-5       # Claude 5 balanced; thinking on by default
@@ -182,6 +183,26 @@ anthropic:claude-sonnet-4-5     # Balanced
 anthropic:claude-haiku-4-5      # Fast and affordable
 anthropic:claude-opus-4-5       # Previous gen
 ```
+
+Opus 5.5 supports `low`, `medium`, `high`, `xhigh`, and `max` effort with adaptive
+thinking; its default is `medium`. `none` uses `low` and emits `effort_clamped`.
+Opus 5.5 and Fable 5.1 reject `toolChoice: 'required'` and named choices locally;
+use `auto` or `none`. The adapter also rejects final native overrides that
+would disable/manualize thinking, set an invalid effort, or send unsupported
+non-default sampling values. When a final request replays signed thinking, Axl sends
+Anthropic's binding beta and `drop_block` policy. A valid native
+`providerOptions.thinking.block_binding.prefix_mismatch_behavior: 'error'` opts out.
+Anthropic can drop incompatible thinking while retaining adjacent text and tool
+blocks; each affected call reports safe reason counts through `diagnostics` and
+`provider_diagnostic { kind: 'reasoning_context_reset' }`. The provider, rather
+than Axl, decides block compatibility. Signed content and transformation paths
+are excluded from diagnostics. This beta-dependent continuation behavior needs
+live certification on the target account.
+
+The [Opus 5.5 model page](https://platform.claude.com/docs/en/models/opus-5-5/overview)
+publishes Standard text rates of $4 input, $20 output, $0.20 cache read, $5
+five-minute cache write, and $8 one-hour cache write per million tokens.
+Unmodeled billing modes remain unpriced.
 
 `claude-mythos-5-1` and `claude-mythos-5` are priced but have no capability entry:
 they are limited-availability models whose per-model thinking semantics are not
@@ -1048,7 +1069,7 @@ const solution = await ctx.ask(reasoner, problem, { effort: 'low' });
 | `temperature` | provider default | Controls randomness (0.0–2.0). Stripped automatically for reasoning models and when thinking is active on Anthropic. |
 | `maxTokens` | `4096` | Maximum completion tokens per call. |
 | `effort` | — | Unified effort level controlling reasoning depth across all providers (see below). |
-| `thinkingBudget` | — | Explicit thinking token budget (advanced). Overrides effort-based allocation. Set to `0` to disable thinking while keeping `effort` for output control (Anthropic). |
+| `thinkingBudget` | — | Explicit thinking token budget (advanced). Overrides effort-based allocation. `0` disables thinking only where the model permits it; Opus 5.5 and Fable 5.1 use adaptive thinking at `low`. |
 | `includeThoughts` | — | Return reasoning summaries in responses. Supported on OpenAI Responses API and Gemini. No-op on Anthropic. |
 | `toolChoice` | — | Controls whether and how the model uses tools (see below). |
 | `stop` | — | Stop sequences — generation stops when any sequence is encountered (see below). |
@@ -1131,9 +1152,9 @@ agent({ model: 'google:gemini-2.5-pro', effort: 'high', includeThoughts: true })
 
 ⊗ Reasoning on self-hosted runtimes is configured at the server (launch flags / `chat_template_kwargs`), so `effort` is generally a no-op; inline `<think>` output is captured.
 
-† Anthropic `effort: 'max'` only supported on Opus 4.8, 4.7, and 4.6. On Sonnet 4.6 and Opus 4.5, capped to `'high'`.
+† Among Claude 4 models, Anthropic `effort: 'max'` is supported on Opus 4.8, 4.7, and 4.6. On Sonnet 4.6 and Opus 4.5, capped to `'high'`.
 
-◊ Anthropic `effort: 'xhigh'` is only supported on Opus 4.8 and 4.7 (positioned between `'high'` and `'max'`). On other Anthropic models and on Gemini 3.x, it clamps to `'high'`.
+◊ Among Claude 4 models, Anthropic `effort: 'xhigh'` is supported on Opus 4.8 and 4.7 (between `'high'` and `'max'`). Claude 5 supports it; other Anthropic models and Gemini 3.x clamp to `'high'`.
 
 ⁑ OpenAI pre-gpt-5.1 models (o-series, gpt-5, gpt-5-mini, gpt-5-nano) do not support `reasoning_effort: 'none'`. Axl clamps to `'minimal'` — the lowest supported value.
 
@@ -1172,7 +1193,7 @@ Third-party providers that omit `Provider.effortResolution()` report nothing.
 - **OpenAI o-series** (o1/o3/o4-mini): Uses `developer` role instead of `system`, strips temperature, sends `reasoning_effort`. `effort: 'none'` sends `reasoning_effort: 'minimal'` (o-series doesn't support `'none'`). `effort: 'max'` sends `'high'` (o-series doesn't support `'xhigh'`).
 - **OpenAI GPT-5.x Chat Completions**: Uses `system`, strips temperature when reasoning is active, and supports parallel tool calls. The compatibility baseline maps GPT-5.2+ `'max'` to `'xhigh'`, reported through a `provider_diagnostic` event. Earlier families retain their lower caps.
 - **OpenAI Responses API**: Uses `reasoning: { effort }`; exact GPT-5.6 IDs accept native `'max'` and omit `temperature` because that family rejects it even when reasoning uses the provider default. Older models keep their documented clamps. `includeThoughts: true` enables reasoning summaries (`reasoning: { summary: 'detailed' }`). Reasoning context is automatically round-tripped via `providerMetadata.openaiReasoningItems`.
-- **Anthropic Claude 5**: Fable 5.1 and Fable 5 always reason; Opus 5 and Sonnet 5 reason by default. All four accept the full active effort vocabulary through adaptive thinking. Opaque thinking blocks are preserved in `providerMetadata` for tool continuations. Axl does not request beta fast-mode or model-fallback headers; if Anthropic reports that a different fallback model served the call, Axl fails before persisting history or estimating cost.
+- **Anthropic Claude 5**: Fable 5.1, Fable 5, and Opus 5.5 always reason; Opus 5 and Sonnet 5 reason by default. These models accept the full active effort vocabulary through adaptive thinking. Opaque thinking blocks are preserved in `providerMetadata` for tool continuations. Axl does not request beta fast-mode or model-fallback headers; if Anthropic reports that a different fallback model served the call, Axl fails before persisting history or estimating cost.
 - **Anthropic Opus 4.8**: Supports adaptive thinking and native `'xhigh'`/`'max'`.
 - **Anthropic Opus 4.7**: Same adaptive-thinking behavior as 4.6. Additionally supports `effort: 'xhigh'` as a first-class tier between `'high'` and `'max'`, sent as `output_config.effort: 'xhigh'`. Same pricing as Opus 4.6 ($5/$25 per 1M tokens).
 - **Anthropic 4.6** (Opus 4.6, Sonnet 4.6): `effort` enables adaptive thinking (`thinking: { type: "adaptive" }` + `output_config: { effort }`). Temperature stripped when thinking active. `thinkingBudget: 0` + `effort` sends only `output_config.effort` (no thinking block, temperature allowed). `effort: 'xhigh'` clamps to `'high'` (4.6 doesn't expose a distinct xhigh tier).

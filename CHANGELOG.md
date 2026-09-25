@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Exact GPT-6 Astra, Sol, and Luna support on OpenAI Responses and Chat Completions, with endpoint-aware reasoning and local typed errors for unsupported Chat tool or sampling combinations. Direct Standard text pricing covers cache reads/writes and the 272K-token long-context boundary; unsupported billing remains unpriced. Exact-model live acceptance is pending.
+- Claude Opus 5.5 support with always-on adaptive thinking, five positive effort levels, a diagnostic low-floor clamp for `none`, and Standard base/cache pricing. Opus 5.5 and Fable 5.1 reject forced tool choice before dispatch. Signed thinking replay uses Anthropic's binding beta and default `drop_block` recovery; safe dropped-block counts appear per affected call in adapter diagnostics and runtime traces. Exact-model live continuation remains pending.
 
 ## [0.24.2] - 2026-09-25
 

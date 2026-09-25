@@ -194,6 +194,65 @@ describe.skipIf(!process.env.OPENAI_API_KEY)('latest models: OpenAI live accepta
 describe.skipIf(!process.env.ANTHROPIC_API_KEY)('latest models: Anthropic live acceptance', () => {
   const provider = new AnthropicProvider();
 
+  it('Opus 5.5 text and terminal stream use the exact model with metered Standard cost', async () => {
+    const text = await provider.chat(prompt, {
+      model: 'claude-opus-5-5',
+      maxTokens: 128,
+      effort: 'low',
+    });
+    expectMetered(text, 'static');
+    const done = await collectDone(
+      provider.stream(prompt, { model: 'claude-opus-5-5', maxTokens: 128, effort: 'low' }),
+    );
+    expect(done.usage?.total_tokens).toBeGreaterThan(0);
+    expect(done.cost).toBeGreaterThan(0);
+  }, 180_000);
+
+  it('Opus 5.5 auto tool continuation retains signed blocks and reports an edited-prefix reset', async () => {
+    const model = 'claude-opus-5-5';
+    const initial: ChatMessage[] = [
+      { role: 'user', content: 'Call acceptance_probe now. Do not answer directly.' },
+    ];
+    const first = await provider.chat(initial, {
+      model,
+      maxTokens: 512,
+      effort: 'high',
+      tools,
+      toolChoice: 'auto',
+    });
+    expect(first.tool_calls?.[0]?.function.name).toBe('acceptance_probe');
+    expect(first.providerMetadata?.anthropicThinkingBlocks).toBeDefined();
+    const continuation: ChatMessage[] = [
+      ...initial,
+      {
+        role: 'assistant',
+        content: first.content,
+        tool_calls: first.tool_calls,
+        providerMetadata: first.providerMetadata,
+      },
+      { role: 'tool', content: 'accepted', tool_call_id: first.tool_calls![0].id },
+    ];
+    const same = await provider.chat(continuation, {
+      model,
+      maxTokens: 256,
+      tools,
+      toolChoice: 'auto',
+    });
+    expect(same.usage?.total_tokens).toBeGreaterThan(0);
+    expect(same.diagnostics?.reasoningContextReset).toBeUndefined();
+    const edited = await provider.chat(
+      [
+        { role: 'system', content: 'New instruction after signed thinking was produced.' },
+        ...continuation,
+      ],
+      { model, maxTokens: 256, tools, toolChoice: 'auto' },
+    );
+    expect(edited.diagnostics?.reasoningContextReset?.droppedBlocks).toBeGreaterThan(0);
+    expect(
+      edited.diagnostics?.reasoningContextReset?.reasons.prefix_binding_mismatch,
+    ).toBeGreaterThan(0);
+  }, 240_000);
+
   it.each(['claude-fable-5-1', 'claude-fable-5', 'claude-opus-5', 'claude-sonnet-5'])(
     'non-stream accepts exact model %s with its default thinking mode',
     async (model) => {

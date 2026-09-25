@@ -2618,6 +2618,7 @@ export class WorkflowContext<TInput = unknown> {
                   usage: chunk.usage,
                   cost: chunk.cost,
                   providerMetadata: chunk.providerMetadata,
+                  diagnostics: chunk.diagnostics,
                   timing: chunk.timing,
                 };
               }
@@ -2802,6 +2803,21 @@ export class WorkflowContext<TInput = unknown> {
         timingTotals.queuedMs += response.timing.queuedMs;
         timingTotals.retryMs += response.timing.retryMs;
         timingTotals.wireMs += response.timing.wireMs;
+      }
+
+      const reasoningReset = response.diagnostics?.reasoningContextReset;
+      if (reasoningReset && reasoningReset.droppedBlocks > 0) {
+        this.emitEvent({
+          type: 'provider_diagnostic',
+          agent: agent._name,
+          data: {
+            kind: 'reasoning_context_reset',
+            ...(provider.name ? { provider: provider.name } : {}),
+            model: typeof providerOptions?.model === 'string' ? providerOptions.model : model,
+            droppedBlocks: reasoningReset.droppedBlocks,
+            reasons: reasoningReset.reasons,
+          },
+        });
       }
 
       // Snapshot of what we actually sent the provider this turn (excluding the

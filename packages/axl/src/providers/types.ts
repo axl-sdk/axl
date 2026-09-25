@@ -1,4 +1,10 @@
-import type { CallTiming, ChatMessage, ProviderResponse, ToolCallMessage } from '../types.js';
+import type {
+  CallTiming,
+  ChatMessage,
+  ProviderResponse,
+  ToolCallMessage,
+  ReasoningContextReset,
+} from '../types.js';
 import type { InputMediaSource, ModelInput } from '../input.js';
 import type { RecordedAudioSource } from '../transcription.js';
 import type { DispatchAdmission } from '../accounting.js';
@@ -46,9 +52,8 @@ export type ToolDefinition = {
 /**
  * Unified effort level controlling how thoroughly the model responds.
  *
- * - `'none'` — Disable thinking/reasoning. On Gemini 3.x, maps to the model's
- *   minimum thinking level (3.1 Pro: 'low', others: 'minimal'). On other providers,
- *   fully disables reasoning.
+ * - `'none'` — Disable thinking/reasoning where supported. Gemini 3.x and
+ *   always-on Claude models clamp to their minimum thinking level.
  * - `'low'` through `'max'` — Increasing levels of reasoning depth and token spend.
  * - `'xhigh'` — Extra-high tier between `'high'` and `'max'`. Supported natively on
  *   Anthropic Opus 4.7 (`output_config.effort: 'xhigh'`) and OpenAI gpt-5.2+
@@ -116,7 +121,8 @@ export type ChatOptions = {
    *  thinking/reasoning allocation. On Anthropic 4.6, `effort` still controls output quality
    *  independently. On all other providers, `thinkingBudget` fully overrides `effort` for
    *  reasoning behavior. Set to 0 to disable thinking while keeping effort for output control
-   *  (Anthropic-specific optimization; on other providers, simply disables reasoning). */
+   *  where the model permits it (Anthropic-specific optimization; on other providers,
+   *  simply disables reasoning). Claude Opus 5.5 and Fable 5.1 cannot disable thinking. */
   thinkingBudget?: number;
   /** Show reasoning summaries in responses (thinking_content / thinking_delta).
    *  Supported on OpenAI Responses API and Gemini. No-op on Anthropic. */
@@ -169,6 +175,8 @@ export type StreamChunk =
       costProvenance?: 'provider_reported' | 'price_table_estimate';
       /** Provider-specific opaque metadata (e.g. raw Gemini parts with thought signatures). */
       providerMetadata?: Record<string, unknown>;
+      /** Safe per-call provider diagnostics, in parity with ProviderResponse. */
+      diagnostics?: { reasoningContextReset?: ReasoningContextReset };
       /**
        * Per-call latency breakdown. The `done` chunk is the only channel a
        * stream has back to the runtime, so every terminal `done` must carry it

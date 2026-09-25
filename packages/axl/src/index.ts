@@ -267,6 +267,7 @@ export {
   ToolFailure,
   InvalidModelInputError,
   UnsupportedModelInputError,
+  UnsupportedModelOptionError,
   AdmissionDeniedError,
   isAdmissionDeniedError,
 } from './errors.js';

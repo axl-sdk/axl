@@ -16,6 +16,7 @@ import {
 } from './openai-compatible.js';
 import { OPENAI_CHAT_AUDIO_FORMATS } from './audio-format.js';
 import type { ProviderResponse } from '../types.js';
+import { UnsupportedModelOptionError } from '../errors.js';
 
 // ---------------------------------------------------------------------------
 // Public flat compatibility table. It intentionally cannot represent the
@@ -96,6 +97,24 @@ const withLongContext = (short: OpenAIRates): DirectOpenAIModel['long'] => ({
  * never inherit an alias price.
  */
 const DIRECT_OPENAI_CATALOG: readonly DirectOpenAIModel[] = [
+  {
+    aliases: ['gpt-6-astra'],
+    short: { input: 10 / M, cachedInput: 1 / M, cacheWrite: 12.5 / M, output: 50 / M },
+    long: { input: 20 / M, cachedInput: 2 / M, cacheWrite: 25 / M, output: 75 / M },
+    contextBoundary: LONG_CONTEXT_BOUNDARY,
+  },
+  {
+    aliases: ['gpt-6-sol'],
+    short: { input: 2 / M, cachedInput: 0.2 / M, cacheWrite: 2.5 / M, output: 10 / M },
+    long: { input: 4 / M, cachedInput: 0.4 / M, cacheWrite: 5 / M, output: 15 / M },
+    contextBoundary: LONG_CONTEXT_BOUNDARY,
+  },
+  {
+    aliases: ['gpt-6-luna'],
+    short: { input: 0.1 / M, cachedInput: 0.01 / M, cacheWrite: 0.125 / M, output: 0.5 / M },
+    long: { input: 0.2 / M, cachedInput: 0.02 / M, cacheWrite: 0.25 / M, output: 0.75 / M },
+    contextBoundary: LONG_CONTEXT_BOUNDARY,
+  },
   {
     aliases: ['gpt-5.6', 'gpt-5.6-sol'],
     snapshotBase: 'gpt-5.6-sol',
@@ -538,6 +557,9 @@ export function estimateDirectOpenAICost(
     ![prompt_tokens, completion_tokens, cached, cacheWrite, audioInput, audioOutput].every(
       (count) => Number.isSafeInteger(count) && count >= 0,
     ) ||
+    (isExactGPT6Model(model) &&
+      (!Number.isSafeInteger(usage.total_tokens) ||
+        usage.total_tokens !== prompt_tokens + completion_tokens)) ||
     cached + cacheWrite + audioInput > prompt_tokens ||
     audioOutput > completion_tokens
   ) {
@@ -613,7 +635,77 @@ export function isOSeriesModel(model: string): boolean {
 
 /** Returns true for models that accept reasoning_effort. */
 export function supportsReasoningEffort(model: string): boolean {
-  return isOSeriesModel(model) || /^gpt-5/.test(model);
+  return isOSeriesModel(model) || /^gpt-5/.test(model) || GPT_6_REASONING_MODELS.has(model);
+}
+
+const GPT_6_REASONING_MODELS = new Set(['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna']);
+
+export function isExactGPT6Model(model: string): boolean {
+  return GPT_6_REASONING_MODELS.has(model);
+}
+
+/** Validate only the three exact GPT-6 IDs against the final merged request. */
+export function validateGPT6RequestBody(
+  body: Record<string, unknown>,
+  endpoint: 'openai' | 'openai-responses',
+): void {
+  const model = body.model;
+  if (typeof model !== 'string' || !GPT_6_REASONING_MODELS.has(model)) return;
+  const fail = (option: string, remediation: string): never => {
+    throw new UnsupportedModelOptionError({ provider: endpoint, model, option, remediation });
+  };
+  const rawEffort =
+    endpoint === 'openai'
+      ? body.reasoning_effort
+      : body.reasoning !== null && typeof body.reasoning === 'object'
+        ? (body.reasoning as { effort?: unknown }).effort
+        : undefined;
+  const allowed =
+    model === 'gpt-6-astra'
+      ? ['low', 'medium', 'high', 'xhigh', 'max']
+      : ['none', 'low', 'medium', 'high', 'xhigh', 'max'];
+  if (rawEffort !== undefined && !allowed.includes(rawEffort as string)) {
+    fail('reasoning effort', `Use one of: ${allowed.join(', ')}.`);
+  }
+  // Omitting effort uses the model's active default (medium), not `none`.
+  const activeReasoning = rawEffort !== 'none';
+  if (endpoint === 'openai') {
+    const toolChoice = body.tool_choice;
+    const toolIntent =
+      (Array.isArray(body.tools) && body.tools.length > 0) ||
+      (toolChoice !== undefined &&
+        toolChoice !== null &&
+        toolChoice !== 'none' &&
+        toolChoice !== 'auto');
+    if (toolIntent && (model === 'gpt-6-astra' || activeReasoning)) {
+      fail(
+        'Chat Completions tool calling',
+        model === 'gpt-6-astra'
+          ? `Use openai-responses:${model} for tools.`
+          : `Use openai-responses:${model} for reasoning with tools, or set effective reasoning_effort to 'none'.`,
+      );
+    }
+  }
+  if (activeReasoning) {
+    const forbidden =
+      endpoint === 'openai'
+        ? ['temperature', 'top_p', 'top_logprobs', 'logprobs']
+        : ['temperature', 'top_p', 'top_logprobs'];
+    for (const key of forbidden) {
+      if (body[key] !== undefined)
+        fail(key, `Remove ${key} or set reasoning effort to 'none' on Sol or Luna.`);
+    }
+    if (
+      endpoint === 'openai-responses' &&
+      Array.isArray(body.include) &&
+      body.include.includes('message.output_text.logprobs')
+    ) {
+      fail(
+        'message.output_text.logprobs',
+        'Remove it from include or set reasoning effort to none on Sol or Luna.',
+      );
+    }
+  }
 }
 
 /** Exact GPT-5.6 IDs that support native `max` on the Responses endpoint. */
@@ -625,14 +717,14 @@ const GPT_56_REASONING_MODELS = new Set([
 ]);
 
 export function supportsMaxReasoningEffort(model: string): boolean {
-  return GPT_56_REASONING_MODELS.has(model);
+  return GPT_56_REASONING_MODELS.has(model) || GPT_6_REASONING_MODELS.has(model);
 }
 
 export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
 /** Returns true for models that support reasoning_effort: 'none' (gpt-5.1+). */
 export function supportsReasoningNone(model: string): boolean {
-  return /^gpt-5\.[1-9]/.test(model);
+  return /^gpt-5\.[1-9]/.test(model) || model === 'gpt-6-sol' || model === 'gpt-6-luna';
 }
 
 /**
@@ -642,7 +734,7 @@ export function supportsReasoningNone(model: string): boolean {
  */
 export function supportsXhigh(model: string): boolean {
   // gpt-5.2+ — models after gpt-5.1-codex-max
-  return /^gpt-5\.([2-9]|\d{2,})/.test(model);
+  return /^gpt-5\.([2-9]|\d{2,})/.test(model) || GPT_6_REASONING_MODELS.has(model);
 }
 
 /**
@@ -657,6 +749,7 @@ export function supportsXhigh(model: string): boolean {
  *   Chat Completions applies its endpoint-specific xhigh cap afterward
  */
 export function clampReasoningEffort(model: string, effort: ReasoningEffort): ReasoningEffort {
+  if (model === 'gpt-6-astra' && (effort === 'none' || effort === 'minimal')) return 'low';
   // gpt-5-pro only supports 'high'
   if (model.startsWith('gpt-5-pro')) return 'high';
 
@@ -719,7 +812,7 @@ export function resolveOpenAIChatReasoningEffort(
   resolved: ResolvedThinkingOptions,
 ): ReasoningEffort | undefined {
   const effort = resolveOpenAIReasoningEffort(model, resolved);
-  return effort === 'max' ? 'xhigh' : effort;
+  return effort === 'max' && !GPT_6_REASONING_MODELS.has(model) ? 'xhigh' : effort;
 }
 
 /**
@@ -769,7 +862,11 @@ export const openaiReasoningEmit: ReasoningEmit = (body, resolved, model) => {
 
   if (wireEffort) body.reasoning_effort = wireEffort;
 
-  return { stripTemperature: oSeries || (reasoningCapable && wireEffort !== undefined) };
+  return {
+    stripTemperature:
+      oSeries ||
+      (reasoningCapable && wireEffort !== undefined && !GPT_6_REASONING_MODELS.has(model)),
+  };
 };
 
 /** Canonical OpenAI Chat Completions profile. */
@@ -826,6 +923,10 @@ export class OpenAIProvider extends OpenAICompatibleProvider {
       resolveOpenAIChatReasoningEffort,
       'OpenAI Chat Completions',
     );
+  }
+
+  protected override validateFinalRequestBody(body: Record<string, unknown>): void {
+    validateGPT6RequestBody(body, 'openai');
   }
 
   protected override computeCost(

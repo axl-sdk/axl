@@ -16,6 +16,8 @@ import {
   supportsMaxReasoningEffort,
   resolveOpenAIReasoningEffort,
   resolveOpenAIEffortResolution,
+  validateGPT6RequestBody,
+  isExactGPT6Model,
 } from './openai.js';
 import { reportedTokenCount } from './openai-compatible.js';
 import { resolveThinkingOptions, resolveApiKey, type ApiKeySource } from './types.js';
@@ -406,8 +408,8 @@ export class OpenAIResponsesProvider implements Provider {
     // supplied because reasoning is active by default for that family.
     const stripTemp =
       oSeries ||
-      supportsMaxReasoningEffort(effectiveModel) ||
-      (reasoningCapable && wireEffort !== undefined);
+      (supportsMaxReasoningEffort(effectiveModel) && !isExactGPT6Model(effectiveModel)) ||
+      (reasoningCapable && wireEffort !== undefined && !isExactGPT6Model(effectiveModel));
 
     // Extract system messages → instructions
     const systemMessages = messages.filter((m) => m.role === 'system');
@@ -470,6 +472,8 @@ export class OpenAIResponsesProvider implements Provider {
     if (options.providerOptions) {
       Object.assign(body, options.providerOptions);
     }
+
+    validateGPT6RequestBody(body, 'openai-responses');
 
     return body;
   }

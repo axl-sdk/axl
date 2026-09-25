@@ -46,6 +46,26 @@ export class UnsupportedModelInputError extends AxlError {
   }
 }
 
+/** Thrown before dispatch when a model or endpoint cannot accept an option or operation. */
+export class UnsupportedModelOptionError extends AxlError {
+  readonly provider: string;
+  readonly model: string;
+  readonly option: string;
+  readonly remediation: string;
+
+  constructor(options: { provider: string; model: string; option: string; remediation: string }) {
+    super(
+      'UNSUPPORTED_MODEL_OPTION',
+      `Provider '${options.provider}' model '${options.model}' does not support ${options.option}. ${options.remediation}`,
+    );
+    this.name = 'UnsupportedModelOptionError';
+    this.provider = options.provider;
+    this.model = options.model;
+    this.option = options.option;
+    this.remediation = options.remediation;
+  }
+}
+
 /** Thrown when the public transcription request contains unsupported or unsafe input. */
 export class InvalidTranscriptionInputError extends AxlError {
   constructor(message: string) {

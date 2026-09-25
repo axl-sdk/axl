@@ -85,6 +85,76 @@ describe.skipIf(!process.env.OPENAI_API_KEY)('latest models: OpenAI live accepta
   const chat = new OpenAIProvider();
   const responses = new OpenAIResponsesProvider();
 
+  // Paid exact-model certification. Keep this file outside the routine live
+  // suite; the frontier gate runs only after an explicit spend decision.
+  it.each(['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna'])(
+    'GPT-6 Responses text and schema accept %s',
+    async (model) => {
+      expectMetered(await responses.chat(prompt, { model, maxTokens: 64 }), 'static');
+      const schema = await responses.chat([{ role: 'user', content: 'Return the status ok.' }], {
+        model,
+        maxTokens: 128,
+        responseFormat: {
+          type: 'json_schema',
+          json_schema: {
+            name: 'status',
+            strict: true,
+            schema: {
+              type: 'object',
+              properties: { status: { type: 'string', enum: ['ok'] } },
+              required: ['status'],
+              additionalProperties: false,
+            },
+          },
+        },
+      });
+      expect(JSON.parse(schema.content)).toEqual({ status: 'ok' });
+      expect(schema.usage?.total_tokens).toBeGreaterThan(0);
+      expect(schema.cost).toBeGreaterThan(0);
+    },
+    120_000,
+  );
+
+  it.each(['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna'])(
+    'GPT-6 Responses tool continuation accepts %s',
+    async (model) => {
+      await toolContinuation(responses, model, 'static');
+    },
+    180_000,
+  );
+
+  it('GPT-6 Responses stream returns terminal usage', async () => {
+    const done = await collectDone(
+      responses.stream(prompt, { model: 'gpt-6-luna', maxTokens: 64 }),
+    );
+    expect(done.usage?.total_tokens).toBeGreaterThan(0);
+    expect(done.cost).toBeGreaterThan(0);
+  }, 120_000);
+
+  it.each(['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna'])(
+    'GPT-6 Chat text accepts %s',
+    async (model) => {
+      expectMetered(await chat.chat(prompt, { model, maxTokens: 64 }), 'static');
+    },
+    120_000,
+  );
+
+  it.each(['gpt-6-sol', 'gpt-6-luna'])(
+    'GPT-6 Chat tools accept %s at explicit none',
+    async (model) => {
+      const response = await chat.chat([{ role: 'user', content: 'Call acceptance_probe now.' }], {
+        model,
+        maxTokens: 64,
+        effort: 'none',
+        tools,
+        toolChoice: { type: 'function', function: { name: 'acceptance_probe' } },
+      });
+      expect(response.tool_calls?.[0]?.function.name).toBe('acceptance_probe');
+      expect(response.usage?.total_tokens).toBeGreaterThan(0);
+    },
+    120_000,
+  );
+
   it.each(['gpt-5.6', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'])(
     'Chat non-stream accepts exact model %s',
     async (model) => {

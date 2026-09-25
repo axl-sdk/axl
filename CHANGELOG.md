@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Exact GPT-6 Astra, Sol, and Luna support on OpenAI Responses and Chat Completions, with endpoint-aware reasoning and local typed errors for unsupported Chat tool or sampling combinations. Direct Standard text pricing covers cache reads/writes and the 272K-token long-context boundary; unsupported billing remains unpriced. Exact-model live acceptance is pending.
+
 ## [0.24.2] - 2026-09-25
 
 ### Fixed

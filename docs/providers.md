@@ -25,6 +25,9 @@ models below use the `openai-responses:` prefix and share `openai` configuration
 
 ```
 openai-responses:gpt-5.6        # Alias of GPT-5.6 Sol
+openai-responses:gpt-6-astra    # GPT-6 highest capability
+openai-responses:gpt-6-sol      # GPT-6 balanced reasoning
+openai-responses:gpt-6-luna     # GPT-6 efficient reasoning
 openai-responses:gpt-5.6-sol    # Highest-capability GPT-5.6 variant
 openai-responses:gpt-5.6-terra  # Balanced GPT-5.6 variant
 openai-responses:gpt-5.6-luna   # Fast GPT-5.6 variant
@@ -42,6 +45,9 @@ Responses adapter does not support, such as stop sequences.
 
 ```
 openai:gpt-5.6                  # Alias of GPT-5.6 Sol
+openai:gpt-6-astra              # GPT-6 text; tools require Responses
+openai:gpt-6-sol                # GPT-6 text; Chat tools require explicit none effort
+openai:gpt-6-luna               # GPT-6 text; Chat tools require explicit none effort
 openai:gpt-5.6-sol              # Highest-capability GPT-5.6 variant
 openai:gpt-5.6-terra            # Balanced GPT-5.6 variant
 openai:gpt-5.6-luna             # Fast GPT-5.6 variant
@@ -123,6 +129,37 @@ GPT-5.x uses `system` and supports the same portable option. Exact GPT-5.6 Chat 
 `effort: 'max'` use `xhigh` and report the clamp through a `provider_diagnostic`
 event; choose `openai-responses:` for native `max`. For compatibility, unknown GPT-5-shaped IDs retain the older baseline request mapping,
 but never inherit exact pricing or GPT-5.6-specific capabilities.
+
+### GPT-6 endpoint and pricing rules
+
+The exact `gpt-6-astra`, `gpt-6-sol`, and `gpt-6-luna` IDs support the existing
+text, structured-output, streaming, and function-tool paths. Prefer
+`openai-responses:` for tools: Astra tool calling requires Responses, while Sol
+and Luna Chat Completions function tools require an explicitly effective
+`reasoning_effort: 'none'`. Axl checks the final request after `providerOptions`
+merges and throws `UnsupportedModelOptionError` before dispatch for a forbidden
+combination. The error names the provider, effective model, rejected option,
+and an `openai-responses:` remedy. Unknown GPT-6-like IDs pass through without
+inheriting these exact-model rules or pricing.
+
+Astra maps portable `effort: 'none'` to `low`; Sol and Luna accept `none`. All
+three accept native `max` on Responses and Chat. Their default reasoning is
+active. With active reasoning, `temperature`, `top_p`, and `top_logprobs` are
+invalid on either endpoint; Chat also rejects `logprobs`, and Responses rejects
+`message.output_text.logprobs` in `include`. Axl rejects explicit unsupported
+fields before dispatch. With Sol or Luna at effective `none`, those fields may
+be used where the endpoint accepts them.
+
+For representable direct Standard text calls, Axl estimates GPT-6 cost using
+the exact published input, cached-input, cache-write, and output rows. Above
+272,000 **total input tokens**, the long-context row prices the whole call,
+including cache buckets and output. Non-Standard processing, regional billing,
+hosted tools, unverified media, missing usage, and unknown model IDs remain
+unpriced. `OPENAI_PRICING` keeps its public flat tuple shape; these tiered rows
+are private to direct OpenAI estimation. This support is based on the
+[GPT-6 model guidance](https://developers.openai.com/api/docs/guides/latest-model)
+and [Standard pricing](https://developers.openai.com/api/docs/pricing), checked
+September 25, 2026; exact-model live acceptance is still pending.
 
 ## Anthropic
 
@@ -1065,6 +1102,8 @@ agent({ model: 'google:gemini-2.5-pro', effort: 'high', includeThoughts: true })
 | **OpenAI** (GPT-5.2+ baseline) | `reasoning_effort: 'none'` | `reasoning_effort: 'low'` | `reasoning_effort: 'medium'` | `reasoning_effort: 'high'` | `reasoning_effort: 'xhigh'` | `reasoning_effort: 'xhigh'` | nearest effort level* |
 | **OpenAI Chat** (GPT-5.6) | `reasoning_effort: 'none'` | `reasoning_effort: 'low'` | `reasoning_effort: 'medium'` | `reasoning_effort: 'high'` | `reasoning_effort: 'xhigh'` | capped to `'xhigh'` | nearest effort level* |
 | **OpenAI Responses** (GPT-5.6) | `reasoning.effort: 'none'` | `reasoning.effort: 'low'` | `reasoning.effort: 'medium'` | `reasoning.effort: 'high'` | `reasoning.effort: 'xhigh'` | `reasoning.effort: 'max'` | nearest effort level* |
+| **OpenAI Chat / Responses** (GPT-6 Astra) | `low` (clamped) | `low` | `medium` | `high` | `xhigh` | `max` | nearest effort level* |
+| **OpenAI Chat / Responses** (GPT-6 Sol/Luna) | `none` | `low` | `medium` | `high` | `xhigh` | `max` | nearest effort level* |
 | **Anthropic** (Claude 5) | model-specific minimum/default | adaptive + `effort: 'low'` | adaptive + `effort: 'medium'` | adaptive + `effort: 'high'` | adaptive + `effort: 'xhigh'` | adaptive + `effort: 'max'` | unsupported |
 | **Anthropic** (Opus 4.8 / 4.7) | disabled | adaptive + `effort: 'low'` | adaptive + `effort: 'medium'` | adaptive + `effort: 'high'` | adaptive + `effort: 'xhigh'` | adaptive + `effort: 'max'` | manual `budget_tokens` |
 | **Anthropic** (4.6) | disabled | adaptive + `effort: 'low'` | adaptive + `effort: 'medium'` | adaptive + `effort: 'high'` | capped to `'high'`◊ | adaptive + `effort: 'max'`† | manual `budget_tokens` |

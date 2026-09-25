@@ -1682,7 +1682,7 @@ These are different concepts in axl:
 
 | Term | Meaning |
 |------|---------|
-| **Turn** | One iteration of the tool-call loop inside a single `ctx.ask()` — i.e., one provider HTTP call. Capped by `AgentConfig.maxTurns` (default 25). Schema/validate/guardrail retries each consume a turn. Stamped on `agent_call_start`/`agent_call_end` events as `turn: N` |
+| **Turn** | One iteration of the tool-call loop inside a single `ctx.ask()` — i.e., one provider HTTP call. Capped by `AgentConfig.maxTurns` (default 25). Schema/validate/guardrail retries each consume a turn. Stamped on `agent_call_start`/`agent_call_end` events as `turn: N`; a standalone context-management summary call has `data.purpose: 'summary'` and `turn: 1` outside this loop |
 | **Exchange** (or "round") | One user↔assistant round-trip at the session level — roughly one `session.send()` call. An exchange can internally invoke multiple `ctx.ask()` calls, each running its own turn loop |
 
 If you are coming from other LLM SDKs where "turn" means a conversational round-trip, mentally rename axl's `maxTurns` to "max provider calls per ask".
@@ -2304,8 +2304,8 @@ import type { AxlEvent, AxlEventType, AxlEventOf, AskScoped } from '@axlsdk/axl'
 | `transcription_end` | — | `transcriptionId`, `model?`, `duration`, `cost?`, `tokens?`, `data: { status, provider?, model?, audio?, text?, usage?, pricingStatus?, cleanupStatus?, error?, errorCode?, providerError?: { status, retryable, retryAfterMs?, requestId? } }` | Exactly once after transcription completes, fails, or aborts. Provider failures retain only safe HTTP diagnostics. `text` is present on an unredacted successful event and scrubbed by `trace.redact`; raw audio/base64/reference/provider body are never emitted. |
 | `ask_start` | `AskScoped` | `prompt: string` | Top of every `ctx.ask()` |
 | `ask_end` | `AskScoped` | `outcome: { ok: true, result } \| { ok: false, error }`, `cost`, `duration` | Every `ctx.ask()` exit. Ask-internal failures surface here, NOT via the workflow-level `error` event |
-| `agent_call_start` | `AskScoped` | `agent: string`, `model: string`, `turn: number`, `data: AgentCallStartData` | Before each LLM call (one per loop turn) |
-| `agent_call_end` | `AskScoped` | `agent: string`, `model: string`, `cost?: number`, `unpriced?: boolean`, `duration: number`, `timing?: CallTiming`, `data: AgentCallEndData` | After each LLM call settles. `unpriced` marks an explicit unknown-cost lower bound, including a dispatched stalled request abandoned without usage. `timing` is present whenever the provider reported one — including the error path, when the provider returned a response (a non-2xx, or a mid-stream failure). It is absent when there was nothing to measure: a connection-level failure, an abort, or a non-provider throw. `status` is not a proxy for this — see [`ProviderError` fields](#providererror-fields) |
+| `agent_call_start` | `AskScoped` | `agent: string`, `model: string`, `turn: number`, `data: AgentCallStartData` | Before each LLM call, including context-management summary generation (`data.purpose: 'summary'`) |
+| `agent_call_end` | `AskScoped` | `agent: string`, `model: string`, `cost?: number`, `unpriced?: boolean`, `duration: number`, `timing?: CallTiming`, `data: AgentCallEndData` | After each LLM call settles, including context-management summary generation. `unpriced` marks an explicit unknown-cost lower bound, including a completed unknown-price summary or a dispatched stalled request abandoned without usage. `timing` is present whenever the provider reported one — including the error path, when the provider returned a response (a non-2xx, or a mid-stream failure). It is absent when there was nothing to measure: a connection-level failure, an abort, or a non-provider throw. `status` is not a proxy for this — see [`ProviderError` fields](#providererror-fields) |
 | `token` | `AskScoped` | `data: string` | Streaming text chunk. **Stream-only** — never persisted to `ExecutionInfo.events` |
 | `tool_call_rejected` | `AskScoped` | `tool: string`, `callId: string`, `data: ToolCallRejectedData` | Provider request rejected before execution starts; no start/end pair |
 | `tool_call_start` | `AskScoped` | `tool: string`, `callId: string`, `data: ToolCallStartDataV2` | After availability, JSON, and local argument validation succeeds |
@@ -2352,7 +2352,8 @@ Populated at dispatch time, before the provider responds. Lets consumers render 
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `prompt` | `string` | Original user prompt passed to `ctx.ask()`. Does not include retry feedback or tool results |
+| `prompt` | `string` | Original ask prompt, or summarized history when `purpose === 'summary'`. Ordinary calls do not include retry feedback or tool results |
+| `purpose` | `'summary'?` | Present for a generated context-management summary; its `prompt` is the summarized history and its `turn` is `1` for this standalone call. Cached summary reuse emits no call pair |
 | `system` | `string?` | Resolved system prompt (dynamic selectors evaluated at call time) |
 | `params` | `AgentCallParams?` | Resolved model parameters sent to the provider: `{ temperature?, maxTokens?, effort?, thinkingBudget?, includeThoughts?, toolChoice?, stop? }` |
 | `turn` | `number` | 1-indexed iteration of the tool-calling loop for this `ctx.ask()` call |
@@ -2367,6 +2368,7 @@ Populated when the provider returns (success or recoverable failure). Pair invar
 | Field | Type | Description |
 |-------|------|-------------|
 | `response` | `string` | Final LLM response content for this turn. Empty string on error |
+| `purpose` | `'summary'?` | Mirrors the matching start event for context-management summary calls, so cost can be attributed without joining events |
 | `thinking` | `string?` | Reasoning/thinking content returned by the provider, when available |
 | `turn` | `number` | 1-indexed iteration of the tool-calling loop. Mirrors the matching `agent_call_start.data.turn` |
 | `retryReason` | `'schema' \| 'validate' \| 'guardrail'?` | Mirrors `agent_call_start.data.retryReason` so cost-attribution consumers reading `agent_call_end` (where `cost` lives) can bucket without joining |

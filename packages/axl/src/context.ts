@@ -2026,11 +2026,20 @@ export class WorkflowContext<TInput = unknown> {
       if (historyEstimate.tokens > availableForHistory) {
         // Need to summarize: find the split point
         const summarizedMessages = await this.summarizeHistory(
+          agent._name,
+          modelUri,
           provider,
           model,
           sessionHistory,
           availableForHistory,
         );
+        // A completed summary is charged before the ask's first model turn.
+        // Stop here if that charge exhausted the budget, while preserving
+        // finish_and_stop's existing behavior within an active tool loop.
+        if (this.budgetContext?.exceeded && this.budgetContext.policy !== 'warn') {
+          const { limit, totalCost: spent, policy } = this.budgetContext;
+          throw new BudgetExceededError(limit, spent, policy);
+        }
         for (const msg of summarizedMessages) {
           messages.push(msg);
         }
@@ -3792,6 +3801,8 @@ export class WorkflowContext<TInput = unknown> {
    * Keeps recent messages intact, summarizes older ones.
    */
   private async summarizeHistory(
+    agentName: string,
+    modelUri: string,
     provider: Provider,
     model: string,
     history: ChatMessage[],
@@ -3903,17 +3914,80 @@ export class WorkflowContext<TInput = unknown> {
       .map((m) => `${m.role}: ${summarizeModelInput(m.content)}`)
       .join('\n');
 
-    const summaryResponse = await summaryProvider.chat(
-      [
-        {
-          role: 'system',
-          content:
-            'Summarize the following conversation concisely, preserving key facts, decisions, and context needed for continuing the conversation.',
+    const summarySystem =
+      'Summarize the following conversation concisely, preserving key facts, decisions, and context needed for continuing the conversation.';
+    const effectiveSummaryModelUri = summaryModelUri || modelUri;
+    const summaryStart = Date.now();
+    this.emitEvent({
+      type: 'agent_call_start',
+      agent: agentName,
+      model: effectiveSummaryModelUri,
+      turn: 1,
+      data: {
+        purpose: 'summary',
+        prompt: oldContent,
+        system: summarySystem,
+        params: { maxTokens: 1024 },
+        turn: 1,
+      },
+    });
+
+    let summaryResponse: ProviderResponse;
+    try {
+      this.currentSignal?.throwIfAborted();
+      summaryResponse = await summaryProvider.chat(
+        [
+          { role: 'system', content: summarySystem },
+          { role: 'user', content: oldContent },
+        ],
+        { model: summaryModel, maxTokens: 1024, signal: this.currentSignal },
+      );
+    } catch (error) {
+      const providerError = error instanceof ProviderError ? error : undefined;
+      this.emitEvent({
+        type: 'agent_call_end',
+        agent: agentName,
+        model: effectiveSummaryModelUri,
+        duration: Date.now() - summaryStart,
+        ...(providerError?.timing ? { timing: providerError.timing } : {}),
+        data: {
+          purpose: 'summary',
+          response: '',
+          turn: 1,
+          // Provider errors may echo the summarized history, so the event
+          // uses a fixed projection even when trace redaction is disabled.
+          error: 'Context-management summary call failed',
+          ...(providerError
+            ? { status: providerError.status, retryable: providerError.retryable }
+            : {}),
         },
-        { role: 'user', content: oldContent },
-      ],
-      { model: summaryModel, maxTokens: 1024, signal: this.currentSignal },
-    );
+      });
+      throw error;
+    }
+
+    // Accounting has already settled via the scoped provider facade. This
+    // leaf feeds the ask/event rollup; the separate budget rail needs one
+    // charge. Unknown-cost completed work remains an explicit lower bound.
+    if (isUsableCost(summaryResponse.cost)) this._accumulateBudgetCost(summaryResponse.cost);
+    this.emitEvent({
+      type: 'agent_call_end',
+      agent: agentName,
+      model: effectiveSummaryModelUri,
+      cost: summaryResponse.cost,
+      ...(!isUsableCost(summaryResponse.cost) ? { unpriced: true } : {}),
+      tokens: summaryResponse.usage
+        ? {
+            input: summaryResponse.usage.prompt_tokens,
+            output: summaryResponse.usage.completion_tokens,
+            reasoning: summaryResponse.usage.reasoning_tokens,
+            cached: summaryResponse.usage.cached_tokens,
+            cacheWrite: summaryResponse.usage.cache_write_tokens,
+          }
+        : undefined,
+      duration: Date.now() - summaryStart,
+      ...(summaryResponse.timing ? { timing: summaryResponse.timing } : {}),
+      data: { purpose: 'summary', response: summaryResponse.content, turn: 1 },
+    });
 
     this.summaryCache = summaryResponse.content;
 

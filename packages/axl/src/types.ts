@@ -300,7 +300,9 @@ export type AgentCallParams = {
  * for completion.
  */
 export type AgentCallStartData = {
-  /** Original user prompt passed to `ctx.ask()`. Does not include retry feedback or tool results. */
+  /** Context-management summarizer call, separate from the ask's tool loop. */
+  purpose?: 'summary';
+  /** Original ask prompt, or summarized history when `purpose === 'summary'`. */
   prompt: string;
   /** Bounded rich-input shape; omitted for legacy string calls. */
   input?: ModelInputDescriptor;
@@ -334,6 +336,8 @@ export type AgentCallStartData = {
  * (top-level on the event) when partial usage is available.
  */
 export type AgentCallEndData = {
+  /** Mirrors `agent_call_start.data.purpose` for cost attribution without a join. */
+  purpose?: 'summary';
   /** Final LLM response content for this turn. Empty string on error. */
   response: string;
   /** Reasoning/thinking content returned by the provider, when available. */

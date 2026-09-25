@@ -333,6 +333,60 @@ describe('Anthropic thinking reset diagnostics', () => {
       expect(JSON.stringify(chunks.at(-1))).not.toMatch(/signed-secret|messages\./);
     },
   );
+
+  it.each([
+    { final: [], expected: undefined },
+    {
+      final: [drops[0], drops[1]],
+      expected: {
+        droppedBlocks: 2,
+        reasons: { prefix_binding_mismatch: 1, model_binding_mismatch: 1 },
+      },
+    },
+  ])(
+    'uses final stream transformations as the replacement when present',
+    async ({ final, expected }) => {
+      const events = [
+        {
+          type: 'message_start',
+          message: {
+            model: 'claude-opus-5-5',
+            usage: { input_tokens: 10 },
+            input_transformations: [drops[0]],
+          },
+        },
+        { type: 'message_delta', usage: { output_tokens: 5 }, input_transformations: final },
+        { type: 'message_stop' },
+      ];
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            new TextEncoder().encode(
+              events.map((event) => `data: ${JSON.stringify(event)}\n`).join(''),
+            ),
+          );
+          controller.close();
+        },
+      });
+      globalThis.fetch = vi
+        .fn()
+        .mockResolvedValue({ ok: true, status: 200, headers: new Headers(), body });
+      const chunks = [];
+      for await (const chunk of provider().stream(replay, { model: 'claude-opus-5-5' }))
+        chunks.push(chunk);
+      const done = chunks.at(-1);
+      if (expected) {
+        expect(done).toMatchObject({
+          type: 'done',
+          diagnostics: { reasoningContextReset: expected },
+        });
+      } else {
+        expect(done).toMatchObject({ type: 'done' });
+        expect(done).not.toHaveProperty('diagnostics.reasoningContextReset');
+      }
+      expect(JSON.stringify(done)).not.toMatch(/signed-secret|messages\./);
+    },
+  );
 });
 
 describe('runtime continuation after Axl context summarization', () => {

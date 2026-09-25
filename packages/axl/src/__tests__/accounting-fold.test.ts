@@ -20,6 +20,9 @@ import { agent } from '../agent.js';
 import type { Accounting } from '../accounting.js';
 import type { ChatMessage, ChatOptions, Provider, StreamChunk } from '../providers/types.js';
 import type { ProviderResponse } from '../types.js';
+import type { AxlEvent } from '../types.js';
+import { eventCostContribution } from '../event-utils.js';
+import { ProviderError } from '../providers/errors.js';
 import { ScriptedProvider, scriptedRuntime } from './accounting-helpers.js';
 
 const USAGE = { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 };
@@ -163,6 +166,11 @@ describe('A2.2: work delegated to a sub-scope is folded into the parent exactly 
 // ═══════════════════════════════════════════════════════════════════════════
 
 describe('A2.4: a context-management summarization call is measured like any other', () => {
+  const overflowHistory: ChatMessage[] = Array.from({ length: 20 }, (_, i) => ({
+    role: i % 2 === 0 ? ('user' as const) : ('assistant' as const),
+    content: `turn ${i}: ${'x'.repeat(200)}`,
+  }));
+
   it('adds the summarizer charge to the scope that triggered the overflow', async () => {
     const main = new ScriptedProvider([{ cost: 0.4 }], { name: 'main' });
     const runtime = new AxlRuntime({
@@ -171,16 +179,13 @@ describe('A2.4: a context-management summarization call is measured like any oth
     });
     runtime.registerProvider('main', main);
     runtime.registerProvider('summarizer', flatRate('summarizer', 0.1));
+    const events: AxlEvent[] = [];
+    runtime.on('trace', (event) => events.push(event));
 
     // A tiny window with a long history forces the summarization branch.
     const asker = agent({ name: 'a', model: 'main:m', maxContext: 400 });
-    const sessionHistory: ChatMessage[] = Array.from({ length: 20 }, (_, i) => ({
-      role: i % 2 === 0 ? ('user' as const) : ('assistant' as const),
-      content: `turn ${i}: ${'x'.repeat(200)}`,
-    }));
-
     const outcome = await runtime.trackOutcome(async () => {
-      const ctx = runtime.createContext({ sessionHistory });
+      const ctx = runtime.createContext({ sessionHistory: overflowHistory });
       return ctx.ask(asker, 'and now the newest question');
     });
 
@@ -191,6 +196,172 @@ describe('A2.4: a context-management summarization call is measured like any oth
     expect(outcome.accounting.knownCost).toBeCloseTo(0.5, 10);
     expect(outcome.accounting.breakdown.generation).toBeCloseTo(0.5, 10);
     expect(outcome.accounting.completeness).toBe('complete');
+    const summaryStarts = events.filter(
+      (event) => event.type === 'agent_call_start' && event.data.purpose === 'summary',
+    );
+    const summaryEnds = events.filter(
+      (event) => event.type === 'agent_call_end' && event.data.purpose === 'summary',
+    );
+    expect(summaryStarts).toHaveLength(1);
+    expect(summaryEnds).toHaveLength(1);
+    expect(summaryEnds[0]).toMatchObject({ model: 'summarizer:s', cost: 0.1 });
+    const askEnd = events.find((event) => event.type === 'ask_end');
+    expect(askEnd).toMatchObject({ cost: 0.5 });
+    expect(events.reduce((sum, event) => sum + eventCostContribution(event), 0)).toBeCloseTo(
+      0.5,
+      10,
+    );
+  });
+
+  it('stops before the main call when a priced summary exhausts a finish_and_stop budget', async () => {
+    const main = new ScriptedProvider([{ cost: 0.4 }], { name: 'main' });
+    const runtime = new AxlRuntime({
+      defaultProvider: 'main',
+      contextManagement: { summaryModel: 'summarizer:s', reserveTokens: 100 },
+    });
+    runtime.registerProvider('main', main);
+    runtime.registerProvider('summarizer', flatRate('summarizer', 0.1));
+    const events: AxlEvent[] = [];
+    runtime.on('trace', (event) => events.push(event));
+    const asker = agent({ name: 'a', model: 'main:m', maxContext: 400 });
+
+    const outcome = await runtime.trackOutcome(async () => {
+      const ctx = runtime.createContext({ sessionHistory: overflowHistory });
+      return ctx.budget({ cost: '$0.05', onExceed: 'finish_and_stop' }, () =>
+        ctx.ask(asker, 'new question'),
+      );
+    });
+
+    expect(outcome.status).toBe('fulfilled');
+    expect(outcome.value).toMatchObject({ budgetExceeded: true, totalCost: 0.1, unpriced: false });
+    expect(main.calls).toHaveLength(0);
+    expect(outcome.accounting.knownCost).toBeCloseTo(0.1, 10);
+    expect(events.filter((event) => event.type === 'agent_call_end')).toHaveLength(1);
+    expect(events.find((event) => event.type === 'ask_end')).toMatchObject({ cost: 0.1 });
+  });
+
+  it('marks an unknown-price summary as a lower bound without stopping a later priced call', async () => {
+    const main = new ScriptedProvider([{ cost: 0.4 }], { name: 'main' });
+    const runtime = new AxlRuntime({
+      defaultProvider: 'main',
+      contextManagement: { summaryModel: 'summarizer:s', reserveTokens: 100 },
+    });
+    runtime.registerProvider('main', main);
+    runtime.registerProvider('summarizer', {
+      ...flatRate('summarizer', 0),
+      async chat() {
+        return { content: 'short summary', usage: USAGE };
+      },
+    });
+    const events: AxlEvent[] = [];
+    runtime.on('trace', (event) => events.push(event));
+    const asker = agent({ name: 'a', model: 'main:m', maxContext: 400 });
+
+    const outcome = await runtime.trackOutcome(async () => {
+      const ctx = runtime.createContext({ sessionHistory: overflowHistory });
+      return ctx.budget({ cost: '$1', onExceed: 'hard_stop' }, () =>
+        ctx.ask(asker, 'new question'),
+      );
+    });
+
+    expect(outcome.status).toBe('fulfilled');
+    expect(outcome.value).toMatchObject({ budgetExceeded: false, totalCost: 0.4, unpriced: true });
+    expect(main.calls).toHaveLength(1);
+    expect(
+      events.find((event) => event.type === 'agent_call_end' && event.data.purpose === 'summary'),
+    ).toMatchObject({ unpriced: true });
+    expect(events.find((event) => event.type === 'ask_end')).toMatchObject({
+      cost: 0.4,
+      unpriced: true,
+    });
+  });
+
+  it('reuses a cached summary without a second summary charge', async () => {
+    const main = new ScriptedProvider([{ cost: 0.4 }], { name: 'main' });
+    const summarizer = new ScriptedProvider([{ content: 'short summary', cost: 0.1 }], {
+      name: 'summarizer',
+    });
+    const runtime = new AxlRuntime({
+      defaultProvider: 'main',
+      contextManagement: { summaryModel: 'summarizer:s', reserveTokens: 100 },
+    });
+    runtime.registerProvider('main', main);
+    runtime.registerProvider('summarizer', summarizer);
+    const events: AxlEvent[] = [];
+    runtime.on('trace', (event) => events.push(event));
+    const asker = agent({ name: 'a', model: 'main:m', maxContext: 400 });
+
+    const outcome = await runtime.trackOutcome(async () => {
+      const ctx = runtime.createContext({ sessionHistory: overflowHistory });
+      await ctx.ask(asker, 'first');
+      await ctx.ask(asker, 'second');
+    });
+
+    expect(outcome.status).toBe('fulfilled');
+    expect(summarizer.calls).toHaveLength(1);
+    expect(main.calls).toHaveLength(2);
+    expect(
+      events.filter((event) => event.type === 'agent_call_end' && event.data.purpose === 'summary'),
+    ).toHaveLength(1);
+    expect(outcome.accounting.knownCost).toBeCloseTo(0.9, 10);
+    expect(events.filter((event) => event.type === 'ask_end').map((event) => event.cost)).toEqual([
+      0.5, 0.4,
+    ]);
+  });
+
+  it('pairs a failed summary and keeps echoed history out of its diagnostic event', async () => {
+    const main = new ScriptedProvider([{ cost: 0.4 }], { name: 'main' });
+    const runtime = new AxlRuntime({
+      defaultProvider: 'main',
+      contextManagement: { summaryModel: 'summarizer:s', reserveTokens: 100 },
+      trace: { redact: true },
+    });
+    runtime.registerProvider('main', main);
+    runtime.registerProvider(
+      'summarizer',
+      new ScriptedProvider(
+        [
+          {
+            throws: new ProviderError({
+              provider: 'summarizer',
+              status: 503,
+              retryable: true,
+              message: 'private history echoed by provider',
+              body: 'private history in raw body',
+            }),
+          },
+        ],
+        { name: 'summarizer' },
+      ),
+    );
+    const events: AxlEvent[] = [];
+    runtime.on('trace', (event) => events.push(event));
+    const ctx = runtime.createContext({ sessionHistory: overflowHistory });
+
+    await expect(
+      ctx.ask(agent({ name: 'a', model: 'main:m', maxContext: 400 }), 'new question'),
+    ).rejects.toBeInstanceOf(ProviderError);
+
+    const starts = events.filter((event) => event.type === 'agent_call_start');
+    const ends = events.filter((event) => event.type === 'agent_call_end');
+    expect(starts).toHaveLength(1);
+    expect(ends).toHaveLength(1);
+    expect(starts[0]).toMatchObject({
+      model: 'summarizer:s',
+      data: { purpose: 'summary', prompt: '[redacted]' },
+    });
+    expect(ends[0]).toMatchObject({
+      model: 'summarizer:s',
+      data: {
+        purpose: 'summary',
+        response: '[redacted]',
+        error: '[redacted]',
+        status: 503,
+        retryable: true,
+      },
+    });
+    expect(JSON.stringify(events)).not.toContain('private history');
+    expect(main.calls).toHaveLength(0);
   });
 });
 

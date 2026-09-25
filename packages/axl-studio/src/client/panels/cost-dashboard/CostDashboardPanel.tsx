@@ -94,7 +94,11 @@ export function CostDashboardPanel() {
       description={
         costs.totalCost > 0 ? (
           <>
-            <span>{formatCost(costs.totalCost)} total</span>
+            <span>
+              {costs.unpricedCalls > 0
+                ? `≥ ${formatCost(costs.totalCost)} lower bound`
+                : `${formatCost(costs.totalCost)} total`}
+            </span>
             <span className="opacity-40 mx-1.5">·</span>
             <span>
               {agentCount} agent{agentCount !== 1 ? 's' : ''}

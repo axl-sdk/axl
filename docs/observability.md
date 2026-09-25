@@ -758,6 +758,8 @@ for await (const event of stream.lifecycle) {
   repeated calls within one tool loop. Direct adapter responses and terminal
   stream chunks carry the same safe counts in `diagnostics.reasoningContextReset`.
   Transformation paths, signed blocks, and raw provider bodies are never included.
+  Studio's trace list displays only the normalized dropped-block count and known
+  reasons. Its cost dashboard labels mixed priced/unpriced spend as a lower bound.
 - A provider whose `effortResolution()` throws or reports a malformed clamp fails the ask
   with that error.
 

@@ -104,6 +104,29 @@ describe('TraceEventList', () => {
     expect(screen.getByText('$0.000420')).toBeInTheDocument();
   });
 
+  it('shows only safe reasoning reset counts in the trace', async () => {
+    render(
+      <TraceEventList
+        events={[
+          makeEvent({
+            type: 'provider_diagnostic',
+            data: {
+              kind: 'reasoning_context_reset',
+              model: 'claude-opus-5-5',
+              droppedBlocks: 2,
+              reasons: { prefix_binding_mismatch: 1, model_binding_mismatch: 1 },
+              path: 'secret-provider-path',
+            },
+          }),
+        ]}
+      />,
+    );
+    await userEvent.click(screen.getByRole('button', { name: /provider_diagnostic/ }));
+    expect(screen.getByText(/2 thinking blocks dropped/)).toBeInTheDocument();
+    expect(screen.getByText(/1 prefix mismatch/)).toBeInTheDocument();
+    expect(screen.queryByText(/secret-provider-path/)).not.toBeInTheDocument();
+  });
+
   it('expand-all opens every row simultaneously', async () => {
     // Prompt now lives on agent_call_start (request side), not _end.
     const events = [

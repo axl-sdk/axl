@@ -583,6 +583,31 @@ function GenericBody({ event }: { event: HistoricalAxlEvent }) {
   );
 }
 
+/** Render only the normalized diagnostic fields, including for older stored traces. */
+function ProviderDiagnosticBody({ event }: { event: HistoricalAxlEvent }) {
+  if (event.schemaVersion !== 2 || event.type !== 'provider_diagnostic') return null;
+  const diagnostic = event.data;
+  if (diagnostic.kind === 'reasoning_context_reset') {
+    return (
+      <p className="text-xs">
+        <strong>Reasoning context reset:</strong> {diagnostic.droppedBlocks} thinking block
+        {diagnostic.droppedBlocks === 1 ? '' : 's'} dropped
+        {diagnostic.reasons.prefix_binding_mismatch
+          ? ` · ${diagnostic.reasons.prefix_binding_mismatch} prefix mismatch`
+          : ''}
+        {diagnostic.reasons.model_binding_mismatch
+          ? ` · ${diagnostic.reasons.model_binding_mismatch} model mismatch`
+          : ''}
+      </p>
+    );
+  }
+  return (
+    <p className="text-xs">
+      <strong>Effort clamped:</strong> {diagnostic.requested} → {diagnostic.effective}
+    </p>
+  );
+}
+
 // ── Event row + body ────────────────────────────────────────────────
 
 function TraceEventRow({
@@ -720,6 +745,8 @@ function TraceEventRow({
             <PipelineBody event={event} />
           ) : event.type === 'handoff_start' || event.type === 'handoff_return' ? (
             <HandoffBody event={event} />
+          ) : event.type === 'provider_diagnostic' ? (
+            <ProviderDiagnosticBody event={event} />
           ) : (
             <GenericBody event={event} />
           )}

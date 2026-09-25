@@ -10,8 +10,9 @@ OpenAI's, Anthropic's, and Gemini's own endpoints an identifiable quota or spend
 [Rate limiting](#rate-limiting).
 
 The base catalog and pricing were reviewed against first-party documentation on
-August 3, 2026; native image transport and the current GPT-5.6, Claude Opus 5,
-and Gemini 3.8 Flash parameter seams were refreshed on September 2. Exact known
+August 3, 2026; native image transport was refreshed on September 2, and the
+GPT-6, Claude Opus 5.5, and Gemini 3.8 Flash contracts were checked on September 25.
+Exact known
 IDs receive their documented parameter and pricing behavior. Other IDs may pass
 through to the provider but remain unpriced and do not inherit model-specific
 behavior. See the [catalog verification](./verification/latest-provider-models-2026-08-03.md)
@@ -246,6 +247,21 @@ billing a rate it cannot verify; Google recommends `gemini-3.8-flash` instead.
 Because unpriced spend is reported but not enforced, a `ctx.budget()` cost limit
 will not trip on this model — the budget flags `unpriced` instead. Pin a priced
 model if you need a hard cost cap. See [Gemini deprecations](https://ai.google.dev/gemini-api/docs/deprecations).
+
+For exact `gemini-3.6-flash`, `gemini-3.7-flash`, and `gemini-3.8-flash`, direct
+Standard token estimates use Google's published promotional input/cache-read/output
+rates of $0.75/$0.075/$3.75 per million tokens through 2026-12-31 UTC, then
+$1.50/$0.15/$7.50 beginning 2027-01-01 UTC. Axl selects the rate when transport
+first dispatches, after any rate-governor wait, and keeps it for that call's
+result or stream. Non-Standard tiers and unmodeled charges remain unpriced.
+The [Google price page](https://ai.google.dev/gemini-api/docs/pricing) does not
+establish a distinct recorded-audio input rate for 3.8 Flash, so calls with
+positive audio tokens remain unpriced. The
+[3.8 model card](https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash)
+lists video and PDF input upstream; Axl's public `ModelInput` currently covers
+text, image, and recorded audio only. Exact 3.8 provider acceptance is pending
+the gated `AXL_FRONTIER_GEMINI_LIVE=1 pnpm test:integration:frontier` check with
+a Google key.
 
 Gemini [requires every `functionResponse.response` to be a JSON
 object](https://ai.google.dev/api/generate-content#FunctionResponse). Axl parses canonical
@@ -1607,14 +1623,14 @@ frontier family is current:
   date and source beside each adapter table or profile.
 - Add only documented IDs and snapshot formats. Keep unknown IDs pass-through but unpriced.
 - Recheck every billed category, modifier, and effective-dated rate; missing billing data must
-  remain unknown rather than becoming an inferred zero.
+  remain unknown rather than becoming an inferred zero. Encode a published successor rate
+  when its effective date is confirmed, as for Gemini Flash above.
 - Add unit fixtures, run both live integration gates, and save a dated result under
   `docs/verification/`, including any credential-gated gaps.
 
-Promotional rates currently in effect, to re-verify (record the then-current value; do not
-encode the expiry as a code-side transition):
+Promotional rates currently in effect, to re-verify against the first-party pages:
 
 | Model | Promotional rate | Announced through |
 |-------|------------------|-------------------|
 | `gpt-5.6-sol` | $4 / $20 (cache write $5) | at least November 21, 2026 |
-| `gemini-3.6-flash`, `gemini-3.7-flash`, `gemini-3.8-flash` | $0.75 / $3.75 | December 31, 2026 |
+| `gemini-3.6-flash`, `gemini-3.7-flash`, `gemini-3.8-flash` | $0.75 / $3.75; dated successor encoded above | December 31, 2026 |

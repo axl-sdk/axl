@@ -97,6 +97,7 @@ export const EVENT_COLORS: Record<string, string> = {
   token: 'bg-slate-300',
   partial_object: 'bg-slate-300',
   log: 'bg-slate-400',
+  provider_diagnostic: 'bg-slate-400',
 
   // ── Terminal markers ───────────────────────────────────────────────
   // Distinct from log/token slate so the terminal `done` doesn't visually

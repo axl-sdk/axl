@@ -258,7 +258,8 @@ function parseGeminiFunctionResponse(content: string): Record<string, unknown> {
 // Per-token Standard-tier pricing (USD) for supported current Gemini models.
 // Reviewed 2026-09-25 against https://ai.google.dev/gemini-api/docs/pricing.
 // The exact 3.6/3.7/3.8 Flash Standard rows have published promotional and
-// successor rates. Resolve the applicable schedule once at transport dispatch.
+// successor rates. Resolve the applicable schedule at each transport attempt's
+// dispatch; only the returned attempt contributes usage and cost.
 // Model ids deliberately match exactly: a date/version suffix can change the
 // billing contract, so an unknown sibling must remain unpriced.
 // ---------------------------------------------------------------------------
@@ -356,7 +357,7 @@ type GeminiPricingContext = {
   model: string;
   serviceTier?: unknown;
   eligibleRequest: boolean;
-  /** Captured on the first transport dispatch, after admission and governor wait. */
+  /** Captured on each transport dispatch; the returned attempt owns the billed usage. */
   rates?: Readonly<Record<string, GeminiRate>>;
 };
 
@@ -367,7 +368,7 @@ function geminiPricingTimingObserver(
   return {
     ...recorder.observer,
     onDispatch: (attempt, at) => {
-      if (attempt === 1) context.rates = geminiRatesAtDispatch(at);
+      context.rates = geminiRatesAtDispatch(at);
       recorder.observer.onDispatch?.(attempt, at);
     },
   };

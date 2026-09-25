@@ -198,6 +198,59 @@ describe('GeminiProvider', () => {
         expect(fetchMock).toHaveBeenCalledTimes(2);
       });
 
+      it.each(['generateContent', 'Interactions'])(
+        'uses the billed %s retry dispatch when a 503 crosses the UTC boundary',
+        async (transport) => {
+          vi.useFakeTimers();
+          vi.setSystemTime(Date.parse('2026-12-31T23:59:59.999Z'));
+          try {
+            const responseBody =
+              transport === 'generateContent'
+                ? makeGeminiResponse('ok', usage)
+                : {
+                    model: 'gemini-3.8-flash',
+                    status: 'completed',
+                    steps: [],
+                    usage: {
+                      total_input_tokens: 100,
+                      total_output_tokens: 30,
+                      total_thought_tokens: 10,
+                      total_cached_tokens: 20,
+                      total_tokens: 140,
+                      input_tokens_by_modality: [{ modality: 'image', tokens: 100 }],
+                    },
+                  };
+            const fetchMock = vi
+              .fn()
+              .mockResolvedValueOnce(new Response('', { status: 503 }))
+              .mockResolvedValueOnce(
+                new Response(JSON.stringify(responseBody), {
+                  headers: { 'content-type': 'application/json' },
+                }),
+              );
+            globalThis.fetch = fetchMock as typeof fetch;
+            const dispatches: number[] = [];
+            const messages =
+              transport === 'Interactions'
+                ? [{ role: 'user' as const, content: [geminiFileImage()] }]
+                : [{ role: 'user' as const, content: 'Hello' }];
+            const pending = new GeminiProvider().chat(messages, {
+              model: 'gemini-3.8-flash',
+              requestLifecycle: { onDispatch: () => dispatches.push(Date.now()) },
+            });
+            await vi.advanceTimersByTimeAsync(2000);
+            const response = await pending;
+            expect(fetchMock).toHaveBeenCalledTimes(2);
+            expect(dispatches).toHaveLength(2);
+            expect(dispatches[0]).toBeLessThan(Date.parse('2027-01-01T00:00:00.000Z'));
+            expect(dispatches[1]).toBeGreaterThanOrEqual(Date.parse('2027-01-01T00:00:00.000Z'));
+            expect(response.cost).toBeCloseTo(expectedCost(1.5e-6, 0.15e-6, 7.5e-6), 12);
+          } finally {
+            vi.useRealTimers();
+          }
+        },
+      );
+
       it('uses the successor rate on an Interactions image call', async () => {
         vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2027-01-01T00:00:00.000Z'));
         mockFetch({

@@ -251,9 +251,10 @@ model if you need a hard cost cap. See [Gemini deprecations](https://ai.google.d
 For exact `gemini-3.6-flash`, `gemini-3.7-flash`, and `gemini-3.8-flash`, direct
 Standard token estimates use Google's published promotional input/cache-read/output
 rates of $0.75/$0.075/$3.75 per million tokens through 2026-12-31 UTC, then
-$1.50/$0.15/$7.50 beginning 2027-01-01 UTC. Axl selects the rate when transport
-first dispatches, after any rate-governor wait, and keeps it for that call's
-result or stream. Non-Standard tiers and unmodeled charges remain unpriced.
+$1.50/$0.15/$7.50 beginning 2027-01-01 UTC. Axl selects the rate at dispatch
+of the returned transport attempt, after any rate-governor or retry wait, and
+keeps it for that attempt's result or stream. Non-Standard tiers and unmodeled
+charges remain unpriced.
 The [Google price page](https://ai.google.dev/gemini-api/docs/pricing) does not
 establish a distinct recorded-audio input rate for 3.8 Flash, so calls with
 positive audio tokens remain unpriced. The

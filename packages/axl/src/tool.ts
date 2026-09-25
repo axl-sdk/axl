@@ -1,6 +1,6 @@
 import { ZodError, type z } from 'zod';
 import type { WorkflowContext } from './context.js';
-import { AdmissionDeniedError, rethrowEventStreamOverflow } from './errors.js';
+import { isAdmissionDeniedError, rethrowEventStreamOverflow } from './errors.js';
 import { openOperation } from './accounting.js';
 import type { ToolArgumentIssue } from './types.js';
 
@@ -587,7 +587,7 @@ export function tool<TInput extends z.ZodType, TOutput = unknown>(
       } catch (err) {
         if (options?.signal?.aborted) options.signal.throwIfAborted();
         if (isAbortError(err)) throw err;
-        if (err instanceof AdmissionDeniedError) throw err;
+        if (isAdmissionDeniedError(err)) throw err;
         rethrowEventStreamOverflow(err);
         lastError = err instanceof Error ? err : new Error(String(err));
 

@@ -717,6 +717,13 @@ could not price is reported as unknown (`unpriced`, with `accounting.reasons`) r
 than as zero — and because unknown spend cannot be enforced against, it does not consume
 a budget either.
 
+Compatible ESM/CJS or duplicate Axl loads in the same JavaScript realm share
+the accounting scope, budget controller, and request capture channel. A workflow
+using another compatible copy is measured and charged to this run. If a loaded
+copy cannot join the active accounting protocol, paid work is refused and the
+run is marked `incomplete` / `uninstrumented`; update older Axl copies to get
+this guarantee. See [cross-copy accounting](../../docs/observability.md#completeness-and-reasons).
+
 ### Captured requests (opt-in)
 
 When a score looks wrong, the next question is what the model was actually

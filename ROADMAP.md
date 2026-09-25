@@ -25,7 +25,9 @@
   Comparisons certify cost only on complete, like-for-like data. Opt-in
   request capture writes attempt-level diagnostics to a managed artifact
   store with leases, retention mirroring, writer-applied redaction, and
-  Studio import/export; Studio presents spend with its completeness
+  Studio import/export; compatible ESM/CJS and duplicate loads share the
+  accounting and capture context so budgets do not lose cross-copy work.
+  Studio presents spend with its completeness
   everywhere and keeps its client mirror pinned to the eval package by a
   drift test. See [observability.md](docs/observability.md),
   [testing.md](docs/testing.md), and

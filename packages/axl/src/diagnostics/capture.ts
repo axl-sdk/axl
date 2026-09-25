@@ -23,9 +23,8 @@
  * `redactCapturedRequest()` before it reaches the sink.
  */
 
-import { AsyncLocalStorage } from 'node:async_hooks';
-
 import { describeModelInput, type ModelInputDescriptor } from '../input.js';
+import { sharedContext } from '../shared-context.js';
 import type {
   ChatMessage,
   ChatOptions,
@@ -554,8 +553,10 @@ function describe(error: unknown): string {
 // Ambient plumbing
 // ---------------------------------------------------------------------------
 
-const channelStorage = new AsyncLocalStorage<RequestCaptureChannel>();
-const correlationStorage = new AsyncLocalStorage<CaptureCorrelation>();
+const channelStorage =
+  sharedContext.capture as import('node:async_hooks').AsyncLocalStorage<RequestCaptureChannel>;
+const correlationStorage =
+  sharedContext.correlation as import('node:async_hooks').AsyncLocalStorage<CaptureCorrelation>;
 
 /** @internal The capture channel for the active `trackOutcome` scope, if any. */
 export function currentCaptureChannel(): RequestCaptureChannel | undefined {
@@ -613,7 +614,7 @@ export type CaptureTurnContext = {
  */
 type TurnSlot = { current: CaptureTurnContext };
 
-const turnStorage = new AsyncLocalStorage<TurnSlot>();
+const turnStorage = sharedContext.turn as import('node:async_hooks').AsyncLocalStorage<TurnSlot>;
 
 /** @internal Turn identity for the provider call running on this async context. */
 export function currentCaptureTurn(): CaptureTurnContext | undefined {

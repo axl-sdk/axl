@@ -323,6 +323,8 @@ This is what makes "what did the failed run cost?" answerable: a workflow that t
 | `admission` | `AdmissionController` | — | Stops admitting new paid operations once known spend reaches the limit. Must be an `AdmissionController` instance (from any copy of `@axlsdk/axl`); an object without the internal settlement channel raises `AxlError('INCOMPATIBLE_ADMISSION_CONTROLLER')` rather than silently losing the charge. Use the exported `isAdmissionDeniedError(err)` to classify a refusal — it matches structurally, so it works across duplicate installs where `instanceof` does not |
 | `captureTraces` | `boolean` | `false` | As `trackExecution` |
 | `captureTimingSamples` | `boolean` | `false` | As `trackExecution` |
+| `capture` | `RequestCaptureChannel` | inherited, else off | Send bounded provider request records to this channel; the caller closes it. Compatible nested copies inherit the channel |
+| `captureCorrelation` | `{ caseIndex?, scorer? }` | inherited | Merge eval item/scorer identity onto captured records in this scope |
 
 ```typescript
 const outcome = await runtime.trackOutcome(
@@ -336,7 +338,9 @@ if (outcome.status === 'rejected') {
 }
 ```
 
-Scopes nest. An operation settled inside a child `trackOutcome` is counted **exactly once** in every enclosing scope, so a parent total is the sum of disjoint operations. Concurrent `trackOutcome` calls on one runtime are isolated — neither sees the other's operations, budget closure or spend.
+Scopes nest. An operation settled inside a child `trackOutcome` is counted **exactly once** in every enclosing scope, so a parent total is the sum of disjoint operations. Compatible ESM, CJS, and duplicated installs in one JavaScript realm share this scope, admission, and request capture context. Concurrent `trackOutcome` calls remain isolated — neither sees the other's operations, budget closure or spend. Cross-copy work emits one warning per copy pair with both resolved paths and versions.
+
+If a participating copy encounters an active scope with an incompatible accounting protocol, it refuses the operation before dispatch with `AxlError('INCOMPATIBLE_ACCOUNTING_SCOPE')`; the enclosing scope becomes `incomplete` with `reasons.uninstrumented`. Copies released before this shared protocol cannot announce their private scopes or operations, so this guarantee requires compatible updated copies. Separate worker threads and VM realms have separate contexts.
 
 ### `Accounting`
 
@@ -353,7 +357,7 @@ type Accounting = {
   operations: {
     total: number;                   // admitted and opened
     settled: number;                 // terminal with a usable cost, including a known $0
-    unknown: number;                 // terminal without one — drives `completeness`
+    unknown: number;                 // terminal without one; coverage failures can also make `incomplete`
     denied: number;                  // refused admission; never dispatched
     byKind: Partial<Record<OperationKind, number>>;
   };
@@ -362,7 +366,7 @@ type Accounting = {
 };
 ```
 
-**Zero is never unknown.** A known $0 settles `complete`. Anything dispatched whose charge could not be established settles `unknown` with a reason, making `completeness: 'incomplete'` and `knownCost` an explicit **lower bound**.
+**Zero is never unknown.** A known $0 settles `complete`. Anything dispatched whose charge could not be established settles `unknown` with a reason, making `completeness: 'incomplete'` and `knownCost` an explicit **lower bound**. A detected incompatible scope also makes the result incomplete, even though its refused operation does not increment `unknown`.
 
 At finalization `operations.total === settled + unknown`. Denied operations are tracked separately and excluded from `total` (an operation refused at the transport check is retracted from it), because refused work contributes nothing anywhere.
 
@@ -372,7 +376,7 @@ At finalization `operations.total === settled + unknown`. Denied operations are 
 | `usage_missing` | Dispatched, but the terminal outcome carried no usage — a failure, abort or stall |
 | `abandoned` | Dispatched and never settled before its scope finalized |
 | `external_unreported` | An external operation finished without calling `report.setCost()` |
-| `uninstrumented` | A consumer ran work with no accounting scope available. Core defines the name; no core producer emits it |
+| `uninstrumented` | A consumer had no accounting scope, or a loaded copy attempted work under an incompatible active scope; the latter is refused before dispatch and marks the scope incomplete without incrementing `operations.unknown` |
 
 | `CostProvenance` | Meaning |
 |---|---|
@@ -2514,6 +2518,7 @@ All errors extend `AxlError`.
 | `StallTimeoutError` | `ctx.ask()` | A dispatched provider request exceeded `stallTimeout` without streaming progress (or exceeded the non-stream dispatch-to-completion limit). Extends `TimeoutError`, names the agent, and is distinguishable with `instanceof StallTimeoutError`. |
 | `MaxTurnsError` | `ctx.ask()` | Agent exceeded its configured `maxTurns` |
 | `BudgetExceededError` | `ctx.budget()` | Budget exceeded with `hard_stop` policy. Includes `.limit`, `.spent`, `.policy` |
+| `AxlError` / `INCOMPATIBLE_ACCOUNTING_SCOPE` | paid operation or nested `trackOutcome` under another loaded copy's incompatible active scope | Refuses the operation before dispatch; the enclosing accounting becomes `incomplete` / `uninstrumented` |
 | `GuardrailError` | `ctx.ask()` | Guardrail blocked and retries exhausted. Includes `.guardrailType`, `.reason` |
 | `ProviderError` | provider adapters (via `ctx.ask()`) | Non-2xx HTTP response, or a normalized network failure (`status: 0`). `code: 'PROVIDER_ERROR'`. Includes `.provider`, `.status`, `.retryable`, `.retryAfterMs?`, `.requestId?`, `.body?`, `.timing?`. Message is the provider's text verbatim (no prefix). |
 | `InvalidModelInputError` | `ctx.ask()`, `ctx.delegate()`, `agent.ask()` | Malformed `ModelInput`. `code: 'INVALID_MODEL_INPUT'`. Invalid inputs fail before dispatch and the message never includes raw media. |

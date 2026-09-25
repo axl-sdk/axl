@@ -1,4 +1,11 @@
 import { defineConfig } from 'tsup';
+import { readFileSync } from 'node:fs';
+
+const version = (
+  JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')) as {
+    version: string;
+  }
+).version;
 
 export default defineConfig({
   entry: ['src/index.ts'],
@@ -9,6 +16,10 @@ export default defineConfig({
   // @axlsdk/eval is dynamically imported at runtime (optional) — never bundle it
   external: ['@axlsdk/eval'],
   esbuildOptions(options, context) {
+    options.define = {
+      ...options.define,
+      __AXL_PACKAGE_VERSION__: JSON.stringify(version),
+    };
     // The optional native deps (`better-sqlite3`, `redis`) load through a
     // synchronous `require()` — a sync constructor like `new SQLiteStore(path)`
     // can't await a dynamic import. esbuild rewrites those calls to its own
@@ -23,8 +34,11 @@ export default defineConfig({
         js: [
           "import { createRequire as __axlCreateRequire } from 'node:module';",
           'const require = __axlCreateRequire(import.meta.url);',
+          'const __AXL_BUILD_PATH__ = import.meta.url;',
         ].join('\n'),
       };
+    } else {
+      options.banner = { js: 'const __AXL_BUILD_PATH__ = __filename;' };
     }
   },
 });

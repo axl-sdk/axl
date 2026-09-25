@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.1] - 2026-09-25
+
+### Fixed
+
+- Accounting scopes, admission controllers, and request capture now join across compatible ESM/CJS or duplicated `@axlsdk/axl` loads in one JavaScript realm. Cross-copy calls keep their cost and capture refs, share nested budgets, and emit a one-time warning with both copies' paths and versions. Budget denials from another copy also stop tool retries. Incompatible participating copies refuse paid work and mark the enclosing scope `incomplete` / `uninstrumented` instead of reporting a confident $0. Both copies must use this or a later compatible accounting protocol; older releases cannot detect or join the new scope.
+
 ## [0.24.0] - 2026-09-24
 
 ### Added

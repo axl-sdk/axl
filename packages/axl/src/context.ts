@@ -2293,6 +2293,7 @@ export class WorkflowContext<TInput = unknown> {
 
       const chatOptions: ChatOptions = {
         model,
+        accountingModelUri: effectiveModelUri,
         temperature: options?.temperature ?? agent._config.temperature,
         tools: toolDefs.length > 0 ? toolDefs : undefined,
         maxTokens: options?.maxTokens ?? agent._config.maxTokens ?? 4096,

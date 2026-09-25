@@ -499,11 +499,19 @@ type ToolInternals = {
   ): Promise<unknown>;
 };
 
-const TOOL_INTERNALS = new WeakMap<object, ToolInternals>();
+// A tool may be defined by the ESM build and invoked by a CJS runtime (or
+// vice versa). Module-local WeakMaps cannot see the other build's tools.
+const TOOL_INTERNALS: unique symbol = Symbol.for('axl.tool.internals.v1');
 
 function getToolInternals(tool: Tool): ToolInternals {
-  const internals = TOOL_INTERNALS.get(tool as object);
-  if (!internals) throw new Error(`Tool "${tool.name}" was not created by tool()`);
+  const internals = (tool as Tool & { [TOOL_INTERNALS]?: ToolInternals })[TOOL_INTERNALS];
+  if (
+    !internals ||
+    typeof internals.prepareInput !== 'function' ||
+    typeof internals.executePrepared !== 'function'
+  ) {
+    throw new Error(`Tool "${tool.name}" was not created by a compatible tool()`);
+  }
   return internals;
 }
 
@@ -661,9 +669,11 @@ export function tool<TInput extends z.ZodType, TOutput = unknown>(
 
     _execute: execute,
   };
-  TOOL_INTERNALS.set(instance, {
-    prepareInput,
-    executePrepared: executePrepared as ToolInternals['executePrepared'],
+  Object.defineProperty(instance, TOOL_INTERNALS, {
+    value: {
+      prepareInput,
+      executePrepared: executePrepared as ToolInternals['executePrepared'],
+    } satisfies ToolInternals,
   });
   return instance;
 }

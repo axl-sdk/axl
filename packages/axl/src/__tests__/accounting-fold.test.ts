@@ -24,6 +24,84 @@ import { ScriptedProvider, scriptedRuntime } from './accounting-helpers.js';
 
 const USAGE = { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 };
 
+describe('settlement-backed agent diagnostics', () => {
+  it('excludes a direct provider call from agent metadata while charging its cost', async () => {
+    const runtime = new AxlRuntime({ defaultProvider: 'paid' });
+    runtime.registerProvider('paid', {
+      name: 'paid',
+      async chat() {
+        return {
+          content: 'ok',
+          cost: 0.1,
+          usage: USAGE,
+          timing: { queuedMs: 2, retryMs: 3, wireMs: 5, ttfbMs: 1, attempts: 1 },
+        };
+      },
+      // eslint-disable-next-line require-yield
+      async *stream() {
+        throw new Error('unused');
+      },
+    });
+    runtime.register(
+      workflow({
+        name: 'paid-ask',
+        input: z.any(),
+        handler: (ctx) => ctx.ask(agent({ name: 'a', model: 'paid:m' }), 'go'),
+      }),
+    );
+    const result = await runtime.trackOutcome(async () => {
+      await runtime.execute('paid-ask', {});
+      await runtime.resolveProvider('paid:m').provider.chat([], { model: 'm' });
+    });
+    expect(result.status).toBe('fulfilled');
+    expect(result.accounting.knownCost).toBeCloseTo(0.2, 10);
+    expect(result.accounting.operations.byKind.chat).toBe(2);
+    expect(result.metadata).toMatchObject({
+      modelCallCounts: { 'paid:m': 1 },
+      agentCalls: 1,
+      tokens: { input: 10, output: 5, reasoning: 0 },
+    });
+    expect(result.modelTiming?.['paid:m'].calls).toBe(1);
+  });
+
+  it('keeps timing for a successful custom call with no usage or price', async () => {
+    const runtime = new AxlRuntime({ defaultProvider: 'bare' });
+    runtime.registerProvider('bare', {
+      name: 'bare',
+      async chat() {
+        return {
+          content: 'ok',
+          timing: { queuedMs: 2, retryMs: 3, wireMs: 5, ttfbMs: 1, attempts: 1 },
+        };
+      },
+      // eslint-disable-next-line require-yield
+      async *stream() {
+        throw new Error('unused');
+      },
+    });
+    runtime.register(
+      workflow({
+        name: 'bare-ask',
+        input: z.any(),
+        handler: (ctx) => ctx.ask(agent({ name: 'a', model: 'bare:m' }), 'go'),
+      }),
+    );
+    const result = await runtime.trackOutcome(() => runtime.execute('bare-ask', {}), {
+      captureTimingSamples: true,
+    });
+    expect(result.status).toBe('fulfilled');
+    expect(result.accounting.reasons).toEqual({ usage_missing: 1 });
+    expect(result.metadata.modelCallCounts).toEqual({ 'bare:m': 1 });
+    expect(result.modelTiming?.['bare:m']).toMatchObject({
+      calls: 1,
+      queuedMs: 2,
+      retryMs: 3,
+      wireMs: 5,
+      samples: [{ queuedMs: 2, retryMs: 3, wireMs: 5 }],
+    });
+  });
+});
+
 /** A one-turn adapter that never throws, on its own provider name. */
 function flatRate(name: string, cost: number): Provider {
   return {

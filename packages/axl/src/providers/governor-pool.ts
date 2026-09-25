@@ -88,10 +88,10 @@ export const ADAPTIVE_RATE = Object.freeze({
  * share one predicate, `Date.now() < brakeUntil`. A scope that does not adapt
  * never brakes, so it behaves exactly as a plain `RateLimiter`.
  *
- * Adapting needs no quota dialect. A dialect (first-party OpenAI and Anthropic
- * at the vendor origin, see `quota.ts`) adds only two vendor-specific extras:
- * spend-cap classification of a 429 body, and the 2xx quota hint that holds
- * recovery. Without one, every 429 is treated as a rate limit and the hint is
+ * Adapting needs no quota dialect. A dialect (first-party OpenAI, Anthropic,
+ * or Gemini at the vendor origin, see `quota.ts`) adds classification of a
+ * 429 body; OpenAI and Anthropic also provide 2xx quota hints. Without one,
+ * every 429 is treated as a rate limit and the hint is
  * never read, so recovery and reopening proceed as if the account were healthy.
  */
 export class ScopeGovernor extends RateLimiter {

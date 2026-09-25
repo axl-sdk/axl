@@ -6,7 +6,7 @@ adapters plus OpenAI-compatible presets, all built on raw `fetch` with no provid
 All providers retry `429` (rate limit), `503` (unavailable), and `529` (overloaded)
 responses with exponential backoff. On every built-in chat provider a rate-limit `429`
 also pauses every call on the same account and model and retries on its own budget; on
-OpenAI's and Anthropic's own endpoints a spend-cap `429` fails fast instead; see
+OpenAI's, Anthropic's, and Gemini's own endpoints an identifiable quota or spend-cap `429` fails fast instead; see
 [Rate limiting](#rate-limiting).
 
 The base catalog and pricing were reviewed against first-party documentation on
@@ -549,8 +549,10 @@ below.
   permit back while it waits, and retries first when the pause ends.
 - **Rate limits have their own retry budget,** `maxRateLimitRetries` (default 8),
   separate from the 2 retries for `503`/`529`/network errors. A call against a
-  saturated account can take several minutes, without holding a permit. Your ask
-  `timeout`, signal and `AdmissionController` still stop it. When the budget runs out,
+  saturated account can take several minutes, without holding a permit. Use an ask
+  `signal: AbortSignal.timeout(...)` to bound that wait: `timeout` only stops a later
+  provider turn and `stallTimeout` runs only during a dispatched request.
+  `AdmissionController` can stop the next dispatch when spend closes. When the retry budget runs out,
   the last `429` surfaces as a `ProviderError` with its raw body and `retryAfterMs`.
 - **Then the scope paces itself** (see "Adaptive pacing" below) and returns to unpaced
   once the provider stops pushing back.
@@ -558,24 +560,28 @@ below.
   spacing and no warning. Request size is never estimated, and quota headers alone
   never slow a scope. `503`/`529` and network errors keep their usual retries.
 
-**Spend caps: fast only on first-party OpenAI and Anthropic.** These are the only
-providers with a **quota dialect**, and only at the vendor's own origin
-(`https://api.openai.com`, `https://api.anthropic.com`; an explicit `baseUrl` on that
-origin counts). There, Axl reads the `429`
-body. Anthropic's `enforced_spend_limit_reached`, and OpenAI's `insufficient_quota`
+**Identifiable terminal quotas and spend caps fail fast at vendor origins.** OpenAI,
+Anthropic, and Gemini have a **quota dialect** at their own origins only
+(`https://api.openai.com`, `https://api.anthropic.com`,
+`https://generativelanguage.googleapis.com`; an explicit `baseUrl` on that origin counts).
+There, Axl reads the `429` body. Anthropic's `enforced_spend_limit_reached`, and OpenAI's `insufficient_quota`
 and billing codes (`credit_balance_exhausted`, `organization_spend_limit_exceeded`,
 `project_spend_limit_exceeded`, `organization_usage_limit_exceeded`), return at once
-as a `ProviderError` with `status: 429`, with no retry and no pause. Their quota
-headers also hold recovery (below). These body shapes come from the vendors'
-documentation and haven't been checked against a live spend cap. An unrecognized
+as a `ProviderError` with `status: 429`, with no retry and no pause. Gemini also
+fails fast for explicit `quota_exceeded`, a daily `quotaId`, or a message naming a
+spending cap or depleted prepay credits. A generic `RESOURCE_EXHAUSTED` or
+"current quota" message is ambiguous and still retries; Google also uses it for
+short rate limits (see Google's [rate-limit guide](https://ai.google.dev/gemini-api/docs/rate-limits)
+and [API errors](https://ai.google.dev/gemini-api/docs/api-errors)). Only OpenAI and Anthropic's quota headers hold recovery (below).
+These body shapes have not been checked against a live spend cap. An unrecognized
 body is treated as a rate limit.
 
-Everywhere else (Gemini, the presets, and OpenAI or Anthropic behind a proxy,
+Everywhere else (the presets, and a vendor behind a proxy,
 gateway or self-hosted `baseUrl`), Axl never reads the body, and **every `429` is a
 rate limit**. The tradeoff: a `429` that waiting can't fix fails only after the
 retry budget is spent, about 3 minutes instead of about 3 s, and holds the other
-calls on that model meanwhile. Examples are a spend cap, a daily quota such as
-Gemini's `RESOURCE_EXHAUSTED`, or a gateway's per-request policy rejection. It
+calls on that model meanwhile. Examples are an unidentified spend cap or daily quota,
+or a gateway's per-request policy rejection. It
 still fails with the same `ProviderError`. Use `adaptive: false` on that provider
 block if this matters more to you than riding out throttling.
 
@@ -803,7 +809,9 @@ Thus queue wait and backoff cannot be mislabeled as a provider stall. For a non-
 request the same window runs from dispatch through completion. A silent request throws
 `StallTimeoutError` (a `TimeoutError` subtype); any partial streamed result is discarded.
 
-Use an ask or context `signal` for a strict total SLA instead. Provider transports receive the
+Use an ask or context `signal` for a strict total SLA, including the 429 brake,
+retry backoff, and limiter queue. `timeout` is checked between turns, so an
+in-flight transport retry loop may outlast it. Provider transports receive the
 composed signal; the first context, branch, or ask signal to abort wins and its exact external
 reason propagates unchanged. Custom providers should pass `ChatOptions.signal` to their
 transport. Axl starts a custom provider's opt-in stall timer conservatively when its method is

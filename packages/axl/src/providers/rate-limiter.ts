@@ -65,7 +65,8 @@ export type RateLimitConfig = {
    * `adaptive`), a call first waits out any active rate-limit brake and only
    * then starts this clock; a call already queued when a brake begins keeps
    * its clock running through it. A retry's re-acquire after a rate-limit 429
-   * is exempt: it is bounded by `maxRateLimitRetries` and the ask's `timeout`.
+   * is exempt: it is bounded by `maxRateLimitRetries`, or by the ask's abort
+   * signal when the caller needs a strict deadline.
    */
   acquireTimeoutMs?: number;
   /**
@@ -78,12 +79,10 @@ export type RateLimitConfig = {
    * recovered linearly on success, dropped once traffic stays well below it;
    * tuning is internal) until it reopens. Nothing waits before the first 429.
    *
-   * Only first-party OpenAI (`openai:`, `openai-responses:`) and Anthropic at
-   * the vendor's default endpoint origin read the 429 body: there a spend-cap
-   * 429 fails fast, and a low quota header holds recovery. Everywhere else
-   * (Gemini, OpenAI-compatible presets, a proxy or gateway `baseUrl`) every
-   * 429 is a rate limit, so a spend-cap or daily-quota 429 fails only once
-   * `maxRateLimitRetries` is spent.
+   * First-party OpenAI, Anthropic, and Gemini at their vendor origins read
+   * 429 bodies: explicit terminal quota/billing limits fail fast. Only OpenAI
+   * and Anthropic read 2xx quota hints. Unrecognized Gemini 429s, presets,
+   * and proxy/gateway origins retry as rate limits.
    *
    * `false` restores the plain behavior: a 429 shares the transient retry
    * budget, holds up no other call, and nothing is paced. Ignored by a

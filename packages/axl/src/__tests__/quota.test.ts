@@ -3,17 +3,20 @@ import {
   CLASSIFY_BODY_CAP_BYTES,
   anthropicQuotaDialect,
   classifySafely,
+  geminiQuotaDialect,
   openaiQuotaDialect,
   quotaDialectFor,
   type QuotaDialect,
 } from '../providers/quota.js';
 import {
   ANTHROPIC_DEFAULT_BASE_URL,
+  GEMINI_DEFAULT_BASE_URL,
   OPENAI_DEFAULT_BASE_URL,
 } from '../providers/default-endpoints.js';
 
 const openai = openaiQuotaDialect;
 const anthropic = anthropicQuotaDialect;
+const gemini = geminiQuotaDialect;
 
 function openaiHeaders(v: {
   limitRequests?: string;
@@ -75,12 +78,14 @@ describe('quotaDialectFor', () => {
   // Derived from the adapters' default base URLs, never restated.
   const OPENAI = new URL(OPENAI_DEFAULT_BASE_URL).origin;
   const ANTHROPIC = new URL(ANTHROPIC_DEFAULT_BASE_URL).origin;
+  const GEMINI = new URL(GEMINI_DEFAULT_BASE_URL).origin;
   const openaiHost = new URL(OPENAI_DEFAULT_BASE_URL).host;
   const anthropicHost = new URL(ANTHROPIC_DEFAULT_BASE_URL).host;
 
-  it('returns a dialect for OpenAI and Anthropic at their own default origins', () => {
+  it('returns a dialect at each supported vendor origin', () => {
     expect(quotaDialectFor('openai', OPENAI)).toBe(openaiQuotaDialect);
     expect(quotaDialectFor('anthropic', ANTHROPIC)).toBe(anthropicQuotaDialect);
+    expect(quotaDialectFor('google', GEMINI)).toBe(geminiQuotaDialect);
     // Spelling variants normalize to the same origin.
     expect(
       quotaDialectFor('anthropic', new URL(`https://${anthropicHost.toUpperCase()}:443/v1`).origin),
@@ -101,11 +106,12 @@ describe('quotaDialectFor', () => {
     for (const origin of ['https://gateway.example.com', OPENAI]) {
       expect(quotaDialectFor('anthropic', origin)).toBeUndefined();
     }
+    expect(quotaDialectFor('google', OPENAI)).toBeUndefined();
+    expect(quotaDialectFor('google', 'https://gateway.example.com')).toBeUndefined();
   });
 
   it('other families have no dialect, even at a vendor origin', () => {
     for (const family of [
-      'google',
       'azure',
       'openrouter',
       'groq',
@@ -121,6 +127,13 @@ describe('quotaDialectFor', () => {
 });
 
 describe('hint', () => {
+  it('Gemini has no 2xx headroom hint', () => {
+    expect(
+      gemini.hint(
+        new Headers({ 'x-ratelimit-limit-requests': '100', 'x-ratelimit-remaining-requests': '0' }),
+      ),
+    ).toBeUndefined();
+  });
   it('OpenAI: the minimum fraction over the request and token lanes', () => {
     const h = openaiHeaders({
       limitRequests: '500',
@@ -290,6 +303,39 @@ describe('hint', () => {
 });
 
 describe('classify429', () => {
+  it.each([
+    [
+      { error: { code: 'rate_limit_exceeded', message: 'Requests per minute exceeded' } },
+      'unknown',
+    ],
+    [
+      {
+        error: {
+          code: 429,
+          status: 'RESOURCE_EXHAUSTED',
+          message: 'You exceeded your current quota, please check your plan and billing details.',
+        },
+      },
+      'unknown',
+    ],
+    [{ error: { code: 'quota_exceeded', message: 'Daily quota exceeded' } }, 'spend_cap'],
+    [
+      {
+        error: {
+          code: 429,
+          message: 'Your billing account has exceeded its monthly spending cap.',
+        },
+      },
+      'spend_cap',
+    ],
+  ] as const)(
+    'Gemini distinguishes explicit terminal limits from ambiguous rate limits',
+    async (body, expected) => {
+      const response = json429(body);
+      await expect(gemini.classify429(response)).resolves.toBe(expected);
+      expect(response.bodyUsed).toBe(false);
+    },
+  );
   it('Anthropic enforced_spend_limit_reached is a spend cap', async () => {
     await expect(anthropic.classify429(json429(ANTHROPIC_SPEND_CAP))).resolves.toBe('spend_cap');
   });

@@ -86,7 +86,7 @@ const ANTHROPIC_SPEND_CAP = JSON.stringify({
   },
   request_id: 'req_1',
 });
-// Gemini's quota-exhausted 429 shape (no dialect reads it).
+// Generic Gemini RESOURCE_EXHAUSTED is ambiguous: per-minute limits also use it.
 const GEMINI_QUOTA_EXHAUSTED = JSON.stringify({
   error: {
     code: 429,
@@ -899,14 +899,13 @@ describe('AC21: dialect-less built-in scopes brake and retry on the rate-limit b
   it.each<[string, Family, string]>([
     ['openai at a proxy origin, insufficient_quota', 'openai', OPENAI_SPEND_CAP],
     ['anthropic at a proxy origin, enforced_spend_limit_reached', 'anthropic', ANTHROPIC_SPEND_CAP],
-    ['google, RESOURCE_EXHAUSTED', 'google', GEMINI_QUOTA_EXHAUSTED],
   ])(
     '%s: never classified — brakes, spends maxRateLimitRetries, returns the last 429 with its body',
     async (_label, family, body) => {
       const model = MODEL[family];
       const clone = vi.spyOn(Response.prototype, 'clone');
       const net = stubFetch((d) => (d.tag === 'call-a' ? { status: 429, body } : { status: 200 }));
-      const provider = providerFor(family, undefined, family === 'google' ? undefined : PROXY);
+      const provider = providerFor(family, undefined, PROXY);
       const a = outcome(ask(provider, 'call-a', {}, model));
       await at(1);
       const b = outcome(ask(provider, 'call-b', {}, model));
@@ -933,6 +932,52 @@ describe('AC21: dialect-less built-in scopes brake and retry on the rate-limit b
       expect(bodyCancelled(attempts.at(-1)!)).toBe(false);
     },
   );
+
+  it('Gemini generic RESOURCE_EXHAUSTED still retries, with its original body intact', async () => {
+    const body = GEMINI_QUOTA_EXHAUSTED;
+    const net = stubFetch((d) => (d.tag === 'call-a' ? { status: 429, body } : { status: 200 }));
+    const provider = providerFor('google');
+    const a = outcome(ask(provider, 'call-a', {}, MODEL.google));
+    await vi.runAllTimersAsync();
+    const err = ((await a) as { error: ProviderError }).error;
+    expect(err.body).toBe(body);
+    expect(err.timing?.attempts).toBe(DEFAULT_MAX_RATE_LIMIT_RETRIES + 1);
+    expect(net.of('call-a')).toHaveLength(DEFAULT_MAX_RATE_LIMIT_RETRIES + 1);
+  });
+
+  it.each([
+    JSON.stringify({
+      error: {
+        code: 429,
+        status: 'RESOURCE_EXHAUSTED',
+        message: 'Your billing account has exceeded its monthly spending cap.',
+      },
+    }),
+    JSON.stringify({ error: { code: 'quota_exceeded', message: 'Daily quota exceeded' } }),
+    JSON.stringify({
+      error: {
+        code: 429,
+        status: 'RESOURCE_EXHAUSTED',
+        details: [
+          {
+            '@type': 'type.googleapis.com/google.rpc.QuotaFailure',
+            violations: [{ quotaId: 'GenerateRequestsPerDayPerProjectPerModel-FreeTier' }],
+          },
+        ],
+      },
+    }),
+  ])('Gemini explicit quota/spend cap fails fast without braking siblings', async (body) => {
+    const net = stubFetch((d) => (d.tag === 'call-a' ? { status: 429, body } : { status: 200 }));
+    const provider = providerFor('google');
+    const a = outcome(ask(provider, 'call-a', {}, MODEL.google));
+    await at(1);
+    const b = outcome(ask(provider, 'call-b', {}, MODEL.google));
+    await vi.runAllTimersAsync();
+    expect(((await a) as { error: ProviderError }).error.body).toBe(body);
+    expect(net.of('call-a')).toHaveLength(1);
+    expect(net.of('call-b')).toHaveLength(1);
+    expect((await b).ok).toBe(true);
+  });
 
   it.each(DIALECT_LESS)(
     '$label, adaptive: false: a 429 holds no sibling and shares the 3-attempt transient budget',

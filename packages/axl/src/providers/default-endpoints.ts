@@ -8,3 +8,4 @@
  */
 export const OPENAI_DEFAULT_BASE_URL = 'https://api.openai.com/v1';
 export const ANTHROPIC_DEFAULT_BASE_URL = 'https://api.anthropic.com/v1';
+export const GEMINI_DEFAULT_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta';

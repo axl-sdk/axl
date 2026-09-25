@@ -24,6 +24,7 @@ import type { InputContentPart, InputMediaSource } from '../input.js';
 import type { RecordedAudioSource } from '../transcription.js';
 import { InvalidModelInputError, UnsupportedModelInputError } from '../errors.js';
 import { firstRichPart, type RichModality } from './rich-input.js';
+import { GEMINI_DEFAULT_BASE_URL } from './default-endpoints.js';
 
 function hasRichGeminiMessages(messages: readonly ChatMessage[]): boolean {
   return messages.some((message) => Array.isArray(message.content));
@@ -336,7 +337,7 @@ type GeminiPriceUsage = {
   modalities?: { audioTokens: number; nonAudioTokens: number };
 };
 
-const CANONICAL_GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta';
+const CANONICAL_GEMINI_BASE_URL = GEMINI_DEFAULT_BASE_URL;
 
 type GeminiPricingContext = {
   model: string;
@@ -915,10 +916,7 @@ export class GeminiProvider implements Provider {
   ) {
     this.apiKeySource =
       options.apiKey ?? process.env.GOOGLE_API_KEY ?? process.env.GEMINI_API_KEY ?? '';
-    this.baseUrl = (options.baseUrl ?? 'https://generativelanguage.googleapis.com/v1beta').replace(
-      /\/$/,
-      '',
-    );
+    this.baseUrl = (options.baseUrl ?? GEMINI_DEFAULT_BASE_URL).replace(/\/$/, '');
     assertSafeProviderBaseUrl(
       this.baseUrl,
       'Google provider',

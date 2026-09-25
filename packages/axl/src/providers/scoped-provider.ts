@@ -34,7 +34,7 @@ import {
   type RequestCaptureChannel,
 } from '../diagnostics/capture.js';
 import { redactCapturedRequest } from '../redaction.js';
-import type { ProviderResponse } from '../types.js';
+import type { CallTiming, ProviderResponse } from '../types.js';
 import type { ChatMessage, ChatOptions, Provider, StreamChunk } from './types.js';
 
 /** Map a provider usage block onto the accounting usage buckets. */
@@ -49,6 +49,40 @@ function toAccountingUsage(
     cachedTokens: usage.cached_tokens ?? 0,
     cacheWriteTokens: usage.cache_write_tokens ?? 0,
   };
+}
+
+/** Optional diagnostics must never turn a settled response into a failure. */
+function safeTiming(response: { timing?: CallTiming }): CallTiming | undefined {
+  try {
+    const timing = response.timing;
+    if (!timing) return undefined;
+    // Snapshot the fields before settlement. A custom provider may supply a
+    // getter or proxy whose later read throws; diagnostics cannot interrupt a
+    // successful accounting/admission settlement.
+    const queuedMs = timing.queuedMs;
+    const retryMs = timing.retryMs;
+    const wireMs = timing.wireMs;
+    if (![queuedMs, retryMs, wireMs].every((value) => Number.isFinite(value) && value >= 0)) {
+      return undefined;
+    }
+    const attempts = timing.attempts;
+    const ttfbMs = timing.ttfbMs;
+    const rateLimitRetries = timing.rateLimitRetries;
+    const firstTokenMs = timing.firstTokenMs;
+    const valid = (value: unknown): value is number =>
+      typeof value === 'number' && Number.isFinite(value) && value >= 0;
+    return {
+      queuedMs,
+      retryMs,
+      wireMs,
+      ...(valid(attempts) ? { attempts } : {}),
+      ...(valid(ttfbMs) ? { ttfbMs } : {}),
+      ...(valid(rateLimitRetries) ? { rateLimitRetries } : {}),
+      ...(valid(firstTokenMs) ? { firstTokenMs } : {}),
+    } as CallTiming;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -350,7 +384,13 @@ function openProviderOperation(
   kind: 'chat' | 'stream',
   options: ChatOptions,
 ): OperationHandle | undefined {
-  const handle = openOperation({ kind, model: options.model, provider: raw.name });
+  const handle = openOperation({
+    kind,
+    model: options.model,
+    diagnosticModelUri: options.accountingModelUri,
+    provider: raw.name,
+    agentCall: options.accountingModelUri !== undefined,
+  });
   // Only an adapter that declares it reports transport dispatch can prove that
   // a usage-less failure was never billed. Everyone else stays conservative.
   if (handle && raw.reportsRequestLifecycle === true) handle.markDispatchObservable();
@@ -383,6 +423,7 @@ export function createScopedProvider(raw: Provider): Provider {
         cost: response.cost,
         provenance: response.costProvenance,
         usage: toAccountingUsage(response.usage),
+        timing: safeTiming(response),
       });
       recorder?.end({ response });
       return response;
@@ -486,6 +527,7 @@ export function createScopedProvider(raw: Provider): Provider {
               cost: result.value.cost,
               provenance: result.value.costProvenance,
               usage: toAccountingUsage(result.value.usage),
+              timing: safeTiming(result.value),
             });
             settled = true;
             // The `done` chunk is a stream's response: link its usage/cost to

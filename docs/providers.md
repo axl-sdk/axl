@@ -161,7 +161,11 @@ unpriced. `OPENAI_PRICING` keeps its public flat tuple shape; these tiered rows
 are private to direct OpenAI estimation. This support is based on the
 [GPT-6 model guidance](https://developers.openai.com/api/docs/guides/latest-model)
 and [Standard pricing](https://developers.openai.com/api/docs/pricing), checked
-September 25, 2026; exact-model live acceptance is still pending.
+September 25, 2026. Live calls accepted text and strict schema on all three
+Responses IDs, Chat text on all three, an Astra Responses tool continuation,
+Luna Responses streaming, and Sol/Luna Chat tools at explicit `none`. The
+long-context and cache-write billing estimates have local arithmetic coverage
+but were not compared with live invoice charges.
 
 ## Anthropic
 
@@ -198,8 +202,15 @@ Anthropic can drop incompatible thinking while retaining adjacent text and tool
 blocks; each affected call reports safe reason counts through `diagnostics` and
 `provider_diagnostic { kind: 'reasoning_context_reset' }`. The provider, rather
 than Axl, decides block compatibility. Signed content and transformation paths
-are excluded from diagnostics. This beta-dependent continuation behavior needs
-live certification on the target account.
+are excluded from diagnostics. Live calls on the target account preserved
+same-prefix signed thinking and the Opus-to-Fable 5.1 model switch, and
+reported safe reset reasons for an edited system prefix and a Fable-to-Opus
+switch. Further live calls verified edited tool and prior-message prefixes,
+native `error` rejection for a changed prefix, and terminal streamed reset.
+A runtime live case regenerated then reused an automatic `maxContext` summary;
+both continuations retained the signed tool turn and reported one safe reset
+per affected call. The full effort vocabulary and `none` clamp have local
+adapter coverage; live calls exercised `low` and `max`.
 
 The [Opus 5.5 model page](https://platform.claude.com/docs/en/models/opus-5-5/overview)
 publishes Standard text rates of $4 input, $20 output, $0.20 cache read, $5
@@ -261,9 +272,11 @@ establish a distinct recorded-audio input rate for 3.8 Flash, so calls with
 positive audio tokens remain unpriced. The
 [3.8 model card](https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash)
 lists video and PDF input upstream; Axl's public `ModelInput` currently covers
-text, image, and recorded audio only. Exact 3.8 provider acceptance is pending
-the gated `AXL_FRONTIER_GEMINI_LIVE=1 pnpm test:integration:frontier` check with
-a Google key.
+text, image, and recorded audio only. Selected exact 3.8 live calls accepted
+GenerateContent text, schema, tools, and streaming plus Interactions image
+and recorded audio. The audio response reported positive input tokens and
+remains unpriced. See the [dated verification record](./verification/frontier-model-refresh-2026-09-25.md)
+for the tested combinations and remaining limits.
 
 Gemini [requires every `functionResponse.response` to be a JSON
 object](https://ai.google.dev/api/generate-content#FunctionResponse). Axl parses canonical

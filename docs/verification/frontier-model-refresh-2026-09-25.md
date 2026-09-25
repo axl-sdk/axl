@@ -24,23 +24,51 @@ lower-bound display. Studio's dev server loaded the trace and cost views.
 
 The independent consequential-seam review approved the SDK diff with no open
 code defects. These checks use controlled transports or fixture providers;
-they do not show that the new model IDs accept these requests on a live account.
+the exact-model acceptance evidence below comes from separate live calls.
 
-## Provider acceptance pending
+## Exact-model live acceptance
 
-The gated `pnpm test:integration:frontier` suite collected 43 cases and skipped
-all of them without OpenAI, Anthropic, or Google credentials. No paid calls
-were made. Live evidence is still needed for:
+The root `.env` contains OpenAI, Anthropic, and Google credentials. The live
+loader accepts its `export` syntax; an earlier shell check missed that syntax.
+Narrow, named test selections made **40 logical model calls** across those
+providers. The entire frontier gate was not run because it also includes
+unrelated legacy and xAI cases. No provider key or raw response is recorded here.
 
-- OpenAI GPT-6 Responses and Chat endpoint acceptance, schema/stream/tool
-  continuation, Sol/Luna Chat tools at explicit `none`, and real usage/cache
-  semantics.
-- Anthropic Opus 5.5 adaptive effort and genuine signed-thinking replay across
-  compatible/incompatible prefixes, model changes, summaries, native opt-out,
-  and streaming transformation placement.
-- Gemini 3.8 Flash GenerateContent and Interactions acceptance, including
-  image/audio interpretation, tool/stream/schema results, and observed usage
-  buckets.
+- **OpenAI:** GPT-6 Astra, Sol, and Luna accepted Responses text and strict
+  schema calls and Chat text calls. Astra completed a Responses function-tool
+  continuation; Luna returned terminal stream usage; Sol and Luna accepted Chat
+  function tools with explicit `none`. Each tested response returned usage and
+  an estimated Standard cost. Forbidden combinations remain covered by local
+  zero-fetch assertions. Real cache-write and over-272K-token pricing were not
+  exercised; their estimator arithmetic has local fixture coverage.
+- **Anthropic:** Opus 5.5 accepted text, terminal streaming, and an automatic
+  tool continuation with genuine signed thinking. An unchanged continuation
+  preserved that thinking; an edited system prefix reported
+  `prefix_binding_mismatch`. Opus-to-Fable 5.1 preserved compatible thinking,
+  and Fable-to-Opus reported `model_binding_mismatch`. Live effort levels were
+  `low` and `max`. Further live calls verified edited tool and prior-message
+  resets, a provider 400 for explicit native `error` policy, and a terminal
+  streamed reset with the same edited prefix. A runtime test then generated
+  one `maxContext` summary and reused it on a second ask around a genuine
+  signed tool turn. Both outgoing requests retained the original user text,
+  signed thinking, and matching tool-use/result IDs; each affected call
+  emitted one safe reset diagnostic. The other effort levels, `none` clamp,
+  and forced-tool rejection have local zero-fetch/adapter coverage only.
+  Anthropic may omit a thinking block on a simple adaptive-thinking request;
+  two seed probes returned no signed block and were excluded from replay
+  assertions.
+- **Google:** Gemini 3.8 Flash accepted GenerateContent text, strict schema,
+  function-tool continuation, and streaming calls, plus Interactions image and
+  recorded-audio input. The responses reported the exact model and usage.
+  `none` resolved to `low`. The image call received a positive token estimate;
+  the audio call reported positive audio input tokens and remained unpriced.
+
+The selected live scenarios passed under the approved 42-call / $5 ceiling.
+This record does not claim a provider invoice audit: costs are adapter
+estimates, and precise billed spend is unknown. Real cache-write and
+over-272K-token billing, non-Standard billing tiers, and Anthropic effort
+values other than the two exercised live remain unverified at the provider
+boundary.
 
 Google's published Gemini 3.8 rates do not establish a distinct recorded-audio
 input rate. Positive audio-token calls remain unpriced, and any execution

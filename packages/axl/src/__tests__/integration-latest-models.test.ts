@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it } from 'vitest';
 import { AnthropicProvider } from '../providers/anthropic.js';
 import { GeminiProvider } from '../providers/gemini.js';
 import { OpenAICompatibleProvider } from '../providers/openai-compatible.js';
@@ -82,8 +82,12 @@ async function toolContinuation(
 }
 
 describe.skipIf(!process.env.OPENAI_API_KEY)('latest models: OpenAI live acceptance', () => {
-  const chat = new OpenAIProvider();
-  const responses = new OpenAIResponsesProvider();
+  let chat: OpenAIProvider;
+  let responses: OpenAIResponsesProvider;
+  beforeAll(() => {
+    chat = new OpenAIProvider();
+    responses = new OpenAIResponsesProvider();
+  });
 
   // Paid exact-model certification. Keep this file outside the routine live
   // suite; the frontier gate runs only after an explicit spend decision.
@@ -192,7 +196,10 @@ describe.skipIf(!process.env.OPENAI_API_KEY)('latest models: OpenAI live accepta
 });
 
 describe.skipIf(!process.env.ANTHROPIC_API_KEY)('latest models: Anthropic live acceptance', () => {
-  const provider = new AnthropicProvider();
+  let provider: AnthropicProvider;
+  beforeAll(() => {
+    provider = new AnthropicProvider();
+  });
 
   it('Opus 5.5 text and terminal stream use the exact model with metered Standard cost', async () => {
     const text = await provider.chat(prompt, {
@@ -275,7 +282,10 @@ describe.skipIf(!process.env.ANTHROPIC_API_KEY)('latest models: Anthropic live a
 });
 
 describe.skipIf(!process.env.GOOGLE_API_KEY)('latest models: Gemini live acceptance', () => {
-  const provider = new GeminiProvider();
+  let provider: GeminiProvider;
+  beforeAll(() => {
+    provider = new GeminiProvider();
+  });
 
   it.each(['gemini-3.6-flash', 'gemini-3.5-flash-lite'])(
     'non-stream accepts exact model %s without deprecated sampling fields',
@@ -302,7 +312,10 @@ describe.skipIf(!process.env.GOOGLE_API_KEY)('latest models: Gemini live accepta
 });
 
 describe.skipIf(!process.env.XAI_API_KEY)('latest models: xAI Chat live acceptance', () => {
-  const provider = new OpenAICompatibleProvider({ profile: XAI_PROFILE });
+  let provider: OpenAICompatibleProvider;
+  beforeAll(() => {
+    provider = new OpenAICompatibleProvider({ profile: XAI_PROFILE });
+  });
 
   it.each(['grok-4.5', 'grok-4.3', 'grok-4.20', 'grok-4.20-non-reasoning'])(
     'non-stream accepts exact current Chat model %s and returned USD ticks',

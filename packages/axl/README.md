@@ -597,6 +597,11 @@ startup pass plus a periodic sweep. See
 [observability.md](../../docs/observability.md#captured-requests-opt-in) and
 [integration.md](../../docs/integration.md#diagnostic-artifact-storage).
 
+Compatible loaded ESM/CJS copies share accounting, admission, and capture in
+one JavaScript realm. Cross-copy work emits one warning identifying both copies;
+see [accounting completeness](../../docs/observability.md#completeness-and-reasons)
+for protocol compatibility and upgrade guidance.
+
 **Embedder cost attribution.** `OpenAIEmbedder` reports `{ tokens, cost, model }` on every embed call — computed from the response's `prompt_tokens` and a pricing table (`text-embedding-3-small` $0.02/1M, `-large` $0.13/1M, `ada-002` $0.10/1M). The cost flows through `runtime.trackExecution()` the same way agent-call cost does, counts against `ctx.budget()`, and shows up in Studio's Cost Dashboard under "Memory (Embedder)". See [observability.md](../../docs/observability.md#event-types) for the trace-event shape.
 
 **Custom `Embedder` implementations** (breaking change in 0.15.0 — `embed()` previously returned `Promise<number[][]>`):

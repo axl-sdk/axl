@@ -30,9 +30,8 @@
  * `knownCost` an explicit lower bound.
  */
 
-import { AsyncLocalStorage } from 'node:async_hooks';
-
 import { AdmissionDeniedError, AxlError } from './errors.js';
+import { sharedContext, sharedGuard, thisCopy, warnCrossCopy } from './shared-context.js';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -45,8 +44,9 @@ import { AdmissionDeniedError, AxlError } from './errors.js';
  *
  * - `'complete'` — every operation in the scope reached a terminal state with a
  *   usable charge (including known $0).
- * - `'incomplete'` — at least one operation settled without a usable charge;
- *   `knownCost` is a lower bound and `reasons` says why.
+ * - `'incomplete'` — at least one operation lacked a usable charge, or the
+ *   scope detected work from an incompatible loaded copy; `knownCost` is a
+ *   lower bound and `reasons` says why.
  * - `'unverified'` — reserved for READERS of artifacts that carry no
  *   accounting at all (legacy eval results). A live scope never produces it.
  */
@@ -74,9 +74,8 @@ export type AccountingReason =
   /** An external operation finished without calling `report.setCost()`. */
   | 'external_unreported'
   /**
-   * A consumer ran work with no accounting scope available (e.g. `@axlsdk/eval`
-   * driving a runtime that predates `trackOutcome`). Core defines the name only
-   * — no core producer emits it.
+   * A consumer ran work with no accounting scope available, or another loaded
+   * copy attempted work under a scope whose accounting protocol it cannot join.
    */
   | 'uninstrumented';
 
@@ -109,7 +108,7 @@ export type Accounting = {
   /** Sum of settled, usable, disjoint charges. Never includes caller aggregates. */
   knownCost: number;
   completeness: AccountingCompleteness;
-  /** Reason → count of operations carrying it. Empty object when complete. */
+  /** Reason → count of unresolved operations or coverage failures. */
   reasons: Partial<Record<AccountingReason, number>>;
   usage: AccountingUsage;
   operations: {
@@ -122,7 +121,7 @@ export type Accounting = {
     total: number;
     /** Terminal with a usable cost, including a known $0. */
     settled: number;
-    /** Terminal or abandoned without a usable cost. Drives `completeness`. */
+    /** Terminal or abandoned without a usable cost. Coverage failures can also make `incomplete`. */
     unknown: number;
     /** Refused admission — never dispatched, contributes nothing anywhere. */
     denied: number;
@@ -306,10 +305,8 @@ function isUsableCost(cost: unknown): cost is number {
   return typeof cost === 'number' && Number.isFinite(cost) && cost >= 0;
 }
 
-let operationCounter = 0;
 function nextOperationId(): string {
-  operationCounter += 1;
-  return `op_${operationCounter}`;
+  return sharedContext.nextOperationId();
 }
 
 /**
@@ -360,6 +357,12 @@ class AccountingScope {
   /** An operation refused admission BEFORE it was ever opened. */
   recordDenied(): void {
     this.denied += 1;
+  }
+
+  /** A foreign protocol attempted work we cannot measure. Mark every live ancestor. */
+  markUninstrumented(): void {
+    if (this.finalized || this.reasons.has('uninstrumented')) return;
+    this.reasons.set('uninstrumented', 1);
   }
 
   /** An already-open operation refused at the dispatch check: retract it. */
@@ -435,7 +438,7 @@ class AccountingScope {
       version: 1,
       currency: 'USD',
       knownCost: this.knownCost,
-      completeness: this.unknown > 0 ? 'incomplete' : 'complete',
+      completeness: this.reasons.size > 0 ? 'incomplete' : 'complete',
       reasons: Object.fromEntries(this.reasons) as Partial<Record<AccountingReason, number>>,
       usage: { ...this.usage },
       operations: {
@@ -451,12 +454,14 @@ class AccountingScope {
   }
 }
 
-const accountingStorage = new AsyncLocalStorage<AccountingScope>();
+const accountingStorage =
+  sharedContext.accounting as import('node:async_hooks').AsyncLocalStorage<AccountingScope>;
 
 /** @internal Set while an instrumented operation's body runs, so transports
  *  that do not receive `ChatOptions` (embedder, transcription) can still find
  *  their dispatch hook. */
-const dispatchAdmissionStorage = new AsyncLocalStorage<DispatchAdmission>();
+const dispatchAdmissionStorage =
+  sharedContext.dispatch as import('node:async_hooks').AsyncLocalStorage<DispatchAdmission>;
 
 /**
  * The dispatch hook for the operation currently executing on this async
@@ -494,7 +499,7 @@ export function runWithDispatchAdmission<T>(
  * Charge a controller, failing loudly when the object cannot actually be
  * charged.
  *
- * The registry symbol above makes two copies of this package interoperate, but
+ * The settlement symbol lets compatible copies charge the same controller, but
  * it cannot make an object that never had the channel work. A plain object
  * shaped like a controller, or one built by a package version predating this
  * channel, would otherwise die as `TypeError: scope.admission[Symbol(...)] is
@@ -620,13 +625,24 @@ export type OperationHandle = {
  * Check admission and open an operation on the active scope.
  *
  * Returns `undefined` when no scope is active — callers then delegate verbatim
- * with no admission and no accounting, exactly as before this seam existed.
+ * with no admission and no accounting. An incompatible participating copy's
+ * active scope is different: its guard refuses work before it can dispatch.
  *
  * @throws AdmissionDeniedError when the narrowest enclosing controller is
  *   closed. The operation is recorded as `denied` and never dispatched.
  * @internal
  */
 export function openOperation(descriptor: OperationDescriptor): OperationHandle | undefined {
+  const guard = sharedGuard.storage.getStore();
+  if (guard && guard.contextId !== sharedContext.id) {
+    guard.markUninstrumented();
+    warnCrossCopy(guard.owner, false);
+    throw new AxlError(
+      'INCOMPATIBLE_ACCOUNTING_SCOPE',
+      'The active @axlsdk/axl accounting scope uses an incompatible loaded copy; paid work was refused before dispatch.',
+    );
+  }
+  if (guard) warnCrossCopy(guard.owner, true);
   const scope = accountingStorage.getStore();
   if (!scope || scope.isFinalized) return undefined;
 
@@ -746,8 +762,39 @@ export async function runInAccountingScope<T>(
     purpose: options.purpose ?? parent?.purpose ?? 'generation',
     admission: options.admission,
   });
+  const enclosingGuard = sharedGuard.storage.getStore();
+  if (enclosingGuard)
+    warnCrossCopy(enclosingGuard.owner, enclosingGuard.contextId === sharedContext.id);
+  if (enclosingGuard && enclosingGuard.contextId !== sharedContext.id) {
+    enclosingGuard.markUninstrumented();
+    scope.markUninstrumented();
+    scope.finalize();
+    return {
+      outcome: {
+        status: 'rejected',
+        error: new AxlError(
+          'INCOMPATIBLE_ACCOUNTING_SCOPE',
+          'The active @axlsdk/axl accounting scope uses an incompatible loaded copy; paid work was refused before dispatch.',
+        ),
+      },
+      accounting: scope.toAccounting(),
+    };
+  }
+  const markUninstrumented = (): void => {
+    let current: AccountingScope | undefined = scope;
+    while (current) {
+      // A detached child may already have finalized while its ancestor is
+      // still active. The child cannot change, but the ancestor must not claim
+      // complete coverage after an incompatible copy attempted work below it.
+      if (!current.isFinalized) current.markUninstrumented();
+      current = current.parent;
+    }
+  };
   try {
-    const value = await accountingStorage.run(scope, fn);
+    const value = await sharedGuard.storage.run(
+      { contextId: sharedContext.id, owner: thisCopy, markUninstrumented },
+      () => accountingStorage.run(scope, fn),
+    );
     scope.finalize();
     return { outcome: { status: 'fulfilled', value }, accounting: scope.toAccounting() };
   } catch (error) {

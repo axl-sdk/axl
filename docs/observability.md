@@ -27,21 +27,32 @@ call. Do not add them together.
 `knownCost` is the sum of charges Axl could actually establish. When it could not establish one,
 the scope says so rather than rounding the unknown down to zero:
 
-- `completeness: 'complete'` — every operation reached a terminal state with a usable charge,
-  **including a known $0**. A free call is complete, not unknown.
+- `completeness: 'complete'` — every observed operation reached a terminal state with a usable
+  charge, **including a known $0**, and no coverage failure was detected. A free call is
+  complete, not unknown.
 - `completeness: 'incomplete'` — at least one operation did not. `knownCost` is a **lower
   bound**, and `reasons` counts why: `unpriced_model` (usage reported, no usable cost — a
   pricing-table miss, or a `NaN`/negative/`Infinity` from an adapter), `usage_missing`
   (dispatched, but the terminal outcome carried no usage at all — a failure, an abort, a
   refused retry, or a successful response from a usage-omitting adapter), `abandoned`
   (dispatched and never settled before the scope finalized), `external_unreported` (a
-  `withExternalOperation` that never called `report.setCost`).
+  `withExternalOperation` that never called `report.setCost`), or a participating loaded
+  copy attempted work under an incompatible scope (`uninstrumented`). The latter is refused
+  before dispatch; it marks coverage incomplete without adding an unknown operation.
 - `completeness: 'unverified'` — only ever produced by readers of legacy artifacts that carry no
   accounting at all. A live scope never emits it.
 
 This is coverage of Axl-observable operations, not invoice reconciliation. Arbitrary I/O inside
 your own tool handlers is invisible unless you declare it with
 [`ctx.withExternalOperation`](./api-reference.md#externaloperationdescriptor-fn--ctxwithexternaloperationdescriptor-fn).
+
+Compatible loaded copies of Axl in one JavaScript realm share accounting scopes, admission,
+request capture and operation IDs. This includes the ESM and CJS builds. The first cross-copy
+operation logs both resolved paths and versions once per pair. A participating copy that cannot
+join an active scope fails closed with `INCOMPATIBLE_ACCOUNTING_SCOPE` and leaves the outer
+scope `incomplete` / `uninstrumented`. An older copy that predates this protocol cannot be
+detected reliably; upgrade or deduplicate all copies used for paid work. Worker threads and VM
+realms do not share the context.
 
 Operations refused admission by an [`AdmissionController`](./api-reference.md#admissioncontroller)
 are counted under `operations.denied` and contribute nothing — no charge, no reason, and no

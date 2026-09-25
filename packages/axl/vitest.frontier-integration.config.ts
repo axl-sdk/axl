@@ -6,7 +6,10 @@ export default defineConfig({
     globals: true,
     environment: 'node',
     env: loadLiveIntegrationEnv(),
-    include: ['src/__tests__/integration-latest-models.test.ts'],
+    include: [
+      'src/__tests__/integration-latest-models.test.ts',
+      'src/__tests__/integration-frontier-gemini.test.ts',
+    ],
     testTimeout: 180_000,
   },
 });

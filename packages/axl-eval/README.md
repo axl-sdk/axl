@@ -414,11 +414,13 @@ actually measured. The value is still validated — a non-negative finite number
 dropped with a `console.warn` — so `{ cost: 'free' }` can poison nothing.
 
 **Additive item metadata.** Returning `{ output, metadata: { category: 'billing' } }`
-preserves tracked models, tokens, agent calls, and workflow attribution, with or without
-trace capture. User keys override tracked defaults; nested objects are replaced wholesale.
-An explicit `models` or `workflows` list without corresponding call counts removes the
-inherited count map so run totals use the list fallback. Supply both list and counts for
-exact custom accounting. See the [metadata contract](../../docs/api-reference.md#evalitem).
+adds application keys beside measured models, tokens, agent calls, and workflow
+attribution. The reserved measurement keys (`models`, `modelCallCounts`,
+`tokens`, `agentCalls`, `workflows`, `workflowCallCounts`) are kept under
+`item.callerReport.metadata` if returned by the callback; they do not override
+the runtime's measurement. Model diagnostics and timing follow the accounting
+scope across runtimes and compatible ESM/CJS copies. Workflow names and captured
+traces still depend on the runtime hosting `trackOutcome`.
 
 ### Studio
 

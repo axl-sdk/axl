@@ -10,6 +10,7 @@
 import { describe, it, expect, vi } from 'vitest';
 
 import { AxlRuntime } from '../runtime.js';
+import { AdmissionController } from '../accounting.js';
 import { createScopedProvider } from '../providers/scoped-provider.js';
 import type { ChatMessage, ChatOptions, Provider, StreamChunk } from '../providers/types.js';
 import type { EffortResolution, InputModalitySupport } from '../providers/types.js';
@@ -88,6 +89,34 @@ function runtimeWith(raw: Provider): AxlRuntime {
 }
 
 describe('I10: the facade forwards everything but chat and stream', () => {
+  it('does not let a hostile timing field interrupt a successful settlement', async () => {
+    const runtime = runtimeWith({
+      name: 'rich',
+      async chat() {
+        const timing = {} as { queuedMs: number };
+        Object.defineProperty(timing, 'queuedMs', {
+          get() {
+            throw new Error('hostile timing');
+          },
+        });
+        return { content: 'ok', cost: 0.1, timing: timing as never };
+      },
+      // eslint-disable-next-line require-yield
+      async *stream() {
+        throw new Error('unused');
+      },
+    });
+    const provider = runtime.resolveProvider('rich:m').provider;
+    const admission = new AdmissionController({ limit: 1 });
+    const outcome = await runtime.trackOutcome(
+      () => provider.chat([], { model: 'm', accountingModelUri: 'rich:m' }),
+      { admission },
+    );
+    expect(outcome.status).toBe('fulfilled');
+    expect(outcome.accounting.knownCost).toBe(0.1);
+    expect(admission.knownSpend).toBe(0.1);
+    expect(outcome.modelTiming).toBeUndefined();
+  });
   it('returns a stable facade that is NOT the registered instance', () => {
     const raw = new RichProvider();
     const runtime = runtimeWith(raw);

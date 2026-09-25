@@ -2,14 +2,11 @@
  * Quota dialects: how a first-party provider reports rate-limit headroom and
  * why it returned a 429.
  *
- * Only first-party OpenAI (the `openai` family, which covers both
- * `openai:` and `openai-responses:`) and Anthropic at the vendor's default
- * origin have a dialect. Every other scope (Gemini, OpenAI-compatible presets
- * such as Azure or OpenRouter, a first-party vendor behind a proxy) has none.
- * It still adapts (fleet brake, rate-limit retry budget, adaptive pacing; see
- * `governor-pool.ts`), but treats every 429 as a rate limit without reading
- * its body and never reads a quota hint. A preset gets a dialect only after
- * live evidence for its headers and 429 bodies.
+ * First-party OpenAI, Anthropic, and Gemini at their vendor origins have
+ * dialects. Gemini classifies explicit terminal quota/billing errors but has
+ * no 2xx headroom hint. Other scopes still adapt without a dialect and treat
+ * every 429 as a rate limit. A preset gets a dialect only after evidence for
+ * its headers and 429 bodies.
  *
  * A dialect answers two questions:
  *
@@ -19,7 +16,8 @@
  *   more. `reset` headers are never read, so no duration or timestamp parsing
  *   exists here.
  * - {@link QuotaDialect.classify429}: whether a 429 is an ordinary rate limit
- *   (wait and retry) or a spend cap (retrying cannot help until a human acts).
+ *   (wait and retry) or a terminal quota/billing limit (this request cannot
+ *   recover within its retry budget).
  *   It reads a byte-capped clone of the body so the adapter's own later
  *   `res.text()` still receives the raw body for `ProviderError.body`.
  *
@@ -29,7 +27,11 @@
  *
  * Internal: nothing here is barrel-exported.
  */
-import { ANTHROPIC_DEFAULT_BASE_URL, OPENAI_DEFAULT_BASE_URL } from './default-endpoints.js';
+import {
+  ANTHROPIC_DEFAULT_BASE_URL,
+  GEMINI_DEFAULT_BASE_URL,
+  OPENAI_DEFAULT_BASE_URL,
+} from './default-endpoints.js';
 
 /**
  * Why a 429 was returned. `'unknown'` means the body did not identify either
@@ -247,6 +249,42 @@ export const anthropicQuotaDialect: QuotaDialect = makeDialect(
 );
 
 /**
+ * Gemini uses RESOURCE_EXHAUSTED for both short rate limits and limits that
+ * cannot clear during this request. Only explicit machine codes, quota IDs,
+ * and billing messages classify the latter; the generic status and the
+ * common "current quota" message are ambiguous and remain retryable.
+ * Gemini does not publish headroom headers, so `hint` is always absent.
+ */
+export const geminiQuotaDialect: QuotaDialect = makeDialect([], (error) => {
+  if (error.code === 'quota_exceeded') return 'spend_cap';
+  if (Array.isArray(error.details)) {
+    for (const detail of error.details) {
+      if (typeof detail !== 'object' || detail === null) continue;
+      const violations = (detail as Record<string, unknown>).violations;
+      if (!Array.isArray(violations)) continue;
+      if (
+        violations.some((violation) => {
+          if (typeof violation !== 'object' || violation === null) return false;
+          const id = (violation as Record<string, unknown>).quotaId;
+          return typeof id === 'string' && /perday|daily|spend|billing/i.test(id);
+        })
+      )
+        return 'spend_cap';
+    }
+  }
+  const message = error.message;
+  if (
+    typeof message === 'string' &&
+    /monthly spending cap|spend(?:-based|ing)? (?:cap|limit)|prepay(?:ment)? credits? (?:are )?depleted/i.test(
+      message,
+    )
+  ) {
+    return 'spend_cap';
+  }
+  return 'unknown';
+});
+
+/**
  * Keyed by governor-scope family (`governor-pool.ts`); a Map so no prototype key
  * resolves. Each dialect describes its vendor's own endpoint only, so it is paired
  * with the origin of the adapters' default base URL.
@@ -257,6 +295,7 @@ const DIALECTS: ReadonlyMap<string, { origin: string; dialect: QuotaDialect }> =
     'anthropic',
     { origin: new URL(ANTHROPIC_DEFAULT_BASE_URL).origin, dialect: anthropicQuotaDialect },
   ],
+  ['google', { origin: new URL(GEMINI_DEFAULT_BASE_URL).origin, dialect: geminiQuotaDialect }],
 ]);
 
 /**

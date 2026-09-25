@@ -51,6 +51,7 @@ import {
   type Accounting,
   type AdmissionController,
   type OperationPurpose,
+  type SettlementDiagnostics,
 } from './accounting.js';
 import { createScopedProvider } from './providers/scoped-provider.js';
 import {
@@ -682,7 +683,7 @@ export type ModelTimingRollup = Record<
     /** Timed calls that reported a `firstTokenMs` — the denominator for it. */
     firstTokenCalls?: number;
     /**
-     * The per-call blocks the sums were built from, in event order.
+     * The per-call blocks the sums were built from, in settlement order.
      * `length === calls`. Present only under `captureTimingSamples`, because
      * retaining it is O(calls) in memory and the sums alone are O(models) — a
      * caller that needs a real DISTRIBUTION (percentiles, min/max) cannot
@@ -3208,8 +3209,9 @@ export class AxlRuntime extends EventEmitter {
    * new paid operations once known spend reaches the limit. Already-dispatched
    * work still settles and is still counted.
    *
-   * `metadata`, `modelTiming` and `traces` remain EVENT-derived and therefore
-   * depend on trace configuration; `accounting` never does.
+   * Model metadata and timing share the settlement scope with accounting, so
+   * they cross runtimes and compatible ESM/CJS copies. Workflow names and
+   * captured traces still come from this runtime's events.
    */
   async trackOutcome<T>(
     fn: () => Promise<T>,
@@ -3222,29 +3224,10 @@ export class AxlRuntime extends EventEmitter {
       parent: parentScope,
     };
 
-    const modelCalls = new Map<string, number>();
-    const modelTiming = new Map<
-      string,
-      {
-        calls: number;
-        queuedMs: number;
-        retryMs: number;
-        wireMs: number;
-        firstTokenMs?: number;
-        firstTokenCalls?: number;
-        samples?: CallTiming[];
-      }
-    >();
-    // Opt-in: retaining every block is O(calls), and only a caller building a
-    // distribution (axl-eval's `summary.modelTiming`) reads them. `trackCost`
-    // and the internal eval-history wrapper discard `modelTiming` entirely.
-    const captureTimingSamples = options?.captureTimingSamples === true;
     // Insertion-ordered Map: first time we see a workflow it gets added at
     // the end, so iteration order is "first-seen first" — which for nested
     // workflow calls puts the outermost workflow first.
     const workflowCalls = new Map<string, number>();
-    const tokens = { input: 0, output: 0, reasoning: 0 };
-    let agentCalls = 0;
     const capturedTraces: AxlEvent[] | undefined = options?.captureTraces ? [] : undefined;
 
     const listener = (event: AxlEvent) => {
@@ -3254,55 +3237,6 @@ export class AxlRuntime extends EventEmitter {
       // total feeds `trackCost`-era consumers of the TRACE rail only; the
       // authoritative figure is `accounting.knownCost`.
       scope.totalCost += eventCostContribution(event);
-      if (event.type === 'agent_call_end') {
-        if (event.model) modelCalls.set(event.model, (modelCalls.get(event.model) ?? 0) + 1);
-        agentCalls++;
-        if (event.tokens) {
-          tokens.input += event.tokens.input ?? 0;
-          tokens.output += event.tokens.output ?? 0;
-          tokens.reasoning += event.tokens.reasoning ?? 0;
-        }
-        // Latency rollup, same key as modelCallCounts. Only timed calls enter a
-        // bucket, so an uninstrumented provider adds nothing rather than
-        // contributing zeros that would deflate a mean.
-        //
-        // SUCCESSFUL calls only — see the `ModelTimingRollup` docs for why.
-        // `data.error` is set on the error-path `agent_call_end` and never on
-        // the success path, so it is the discriminator.
-        const failed = event.data?.error != null;
-        if (event.model && event.timing && !failed) {
-          const t = event.timing;
-          let bucket = modelTiming.get(event.model);
-          if (!bucket) {
-            bucket = {
-              calls: 0,
-              queuedMs: 0,
-              retryMs: 0,
-              wireMs: 0,
-              ...(captureTimingSamples ? { samples: [] } : {}),
-            };
-            modelTiming.set(event.model, bucket);
-          }
-          bucket.calls++;
-          // Keep the raw block alongside the sums when asked. A consumer that
-          // needs a real per-call distribution (axl-eval's
-          // `summary.modelTiming`) can't recover one from sums, and re-deriving
-          // it from `captureTraces` would force it to buffer whole events.
-          bucket.samples?.push(t);
-          bucket.queuedMs += t.queuedMs;
-          bucket.retryMs += t.retryMs;
-          bucket.wireMs += t.wireMs;
-          // Streaming-only: sum it only across the calls that reported it, and
-          // leave the key off when none did. `firstTokenCalls` rides along as
-          // its own denominator so a model mixing streamed and non-streamed
-          // calls still yields an exact mean — dividing by `calls` would
-          // under-report it.
-          if (t.firstTokenMs != null) {
-            bucket.firstTokenMs = (bucket.firstTokenMs ?? 0) + t.firstTokenMs;
-            bucket.firstTokenCalls = (bucket.firstTokenCalls ?? 0) + 1;
-          }
-        }
-      }
       // Both `runtime.execute()` and `runtime.stream()` now emit workflow_start
       // as a first-class `type: 'workflow_start'` event. AxlTestRuntime does
       // the same. The prior log-form fallback is no longer needed.
@@ -3353,12 +3287,17 @@ export class AxlRuntime extends EventEmitter {
     this.on('trace', listener);
     let outcome: { status: 'fulfilled'; value: T } | { status: 'rejected'; error: unknown };
     let accounting: Accounting;
+    let diagnostics: SettlementDiagnostics;
     try {
       // The accounting scope wraps the cost scope, so both are active for `fn`
       // and both are finalized on the same settlement — including the throwing
       // path, which is exactly where the old trace-only rail lost charges.
-      ({ outcome, accounting } = await runInAccountingScope<T>(
-        { purpose: options?.purpose, admission: options?.admission },
+      ({ outcome, accounting, diagnostics } = await runInAccountingScope<T>(
+        {
+          purpose: options?.purpose,
+          admission: options?.admission,
+          captureTimingSamples: options?.captureTimingSamples,
+        },
         () =>
           // Capture wraps the cost scope rather than the other way round so a
           // record can never be written for an operation the accounting scope
@@ -3385,13 +3324,18 @@ export class AxlRuntime extends EventEmitter {
     return {
       ...outcome,
       accounting,
-      ...(modelTiming.size > 0 ? { modelTiming: Object.fromEntries(modelTiming) } : {}),
+      ...(Object.keys(diagnostics.modelTiming).length > 0
+        ? { modelTiming: diagnostics.modelTiming }
+        : {}),
       ...(capturedTraces ? { traces: capturedTraces } : {}),
       metadata: {
-        models: [...modelCalls.keys()],
-        modelCallCounts: modelCalls.size > 0 ? Object.fromEntries(modelCalls) : undefined,
-        tokens,
-        agentCalls,
+        models: Object.keys(diagnostics.modelCallCounts),
+        modelCallCounts:
+          Object.keys(diagnostics.modelCallCounts).length > 0
+            ? diagnostics.modelCallCounts
+            : undefined,
+        tokens: diagnostics.tokens,
+        agentCalls: diagnostics.agentCalls,
         workflows: [...workflowCalls.keys()],
         workflowCallCounts: workflowCalls.size > 0 ? Object.fromEntries(workflowCalls) : undefined,
       },

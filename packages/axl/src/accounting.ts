@@ -32,6 +32,7 @@
 
 import { AdmissionDeniedError, AxlError } from './errors.js';
 import { sharedContext, sharedGuard, thisCopy, warnCrossCopy } from './shared-context.js';
+import type { CallTiming } from './types.js';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -264,8 +265,12 @@ export class AdmissionController {
 export type OperationDescriptor = {
   kind: OperationKind;
   model?: string;
+  /** Full agent URI for diagnostic grouping; `model` stays the adapter model. */
+  diagnosticModelUri?: string;
   provider?: string;
   name?: string;
+  /** An agent turn, as distinct from a direct provider call by a scorer. */
+  agentCall?: boolean;
 };
 
 type OperationRecord = {
@@ -273,6 +278,8 @@ type OperationRecord = {
   kind: OperationKind;
   purpose: OperationPurpose;
   model?: string;
+  diagnosticModelUri?: string;
+  agentCall: boolean;
   /** Set once the transport reports the request actually left the process. */
   dispatched: boolean;
   /**
@@ -287,6 +294,26 @@ type SettlementInput = {
   cost?: number;
   provenance?: CostProvenance;
   usage?: Partial<AccountingUsage>;
+  timing?: CallTiming;
+};
+
+/** Diagnostics folded beside accounting, through the same cross-copy scope. */
+export type SettlementDiagnostics = {
+  modelCallCounts: Record<string, number>;
+  tokens: { input: number; output: number; reasoning: number };
+  agentCalls: number;
+  modelTiming: Record<
+    string,
+    {
+      calls: number;
+      queuedMs: number;
+      retryMs: number;
+      wireMs: number;
+      firstTokenMs?: number;
+      firstTokenCalls?: number;
+      samples?: CallTiming[];
+    }
+  >;
 };
 
 function emptyUsage(): AccountingUsage {
@@ -333,15 +360,25 @@ class AccountingScope {
   private readonly reasons = new Map<AccountingReason, number>();
   private readonly breakdown = { generation: 0, judging: 0, external: 0 };
   private readonly provenance = new Map<CostProvenance, number>();
+  private readonly modelCalls = new Map<string, number>();
+  private readonly modelTiming = new Map<
+    string,
+    NonNullable<SettlementDiagnostics['modelTiming'][string]>
+  >();
+  private readonly diagnosticTokens = { input: 0, output: 0, reasoning: 0 };
+  private agentCalls = 0;
+  private readonly captureTimingSamples: boolean;
 
   constructor(options: {
     parent?: AccountingScope;
     purpose: OperationPurpose;
     admission?: AdmissionController;
+    captureTimingSamples?: boolean;
   }) {
     this.parent = options.parent;
     this.purpose = options.purpose;
     this.admission = options.admission;
+    this.captureTimingSamples = options.captureTimingSamples === true;
   }
 
   get isFinalized(): boolean {
@@ -381,6 +418,7 @@ class AccountingScope {
     cost: number,
     provenance: CostProvenance,
     usage?: Partial<AccountingUsage>,
+    timing?: CallTiming,
   ): void {
     this.seen.add(op.id);
     this.openOps.delete(op.id);
@@ -390,18 +428,70 @@ class AccountingScope {
     else this.breakdown[op.purpose] += cost;
     this.provenance.set(provenance, (this.provenance.get(provenance) ?? 0) + cost);
     if (usage) this.addUsage(usage);
+    this.recordAgentCall(op, usage, timing);
   }
 
   recordUnknown(
     op: OperationRecord,
     reason: AccountingReason,
     usage?: Partial<AccountingUsage>,
+    timing?: CallTiming,
   ): void {
     this.seen.add(op.id);
     this.openOps.delete(op.id);
     this.unknown += 1;
     this.reasons.set(reason, (this.reasons.get(reason) ?? 0) + 1);
     if (usage) this.addUsage(usage);
+    this.recordAgentCall(op, usage, timing);
+  }
+
+  private recordAgentCall(
+    op: OperationRecord,
+    usage?: Partial<AccountingUsage>,
+    timing?: CallTiming,
+  ): void {
+    if (!op.agentCall) return;
+    this.agentCalls++;
+    const model = op.diagnosticModelUri ?? op.model;
+    if (!model) return;
+    this.modelCalls.set(model, (this.modelCalls.get(model) ?? 0) + 1);
+    if (usage) {
+      const finite = (value: unknown): number =>
+        typeof value === 'number' && Number.isFinite(value) ? value : 0;
+      this.diagnosticTokens.input += finite(usage.inputTokens);
+      this.diagnosticTokens.output += finite(usage.outputTokens);
+      this.diagnosticTokens.reasoning += finite(usage.reasoningTokens);
+    }
+    if (!timing) return; // A failed call never contributes to successful latency.
+    let bucket = this.modelTiming.get(model);
+    if (!bucket) {
+      bucket = {
+        calls: 0,
+        queuedMs: 0,
+        retryMs: 0,
+        wireMs: 0,
+        ...(this.captureTimingSamples ? { samples: [] } : {}),
+      };
+      this.modelTiming.set(model, bucket);
+    }
+    bucket.calls++;
+    bucket.queuedMs += timing.queuedMs;
+    bucket.retryMs += timing.retryMs;
+    bucket.wireMs += timing.wireMs;
+    bucket.samples?.push(timing);
+    if (timing.firstTokenMs != null) {
+      bucket.firstTokenMs = (bucket.firstTokenMs ?? 0) + timing.firstTokenMs;
+      bucket.firstTokenCalls = (bucket.firstTokenCalls ?? 0) + 1;
+    }
+  }
+
+  toDiagnostics(): SettlementDiagnostics {
+    return {
+      modelCallCounts: Object.fromEntries(this.modelCalls),
+      tokens: { ...this.diagnosticTokens },
+      agentCalls: this.agentCalls,
+      modelTiming: Object.fromEntries(this.modelTiming),
+    };
   }
 
   hasSeen(id: string): boolean {
@@ -532,8 +622,14 @@ function settleOperationUp(
         cost: number;
         provenance: CostProvenance;
         usage?: Partial<AccountingUsage>;
+        timing?: CallTiming;
       }
-    | { outcome: 'unknown'; reason: AccountingReason; usage?: Partial<AccountingUsage> }
+    | {
+        outcome: 'unknown';
+        reason: AccountingReason;
+        usage?: Partial<AccountingUsage>;
+        timing?: CallTiming;
+      }
     | { outcome: 'retracted' },
 ): void {
   // One controller may be attached to several scopes in the chain (a run
@@ -554,14 +650,14 @@ function settleOperationUp(
     if (scope.isFinalized) return;
     switch (outcome.outcome) {
       case 'settled':
-        scope.recordSettled(op, outcome.cost, outcome.provenance, outcome.usage);
+        scope.recordSettled(op, outcome.cost, outcome.provenance, outcome.usage, outcome.timing);
         if (scope.admission && !chargedControllers.has(scope.admission)) {
           chargedControllers.add(scope.admission);
           recordSpend(scope.admission, outcome.cost);
         }
         break;
       case 'unknown':
-        scope.recordUnknown(op, outcome.reason, outcome.usage);
+        scope.recordUnknown(op, outcome.reason, outcome.usage, outcome.timing);
         break;
       case 'retracted':
         scope.recordRetracted(op);
@@ -616,7 +712,7 @@ export type OperationHandle = {
   /** Terminal without a usable charge, for an explicit reason. */
   settleUnknown(reason: AccountingReason, usage?: Partial<AccountingUsage>): void;
   /** Terminal on a thrown error: known $0, unknown, or a dispatch denial. */
-  settleFailure(usage?: Partial<AccountingUsage>): void;
+  settleFailure(usage?: Partial<AccountingUsage>, timing?: CallTiming): void;
   /** Run `fn` with this operation's dispatch hook ambient. */
   run<T>(fn: () => T): T;
 };
@@ -667,6 +763,8 @@ export function openOperation(descriptor: OperationDescriptor): OperationHandle 
     kind: descriptor.kind,
     purpose: scope.purpose,
     model: descriptor.model,
+    diagnosticModelUri: descriptor.diagnosticModelUri,
+    agentCall: descriptor.agentCall === true,
     dispatched: false,
     dispatchObservable: false,
   };
@@ -716,28 +814,34 @@ export function openOperation(descriptor: OperationDescriptor): OperationHandle 
           cost: input.cost,
           provenance: input.provenance ?? 'adapter_reported',
           usage: input.usage,
+          timing: input.timing,
         });
         return;
       }
       // A cost that was offered but is NaN/negative/∞, or usage with no cost at
       // all, is an unpriced model — never a silent zero.
       if (input.cost !== undefined || input.usage !== undefined) {
-        finish({ outcome: 'unknown', reason: 'unpriced_model', usage: input.usage });
+        finish({
+          outcome: 'unknown',
+          reason: 'unpriced_model',
+          usage: input.usage,
+          timing: input.timing,
+        });
         return;
       }
-      handle.settleFailure();
+      handle.settleFailure(undefined, input.timing);
     },
     settleUnknown(reason: AccountingReason, usage?: Partial<AccountingUsage>): void {
       finish({ outcome: 'unknown', reason, usage });
     },
-    settleFailure(usage?: Partial<AccountingUsage>): void {
+    settleFailure(usage?: Partial<AccountingUsage>, timing?: CallTiming): void {
       // Only an adapter that positively reports dispatch can prove that nothing
       // was billed. Anyone else's usage-less failure stays unknown.
       if (op.dispatchObservable && !op.dispatched) {
-        finish({ outcome: 'settled', cost: 0, provenance: 'adapter_reported', usage });
+        finish({ outcome: 'settled', cost: 0, provenance: 'adapter_reported', usage, timing });
         return;
       }
-      finish({ outcome: 'unknown', reason: 'usage_missing', usage });
+      finish({ outcome: 'unknown', reason: 'usage_missing', usage, timing });
     },
     run<T>(fn: () => T): T {
       return runWithDispatchAdmission(handle.dispatchAdmission, fn);
@@ -752,17 +856,23 @@ export function openOperation(descriptor: OperationDescriptor): OperationHandle 
  * @internal `AxlRuntime.trackOutcome` is the public entry point.
  */
 export async function runInAccountingScope<T>(
-  options: { purpose?: OperationPurpose; admission?: AdmissionController },
+  options: {
+    purpose?: OperationPurpose;
+    admission?: AdmissionController;
+    captureTimingSamples?: boolean;
+  },
   fn: () => Promise<T>,
 ): Promise<{
   outcome: { status: 'fulfilled'; value: T } | { status: 'rejected'; error: unknown };
   accounting: Accounting;
+  diagnostics: SettlementDiagnostics;
 }> {
   const parent = accountingStorage.getStore();
   const scope = new AccountingScope({
     parent,
     purpose: options.purpose ?? parent?.purpose ?? 'generation',
     admission: options.admission,
+    captureTimingSamples: options.captureTimingSamples,
   });
   const inheritedGuard = sharedGuard.storage.getStore();
   const enclosingGuard =
@@ -782,6 +892,7 @@ export async function runInAccountingScope<T>(
         ),
       },
       accounting: scope.toAccounting(),
+      diagnostics: scope.toDiagnostics(),
     };
   }
   const markUninstrumented = (): void => {
@@ -808,10 +919,18 @@ export async function runInAccountingScope<T>(
       () => accountingStorage.run(scope, fn),
     );
     scope.finalize();
-    return { outcome: { status: 'fulfilled', value }, accounting: scope.toAccounting() };
+    return {
+      outcome: { status: 'fulfilled', value },
+      accounting: scope.toAccounting(),
+      diagnostics: scope.toDiagnostics(),
+    };
   } catch (error) {
     scope.finalize();
-    return { outcome: { status: 'rejected', error }, accounting: scope.toAccounting() };
+    return {
+      outcome: { status: 'rejected', error },
+      accounting: scope.toAccounting(),
+      diagnostics: scope.toDiagnostics(),
+    };
   }
 }
 

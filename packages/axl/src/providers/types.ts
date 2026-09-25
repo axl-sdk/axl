@@ -79,6 +79,8 @@ export type ToolChoice =
  */
 export type ChatOptions = {
   model: string;
+  /** @internal Full URI of a `ctx.ask` agent turn for cross-runtime diagnostics. */
+  accountingModelUri?: string;
   temperature?: number;
   tools?: ToolDefinition[];
   maxTokens?: number;

@@ -178,6 +178,7 @@ export function preserveErrorCause<T extends Error>(error: T, cause: unknown): T
 }
 
 /** A known tool failure whose author-provided model message is safe to expose. */
+const TOOL_FAILURE_MARKER = Symbol.for('axl.toolFailure.v1');
 export class ToolFailure extends AxlError {
   readonly modelMessage: string;
   declare readonly cause?: unknown;
@@ -186,6 +187,7 @@ export class ToolFailure extends AxlError {
     super(options.code ?? 'TOOL_FAILURE', options.message);
     this.name = 'ToolFailure';
     this.modelMessage = options.modelMessage;
+    Object.defineProperty(this, TOOL_FAILURE_MARKER, { value: true });
     if (options.cause !== undefined) {
       Object.defineProperty(this, 'cause', {
         configurable: true,
@@ -193,6 +195,21 @@ export class ToolFailure extends AxlError {
         value: options.cause,
       });
     }
+  }
+}
+
+/** @internal Recognize an explicit ToolFailure from a compatible loaded copy. */
+export function isToolFailureError(error: unknown): error is ToolFailure {
+  try {
+    return (
+      error instanceof ToolFailure ||
+      (typeof error === 'object' &&
+        error !== null &&
+        (error as { [TOOL_FAILURE_MARKER]?: unknown })[TOOL_FAILURE_MARKER] === true &&
+        typeof (error as { modelMessage?: unknown }).modelMessage === 'string')
+    );
+  } catch {
+    return false;
   }
 }
 

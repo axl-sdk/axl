@@ -12,6 +12,7 @@ import { dataset, runEval } from '@axlsdk/eval';
 
 const cjs = createRequire(import.meta.url)('@axlsdk/axl') as typeof esm;
 const usage = { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 };
+const timing = { queuedMs: 2, retryMs: 3, wireMs: 5, attempts: 1, rateLimitRetries: 0 };
 const roots: string[] = [];
 
 afterEach(async () => {
@@ -19,21 +20,21 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
-function paidRuntime(copy: typeof esm, cost = 0.5) {
+function paidRuntime(copy: typeof esm, cost = 0.5, model = 'm') {
   let calls = 0;
   const runtime = new copy.AxlRuntime({ defaultProvider: 'fixture' });
   runtime.registerProvider('fixture', {
     name: 'fixture',
     async chat() {
       calls++;
-      return { content: 'ok', cost, usage };
+      return { content: 'ok', cost, usage, timing };
     },
     // eslint-disable-next-line require-yield
     async *stream() {
       throw new Error('unused');
     },
   });
-  const asker = copy.agent({ name: 'a', model: 'fixture:m', system: 'fixture' });
+  const asker = copy.agent({ name: 'a', model: `fixture:${model}`, system: 'fixture' });
   runtime.register(
     copy.workflow({
       name: 'ask',
@@ -60,6 +61,18 @@ describe('two loaded builds share accounting', () => {
       completeness: 'complete',
       operations: { total: 1, settled: 1 },
     });
+    expect(measured.metadata).toMatchObject({
+      models: ['fixture:m'],
+      modelCallCounts: { 'fixture:m': 1 },
+      tokens: { input: 1, output: 1, reasoning: 0 },
+      agentCalls: 1,
+    });
+    expect(measured.modelTiming?.['fixture:m']).toMatchObject({
+      calls: 1,
+      queuedMs: 2,
+      retryMs: 3,
+      wireMs: 5,
+    });
 
     const denied = await outer.trackOutcome(() => paid.runtime.execute('ask', {}), {
       admission: new owner.AdmissionController({ limit: 0 }),
@@ -81,8 +94,8 @@ describe('two loaded builds share accounting', () => {
   it('folds nested scopes once and captures distinct cross-copy operations with correlation', async () => {
     vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     const outer = new cjs.AxlRuntime();
-    const paidEsm = paidRuntime(esm);
-    const paidCjs = paidRuntime(cjs);
+    const paidEsm = paidRuntime(esm, 0.5, 'esm');
+    const paidCjs = paidRuntime(cjs, 0.5, 'cjs');
     const lines: string[] = [];
     const capture = new cjs.RequestCaptureChannel({
       sink: {
@@ -100,17 +113,24 @@ describe('two loaded builds share accounting', () => {
         return paidEsm.runtime.trackOutcome(() => paidEsm.runtime.execute('ask', {}), {
           captureCorrelation: { caseIndex: 7 },
           admission,
+          captureTimingSamples: false,
         });
       },
-      { capture, admission },
+      { capture, admission, captureTimingSamples: true },
     );
     await capture.close();
 
     expect(result.accounting).toMatchObject({ knownCost: 1, operations: { total: 2, settled: 2 } });
     expect(admission.knownSpend).toBe(1);
+    expect(result.metadata.modelCallCounts).toEqual({ 'fixture:cjs': 1, 'fixture:esm': 1 });
+    expect(result.metadata.tokens).toEqual({ input: 2, output: 2, reasoning: 0 });
+    expect(result.modelTiming?.['fixture:cjs'].samples).toHaveLength(1);
+    expect(result.modelTiming?.['fixture:esm'].samples).toHaveLength(1);
     expect(result.status).toBe('fulfilled');
     if (result.status === 'fulfilled') {
       expect(result.value.accounting).toMatchObject({ knownCost: 0.5, operations: { total: 1 } });
+      expect(result.value.metadata.modelCallCounts).toEqual({ 'fixture:esm': 1 });
+      expect(result.value.modelTiming?.['fixture:esm'].samples).toBeUndefined();
     }
     const starts = lines
       .map(
@@ -132,8 +152,8 @@ describe('two loaded builds share accounting', () => {
   it('keeps concurrent parent scopes isolated across copies', async () => {
     vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     const outer = new esm.AxlRuntime();
-    const first = paidRuntime(cjs, 0.25);
-    const second = paidRuntime(cjs, 0.75);
+    const first = paidRuntime(cjs, 0.25, 'first');
+    const second = paidRuntime(cjs, 0.75, 'second');
     const [a, b] = await Promise.all([
       outer.trackOutcome(() => first.runtime.execute('ask', {})),
       outer.trackOutcome(() => second.runtime.execute('ask', {})),
@@ -142,6 +162,10 @@ describe('two loaded builds share accounting', () => {
     expect(b.accounting.knownCost).toBe(0.75);
     expect(a.accounting.operations.total).toBe(1);
     expect(b.accounting.operations.total).toBe(1);
+    expect(a.metadata.models).toEqual(['fixture:first']);
+    expect(b.metadata.models).toEqual(['fixture:second']);
+    expect(Object.keys(a.modelTiming ?? {})).toEqual(['fixture:first']);
+    expect(Object.keys(b.modelTiming ?? {})).toEqual(['fixture:second']);
   });
 
   it('does not retry a tool after a denial from the other copy', async () => {
@@ -168,6 +192,132 @@ describe('two loaded builds share accounting', () => {
     if (result.status === 'rejected') expect(esm.isAdmissionDeniedError(result.error)).toBe(true);
     expect(attempts).toBe(1);
     expect(paid.calls()).toBe(0);
+  });
+
+  it.each([
+    ['ESM tool / CJS runtime', esm, cjs],
+    ['CJS tool / ESM runtime', cjs, esm],
+  ])('%s executes a model-requested tool', async (_label, maker, host) => {
+    let calls = 0;
+    let turns = 0;
+    const hooks: string[] = [];
+    const foreignTool = maker.tool({
+      name: 'foreign',
+      description: 'Return a value',
+      input: z.object({ value: z.number() }),
+      handler: async ({ value }) => {
+        calls++;
+        hooks.push('handler');
+        return { value: value + 1 };
+      },
+      hooks: {
+        before(input) {
+          hooks.push('before');
+          return { value: input.value + 1 };
+        },
+        after(output) {
+          hooks.push('after');
+          return { value: output.value + 1 };
+        },
+      },
+    });
+    const runtime = new host.AxlRuntime({ defaultProvider: 'fixture' });
+    runtime.registerTool(foreignTool);
+    runtime.registerProvider('fixture', {
+      name: 'fixture',
+      async chat(messages) {
+        turns++;
+        if (turns === 2) {
+          expect(
+            messages.some(
+              (message) => message.role === 'tool' && message.content === '{"value":5}',
+            ),
+          ).toBe(true);
+        }
+        return turns === 1
+          ? {
+              content: '',
+              tool_calls: [
+                {
+                  id: 'call_1',
+                  type: 'function' as const,
+                  function: { name: 'foreign', arguments: '{"value":2}' },
+                },
+              ],
+            }
+          : { content: 'done' };
+      },
+      // The provider contract requires a stream method; this path must stay unused.
+      // eslint-disable-next-line require-yield
+      async *stream() {
+        throw new Error('unused');
+      },
+    });
+    const asker = host.agent({
+      name: 'user',
+      model: 'fixture:m',
+      system: 'test',
+      tools: [foreignTool],
+    });
+    runtime.register(
+      host.workflow({ name: 'use-tool', input: z.any(), handler: (ctx) => ctx.ask(asker, 'go') }),
+    );
+    await expect(runtime.execute('use-tool', {})).resolves.toBe('done');
+    expect(calls).toBe(1);
+    expect(turns).toBe(2);
+    expect(hooks).toEqual(['before', 'handler', 'after']);
+  });
+
+  it('preserves a model-safe ToolFailure thrown by a tool from the other copy', async () => {
+    const foreignTool = esm.tool({
+      name: 'foreign_failure',
+      description: 'Return a safe failure',
+      input: z.object({}),
+      handler: () => {
+        throw new esm.ToolFailure({ message: 'private detail', modelMessage: 'try another way' });
+      },
+    });
+    const runtime = new cjs.AxlRuntime({ defaultProvider: 'fixture' });
+    let turns = 0;
+    runtime.registerProvider('fixture', {
+      name: 'fixture',
+      async chat(messages) {
+        turns++;
+        if (turns === 1)
+          return {
+            content: '',
+            tool_calls: [
+              {
+                id: 'call_1',
+                type: 'function' as const,
+                function: { name: 'foreign_failure', arguments: '{}' },
+              },
+            ],
+          };
+        expect(
+          messages.some(
+            (message) => message.role === 'tool' && message.content === 'try another way',
+          ),
+        ).toBe(true);
+        return { content: 'recovered' };
+      },
+      // The provider contract requires a stream method; this path must stay unused.
+      // eslint-disable-next-line require-yield
+      async *stream() {
+        throw new Error('unused');
+      },
+    });
+    const asker = cjs.agent({
+      name: 'user',
+      model: 'fixture:m',
+      system: 'test',
+      tools: [foreignTool],
+    });
+    runtime.register(
+      cjs.workflow({ name: 'recover', input: z.any(), handler: (ctx) => ctx.ask(asker, 'go') }),
+    );
+    await expect(runtime.execute('recover', {})).resolves.toBe('recovered');
+    expect(turns).toBe(2);
   });
 
   it('keeps compatible copies joined when another protocol loads first, and refuses a foreign active guard', () => {
@@ -307,5 +457,17 @@ describe('two loaded builds share accounting', () => {
     expect(result.items.map((item) => item.outcome)).toEqual(['completed', 'budget_skipped']);
     expect(result.diagnostics?.records).toBeGreaterThan(0);
     expect(result.items[0].diagnostics?.operations).toHaveLength(1);
+    expect(result.items[0].metadata).toMatchObject({
+      models: ['fixture:m'],
+      modelCallCounts: { 'fixture:m': 1 },
+      tokens: { input: 1, output: 1, reasoning: 0 },
+      agentCalls: 1,
+    });
+    expect(result.summary.modelTiming?.['fixture:m']).toMatchObject({
+      calls: 1,
+      wireMs: { mean: 5 },
+      queuedMs: { mean: 2 },
+      retryMs: { mean: 3 },
+    });
   });
 });

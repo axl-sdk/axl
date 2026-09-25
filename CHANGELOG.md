@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.2] - 2026-09-25
+
+### Fixed
+
+- `trackOutcome` now derives agent model counts, tokens, and successful-call timing from the accounting settlement scope. Evals running work on a second runtime or a compatible ESM/CJS copy retain measured model metadata and `modelTiming`.
+- Tools created by one ESM/CJS copy can be invoked by the other copy's runtime, including model-requested calls.
+- Gemini 429s that explicitly identify a daily quota or billing/spend cap fail fast without braking the model scope. Ambiguous `RESOURCE_EXHAUSTED` errors still retry because Gemini also uses that status for short rate limits.
+- Clarified that `ctx.ask`'s `timeout` is a between-turn budget and `stallTimeout` applies only during dispatched provider work. A strict deadline across a 429 pause, queue, or transport backoff requires an ask or context `signal`, such as `AbortSignal.timeout(...)`.
+
 ## [0.24.1] - 2026-09-25
 
 ### Fixed
@@ -325,8 +334,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     about 3 s) and holds other calls on that model meanwhile.
   - **Opt out** per provider with `rateLimit: { adaptive: false }`.
 
-  Also: a throttled call can now take minutes (your ask `timeout`, signal and
-  `AdmissionController` still stop it). An abort during a pause, queue wait or
+  Also: a throttled call can now take minutes (an ask or context `signal` stops
+  its wait; `timeout` is checked only between turns, and `AdmissionController`
+  can refuse the next dispatch once spend closes). An abort during a pause, queue wait or
   `503` backoff rejects with the signal's own `reason`. `acquireTimeoutMs`
   bounds only a call's first permit wait. A call that arrives during a pause
   starts that clock when the pause ends.

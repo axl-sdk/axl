@@ -247,7 +247,7 @@ function isAbortError(err: unknown, signal?: AbortSignal): boolean {
  * a scope with a quota dialect, a 429 is first classified from a byte-capped
  * clone of its body; a scope without one never reads or clones the body and
  * treats every 429 as a rate limit.
- * - A spend cap (dialect scopes only) is returned at once with its body
+ * - An explicit terminal quota or spend cap is returned at once with its body
  *   intact: no retry, no brake.
  * - Anything else is a rate limit. It brakes the whole scope for `Retry-After`
  *   (else the exponential backoff), clamped at {@link MAX_BACKOFF_MS}, and
@@ -401,8 +401,8 @@ export async function fetchWithRetry(
       governor?.observe(res);
 
       if (scope && res.status === 429) {
-        // Classify BEFORE braking: a spend cap must not hold up the scope.
-        // Without a dialect nothing can tell a spend cap apart, so the body is
+        // Classify BEFORE braking: a terminal quota must not hold up the scope.
+        // Without a dialect nothing can tell that apart, so the body is
         // left untouched and the 429 is a rate limit.
         const kind = scope.dialect ? await classifySafely(scope.dialect, res) : 'unknown';
         if (kind === 'spend_cap') {

@@ -1,8 +1,8 @@
 import {
   isAdmissionDeniedError,
   isEventStreamOverflowError,
+  isToolFailureError,
   rethrowEventStreamOverflow,
-  ToolFailure,
   ToolModelOutputError,
 } from './errors.js';
 import { openOperation } from './accounting.js';
@@ -254,14 +254,6 @@ function eventError(error: unknown): ToolEventError {
   }
 }
 
-function isToolFailure(error: unknown): error is ToolFailure {
-  try {
-    return error instanceof ToolFailure;
-  } catch {
-    return false;
-  }
-}
-
 function cancellation(
   phase: ToolCallCancellation['phase'],
   error: unknown,
@@ -305,7 +297,7 @@ function failed(
   options: { attempts?: number; result?: unknown } = {},
 ): InternalToolOutcome {
   let modelMessage: string | undefined;
-  if (isToolFailure(error)) {
+  if (isToolFailureError(error)) {
     try {
       modelMessage = typeof error.modelMessage === 'string' ? error.modelMessage : undefined;
     } catch {

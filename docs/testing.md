@@ -558,19 +558,17 @@ Three things to know before asserting on capture in a test:
 
 ### Comparing model latency in an eval
 
-Eval callback metadata is additive: returning `{ output, metadata: { category: 'billing' } }`
-preserves the runtime's models, call counts, tokens, and workflow attribution. This applies
-to direct `runEval`, CLI, and registered evals, with or without trace capture. Explicit user
-keys override tracked defaults in a shallow merge: supplying `tokens` replaces that entire
-object. Keep annotations under distinct keys unless you intend to override accounting;
-model/workflow roll-ups use the merged values. An explicit `models` or `workflows` list
-without its corresponding `modelCallCounts` or `workflowCallCounts` replaces that tracked
-count map too, preserving the fallback of one count per list entry per item. Supply both
-the list and counts when reporting exact custom call counts. Cost and budget semantics are unchanged.
+Eval callback metadata is additive for application keys such as `category`.
+The runtime measures `models`, `modelCallCounts`, `tokens`, `agentCalls`,
+`workflows`, and `workflowCallCounts`. If a callback returns any of those keys,
+`runEval` keeps the claim in `item.callerReport.metadata`; it does not replace
+the measurement. Model counts, tokens, and timing follow the accounting scope
+across runtimes and compatible ESM/CJS copies. Workflow names and captured traces
+still require events from the runtime hosting `trackOutcome`.
 
 `EvalItem.duration` and `summary.timing` are wall clock for the whole workflow: tools, gates, and the SDK's own rate-limiter queue are all in there. Under `concurrency` fan-out against a `rateLimit.maxConcurrent` cap, that number says more about your pacing than about the model, so it cannot carry a model comparison.
 
-`runEval` therefore also rolls up per-model provider latency from `agent_call_end.timing`, on the default path as well as under `captureTraces`. Each item gets `item.timing[model] = { calls, queuedMs, retryMs, wireMs, firstTokenMs?, firstTokenCalls? }`, and the run gets `summary.modelTiming[model]`.
+`runEval` therefore also rolls up per-model provider latency from provider settlement, on the default path as well as under `captureTraces`. Each item gets `item.timing[model] = { calls, queuedMs, retryMs, wireMs, firstTokenMs?, firstTokenCalls? }`, and the run gets `summary.modelTiming[model]`.
 
 Compare models on these four per-call distributions, plus one total:
 

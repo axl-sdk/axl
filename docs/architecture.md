@@ -70,24 +70,20 @@ Workflows are named async functions that receive a `WorkflowContext` (`ctx`). Th
 
 Sessions provide multi-turn conversation state. Each session maintains message history and can persist across requests via the state store. Sessions support forking, configurable history limits, and automatic summarization.
 
-Session retention and request context are separate decisions. A session's
-`history.maxMessages` may remove old stored turns and retain their rolling
-summary. An agent's `maxContext` instead builds a request view for that agent:
-its summary covers an exact prefix, followed by every remaining turn. The
-boundary is kept per agent as session metadata (summary, covered count, and a
-hash of the covered prefix), so later sends reuse it without another summary
-call until the prefix, durable summary, or summary model changes. That view
-does not replace the shared session history. For example, a small-context
-classifier may summarize its request while a later large-context expert still
-receives the full retained history. Both summarizers share one prompt and
-provider call (`compaction.ts`). A known client-side rewrite also removes
-Anthropic thinking signed to the old prefix from the affected request; the
-ask-level removal is reported as a `reasoning_context_reset` diagnostic with
-reason `client_prefix_rewrite`, while session-level trimming happens before
-any execution exists and emits no event. Axl does not store an exact provider
-replay transcript, so this does not promise uninterrupted reasoning context
-across independent asks or restarts. See
-[Sessions → Summarization](./api-reference.md#summarization) for the behavior.
+History has two layers. The session layer (`history.maxMessages`) decides what
+is stored: old turns can be dropped and condensed into a rolling summary that
+every later request sees. The agent layer (`maxContext`) decides what one
+agent sees in one request: a summary of the oldest retained turns followed by
+every later turn. That view is remembered per agent with the session and
+reused until the covered turns, the rolling summary, or the summary model
+change, so a small-window classifier and a large-window expert can share one
+session without a summary call on every turn. Both layers use the same
+summarizer. Rewriting the prefix invalidates Anthropic thinking signed to it;
+Axl removes those blocks and reports the agent-layer case as a
+`reasoning_context_reset` with reason `client_prefix_rewrite`. Session history
+is not an exact provider replay, so reasoning continuity is not promised
+across restarts or prompt changes. See
+[Sessions → Summarization](./api-reference.md#summarization).
 
 ## Provider Architecture
 

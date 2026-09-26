@@ -1693,7 +1693,7 @@ const result = await session.send('HandleSupport', { msg: 'Help me' });
 | `session.history()` | Get the last persisted message history snapshot from the store. Does **not** await in-flight `send()`/`stream()` — returns the previously committed state, which may be stale by one exchange |
 | `session.handoffs()` | Get the handoff history for this session. Same snapshot semantics as `history()` |
 | `session.end()` | Close the session and delete history from the store. Serialized: queues behind any in-flight `send`/`stream` so the delete is the final state |
-| `session.fork(newId, { overwrite? })` | Create a copy of this session with a new ID. Copies: history, `summaryCache`, `handoffHistory`, and session-scoped key-value memory entries (vector embeddings are NOT copied — re-embed on the fork if you need semantic recall). Per-agent ask summaries (`askSummary:<agent>`) are not copied, because `StateStore` cannot enumerate metadata keys; the fork's first over-budget ask regenerates its summary. Acquires both source and target locks so it captures a committed snapshot and does not race a concurrent `runtime.session(newId).send(...)`. Throws if `newId === source id` or if the target id already has history (pass `{ overwrite: true }` to replace it) |
+| `session.fork(newId, { overwrite? })` | Create a copy of this session with a new ID. Copies: history, `summaryCache`, `handoffHistory`, and session-scoped key-value memory entries (vector embeddings are NOT copied — re-embed on the fork if you need semantic recall). Per-agent `maxContext` summaries are not copied; the fork regenerates on its first tight ask. Acquires both source and target locks so it captures a committed snapshot and does not race a concurrent `runtime.session(newId).send(...)`. Throws if `newId === source id` or if the target id already has history (pass `{ overwrite: true }` to replace it) |
 
 ### What's stored
 
@@ -1763,8 +1763,11 @@ The `AxlRuntime` extends `EventEmitter`. Subscribe to lifecycle signals:
 
 Two independent summarization paths exist:
 
-- **Session-level** (controlled here via `history.maxMessages` + `history.summarize`). Triggers when persisted history exceeds `maxMessages`. Drops the oldest excess messages, summarizes them with `summaryModel` (folding in the previous rolling summary), and stores the rolling summary as session metadata (`summaryCache`). The summary is included in later model requests even when the agent has no `maxContext` limit or its retained history fits within that limit. It runs in `send()`/`stream()` before the workflow execution exists, so it emits no ask-scoped events (its cost still lands in the active accounting scope). Trimming also removes Anthropic thinking from the retained turns, because their signed prefix changed; that removal is not observable as a `provider_diagnostic` either.
-- **Ask-level** (controlled by `AgentConfig.maxContext`). Triggers inside `ctx.ask()` when the prompt + history would exceed the agent's configured context window. Its summary covers an exact prefix of the retained history; the request carries that summary and **every** later message. The boundary is kept per agent: in memory for the execution and, when the execution belongs to a session, as session metadata under `askSummary:<agentName>` holding the summary, the covered count, a SHA-256 hash of the covered prefix (never the prefix itself), the durable summary it folded in, and the summary model URI. A later ask or a later `send()` reuses it with no summary call while the prefix hash, the durable session summary, and the summary model are unchanged and the complete tail fits; a session trim, an edit to a covered message, or a different summary model forces regeneration. Regeneration includes the durable session summary and every newly covered message. The ask summary never overwrites `summaryCache`, is never used to trim history, and is never shared with another agent, so a small-context agent never reduces a larger-context agent's view. When the projection removes Anthropic thinking signed to the old prefix, the ask emits one `provider_diagnostic` `reasoning_context_reset` with reason `client_prefix_rewrite` before its first model turn. A `persist: false` session never writes `askSummary:*` records, so its over-budget asks regenerate on every `send()`. If the metadata write fails after a summary was generated, the ask continues on its in-memory boundary and emits a `log` event with a `warning`; the next execution regenerates.
+- **Session-level** (`history.maxMessages` + `history.summarize`). When stored history exceeds `maxMessages`, the oldest messages are dropped and, with `summarize: true`, condensed into a rolling summary stored as session metadata (`summaryCache`). That summary is included in every later request for every agent. It runs inside `send()`/`stream()` before the workflow starts, so it emits no ask-scoped events; its cost still lands in the active accounting scope. Trimming also removes Anthropic thinking from the retained turns (their signed prefix changed); that removal is not reported.
+- **Ask-level** (`AgentConfig.maxContext`). When one agent's request would not fit its window, Axl summarizes the oldest part of the retained history and sends that summary followed by **every** later message, nothing skipped. This is a view for that agent only: it never changes stored history, never overwrites `summaryCache`, and never shrinks another agent's view, so a small-window classifier and a large-window expert can share one session.
+  - **Reuse.** The summary is remembered per agent, in memory and (in a session) as metadata under `askSummary:<agentName>`, keyed by a hash of the messages it covers. Later asks and later `send()` calls reuse it with no summary call while those messages, the session's rolling summary, and the summary model are unchanged and the newer messages still fit. Otherwise Axl summarizes again, folding in the old summary.
+  - **Reasoning.** If the new summary invalidates Anthropic thinking signed to the old prefix, Axl removes those blocks and emits one `provider_diagnostic` `reasoning_context_reset` with reason `client_prefix_rewrite` before the first model turn.
+  - **Persistence.** `persist: false` sessions store no summaries and regenerate each `send()`. If saving the summary fails, the ask continues and emits a `log` event with a `warning`; the next execution regenerates.
 
 Both use the same summary prompt and provider call. Both can fire in the same `send()`.
 
@@ -2122,17 +2125,12 @@ each bucket at its actual multiplier. Aggregate-only cache-write usage remains o
 is deliberately unpriced.
 
 `ProviderResponse.diagnostics?.reasoningContextReset` and the terminal stream
-`done.diagnostics` field carry the same optional Anthropic dropped-thinking
-summary: `droppedBlocks` and counts for `prefix_binding_mismatch`,
-`model_binding_mismatch`, `organization_binding_mismatch`, and
-`end_user_binding_mismatch`, plus an `other` count for unrecognized future
-reasons. The shared `ReasoningContextReset` type also has
-`client_prefix_rewrite`, which the runtime itself reports when an
-`AgentConfig.maxContext` summary removed thinking before the call. They never contain
-the signed block, transformation path, or raw response. Custom providers can
-omit `diagnostics`; the runtime emits a `reasoning_context_reset` event only
-when a completed call reports dropped blocks, or before the first model turn
-when its own `maxContext` projection removed blocks (`client_prefix_rewrite`).
+`done.diagnostics` carry the same `ReasoningContextReset`: `droppedBlocks` plus
+per-reason counts (`prefix_binding_mismatch`, `model_binding_mismatch`,
+`organization_binding_mismatch`, `end_user_binding_mismatch`, `other`, and
+`client_prefix_rewrite` for removals Axl made itself before a `maxContext`
+summary). Never the signed block, transformation path, or raw response.
+Custom providers may omit `diagnostics`.
 
 `audio_input_tokens` / `audio_output_tokens` are the audio share of
 `prompt_tokens` / `completion_tokens`, populated on every lane that reports the

@@ -129,17 +129,15 @@ same two usage fields, so the rule holds identically on both OpenAI transports
 OpenAI's o-series uses the `developer` role, strips `temperature`, and supports `effort`.
 GPT-5.x uses `system` and supports the same portable option.
 
-**Sampling under reasoning (all OpenAI reasoning models).** The portable
-`temperature` option is dropped from the request rather than rejected: always
-on o-series and on exact GPT-5.6 Responses requests; on other GPT-5.x requests
-(GPT-5.6 Chat included) when Axl sends a reasoning effort; and on exact GPT-6
-IDs unless the effective effort is `none` (omitting `effort` uses GPT-6's active
-default, so it is dropped). Raw `providerOptions` are different: they merge last
-and are never stripped. On exact GPT-6 IDs Axl checks the final request and
-throws `UnsupportedModelOptionError` before dispatch when a raw field adds a
-forbidden sampling parameter while reasoning is active, or when a raw effort
-override activates reasoning after Axl kept the portable `temperature` (see
-below). On other models the raw field is sent as written.
+**Sampling under reasoning (all OpenAI reasoning models).** While reasoning is
+active, the portable `temperature` option is dropped from the request, not
+rejected. That means always on o-series and exact GPT-5.6 Responses; on other
+GPT-5.x when Axl sends an effort; and on exact GPT-6 IDs unless the effective
+effort is `none` (GPT-6 reasons by default, so omitting `effort` drops it). Raw
+`providerOptions` merge last and are never stripped: on exact GPT-6 IDs a raw
+field that re-adds a forbidden sampling parameter under active reasoning fails
+before dispatch with `UnsupportedModelOptionError`; on other models it is sent
+as written.
 
 Exact GPT-5.6 Chat requests with
 `effort: 'max'` use `xhigh` and report the clamp through a `provider_diagnostic`
@@ -168,20 +166,18 @@ that sets any of these parameters is rejected with `UnsupportedModelOptionError`
 before dispatch. With Sol or Luna at effective `none`, both the portable option
 and the raw fields are sent where the endpoint accepts them.
 
-For representable direct Standard text calls, Axl estimates GPT-6 cost using
-the exact published input, cached-input, cache-write, and output rows. Above
-272,000 **total input tokens**, the long-context row prices the whole call,
-including cache buckets and output. Non-Standard processing, regional billing,
-hosted tools, unverified media, missing usage, and unknown model IDs remain
-unpriced. `OPENAI_PRICING` keeps its public flat tuple shape; these tiered rows
-are private to direct OpenAI estimation. This support is based on the
+Axl prices direct Standard GPT-6 text calls from the published input,
+cached-input, cache-write, and output rows. Above 272,000 **total input
+tokens**, the long-context row prices the whole call, including cache buckets
+and output. Non-Standard processing, regional billing, hosted tools, unverified
+media, missing usage, and unknown model IDs stay unpriced. `OPENAI_PRICING`
+keeps its public flat shape. Sources: the
 [GPT-6 model guidance](https://developers.openai.com/api/docs/guides/latest-model)
 and [Standard pricing](https://developers.openai.com/api/docs/pricing), checked
-September 25, 2026. Live calls accepted text and strict schema on all three
-Responses IDs, Chat text on all three, an Astra Responses tool continuation,
-Luna Responses streaming, and Sol/Luna Chat tools at explicit `none`. The
-long-context and cache-write billing estimates have local arithmetic coverage
-but were not compared with live invoice charges.
+September 25, 2026. The verified live combinations and remaining limits (no
+invoice comparison for long-context or cache-write billing) are in the
+[frontier verification record](./verification/frontier-model-refresh-2026-09-25.md)
+and its [remediation follow-up](./verification/frontier-owner-remediation-2026-09-26.md).
 
 ## Anthropic
 
@@ -206,34 +202,32 @@ anthropic:claude-haiku-4-5      # Fast and affordable
 anthropic:claude-opus-4-5       # Previous gen
 ```
 
-Opus 5.5 supports `low`, `medium`, `high`, `xhigh`, and `max` effort with adaptive
-thinking; its default is `medium`. `none` uses `low` and emits `effort_clamped`.
-Opus 5.5 and Fable 5.1 reject `toolChoice: 'required'` and named choices locally;
-use `auto` or `none`. The adapter also rejects final native overrides that
-would disable/manualize thinking, set an invalid effort, or send unsupported
-non-default sampling values. When a final request replays signed thinking, Axl sends
-Anthropic's binding beta and `drop_block` policy. A valid native
-`providerOptions.thinking.block_binding.prefix_mismatch_behavior: 'error'` opts out.
-Anthropic can drop incompatible thinking while retaining adjacent text and tool
-blocks; each affected call reports safe prefix, model, organization, and
-end-user binding mismatch counts (or `other` for an unrecognized reason) through
-`diagnostics` and
-`provider_diagnostic { kind: 'reasoning_context_reset' }`. The provider, rather
-than Axl, decides block compatibility. Signed content and transformation paths
-are excluded from diagnostics. Live calls on the target account preserved
-same-prefix signed thinking and the Opus-to-Fable 5.1 model switch, and
-reported safe reset reasons for an edited system prefix and a Fable-to-Opus
-switch. Further live calls verified edited tool and prior-message prefixes,
-native `error` rejection for a changed prefix, and terminal streamed reset.
-The current runtime live case accepted a compacted tool-use/tool-result tail
-after Axl removed thinking signed to its old prefix; Anthropic reported no
-reasoning reset for the first compacted call. Axl reports its own removal as a
-`reasoning_context_reset` with the `client_prefix_rewrite` reason. The case made four metered Opus 5.5 calls at an
-Axl usage-based cost estimate of $0.123324. It does not establish exact
-reasoning replay across independent sessions, restarts, or changing prompts
-and tools. See [session summary verification](verification/session-summary-coverage-2026-09-25.md).
-The full effort vocabulary and `none` clamp have local adapter coverage; live
-calls exercised `low` and `max`.
+Opus 5.5 supports `low`, `medium`, `high`, `xhigh`, and `max` with adaptive
+thinking always on; the default is `medium`, and `none` uses `low` with an
+`effort_clamped` diagnostic. Opus 5.5 and Fable 5.1 reject `toolChoice:
+'required'` and named choices before dispatch; use `auto` or `none`. Raw
+overrides that disable thinking, set an invalid effort, or add non-default
+sampling are rejected the same way.
+
+**Thinking continuity.** On these two models a thinking block is valid only
+while everything before it is unchanged. When a request replays thinking, Axl
+sends Anthropic's binding beta with the `drop_block` policy, so an invalidated
+block is dropped by the provider while its text and tool calls survive, and
+the call reports safe per-reason counts in `diagnostics` and a
+`provider_diagnostic { kind: 'reasoning_context_reset' }`. When Axl itself
+rewrites the prefix (a summary or trim), it removes the stale blocks first and
+reports the ask-level case with reason `client_prefix_rewrite`. Set
+`providerOptions.thinking.block_binding.prefix_mismatch_behavior: 'error'` to
+fail instead of recovering. Signed content never appears in diagnostics.
+Live-verified: same-prefix replay, both Opus/Fable switch directions, edited
+system, tool, and message prefixes, the native `error` opt-out, streamed reset,
+a compacted tool exchange, and reuse of a remembered summary across two
+executions with reasoning kept (see the
+[frontier](./verification/frontier-model-refresh-2026-09-25.md),
+[session summary](./verification/session-summary-coverage-2026-09-25.md), and
+[remediation](./verification/frontier-owner-remediation-2026-09-26.md) records).
+This does not promise reasoning continuity across restarts or prompt and tool
+changes. Live calls used `low` and `max`; other levels have adapter coverage.
 
 The [Opus 5.5 model page](https://platform.claude.com/docs/en/models/opus-5-5/overview)
 publishes Standard text rates of $4 input, $20 output, $0.20 cache read, $5
@@ -1255,7 +1249,7 @@ Third-party providers that omit `Provider.effortResolution()` report nothing.
 - **OpenAI o-series** (o1/o3/o4-mini): Uses `developer` role instead of `system`, strips temperature, sends `reasoning_effort`. `effort: 'none'` sends `reasoning_effort: 'minimal'` (o-series doesn't support `'none'`). `effort: 'max'` sends `'high'` (o-series doesn't support `'xhigh'`).
 - **OpenAI GPT-5.x Chat Completions**: Uses `system`, strips the portable `temperature` when Axl sends a reasoning effort, and supports parallel tool calls. The compatibility baseline maps GPT-5.2+ `'max'` to `'xhigh'`, reported through a `provider_diagnostic` event. Earlier families retain their lower caps.
 - **OpenAI Responses API**: Uses `reasoning: { effort }`; exact GPT-5.6 IDs accept native `'max'` and omit `temperature` because that family rejects it even when reasoning uses the provider default. Older models keep their documented clamps. Exact GPT-6 IDs strip the portable `temperature` on both endpoints unless the effective effort is `none`, and reject raw sampling overrides while reasoning is active (see [GPT-6 endpoint and pricing rules](#gpt-6-endpoint-and-pricing-rules)). `includeThoughts: true` enables reasoning summaries (`reasoning: { summary: 'detailed' }`). Reasoning context is automatically round-tripped via `providerMetadata.openaiReasoningItems`.
-- **Anthropic Claude 5**: Fable 5.1, Fable 5, and Opus 5.5 always reason; Opus 5 and Sonnet 5 reason by default. These models accept the full active effort vocabulary through adaptive thinking. Opaque thinking blocks are preserved in `providerMetadata` for tool continuations. When Axl trims or summarizes earlier messages, retained turns are projected without thinking signed to the old prefix; text, tool calls, and other provider metadata remain. An ask-level (`maxContext`) removal is reported as a `reasoning_context_reset` diagnostic with reason `client_prefix_rewrite`. Model-switch drops alone do not delete stored blocks because a later compatible model may read them. A later session execution reuses the agent's persisted ask-summary boundary while its covered prefix is unchanged and the tail fits; a rebuilt ask summary can still reset reasoning, and session history is not an exact provider replay log. Axl does not request beta fast-mode or model-fallback headers; if Anthropic reports that a different fallback model served the call, Axl fails before persisting history or estimating cost.
+- **Anthropic Claude 5**: Fable 5.1, Fable 5, and Opus 5.5 always reason; Opus 5 and Sonnet 5 reason by default. All accept the full active effort vocabulary through adaptive thinking. Opaque thinking blocks are kept in `providerMetadata` for continuations. A summary or trim removes thinking signed to the old prefix and keeps text, tool calls, and other providers' metadata; the `maxContext` case is reported as `reasoning_context_reset` with reason `client_prefix_rewrite` (see [Opus 5.5](#anthropic) above). A model switch does not delete stored blocks, since a compatible model may read them later. Axl does not request beta fast-mode or model-fallback headers; if Anthropic reports that a fallback model served the call, Axl fails before persisting history or estimating cost.
 - **Anthropic Opus 4.8**: Supports adaptive thinking and native `'xhigh'`/`'max'`.
 - **Anthropic Opus 4.7**: Same adaptive-thinking behavior as 4.6. Additionally supports `effort: 'xhigh'` as a first-class tier between `'high'` and `'max'`, sent as `output_config.effort: 'xhigh'`. Same pricing as Opus 4.6 ($5/$25 per 1M tokens).
 - **Anthropic 4.6** (Opus 4.6, Sonnet 4.6): `effort` enables adaptive thinking (`thinking: { type: "adaptive" }` + `output_config: { effort }`). Temperature stripped when thinking active. `thinkingBudget: 0` + `effort` sends only `output_config.effort` (no thinking block, temperature allowed). `effort: 'xhigh'` clamps to `'high'` (4.6 doesn't expose a distinct xhigh tier).

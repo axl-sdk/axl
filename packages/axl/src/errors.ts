@@ -332,7 +332,7 @@ export class TimeoutError extends AxlError {
         (breakdown
           ? ` (elapsed ${breakdown.elapsedMs}ms: queued ${breakdown.queuedMs}ms, ` +
             `retries ${breakdown.retryMs}ms, wire ${breakdown.wireMs}ms, ` +
-            `other ${breakdown.otherMs}ms)`
+            `other ${breakdown.otherMs}ms, charged ${breakdown.chargedMs}ms)`
           : '') +
         (agent ? ` for agent '${agent}'` : ''),
     );

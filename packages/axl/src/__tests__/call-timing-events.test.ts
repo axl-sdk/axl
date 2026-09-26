@@ -316,6 +316,10 @@ describe('TimeoutError breakdown (AC-5)', () => {
     expect(timeout.breakdown).toMatchObject({ queuedMs: 40, retryMs: 0, wireMs: 5 });
     expect(timeout.breakdown!.elapsedMs).toBeGreaterThan(50);
     expect(timeout.breakdown!.chargedMs).toBe(timeout.breakdown!.elapsedMs - 40);
+    // The message shows the number actually compared with the budget, so a
+    // reader never sees elapsed > timeout with a large queued figure and
+    // concludes the governor exclusion did not apply.
+    expect(timeout.message).toContain(`charged ${timeout.breakdown!.chargedMs}ms`);
     // `other` is the residual: elapsed minus the three measured buckets.
     expect(timeout.breakdown!.otherMs).toBe(timeout.breakdown!.elapsedMs - 40 - 0 - 5);
   });

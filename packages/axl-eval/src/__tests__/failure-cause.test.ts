@@ -350,19 +350,20 @@ describe('formatFailureCauses (AC8)', () => {
     retryable: true,
   });
 
-  // E-08: 5 × 429, 3 × 503, 2 × network, 2 × plain Error.
+  // E-08: 5 × 429, 3 × 503, 2 × network, 1 × timeout, 2 × plain Error.
   it('groups by status and provider, most frequent first, summing to the failed count', () => {
     const result = resultWithFailures([
       ...Array.from({ length: 5 }, () => pe(429)),
       ...Array.from({ length: 3 }, () => pe(503, 'anthropic')),
       pe(0),
       pe(0),
+      { name: 'TimeoutError', elapsedMs: 100, chargedMs: 70, queuedMs: 30 },
       { name: 'Error' },
       undefined,
     ]);
 
     expect(formatFailureCauses(result)).toBe(
-      '  Failure causes: 5 × 429 (openai), 3 × 503 (anthropic), 2 × network (openai), 2 × other',
+      '  Failure causes: 5 × 429 (openai), 3 × 503 (anthropic), 2 × network (openai), 2 × other, 1 × timeout',
     );
   });
 

@@ -48,7 +48,6 @@ import {
   isEventStreamOverflowError,
   isUnrecoverableError,
   preserveErrorCause,
-  rethrowEventStreamOverflow,
   rethrowUnrecoverable,
 } from './errors.js';
 import {
@@ -4452,17 +4451,15 @@ export class WorkflowContext<TInput = unknown> {
         const unpriced = this.budgetContext!.unpriced;
         return { value, budgetExceeded: exceeded, totalCost, unpriced };
       } catch (err) {
-        rethrowEventStreamOverflow(err);
+        // A denial or overflow is a stop that outranks this budget's own.
+        rethrowUnrecoverable(err);
+        // The scope this budget runs in was cancelled: that is not a budget
+        // stop, even if the budget also happens to be exceeded.
+        if (parentSignal?.aborted) throw err;
+        // Covers every hard_stop abort of our own: `_accumulateBudgetCost` marks
+        // the budget exceeded before it aborts `controller`, so an AbortError
+        // arriving while not exceeded can only come from an outer scope.
         if (this.budgetContext!.exceeded) {
-          return {
-            value: null,
-            budgetExceeded: true,
-            totalCost: this.budgetContext!.totalCost,
-            unpriced: this.budgetContext!.unpriced,
-          };
-        }
-        // AbortError from hard_stop should count as budget exceeded
-        if (err instanceof DOMException && err.name === 'AbortError' && controller) {
           return {
             value: null,
             budgetExceeded: true,

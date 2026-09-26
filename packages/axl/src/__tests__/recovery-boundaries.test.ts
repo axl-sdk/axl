@@ -31,7 +31,10 @@ class TestProvider {
   readonly name = 'test';
   calls = 0;
 
-  constructor(private readonly contents: string[]) {}
+  constructor(
+    private readonly contents: string[],
+    private readonly cost = 0.001,
+  ) {}
 
   async chat(_messages: unknown[], options: { signal?: AbortSignal }) {
     options.signal?.throwIfAborted();
@@ -40,7 +43,7 @@ class TestProvider {
     return {
       content,
       usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-      cost: 0.001,
+      cost: this.cost,
     };
   }
 
@@ -552,5 +555,107 @@ describe('an aborted scope is not recovered by a ctx recovery boundary', () => {
     await expect(
       ctx.spawn(2, async () => Promise.reject(new Error('boom')), { quorum: 1 }),
     ).rejects.toBeInstanceOf(QuorumNotMet);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ctx.budget
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('ctx.budget reports only its own stop as budgetExceeded', () => {
+  it('an outer abort inside a hard_stop budget that is not exceeded rejects', async () => {
+    const controller = new AbortController();
+    const provider = new TestProvider(['ok']);
+    const { ctx } = createContext(provider, { signal: controller.signal });
+
+    const outcome = ctx.budget({ cost: '$100', onExceed: 'hard_stop' }, async () => {
+      // No reason: the default DOMException('AbortError') has the same shape as
+      // the budget's own hard_stop abort.
+      controller.abort();
+      return ctx.ask(testAgent, 'go');
+    });
+
+    await expect(outcome).rejects.toBe(controller.signal.reason);
+    expect(provider.calls).toBe(0);
+  });
+
+  it('an outer abort inside a hard_stop budget that is already exceeded rejects', async () => {
+    const controller = new AbortController();
+    const provider = new TestProvider(['ok'], 5);
+    const { ctx } = createContext(provider, { signal: controller.signal });
+    const failure = new Error('work failed after the caller cancelled');
+
+    const outcome = ctx.budget({ cost: '$1', onExceed: 'hard_stop' }, async () => {
+      // Exceeds the budget; hard_stop aborts the budget scope, which fails the ask.
+      await ctx.ask(testAgent, 'go').catch(() => undefined);
+      expect(ctx.getBudgetStatus()?.remaining).toBe(0);
+      controller.abort(new Error('caller cancelled'));
+      throw failure;
+    });
+
+    await expect(outcome).rejects.toBe(failure);
+  });
+
+  it('a denial inside a budget that is already exceeded rejects with the same instance', async () => {
+    const provider = new TestProvider(['ok'], 5);
+    const { ctx } = createContext(provider);
+    const denied = denial();
+
+    const outcome = ctx.budget({ cost: '$1', onExceed: 'finish_and_stop' }, async () => {
+      await ctx.ask(testAgent, 'go'); // exceeds the budget
+      throw denied;
+    });
+
+    await expect(outcome).rejects.toBe(denied);
+  });
+
+  it('hard_stop tripping mid-spawn (default mode) reports the budget stop', async () => {
+    const provider = new TestProvider(['ok'], 5);
+    const { ctx } = createContext(provider);
+
+    const result = await ctx.budget({ cost: '$1', onExceed: 'hard_stop' }, () =>
+      ctx.spawn(2, async (i) =>
+        i === 0 ? ctx.ask(testAgent, 'go') : abortable(branchSignal(ctx), () => {}),
+      ),
+    );
+
+    expect(result).toMatchObject({ value: null, budgetExceeded: true });
+    expect(provider.calls).toBe(1);
+  });
+
+  it('hard_stop tripping mid-map (default mode) reports the budget stop', async () => {
+    const provider = new TestProvider(['ok'], 5);
+    const { ctx } = createContext(provider);
+
+    const result = await ctx.budget({ cost: '$1', onExceed: 'hard_stop' }, () =>
+      ctx.map(
+        [0, 1],
+        async (item) =>
+          item === 0 ? ctx.ask(testAgent, 'go') : abortable(branchSignal(ctx), () => {}),
+        { concurrency: 2 },
+      ),
+    );
+
+    expect(result).toMatchObject({ value: null, budgetExceeded: true });
+    expect(provider.calls).toBe(1);
+  });
+
+  it('hard_stop tripping mid-race reports the budget stop', async () => {
+    const provider = new TestProvider(['ok'], 5);
+    const { ctx } = createContext(provider);
+
+    const result = await ctx.budget({ cost: '$1', onExceed: 'hard_stop' }, () =>
+      ctx.race([
+        async () => {
+          await ctx.ask(testAgent, 'go');
+          branchSignal(ctx)?.throwIfAborted();
+          return 'too late';
+        },
+        async () => abortable(branchSignal(ctx), () => {}),
+      ]),
+    );
+
+    expect(result).toMatchObject({ value: null, budgetExceeded: true });
+    expect(provider.calls).toBe(1);
   });
 });

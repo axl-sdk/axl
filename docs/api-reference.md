@@ -416,7 +416,7 @@ Admission is checked at two points: when an operation opens (the provider facade
 
 `extends AxlError`, `code: 'ADMISSION_DENIED'`, fields `{ limit, knownSpend, operation: { kind, model? } }`.
 
-Raised before the request leaves the process, so it never accompanies a charge. It is **never** wrapped in a `ProviderError` or a `TranscriptionOperationError`, never auto-retried by the transport, and never treated as an abort. The same instance passes every recovery boundary in the workflow context unwrapped and unretried: tool handler retries and failure-to-model conversion, `ctx.ask`'s `validate`, `ctx.verify` (retries, `validate`, and `fallback`), and `ctx.spawn` / `ctx.map` / `ctx.race`, which reject with it (and cancel their remaining branches) instead of folding it into a `{ ok: false }` result or `QuorumNotMet`. It is distinct from `BudgetExceededError`, which is `ctx.budget()`'s own workflow-scoped policy and keeps its existing semantics.
+Raised before the request leaves the process, so it never accompanies a charge. It is **never** wrapped in a `ProviderError` or a `TranscriptionOperationError`, never auto-retried by the transport, and never treated as an abort. The same instance passes every recovery boundary in the workflow context unwrapped and unretried: tool handler retries and failure-to-model conversion, `ctx.ask`'s `validate`, `ctx.verify` (retries, `validate`, and `fallback`), `ctx.budget` (never reported as `budgetExceeded`), and `ctx.spawn` / `ctx.map` / `ctx.race`, which reject with it (and cancel their remaining branches) instead of folding it into a `{ ok: false }` result or `QuorumNotMet`. It is distinct from `BudgetExceededError`, which is `ctx.budget()`'s own workflow-scoped policy and keeps its existing semantics.
 
 ### `externalOperation(descriptor, fn)` / `ctx.withExternalOperation(descriptor, fn)`
 
@@ -850,6 +850,11 @@ if (result.budgetExceeded) {
 
 - **`unpriced`** — `true` when the block included work with unknown cost, such as an unpriced model or a dispatched stalled call abandoned without usage. `totalCost` is then a **lower bound** (the unknown component is omitted). The same condition is readable mid-block via [`ctx.getBudgetStatus().unpriced`](#ctxgetbudgetstatus), and Axl logs a one-time `console.warn` per budget block when it happens.
 - ⚠️ **`unpriced` is observability only — cost limits / `hard_stop` are NOT enforced on unknown spend.** The enforcement rail never sees that cost, so a `hard_stop` budget does **not** govern unpriced models (e.g. Bedrock, self-hosted) or abandoned non-cooperative work. Treat `unpriced: true` as "this limit could not be enforced for part of this block."
+
+**Only its own stop is `budgetExceeded`.** The block returns `{ value: null, budgetExceeded: true }` when `fn` fails because this budget was exceeded (including its own `hard_stop` abort). It rejects with the original error instead when:
+
+- `fn` throws `AdmissionDeniedError` (or `EventStreamOverflowError`) — even if the budget is also exceeded, the run-level stop keeps its identity;
+- the scope the budget runs in (the workflow signal, an enclosing race/quorum branch, or an outer `hard_stop` budget) was aborted — a caller cancellation is not reported as budget exhaustion.
 
 **Nesting:** Budget blocks can be nested. Inner budgets roll their costs — **and their `unpriced` lower-bound flag** — up to the parent.
 

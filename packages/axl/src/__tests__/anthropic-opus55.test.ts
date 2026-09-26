@@ -259,6 +259,26 @@ describe('Claude Opus 5.5 final wire contract', () => {
   });
 });
 
+describe('thinking binding derivation is per-model, not per-thinking-mode', () => {
+  it('does not send the binding beta or block_binding for claude-fable-5, an adaptive-always-on model not verified for binding', async () => {
+    const fetcher = fetchResponse({ ...response(), model: 'claude-fable-5' });
+    await provider().chat(replay, { model: 'claude-fable-5' });
+    const request = fetcher.mock.calls[0][1];
+    expect(request.headers['anthropic-beta']).toBeUndefined();
+    const body = JSON.parse(request.body);
+    expect(body.thinking?.block_binding).toBeUndefined();
+  });
+
+  it('does not reject manual/disabled thinking or forced tool choice on claude-fable-5 the way it does on the two bound models', async () => {
+    const fetcher = fetchResponse({ ...response(), model: 'claude-fable-5' });
+    await provider().chat([{ role: 'user', content: 'hi' }], {
+      model: 'claude-fable-5',
+      toolChoice: 'required',
+    });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('Anthropic thinking reset diagnostics', () => {
   const drops = [
     {

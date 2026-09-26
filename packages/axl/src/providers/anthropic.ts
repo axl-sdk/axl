@@ -92,7 +92,6 @@ function anthropicImageBlocks(
 const ANTHROPIC_API_VERSION = '2023-06-01';
 const ANTHROPIC_FILES_BETA = 'files-api-2025-04-14';
 const ANTHROPIC_THINKING_BINDING_BETA = 'thinking-binding-controls-2026-08-01';
-const BOUND_THINKING_MODELS = new Set(['claude-opus-5-5', 'claude-fable-5-1']);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -185,6 +184,20 @@ type ClaudeCapability = {
   manualBudget: boolean;
   stripTemperature?: boolean;
   disableAt?: Exclude<Effort, 'none'>;
+  /**
+   * Requires the `thinking-binding-controls-2026-08-01` beta and final-body
+   * validation/`block_binding` injection when replaying thinking blocks.
+   * Verified per-model against
+   * https://platform.claude.com/docs/en/build-with-claude/preserved-thinking
+   * (2026-09-25): that doc names Claude Opus 5.5 and Claude Fable 5.1 only —
+   * "On Claude Fable 5.1 and Claude Opus 5.5, a thinking block stays valid
+   * only while everything you sent before it is unchanged on later
+   * requests." It does not name Claude Fable 5 (legacy, also
+   * `adaptive-always-on`), so this is an explicit per-model flag rather than
+   * derived from `thinking === 'adaptive-always-on'`. Re-verify against that
+   * page before adding this flag to any other model.
+   */
+  thinkingBinding?: boolean;
 };
 
 const CLAUDE_CAPABILITIES: Record<string, ClaudeCapability> = {
@@ -193,12 +206,14 @@ const CLAUDE_CAPABILITIES: Record<string, ClaudeCapability> = {
     effortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
     manualBudget: false,
     stripTemperature: true,
+    thinkingBinding: true,
   },
   'claude-fable-5-1': {
     thinking: 'adaptive-always-on',
     effortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
     manualBudget: false,
     stripTemperature: true,
+    thinkingBinding: true,
   },
   'claude-fable-5': {
     thinking: 'adaptive-always-on',
@@ -1127,14 +1142,14 @@ export class AnthropicProvider implements Provider {
   private requiresBindingBeta(body: Record<string, unknown>): boolean {
     const thinking = body.thinking;
     return (
-      BOUND_THINKING_MODELS.has(String(body.model)) &&
+      resolveClaudeCapability(String(body.model))?.thinkingBinding === true &&
       (hasReplayedThinking(body) || (isRecord(thinking) && thinking.block_binding !== undefined))
     );
   }
 
   private validateAndBindFinalBody(body: Record<string, unknown>): void {
     const model = typeof body.model === 'string' ? body.model : '';
-    if (!BOUND_THINKING_MODELS.has(model)) return;
+    if (resolveClaudeCapability(model)?.thinkingBinding !== true) return;
     const reject = (option: string, remediation: string): never => {
       throw new UnsupportedModelOptionError({ provider: this.name, model, option, remediation });
     };

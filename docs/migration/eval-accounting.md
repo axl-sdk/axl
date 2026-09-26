@@ -92,7 +92,11 @@ every wrapping boundary intact:
 
 - it is not normalized into a `ProviderError`,
 - it is not wrapped in a `TranscriptionOperationError`,
-- it is not turned into a tool failure fed back to the model, and it is not retried.
+- it is not turned into a tool failure fed back to the model, and it is not retried,
+- it is not a `validate` failure in `ctx.ask` or `ctx.verify`, is not retried by
+  `ctx.verify`, and never yields its `fallback`, and
+- `ctx.spawn`, `ctx.map`, and `ctx.race` reject with it (cancelling their remaining
+  branches) rather than recording `{ ok: false }` or throwing `QuorumNotMet`.
 
 If you catch broadly around `ctx.ask` or a tool call and translate errors into a
 model-visible message, rethrow `AdmissionDeniedError` so the run actually stops.

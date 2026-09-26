@@ -672,8 +672,17 @@ export type SchemaDiagnosticData =
 export type ReasoningContextReset = {
   /** Number of thinking blocks the provider dropped from this call's input. */
   droppedBlocks: number;
-  /** Only documented Anthropic reasons; no block paths or signed content. */
-  reasons: Partial<Record<'prefix_binding_mismatch' | 'model_binding_mismatch', number>>;
+  /** Documented Anthropic reasons and a safe bucket for future reasons; no paths or signed content. */
+  reasons: Partial<
+    Record<
+      | 'prefix_binding_mismatch'
+      | 'model_binding_mismatch'
+      | 'organization_binding_mismatch'
+      | 'end_user_binding_mismatch'
+      | 'other',
+      number
+    >
+  >;
 };
 
 export type ProviderDiagnosticData =

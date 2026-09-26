@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Anthropic reasoning-reset diagnostics now count organization and end-user binding mismatches, as well as unrecognized future dropped-thinking reasons. Runtime events copy only fixed numeric reason counts from provider diagnostics, keeping extra custom-provider fields out of SDK and Studio traces.
+
 ### Added
 
 - Generated `maxContext` summaries now emit a paired, ask-scoped `agent_call_start` / `agent_call_end` with `data.purpose: 'summary'` and the summary model URI. Their known cost joins the ask trace and budget once; unknown-price summaries mark totals as lower bounds. Cached summary reuse incurs no new charge.

@@ -2087,8 +2087,10 @@ is deliberately unpriced.
 
 `ProviderResponse.diagnostics?.reasoningContextReset` and the terminal stream
 `done.diagnostics` field carry the same optional Anthropic dropped-thinking
-summary: `droppedBlocks` and counts for documented
-`prefix_binding_mismatch` / `model_binding_mismatch` reasons. They never contain
+summary: `droppedBlocks` and counts for `prefix_binding_mismatch`,
+`model_binding_mismatch`, `organization_binding_mismatch`, and
+`end_user_binding_mismatch`, plus an `other` count for unrecognized future
+reasons. They never contain
 the signed block, transformation path, or raw response. Custom providers can
 omit `diagnostics`; the runtime emits a `reasoning_context_reset` event only
 when a completed call reports dropped blocks.

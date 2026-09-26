@@ -268,6 +268,8 @@ describe('Anthropic thinking reset diagnostics', () => {
       secret: 'signed-secret',
     },
     { type: 'thinking_dropped', reason: 'model_binding_mismatch', path: 'messages.2.content.0' },
+    { type: 'thinking_dropped', reason: 'organization_binding_mismatch' },
+    { type: 'thinking_dropped', reason: 'end_user_binding_mismatch' },
     {
       type: 'thinking_mismatch_allowed',
       reason: 'prefix_binding_mismatch',
@@ -276,12 +278,18 @@ describe('Anthropic thinking reset diagnostics', () => {
     { type: 'thinking_dropped', reason: 'future_reason', path: 'messages.4.content.0' },
   ];
 
-  it('normalizes only known dropped reasons in direct response', async () => {
+  it('counts all dropped thinking in a direct response without exposing provider details', async () => {
     fetchResponse(response(drops));
     const result = await provider().chat(replay, { model: 'claude-opus-5-5' });
     expect(result.diagnostics?.reasoningContextReset).toEqual({
-      droppedBlocks: 2,
-      reasons: { prefix_binding_mismatch: 1, model_binding_mismatch: 1 },
+      droppedBlocks: 5,
+      reasons: {
+        prefix_binding_mismatch: 1,
+        model_binding_mismatch: 1,
+        organization_binding_mismatch: 1,
+        end_user_binding_mismatch: 1,
+        other: 1,
+      },
     });
     expect(JSON.stringify(result.diagnostics)).not.toMatch(/signed-secret|messages\./);
   });
@@ -325,8 +333,14 @@ describe('Anthropic thinking reset diagnostics', () => {
         type: 'done',
         diagnostics: {
           reasoningContextReset: {
-            droppedBlocks: 2,
-            reasons: { prefix_binding_mismatch: 1, model_binding_mismatch: 1 },
+            droppedBlocks: 5,
+            reasons: {
+              prefix_binding_mismatch: 1,
+              model_binding_mismatch: 1,
+              organization_binding_mismatch: 1,
+              end_user_binding_mismatch: 1,
+              other: 1,
+            },
           },
         },
       });
@@ -527,7 +541,14 @@ describe('runtime call-level reset cardinality', () => {
   it.each([false, true])(
     'emits after each affected turn in one tool loop with stream=%s',
     async (stream) => {
-      const reset = { droppedBlocks: 2, reasons: { prefix_binding_mismatch: 2 } };
+      const reset = {
+        droppedBlocks: 2,
+        reasons: {
+          prefix_binding_mismatch: 2,
+          path: 'messages.secret.path',
+          future_reason: 99,
+        },
+      };
       let turn = 0;
       const scripted: Provider = {
         name: 'anthropic',
@@ -595,13 +616,15 @@ describe('runtime call-level reset cardinality', () => {
           kind: 'reasoning_context_reset',
           provider: 'anthropic',
           model: 'claude-opus-5-5',
-          ...reset,
+          droppedBlocks: 2,
+          reasons: { prefix_binding_mismatch: 2 },
         },
         {
           kind: 'reasoning_context_reset',
           provider: 'anthropic',
           model: 'claude-opus-5-5',
-          ...reset,
+          droppedBlocks: 2,
+          reasons: { prefix_binding_mismatch: 2 },
         },
       ]);
       expect(

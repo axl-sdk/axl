@@ -113,8 +113,14 @@ describe('TraceEventList', () => {
             data: {
               kind: 'reasoning_context_reset',
               model: 'claude-opus-5-5',
-              droppedBlocks: 2,
-              reasons: { prefix_binding_mismatch: 1, model_binding_mismatch: 1 },
+              droppedBlocks: 5,
+              reasons: {
+                prefix_binding_mismatch: 1,
+                model_binding_mismatch: 1,
+                organization_binding_mismatch: 1,
+                end_user_binding_mismatch: 1,
+                other: 1,
+              },
               path: 'secret-provider-path',
             },
           }),
@@ -122,8 +128,11 @@ describe('TraceEventList', () => {
       />,
     );
     await userEvent.click(screen.getByRole('button', { name: /provider_diagnostic/ }));
-    expect(screen.getByText(/2 thinking blocks dropped/)).toBeInTheDocument();
+    expect(screen.getByText(/5 thinking blocks dropped/)).toBeInTheDocument();
     expect(screen.getByText(/1 prefix mismatch/)).toBeInTheDocument();
+    expect(screen.getByText(/1 organization mismatch/)).toBeInTheDocument();
+    expect(screen.getByText(/1 end-user mismatch/)).toBeInTheDocument();
+    expect(screen.getByText(/1 other reason/)).toBeInTheDocument();
     expect(screen.queryByText(/secret-provider-path/)).not.toBeInTheDocument();
   });
 

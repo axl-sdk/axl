@@ -199,7 +199,9 @@ non-default sampling values. When a final request replays signed thinking, Axl s
 Anthropic's binding beta and `drop_block` policy. A valid native
 `providerOptions.thinking.block_binding.prefix_mismatch_behavior: 'error'` opts out.
 Anthropic can drop incompatible thinking while retaining adjacent text and tool
-blocks; each affected call reports safe reason counts through `diagnostics` and
+blocks; each affected call reports safe prefix, model, organization, and
+end-user binding mismatch counts (or `other` for an unrecognized reason) through
+`diagnostics` and
 `provider_diagnostic { kind: 'reasoning_context_reset' }`. The provider, rather
 than Axl, decides block compatibility. Signed content and transformation paths
 are excluded from diagnostics. Live calls on the target account preserved

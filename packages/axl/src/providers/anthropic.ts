@@ -137,9 +137,14 @@ function normalizeThinkingDrops(value: unknown): ReasoningContextReset | undefin
   let droppedBlocks = 0;
   for (const entry of value) {
     if (!isRecord(entry) || entry.type !== 'thinking_dropped') continue;
-    if (entry.reason !== 'prefix_binding_mismatch' && entry.reason !== 'model_binding_mismatch')
-      continue;
-    reasons[entry.reason] = (reasons[entry.reason] ?? 0) + 1;
+    const reason =
+      entry.reason === 'prefix_binding_mismatch' ||
+      entry.reason === 'model_binding_mismatch' ||
+      entry.reason === 'organization_binding_mismatch' ||
+      entry.reason === 'end_user_binding_mismatch'
+        ? entry.reason
+        : 'other';
+    reasons[reason] = (reasons[reason] ?? 0) + 1;
     droppedBlocks++;
   }
   return droppedBlocks > 0 ? { droppedBlocks, reasons } : undefined;

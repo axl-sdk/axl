@@ -19,6 +19,7 @@ import type {
   ChatMessage,
   ToolCallMessage,
   ProviderResponse,
+  ReasoningContextReset,
   CallTiming,
   AgentCallInfo,
   AgentCallParams,
@@ -2815,7 +2816,26 @@ export class WorkflowContext<TInput = unknown> {
       }
 
       const reasoningReset = response.diagnostics?.reasoningContextReset;
-      if (reasoningReset && reasoningReset.droppedBlocks > 0) {
+      if (
+        reasoningReset &&
+        Number.isSafeInteger(reasoningReset.droppedBlocks) &&
+        reasoningReset.droppedBlocks > 0
+      ) {
+        // A custom provider's diagnostics are untrusted event input. Copy only
+        // known numeric counts so extra fields cannot reach traces or Studio.
+        const reasons: ReasoningContextReset['reasons'] = {};
+        for (const reason of [
+          'prefix_binding_mismatch',
+          'model_binding_mismatch',
+          'organization_binding_mismatch',
+          'end_user_binding_mismatch',
+          'other',
+        ] as const) {
+          const count = reasoningReset.reasons?.[reason];
+          if (typeof count === 'number' && Number.isSafeInteger(count) && count > 0) {
+            reasons[reason] = count;
+          }
+        }
         this.emitEvent({
           type: 'provider_diagnostic',
           agent: agent._name,
@@ -2824,7 +2844,7 @@ export class WorkflowContext<TInput = unknown> {
             ...(provider.name ? { provider: provider.name } : {}),
             model: typeof providerOptions?.model === 'string' ? providerOptions.model : model,
             droppedBlocks: reasoningReset.droppedBlocks,
-            reasons: reasoningReset.reasons,
+            reasons,
           },
         });
       }

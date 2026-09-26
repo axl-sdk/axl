@@ -598,6 +598,13 @@ function ProviderDiagnosticBody({ event }: { event: HistoricalAxlEvent }) {
         {diagnostic.reasons.model_binding_mismatch
           ? ` · ${diagnostic.reasons.model_binding_mismatch} model mismatch`
           : ''}
+        {diagnostic.reasons.organization_binding_mismatch
+          ? ` · ${diagnostic.reasons.organization_binding_mismatch} organization mismatch`
+          : ''}
+        {diagnostic.reasons.end_user_binding_mismatch
+          ? ` · ${diagnostic.reasons.end_user_binding_mismatch} end-user mismatch`
+          : ''}
+        {diagnostic.reasons.other ? ` · ${diagnostic.reasons.other} other reason` : ''}
       </p>
     );
   }

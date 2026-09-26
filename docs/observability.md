@@ -744,7 +744,7 @@ deduped `console.warn`:
 | `data.kind` | Fires when | Fields |
 |---|---|---|
 | `effort_clamped` | The provider sent a different native level than the requested `effort` | `requested`, `effective` (provider-native string), `cause`, `model`, `provider?` |
-| `reasoning_context_reset` | Anthropic dropped replayed thinking from one completed provider call | `droppedBlocks`, counts by `prefix_binding_mismatch` and/or `model_binding_mismatch` in `reasons`, `model`, `provider?` |
+| `reasoning_context_reset` | Anthropic dropped replayed thinking from one completed provider call | `droppedBlocks`, counts by prefix, model, organization, or end-user binding mismatch in `reasons` (or `other` for an unrecognized reason), `model`, `provider?` |
 
 ```ts
 for await (const event of stream.lifecycle) {
@@ -764,9 +764,12 @@ for await (const event of stream.lifecycle) {
 - `reasoning_context_reset` is emitted after each affected provider call, including
   repeated calls within one tool loop. Direct adapter responses and terminal
   stream chunks carry the same safe counts in `diagnostics.reasoningContextReset`.
-  Transformation paths, signed blocks, and raw provider bodies are never included.
-  Studio's trace list displays only the normalized dropped-block count and known
-  reasons. Its cost dashboard labels mixed priced/unpriced spend as a lower bound.
+  The runtime copies only known numeric counts from provider diagnostics into
+  events, including for custom providers. Transformation paths, signed blocks,
+  and raw provider bodies are never included.
+  Studio's trace list displays only the normalized dropped-block count and safe
+  reason categories, including `other`. Its cost dashboard labels mixed
+  priced/unpriced spend as a lower bound.
 - A provider whose `effortResolution()` throws or reports a malformed clamp fails the ask
   with that error.
 

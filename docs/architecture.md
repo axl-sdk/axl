@@ -70,6 +70,18 @@ Workflows are named async functions that receive a `WorkflowContext` (`ctx`). Th
 
 Sessions provide multi-turn conversation state. Each session maintains message history and can persist across requests via the state store. Sessions support forking, configurable history limits, and automatic summarization.
 
+Session retention and request context are separate decisions. A session's
+`history.maxMessages` may remove old stored turns and retain their rolling
+summary. An agent's `maxContext` instead builds a temporary view for one ask:
+its summary covers an exact prefix, followed by every remaining turn. That
+view does not replace the shared session history. For example, a small-context
+classifier may summarize its request while a later large-context expert still
+receives the full retained history. A known client-side rewrite also removes
+Anthropic thinking signed to the old prefix from the affected request. Axl
+does not store an exact provider replay transcript, so this does not promise
+uninterrupted reasoning context across independent asks or restarts. See
+[Sessions → Summarization](./api-reference.md#summarization) for the behavior.
+
 ## Provider Architecture
 
 Provider adapters use raw `fetch` with zero SDK dependencies. Each adapter implements the `Provider` interface (`chat` and `stream` methods) and is registered via the `ProviderRegistry` using a factory pattern. Provider URIs follow the `provider:model` scheme.

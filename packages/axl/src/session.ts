@@ -1,5 +1,6 @@
 import type { ChatMessage, HandoffRecord } from './types.js';
 import { clearSessionInput, prepareSessionInput, registerSessionInput } from './session-input.js';
+import { withoutAnthropicThinking } from './summary-replay.js';
 import type { StateStore } from './state/types.js';
 import type { AxlRuntime } from './runtime.js';
 import type { AxlStream } from './stream.js';
@@ -125,7 +126,9 @@ export class Session {
       }
       const trimmed = history.slice(-maxMessages);
       history.length = 0;
-      history.push(...trimmed);
+      // Summarizing or dropping old turns rewrites the signed prefix for every
+      // retained Anthropic thinking block. Keep other provider metadata.
+      history.push(...trimmed.map(withoutAnthropicThinking));
     }
 
     const userMessage: ChatMessage = { role: 'user', content: preparedInput.content };

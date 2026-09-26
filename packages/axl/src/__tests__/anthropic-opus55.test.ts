@@ -411,9 +411,6 @@ describe('runtime continuation after Axl context summarization', () => {
     }));
     history.push(...replay);
     const requests: Array<Record<string, any>> = [];
-    const dropped = [
-      { type: 'thinking_dropped', reason: 'prefix_binding_mismatch', path: 'messages.2.content.0' },
-    ];
     const streamBody = () =>
       new ReadableStream<Uint8Array>({
         start(controller) {
@@ -423,7 +420,7 @@ describe('runtime continuation after Axl context summarization', () => {
               message: {
                 model: 'claude-opus-5-5',
                 usage: { input_tokens: 10 },
-                input_transformations: dropped,
+                input_transformations: [],
               },
             },
             { type: 'content_block_start', content_block: { type: 'text', text: '' } },
@@ -455,7 +452,7 @@ describe('runtime continuation after Axl context summarization', () => {
                 content: [{ type: 'text', text: 'summary' }],
                 input_transformations: undefined,
               }
-            : { ...response(dropped), content: [{ type: 'text', text: 'continued' }] },
+            : { ...response([]), content: [{ type: 'text', text: 'continued' }] },
         body: stream && !isSummary ? streamBody() : undefined,
       };
     });
@@ -489,18 +486,13 @@ describe('runtime continuation after Axl context summarization', () => {
     expect(actualCalls).toHaveLength(2);
     for (const body of actualCalls) {
       expect(String(body.system)).toContain('Summary of earlier conversation');
-      expect(body.thinking.block_binding).toEqual({ prefix_mismatch_behavior: 'drop_block' });
       const assistant = body.messages.find(
         (message: any) =>
           message.role === 'assistant' &&
           Array.isArray(message.content) &&
           message.content.some((block: any) => block.type === 'tool_use'),
       );
-      expect(assistant.content.map((block: any) => block.type)).toEqual([
-        'thinking',
-        'text',
-        'tool_use',
-      ]);
+      expect(assistant.content.map((block: any) => block.type)).toEqual(['text', 'tool_use']);
       expect(
         body.messages.some(
           (message: any) =>
@@ -516,23 +508,7 @@ describe('runtime continuation after Axl context summarization', () => {
       (event) =>
         event.type === 'provider_diagnostic' && event.data.kind === 'reasoning_context_reset',
     );
-    expect(resets).toHaveLength(2);
-    expect(resets.map((event) => event.data)).toEqual([
-      {
-        kind: 'reasoning_context_reset',
-        provider: 'anthropic',
-        model: 'claude-opus-5-5',
-        droppedBlocks: 1,
-        reasons: { prefix_binding_mismatch: 1 },
-      },
-      {
-        kind: 'reasoning_context_reset',
-        provider: 'anthropic',
-        model: 'claude-opus-5-5',
-        droppedBlocks: 1,
-        reasons: { prefix_binding_mismatch: 1 },
-      },
-    ]);
+    expect(resets).toHaveLength(0);
     expect(JSON.stringify(resets)).not.toMatch(/signed-secret|messages\.|private reasoning/);
   });
 });

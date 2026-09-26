@@ -514,6 +514,7 @@ describe.skipIf(!process.env.ANTHROPIC_API_KEY)('latest models: Anthropic live a
     let firstEnd = 0;
     expect(String(await context.ask(worker, 'Confirm the result briefly.')).trim()).not.toBe('');
     firstEnd = requests.length;
+    const eventsAfterFirst = events.length;
     expect(String(await context.ask(worker, 'Confirm it once more.')).trim()).not.toBe('');
 
     const isSummary = (body: Record<string, unknown>) =>
@@ -545,7 +546,9 @@ describe.skipIf(!process.env.ANTHROPIC_API_KEY)('latest models: Anthropic live a
           message.content.some((block) => block.type === 'tool_use' && block.id === toolId),
       );
       const assistantBlocks = Array.isArray(assistant?.content) ? assistant.content : [];
-      expect(assistantBlocks.some((block) => block.type === 'thinking')).toBe(true);
+      // The seed's thinking was signed before Axl inserted the summary. It
+      // must not be re-sent, while its text/tool-use and the tool result stay.
+      expect(assistantBlocks.some((block) => block.type === 'thinking')).toBe(false);
       if (seed.content) {
         expect(
           assistantBlocks.some((block) => block.type === 'text' && block.text === seed.content),
@@ -565,16 +568,13 @@ describe.skipIf(!process.env.ANTHROPIC_API_KEY)('latest models: Anthropic live a
     expect(
       events.filter((event) => event.type === 'agent_call_end' && event.data.purpose === 'summary'),
     ).toHaveLength(1);
-    const resets = events.filter(
-      (event) =>
-        event.type === 'provider_diagnostic' && event.data.kind === 'reasoning_context_reset',
-    );
-    expect(resets).toHaveLength(2);
-    expect(
-      resets.every((event) =>
-        'reasons' in event.data ? event.data.reasons.prefix_binding_mismatch > 0 : false,
-      ),
-    ).toBe(true);
+    const firstResets = events
+      .slice(0, eventsAfterFirst)
+      .filter(
+        (event) =>
+          event.type === 'provider_diagnostic' && event.data.kind === 'reasoning_context_reset',
+      );
+    expect(firstResets).toHaveLength(0);
   }, 300_000);
 
   it.each(['claude-fable-5-1', 'claude-fable-5', 'claude-opus-5', 'claude-sonnet-5'])(

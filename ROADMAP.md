@@ -121,6 +121,11 @@ it cannot price. Both are documented as known gaps in the provider docs.
 
 #### Configurable Session Summarization
 
+Before extending the summarizer controls, make the durable session summary and
+retained history one atomic snapshot with a clear custom-`StateStore` migration.
+Keep agent-specific `maxContext` projections separate from that session state;
+exact provider replay across restarts needs its own scoped conversation design.
+
 The session summarization system (triggered when `maxMessages` is exceeded with `summarize: true`) currently uses a hardcoded prompt and a fixed `maxTokens: 1024` limit. Planned improvements:
 
 - Configurable `summaryMaxTokens` on `SessionOptions.history`

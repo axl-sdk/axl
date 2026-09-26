@@ -3,17 +3,32 @@ import { WorkflowContext } from '../context.js';
 import type { WorkflowContextInit } from '../context.js';
 import { ProviderRegistry } from '../providers/registry.js';
 import { agent } from '../agent.js';
+import { tool } from '../tool.js';
 import type { ChatMessage } from '../types.js';
+import { MemoryStore } from '../state/memory.js';
+import { z } from 'zod';
 
 // ── Mock Provider ────────────────────────────────────────────────────────
 
 class TestProvider {
   readonly name = 'test';
-  private responses: Array<{ content: string; tool_calls?: any[]; cost?: number }>;
+  private responses: Array<{
+    content: string;
+    tool_calls?: any[];
+    cost?: number;
+    providerMetadata?: Record<string, unknown>;
+  }>;
   private callIndex = 0;
   calls: any[] = [];
 
-  constructor(responses: Array<{ content: string; tool_calls?: any[]; cost?: number }>) {
+  constructor(
+    responses: Array<{
+      content: string;
+      tool_calls?: any[];
+      cost?: number;
+      providerMetadata?: Record<string, unknown>;
+    }>,
+  ) {
     this.responses = responses;
   }
 
@@ -24,6 +39,7 @@ class TestProvider {
     return {
       content: resp.content,
       tool_calls: resp.tool_calls,
+      providerMetadata: resp.providerMetadata,
       usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
       cost: resp.cost ?? 0.001,
     };
@@ -49,6 +65,7 @@ function createTestContext(provider: TestProvider, init?: Partial<WorkflowContex
     providerRegistry: registry,
     onTrace: init?.onTrace ?? vi.fn(),
     sessionHistory: init?.sessionHistory,
+    stateStore: init?.stateStore,
   });
 }
 
@@ -248,6 +265,184 @@ describe('Context Window Management', () => {
     );
     expect(summaryCalls.length).toBeGreaterThan(1);
     expect(provider.calls.length).toBeGreaterThan(callsAfterFirst + 1);
+  });
+
+  it('never moves a cached tail past messages the summary did not cover', async () => {
+    const history = generateHistory(24, 400);
+    const provider = new TestProvider([
+      { content: 'First summary.' },
+      { content: 'First answer.' },
+      { content: 'Second summary.' },
+      { content: 'Second answer.' },
+    ]);
+    const ctx = createTestContext(provider, { sessionHistory: history });
+    const compactAgent = agent({ model: 'test:test-model', maxContext: 3300 });
+
+    await ctx.ask(compactAgent, 'First question');
+    const firstAnswer = provider.calls[1].messages;
+    const retained = firstAnswer.filter((m: ChatMessage) => m.role !== 'system');
+    const displacedFact = retained[0].content as string;
+
+    // A later user turn gives the old cache implementation a new anchor. Its
+    // sliding suffix could skip displacedFact without adding it to the summary.
+    for (let i = 0; i < 12; i++) {
+      history.push({
+        role: i % 2 === 0 ? 'user' : 'assistant',
+        content: `new-${i}: ${'y'.repeat(400)}`,
+      });
+    }
+    await ctx.ask(compactAgent, 'Second question');
+
+    const laterSummaryCalls = provider.calls
+      .slice(2)
+      .filter((call) => String(call.messages[0]?.content).includes('Summarize'));
+    const secondAnswer = provider.calls[provider.calls.length - 1].messages;
+    expect(
+      laterSummaryCalls.some((call) => String(call.messages[1]?.content).includes(displacedFact)) ||
+        secondAnswer.some((message: ChatMessage) => message.content === displacedFact),
+    ).toBe(true);
+  });
+
+  it('invalidates an ask summary when its covered history changes in place', async () => {
+    const history = generateHistory(24, 400);
+    const provider = new TestProvider([
+      { content: 'First summary.' },
+      { content: 'First answer.' },
+      { content: 'Updated summary.' },
+      { content: 'Second answer.' },
+    ]);
+    const ctx = createTestContext(provider, { sessionHistory: history });
+    const compactAgent = agent({ model: 'test:test-model', maxContext: 3300 });
+
+    await ctx.ask(compactAgent, 'First question');
+    history[0].content = 'Changed covered fact';
+    await ctx.ask(compactAgent, 'Second question');
+
+    const summaryCalls = provider.calls.filter((call) =>
+      String(call.messages[0]?.content).includes('Summarize'),
+    );
+    expect(summaryCalls).toHaveLength(2);
+    expect(String(summaryCalls[1].messages[1].content)).toContain('Changed covered fact');
+  });
+
+  it('invalidates an ask summary when its summary model changes', async () => {
+    const provider = new TestProvider([
+      { content: 'First summary.' },
+      { content: 'First answer.' },
+      { content: 'Updated summary.' },
+      { content: 'Second answer.' },
+    ]);
+    const ctx = createTestContext(provider, { sessionHistory: generateHistory(24, 400) });
+
+    await ctx.ask(agent({ model: 'test:first-model', maxContext: 3300 }), 'First question');
+    await ctx.ask(agent({ model: 'test:second-model', maxContext: 3300 }), 'Second question');
+
+    const summaryCalls = provider.calls.filter((call) =>
+      String(call.messages[0]?.content).includes('Summarize'),
+    );
+    expect(summaryCalls.map((call) => call.options.model)).toEqual(['first-model', 'second-model']);
+  });
+
+  it('keeps a stored session summary separate from ask projection and large-agent history', async () => {
+    const store = new MemoryStore();
+    await store.saveSessionMeta('summary-session', 'summaryCache', 'Durable fact: blue');
+    const history = generateHistory(24, 400);
+    const provider = new TestProvider([
+      { content: 'Temporary ask summary.' },
+      { content: 'Small answer.' },
+      { content: 'Large answer.' },
+    ]);
+    const ctx = createTestContext(provider, {
+      metadata: { sessionId: 'summary-session', summaryCache: 'Durable fact: blue' },
+      sessionHistory: history,
+      stateStore: store,
+    });
+
+    await ctx.ask(agent({ model: 'test:test-model', maxContext: 3300 }), 'Small question');
+    expect(String(provider.calls[0].messages[1].content)).toContain('Durable fact: blue');
+    expect(await store.getSessionMeta('summary-session', 'summaryCache')).toBe(
+      'Durable fact: blue',
+    );
+
+    await ctx.ask(agent({ model: 'test:test-model', maxContext: 10000 }), 'Large question');
+    const largeRequest = provider.calls[provider.calls.length - 1].messages;
+    expect(
+      largeRequest.some((m: ChatMessage) => String(m.content).includes('Durable fact: blue')),
+    ).toBe(true);
+    expect(largeRequest.some((m: ChatMessage) => String(m.content).includes('Message 0:'))).toBe(
+      true,
+    );
+  });
+
+  it('removes stale Anthropic thinking from a compacted tail but keeps later thinking', async () => {
+    const history = generateHistory(24, 400);
+    history[history.length - 1].providerMetadata = {
+      anthropicThinkingBlocks: [{ type: 'thinking', thinking: 'old', signature: 'old-signature' }],
+      otherProviderKey: 'keep',
+    };
+    const provider = new TestProvider([
+      { content: 'Summary.' },
+      {
+        content: 'First answer.',
+        providerMetadata: {
+          anthropicThinkingBlocks: [
+            { type: 'thinking', thinking: 'new', signature: 'new-signature' },
+          ],
+        },
+      },
+      { content: 'Second answer.' },
+    ]);
+    const ctx = createTestContext(provider, { sessionHistory: history });
+    const compactAgent = agent({ model: 'test:test-model', maxContext: 3300 });
+
+    await ctx.ask(compactAgent, 'First question');
+    const firstRequest = provider.calls[1].messages;
+    const oldTurn = firstRequest.find((m: ChatMessage) => m.content === history[23].content);
+    expect(oldTurn.providerMetadata).toEqual({ otherProviderKey: 'keep' });
+    expect(history[23].providerMetadata).toHaveProperty('anthropicThinkingBlocks');
+
+    await ctx.ask(compactAgent, 'Second question');
+    const secondRequest = provider.calls[provider.calls.length - 1].messages;
+    const newTurn = secondRequest.find((m: ChatMessage) => m.content === 'First answer.');
+    expect(newTurn?.providerMetadata?.anthropicThinkingBlocks).toBeDefined();
+  });
+
+  it('keeps thinking produced by an active tool turn after summarization', async () => {
+    const provider = new TestProvider([
+      { content: 'Summary.' },
+      {
+        content: 'Calling the tool',
+        tool_calls: [
+          {
+            id: 'call-1',
+            type: 'function',
+            function: { name: 'lookup', arguments: '{}' },
+          },
+        ],
+        providerMetadata: {
+          anthropicThinkingBlocks: [
+            { type: 'thinking', thinking: 'active', signature: 'active-signature' },
+          ],
+        },
+      },
+      { content: 'Done.' },
+    ]);
+    const ctx = createTestContext(provider, { sessionHistory: generateHistory(24, 400) });
+    const lookup = tool({ name: 'lookup', input: z.object({}), handler: () => 'found' });
+
+    await ctx.ask(
+      agent({ model: 'test:test-model', maxContext: 3300, tools: [lookup] }),
+      'Use the lookup tool',
+    );
+
+    const continuation = provider.calls[2].messages;
+    const activeTurn = continuation.find(
+      (m: ChatMessage) => m.role === 'assistant' && m.tool_calls?.[0]?.id === 'call-1',
+    );
+    expect(activeTurn.providerMetadata.anthropicThinkingBlocks).toEqual([
+      { type: 'thinking', thinking: 'active', signature: 'active-signature' },
+    ]);
+    expect(continuation.some((m: ChatMessage) => m.role === 'tool')).toBe(true);
   });
 
   it('keeps the request user-first when history holds consecutive assistant turns', async () => {

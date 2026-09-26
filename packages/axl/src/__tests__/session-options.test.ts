@@ -41,6 +41,49 @@ describe('SessionOptions', () => {
   // ═══════════════════════════════════════════════════════════════════════
 
   describe('history.maxMessages', () => {
+    it.each([false, true])(
+      'invalidates retained Anthropic thinking after a prefix rewrite (summarize=%s)',
+      async (summarize) => {
+        const sessionId = `sess-thinking-${summarize}`;
+        await store.saveSession(sessionId, [
+          { role: 'user', content: 'old question' },
+          { role: 'assistant', content: 'old answer' },
+          { role: 'user', content: 'recent question' },
+          {
+            role: 'assistant',
+            content: 'recent answer',
+            providerMetadata: {
+              anthropicThinkingBlocks: [
+                { type: 'thinking', thinking: 'stale', signature: 'old-signature' },
+              ],
+              otherProviderKey: 'preserved',
+            },
+          },
+        ]);
+        let sentHistory: ChatMessage[] = [];
+        runtime = createMockRuntime({
+          execute: vi.fn((_name: string, _input: unknown, opts: any) => {
+            sentHistory = [...opts.metadata.sessionHistory];
+            return Promise.resolve('new answer');
+          }),
+        });
+        const session = new Session(sessionId, runtime, store, {
+          history: {
+            maxMessages: 2,
+            summarize,
+            ...(summarize ? { summaryModel: 'mock:summarizer' } : {}),
+          },
+        });
+
+        await session.send('chat', 'next question');
+
+        expect(sentHistory[1].providerMetadata).toEqual({ otherProviderKey: 'preserved' });
+        expect((await session.history())[1].providerMetadata).toEqual({
+          otherProviderKey: 'preserved',
+        });
+      },
+    );
+
     it('trims history to maxMessages before each send()', async () => {
       let callCount = 0;
       const capturedHistories: ChatMessage[][] = [];

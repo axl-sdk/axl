@@ -3867,6 +3867,7 @@ export class WorkflowContext<TInput = unknown> {
    *  execution belongs to a session and has a store to persist into. */
   private askSummarySessionId(): string | undefined {
     const sessionId = this.metadata?.sessionId;
+    if (this.metadata?.sessionPersist === false) return undefined;
     return this.stateStore && typeof sessionId === 'string' && sessionId.length > 0
       ? sessionId
       : undefined;
@@ -3889,8 +3890,25 @@ export class WorkflowContext<TInput = unknown> {
   private async saveAskSummary(agentName: string, record: AskSummaryRecord): Promise<void> {
     this.askSummaries.set(agentName, record);
     const sessionId = this.askSummarySessionId();
-    if (sessionId) {
-      await this.stateStore!.saveSessionMeta(sessionId, askSummaryMetaKey(agentName), record);
+    if (!sessionId) return;
+    const key = askSummaryMetaKey(agentName);
+    try {
+      await this.stateStore!.saveSessionMeta(sessionId, key, record);
+    } catch (error) {
+      // The record is a cache: this execution already holds the projection it
+      // paid for, and the next execution simply regenerates. Failing the ask
+      // here would waste the summary; hiding the failure would mask a broken
+      // store. Report it and continue.
+      this.emitEvent({
+        type: 'log',
+        agent: agentName,
+        data: {
+          warning:
+            `Could not persist ask summary '${key}' for session '${sessionId}'; ` +
+            `later executions will regenerate it. ` +
+            (error instanceof Error ? error.message : String(error)),
+        },
+      });
     }
   }
 

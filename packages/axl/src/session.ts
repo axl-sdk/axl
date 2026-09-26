@@ -141,6 +141,9 @@ export class Session {
       sessionId: this.sessionId,
       sessionHistory: history,
       ...(cachedSummary ? { summaryCache: cachedSummary } : {}),
+      // An opted-out session must leave nothing at rest, including the
+      // agent-scoped ask-summary records the runtime would otherwise cache.
+      ...(this.options.persist === false ? { sessionPersist: false } : {}),
     };
     return { history, metadata };
   }

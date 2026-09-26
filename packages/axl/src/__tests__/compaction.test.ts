@@ -125,3 +125,72 @@ describe('persisted ask summary through Session', () => {
     ]);
   });
 });
+
+describe('ask summary persistence boundaries', () => {
+  const seedHistory = () =>
+    Array.from({ length: 24 }, (_, i) => ({
+      role: i % 2 === 0 ? ('user' as const) : ('assistant' as const),
+      content: `turn ${i}: ${'x'.repeat(400)}`,
+    }));
+
+  it('a persist: false session never writes askSummary metadata', async () => {
+    const model = recordingProvider('model');
+    const runtime = new AxlRuntime({ defaultProvider: 'model' });
+    runtime.registerProvider('model', model.provider);
+    const store = runtime.getStateStore();
+    // The store holds prior turns (written while persistence was on), but this
+    // session has opted out: the ask must not leave summary content at rest.
+    await store.saveSession('ephemeral', seedHistory());
+    runtime.register(
+      workflow({
+        name: 'chat',
+        input: z.any(),
+        handler: (ctx) =>
+          ctx.ask(agent({ name: 'compact', model: 'model:m', maxContext: 3300 }), ctx.input),
+      }),
+    );
+    const session = runtime.session('ephemeral', { persist: false });
+    await session.send('chat', 'first');
+
+    expect(model.calls.length).toBeGreaterThanOrEqual(2); // summary + ask
+    expect(await store.getSessionMeta('ephemeral', 'askSummary:compact')).toBeNull();
+  });
+
+  it('a failed askSummary cache write is reported and does not fail the paid ask', async () => {
+    const model = recordingProvider('model');
+    const runtime = new AxlRuntime({ defaultProvider: 'model' });
+    runtime.registerProvider('model', model.provider);
+    const store = runtime.getStateStore();
+    await store.saveSession('flaky', seedHistory());
+    const originalSave = store.saveSessionMeta.bind(store);
+    store.saveSessionMeta = async (id, key, value) => {
+      if (key.startsWith('askSummary:')) throw new Error('meta store unavailable');
+      return originalSave(id, key, value);
+    };
+    runtime.register(
+      workflow({
+        name: 'chat',
+        input: z.any(),
+        handler: (ctx) =>
+          ctx.ask(agent({ name: 'compact', model: 'model:m', maxContext: 3300 }), ctx.input),
+      }),
+    );
+    const warnings: string[] = [];
+    runtime.on('trace', (event: { type: string; data?: { warning?: string } }) => {
+      if (event.type === 'log' && event.data?.warning) warnings.push(event.data.warning);
+    });
+
+    const result = await runtime.session('flaky').send('chat', 'first');
+
+    expect(result).toBe(`model reply ${model.calls.length}`);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('askSummary:compact');
+    expect(warnings[0]).toContain('meta store unavailable');
+    // The in-memory boundary still served this execution's request.
+    expect(
+      model.calls[1].messages.some((m) =>
+        String(m.content).startsWith('Summary of earlier conversation'),
+      ),
+    ).toBe(true);
+  });
+});

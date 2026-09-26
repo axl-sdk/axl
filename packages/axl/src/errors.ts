@@ -166,6 +166,37 @@ export function rethrowEventStreamOverflow(error: unknown): void {
   if (isEventStreamOverflowError(error)) throw error;
 }
 
+/**
+ * Is this a control error that no recovery boundary may absorb?
+ *
+ * Recovery boundaries (`ctx.verify` retries and `fallback`, `validate` catches,
+ * the result folding in `ctx.spawn` / `ctx.map`, `ctx.race`'s loser handling)
+ * turn application failures into retries, feedback, or `{ ok: false }` results.
+ * Two errors are not application failures and must pass every such boundary
+ * with their identity intact:
+ *
+ * - `EventStreamOverflowError`: the documented policy is to fail the run when a
+ *   strict observation queue overflows; retrying would only produce more events.
+ * - `AdmissionDeniedError`: a spend refusal is a stop, not a failure. Retrying
+ *   is pointless (the controller stays closed) and wrapping it hides the
+ *   `budget_interrupted` classification that consumers derive from it.
+ *
+ * Keep the two in one predicate so a new boundary cannot honor one and forget
+ * the other. Cancellation is deliberately not here: whether an abort is
+ * recoverable depends on which signal fired, which only the boundary knows.
+ */
+export function isUnrecoverableError(
+  error: unknown,
+): error is EventStreamOverflowError | AdmissionDeniedError {
+  return isEventStreamOverflowError(error) || isAdmissionDeniedError(error);
+}
+
+/** Re-throw an {@link isUnrecoverableError} error before a recovery boundary
+ * can retry it, wrap it, or fold it into a result. */
+export function rethrowUnrecoverable(error: unknown): void {
+  if (isUnrecoverableError(error)) throw error;
+}
+
 /** Preserve the application failure displaced by a stricter terminal error. */
 export function preserveErrorCause<T extends Error>(error: T, cause: unknown): T {
   if (cause === undefined || cause === error || 'cause' in error) return error;

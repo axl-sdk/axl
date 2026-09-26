@@ -416,7 +416,7 @@ Admission is checked at two points: when an operation opens (the provider facade
 
 `extends AxlError`, `code: 'ADMISSION_DENIED'`, fields `{ limit, knownSpend, operation: { kind, model? } }`.
 
-Raised before the request leaves the process, so it never accompanies a charge. It is **never** wrapped in a `ProviderError` or a `TranscriptionOperationError`, never auto-retried by the transport, and never treated as an abort. It is distinct from `BudgetExceededError`, which is `ctx.budget()`'s own workflow-scoped policy and keeps its existing semantics.
+Raised before the request leaves the process, so it never accompanies a charge. It is **never** wrapped in a `ProviderError` or a `TranscriptionOperationError`, never auto-retried by the transport, and never treated as an abort. The same instance passes every recovery boundary in the workflow context unwrapped and unretried: tool handler retries and failure-to-model conversion, `ctx.ask`'s `validate`, `ctx.verify` (retries, `validate`, and `fallback`), `ctx.budget` (never reported as `budgetExceeded`), and `ctx.spawn` / `ctx.map` / `ctx.race`, which reject with it instead of folding it into a `{ ok: false }` result or `QuorumNotMet`. `ctx.race` and quorum-mode `spawn` / `map` also cancel their remaining branches; default-mode `spawn` / `map` own no cancellation signal, so in-flight siblings run on (and are refused at their next admission check) while `map` starts no further items. It is distinct from `BudgetExceededError`, which is `ctx.budget()`'s own workflow-scoped policy and keeps its existing semantics.
 
 ### `externalOperation(descriptor, fn)` / `ctx.withExternalOperation(descriptor, fn)`
 
@@ -551,6 +551,8 @@ applicable per-call, agent, and internal defaults.
 **Returns:** `Promise<T>` — parsed output if `schema` is provided, otherwise `string`.
 
 **Retry mechanics:** All output retries (guardrail, schema, validate) use **accumulating context** — the LLM's failed response is appended as an assistant message, followed by a **user** message explaining the error (a user turn, not a system message: providers hoist system messages out of the conversation, which would leave the request ending on the rejected attempt). On subsequent retries, the LLM sees all prior failed attempts, giving it increasing context for self-correction. Failed responses are **not** persisted to session history; only the final successful response is recorded. Supply `retryFeedback` to write that user message yourself, or to stop retrying — see [Custom retry feedback](#custom-retry-feedback). See the [Output Pipeline](#output-pipeline) for the full gate-by-gate flow.
+
+**Cancellation and admission inside `validate`:** a validator that throws `AdmissionDeniedError`, or throws after this ask's signal (context, branch, or per-ask `signal`) was aborted, is not a validation failure: the error propagates as-is, without a corrective turn or a `ValidationError`.
 
 **Streaming + validate:** As of 0.16.0, `validate` and token streaming (via `runtime.stream()`) coexist — validate runs against the buffered response after streaming completes. (Pre-0.16.0 this combination threw `INVALID_CONFIG`.) For structured output, the typed result is still only available after the full response arrives.
 
@@ -708,6 +710,8 @@ const results = await ctx.spawn(3, (i) => ctx.ask(agent, prompts[i]), { quorum: 
 
 **Returns:** `Promise<Result<T>[]>` where `Result<T>` is `{ ok: true, value: T } | { ok: false, error: string }`.
 
+**Rejects** (instead of recording `{ ok: false }`) when a task throws `AdmissionDeniedError` or `EventStreamOverflowError`, or when a task fails after the scope the spawn runs in (the workflow, an enclosing `hard_stop` budget, race, or quorum) was aborted. The promise rejects with that task's error; with `quorum`, the remaining tasks are cancelled. Tasks cancelled by the spawn's own quorum are still not failures.
+
 ---
 
 ### `ctx.vote(results, options)`
@@ -804,6 +808,13 @@ See [Validated Data Extraction](use-cases.md#validated-data-extraction) for more
 
 **Throws:** `VerifyError` (schema failure) or `ValidationError` (validate failure) if retries exhausted and no fallback provided. When `fn()` throws a `VerifyError` or `ValidationError`, `verify` re-throws the original error (not a new wrapper) after retries are exhausted.
 
+**Stops are not retried:** retries and `fallback` recover from bad output only. `verify` rethrows immediately — unwrapped, without another attempt, and never substituting `fallback` — when:
+
+- `fn` or `validate` throws `AdmissionDeniedError` (or `EventStreamOverflowError`);
+- the scope `verify` runs in (the workflow signal, an enclosing `hard_stop` budget, race, or quorum branch) is aborted. The error `fn` or `validate` threw is rethrown as-is; if an attempt was merely invalid, the signal's abort reason is thrown. Inside a `hard_stop` budget this lets the budget report `{ value: null, budgetExceeded: true }` rather than the fallback.
+
+An ask's own `timeout` / `stallTimeout` failure is a per-call failure, not a cancelled scope, so it is still retried. An interrupted `verify` emits no `verify` trace event — it reached no pass/fail outcome.
+
 **Retry mechanics:** `ctx.verify()` is **not** conversation-aware. It is a plain loop that calls your function, validates the return value (schema then validate), and on failure passes a `VerifyRetry` context to your next call. What you do with that context is entirely up to you — `ctx.verify()` does not modify any LLM conversation or session history. This makes it suitable for retrying any async operation, not just LLM calls.
 
 ---
@@ -839,6 +850,11 @@ if (result.budgetExceeded) {
 
 - **`unpriced`** — `true` when the block included work with unknown cost, such as an unpriced model or a dispatched stalled call abandoned without usage. `totalCost` is then a **lower bound** (the unknown component is omitted). The same condition is readable mid-block via [`ctx.getBudgetStatus().unpriced`](#ctxgetbudgetstatus), and Axl logs a one-time `console.warn` per budget block when it happens.
 - ⚠️ **`unpriced` is observability only — cost limits / `hard_stop` are NOT enforced on unknown spend.** The enforcement rail never sees that cost, so a `hard_stop` budget does **not** govern unpriced models (e.g. Bedrock, self-hosted) or abandoned non-cooperative work. Treat `unpriced: true` as "this limit could not be enforced for part of this block."
+
+**Only its own stop is `budgetExceeded`.** The block returns `{ value: null, budgetExceeded: true }` when `fn` fails because this budget was exceeded (including its own `hard_stop` abort). It rejects with the original error instead when:
+
+- `fn` throws `AdmissionDeniedError` (or `EventStreamOverflowError`) — even if the budget is also exceeded, the run-level stop keeps its identity;
+- the scope the budget runs in (the workflow signal, an enclosing race/quorum branch, or an outer `hard_stop` budget) was aborted — a caller cancellation is not reported as budget exhaustion.
 
 **Nesting:** Budget blocks can be nested. Inner budgets roll their costs — **and their `unpriced` lower-bound flag** — up to the parent.
 
@@ -983,6 +999,8 @@ const fastest = await ctx.race([
 
 **Returns:** `Promise<T>` — the first valid result.
 
+**Rejects** with a branch's error — cancelling the other branches — when a branch or `validate` throws `AdmissionDeniedError` or `EventStreamOverflowError`, or when a branch fails after the scope the race runs in was aborted. Branches cancelled because another branch won are still ignored.
+
 ---
 
 ### `ctx.parallel(fns)`
@@ -1016,6 +1034,8 @@ const results = await ctx.map(reviews, async (review) => {
 | `quorum` | `number` | — | Resolve when this many items succeed. Remaining work is cancelled. Throws `QuorumNotMet` if not met |
 
 **Returns:** `Promise<Result<U>[]>` — results in the same order as `items`. Some may be `{ ok: false }` if they errored.
+
+**Rejects** (instead of recording `{ ok: false }`) when an item throws `AdmissionDeniedError` or `EventStreamOverflowError`, or when an item fails after the scope the map runs in was aborted. No further items start, and with `quorum` the in-flight items are cancelled. Items cancelled by the map's own quorum are still not failures.
 
 ---
 

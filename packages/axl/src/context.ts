@@ -46,8 +46,9 @@ import {
   UnsupportedModelInputError,
   EventStreamOverflowError,
   isEventStreamOverflowError,
+  isUnrecoverableError,
   preserveErrorCause,
-  rethrowEventStreamOverflow,
+  rethrowUnrecoverable,
 } from './errors.js';
 import {
   cloneModelInput,
@@ -3305,7 +3306,10 @@ export class WorkflowContext<TInput = unknown> {
             metadata: this.metadata,
           });
         } catch (err) {
-          rethrowEventStreamOverflow(err);
+          rethrowUnrecoverable(err);
+          // A validator that failed because this ask was cancelled did not judge
+          // the output; turning that into feedback would retry a cancelled ask.
+          if (this.currentSignal?.aborted) throw err;
           validateErr = err;
           const reason = err instanceof Error ? err.message : String(err);
           validateResult = { valid: false, reason: `Validator error: ${reason}` };
@@ -4106,15 +4110,17 @@ export class WorkflowContext<TInput = unknown> {
               reject(new QuorumNotMet(quorum, successCount, results));
             }
           }).catch((err) => {
-            if (isEventStreamOverflowError(err)) {
-              if (!settled) {
-                settled = true;
-                controller.abort();
-                reject(err);
-              }
+            if (settled) return;
+            // A stop (overflow, admission denial) or the cancellation of the scope
+            // this spawn runs in is not a branch failure: reject with it and
+            // cancel the siblings. Checked before the abort-shape test below,
+            // since an outer abort can look exactly like our own quorum abort.
+            if (isUnrecoverableError(err) || parentSignal?.aborted) {
+              settled = true;
+              controller.abort();
+              reject(err);
               return;
             }
-            if (settled) return;
             // AbortErrors from our cancellation don't count as failures
             const isAbort = err instanceof DOMException && err.name === 'AbortError';
             if (isAbort) {
@@ -4143,7 +4149,10 @@ export class WorkflowContext<TInput = unknown> {
         fn(i)
           .then((value): Result<T> => ({ ok: true, value }))
           .catch((err): Result<T> => {
-            rethrowEventStreamOverflow(err);
+            // Stops and outer cancellation reject the spawn; only branch
+            // failures fold into `{ ok: false }` results.
+            rethrowUnrecoverable(err);
+            if (parentSignal?.aborted) throw err;
             return {
               ok: false,
               error: err instanceof Error ? err.message : String(err),
@@ -4293,6 +4302,11 @@ export class WorkflowContext<TInput = unknown> {
   ): Promise<T> {
     const maxRetries = options?.retries ?? 3;
     let lastRetry: VerifyRetry<T> | undefined = undefined;
+    // Retries and `fallback` recover from a bad output, not from the scope that
+    // produced it being cancelled (a caller abort, a `hard_stop` budget, a race
+    // or quorum that no longer needs this branch). Captured at entry: it is the
+    // signal governing every attempt of this verify.
+    const scopeSignal = this.currentSignal;
 
     // Emits exactly one `verify` trace event at each terminal point so consumers
     // can see the outcome (pass/fail) and the number of attempts used. Called
@@ -4322,18 +4336,19 @@ export class WorkflowContext<TInput = unknown> {
           try {
             validateResult = await options.validate(parsed, { metadata: this.metadata });
           } catch (err) {
-            rethrowEventStreamOverflow(err);
+            rethrowUnrecoverable(err);
+            if (scopeSignal?.aborted) throw err;
             const reason = err instanceof Error ? err.message : String(err);
             validateResult = { valid: false, reason: `Validator error: ${reason}` };
           }
           if (!validateResult.valid) {
+            // No error to preserve here, so a cancellation surfaces as its reason.
+            scopeSignal?.throwIfAborted();
             const errorMsg = validateResult.reason ?? 'Validation failed';
             lastRetry = { error: errorMsg, output: rawOutput, parsed };
-            if (attempt === maxRetries) {
-              emitVerifyOutcome(false, attempt + 1, errorMsg);
-              if (options?.fallback !== undefined) return options.fallback;
-              throw new ValidationError(parsed, errorMsg, maxRetries);
-            }
+            // The catch below owns the terminal event and `fallback` for a
+            // ValidationError; handling them here too emitted two events.
+            if (attempt === maxRetries) throw new ValidationError(parsed, errorMsg, maxRetries);
             continue;
           }
         }
@@ -4341,7 +4356,10 @@ export class WorkflowContext<TInput = unknown> {
         emitVerifyOutcome(true, attempt + 1);
         return parsed;
       } catch (err) {
-        rethrowEventStreamOverflow(err);
+        // Deliberately no `verify` event on these exits: the verify was
+        // interrupted and reached no pass/fail verdict.
+        rethrowUnrecoverable(err);
+        if (scopeSignal?.aborted) throw err;
         if (err instanceof ValidationError) {
           // ValidationError from our own validate block or from fn (e.g., ctx.ask() validate
           // exhausted). Extract the parsed object so the next retry can repair it.
@@ -4433,17 +4451,15 @@ export class WorkflowContext<TInput = unknown> {
         const unpriced = this.budgetContext!.unpriced;
         return { value, budgetExceeded: exceeded, totalCost, unpriced };
       } catch (err) {
-        rethrowEventStreamOverflow(err);
+        // A denial or overflow is a stop that outranks this budget's own.
+        rethrowUnrecoverable(err);
+        // The scope this budget runs in was cancelled: that is not a budget
+        // stop, even if the budget also happens to be exceeded.
+        if (parentSignal?.aborted) throw err;
+        // Covers every hard_stop abort of our own: `_accumulateBudgetCost` marks
+        // the budget exceeded before it aborts `controller`, so an AbortError
+        // arriving while not exceeded can only come from an outer scope.
         if (this.budgetContext!.exceeded) {
-          return {
-            value: null,
-            budgetExceeded: true,
-            totalCost: this.budgetContext!.totalCost,
-            unpriced: this.budgetContext!.unpriced,
-          };
-        }
-        // AbortError from hard_stop should count as budget exceeded
-        if (err instanceof DOMException && err.name === 'AbortError' && controller) {
           return {
             value: null,
             budgetExceeded: true,
@@ -4591,7 +4607,9 @@ export class WorkflowContext<TInput = unknown> {
                     return;
                   }
                 } catch (err) {
-                  rethrowEventStreamOverflow(err);
+                  // Rejects the continuation; the catch below settles the race.
+                  rethrowUnrecoverable(err);
+                  if (parentSignal?.aborted) throw err;
                   remaining--;
                   lastError =
                     err instanceof Error ? err : new Error(`Validator error: ${String(err)}`);
@@ -4613,15 +4631,25 @@ export class WorkflowContext<TInput = unknown> {
             resolve(value);
           })
           .catch((err) => {
-            if (isEventStreamOverflowError(err)) {
+            if (isUnrecoverableError(err)) {
               if (!settled) {
                 settled = true;
                 controller.abort();
                 reject(err);
               }
+              // Overflow must still reach the branch drain even after a winner.
               throw err;
             }
             if (settled) return;
+            // The scope this race runs in was cancelled: that is the race's
+            // outcome, not a lost branch. Checked by signal state because an
+            // outer abort can have the same shape as our own loser abort.
+            if (parentSignal?.aborted) {
+              settled = true;
+              controller.abort();
+              reject(err);
+              return;
+            }
             // Ignore AbortErrors from our own cancellation
             if (err instanceof DOMException && err.name === 'AbortError') {
               remaining--;
@@ -4703,13 +4731,22 @@ export class WorkflowContext<TInput = unknown> {
             results[idx] = { ok: true, value };
             successCount++;
           } catch (err) {
-            if (isEventStreamOverflowError(err)) {
+            if (isUnrecoverableError(err)) {
               settled = true;
               controller?.abort();
               reject(err);
               throw err;
             }
             if (settled) {
+              return;
+            }
+            // The scope this map runs in was cancelled: reject rather than fold
+            // it into a result. Checked by signal state, before the own-quorum
+            // abort test, because the two can have the same shape.
+            if (parentSignal?.aborted) {
+              settled = true;
+              controller?.abort();
+              reject(err);
               return;
             }
             // Ignore AbortErrors from our own quorum cancellation

@@ -8,6 +8,7 @@ import { randomUUID } from 'node:crypto';
 import type { AxlEvent, ToolCallMessage } from '../types.js';
 import type { HumanDecision } from '../types.js';
 import { createSequenceProvider, createTestCtx } from './helpers.js';
+import { ValidationError } from '../errors.js';
 
 /**
  * Trace observability coverage — these tests pin the contract that the trace
@@ -643,6 +644,24 @@ describe('trace events — verify emission', () => {
     expect(data.passed).toBe(false);
     expect(data.attempts).toBe(2); // retries=1 → 2 attempts total
     expect(data.lastError).toBeDefined();
+  });
+
+  it('emits exactly one verify event when validate exhausts retries without a fallback', async () => {
+    const { ctx, traces } = createTestCtx();
+    const schema = z.object({ n: z.number() });
+    await expect(
+      ctx.verify(async () => ({ n: 1 }), schema, {
+        retries: 1,
+        validate: async () => ({ valid: false, reason: 'nope' }),
+      }),
+    ).rejects.toThrow(ValidationError);
+
+    const verifyEvents = traces.filter((t) => t.type === 'verify');
+    expect(verifyEvents).toHaveLength(1);
+    const data = verifyEvents[0].data as Record<string, unknown>;
+    expect(data.passed).toBe(false);
+    expect(data.attempts).toBe(2);
+    expect(data.lastError).toBe('nope');
   });
 
   it('emits verify event with passed: false on fallback path', async () => {

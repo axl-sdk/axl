@@ -718,7 +718,10 @@ function gpt6(
     reasoning: true,
     efforts: bothEndpoints(efforts),
     defaultEffort: 'medium',
-    sampling: bothEndpoints<OpenAISamplingRestriction>('never'),
+    // Same policy as GPT-5.x: a portable `temperature` is dropped while
+    // reasoning is active (including the active default). A raw
+    // `providerOptions` sampling field is rejected by the final-body check.
+    sampling: bothEndpoints<OpenAISamplingRestriction>('unless-effort-none'),
     chatTools,
     validatesFinalBody: true,
     strictUsageTotals: true,

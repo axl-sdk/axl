@@ -175,15 +175,17 @@ describe('exact GPT-6 adapter boundary', () => {
     },
   );
 
-  it('rejects explicit temperature and Responses logprobs include while reasoning is active', async () => {
+  it('rejects raw Responses sampling overrides and the logprobs include while reasoning is active', async () => {
     const { fetchMock } = captureFetch();
     const provider = new OpenAIResponsesProvider({ apiKey: 'test' });
-    await expect(
-      provider.chat(message, {
-        model: 'gpt-6-astra',
-        temperature: 0.4,
-      }),
-    ).rejects.toMatchObject({ option: 'temperature' });
+    for (const option of ['temperature', 'top_p', 'top_logprobs']) {
+      await expect(
+        provider.chat(message, {
+          model: 'gpt-6-astra',
+          providerOptions: { [option]: 0.5 },
+        }),
+      ).rejects.toMatchObject({ option, model: 'gpt-6-astra', provider: 'openai-responses' });
+    }
     await expect(
       provider.chat(message, {
         model: 'gpt-6-sol',
@@ -202,6 +204,124 @@ describe('exact GPT-6 adapter boundary', () => {
     });
     expect(requests[0].temperature).toBe(0.4);
     expect(response.cost).toBeUndefined();
+  });
+});
+
+/**
+ * Portable `ChatOptions.temperature` follows the same policy as GPT-5.x: it is
+ * stripped while reasoning is active. Only a raw `providerOptions` field that
+ * re-injects a forbidden wire parameter is rejected. Every case asserts the
+ * final wire body, so "stripped" and "rejected" cannot be confused.
+ */
+describe('GPT-6 sampling policy: portable options stripped, raw overrides rejected', () => {
+  const endpoints = [
+    { name: 'Chat', create: () => new OpenAIProvider({ apiKey: 'test' }) },
+    { name: 'Responses', create: () => new OpenAIResponsesProvider({ apiKey: 'test' }) },
+  ] as const;
+  const models = ['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna'];
+
+  for (const endpoint of endpoints) {
+    it.each(models)(
+      `${endpoint.name} strips portable temperature for %s under explicit active effort`,
+      async (model) => {
+        const { requests } = captureFetch();
+        await endpoint.create().chat(message, { model, effort: 'high', temperature: 0.4 });
+        expect(requests).toHaveLength(1);
+        expect(requests[0]).not.toHaveProperty('temperature');
+        expect(requests[0].model).toBe(model);
+      },
+    );
+
+    it.each(models)(
+      `${endpoint.name} strips portable temperature for %s under the active default effort`,
+      async (model) => {
+        const { requests } = captureFetch();
+        await endpoint.create().chat(message, { model, temperature: 0.4 });
+        expect(requests).toHaveLength(1);
+        expect(requests[0]).not.toHaveProperty('temperature');
+        expect(requests[0]).not.toHaveProperty('reasoning_effort');
+      },
+    );
+
+    it(`${endpoint.name} strips portable temperature when Astra clamps none to low`, async () => {
+      const { requests } = captureFetch();
+      await endpoint.create().chat(message, {
+        model: 'gpt-6-astra',
+        effort: 'none',
+        temperature: 0.4,
+      });
+      expect(requests).toHaveLength(1);
+      expect(requests[0]).not.toHaveProperty('temperature');
+    });
+
+    it.each(['gpt-6-sol', 'gpt-6-luna'])(
+      `${endpoint.name} keeps portable temperature for %s at effective none`,
+      async (model) => {
+        const { requests } = captureFetch();
+        await endpoint.create().chat(message, { model, effort: 'none', temperature: 0.4 });
+        expect(requests).toHaveLength(1);
+        expect(requests[0].temperature).toBe(0.4);
+      },
+    );
+
+    it(`${endpoint.name} keeps a raw temperature override for Sol at effective none`, async () => {
+      const { requests } = captureFetch();
+      await endpoint.create().chat(message, {
+        model: 'gpt-6-sol',
+        effort: 'none',
+        providerOptions: { temperature: 0.3, top_p: 0.9 },
+      });
+      expect(requests).toHaveLength(1);
+      expect(requests[0]).toMatchObject({ temperature: 0.3, top_p: 0.9 });
+    });
+
+    it(`${endpoint.name} rejects a raw temperature override even when a portable one was stripped`, async () => {
+      const { fetchMock } = captureFetch();
+      await expect(
+        endpoint.create().chat(message, {
+          model: 'gpt-6-luna',
+          effort: 'high',
+          temperature: 0.4,
+          providerOptions: { temperature: 0.5 },
+        }),
+      ).rejects.toBeInstanceOf(UnsupportedModelOptionError);
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+  }
+
+  it.each([
+    ['Chat', () => new OpenAIProvider({ apiKey: 'test' }), { reasoning_effort: 'high' }],
+    [
+      'Responses',
+      () => new OpenAIResponsesProvider({ apiKey: 'test' }),
+      { reasoning: { effort: 'high' } },
+    ],
+  ] as const)(
+    '%s rejects a raw effort override that activates reasoning after the portable temperature was kept',
+    async (_name, create, providerOptions) => {
+      const { fetchMock } = captureFetch();
+      await expect(
+        create().chat(message, {
+          model: 'gpt-6-sol',
+          effort: 'none',
+          temperature: 0.4,
+          providerOptions: { ...providerOptions },
+        }),
+      ).rejects.toMatchObject({ option: 'temperature', model: 'gpt-6-sol' });
+      expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it('Chat strips portable temperature in the streaming request body too', async () => {
+    const { requests } = captureFetch();
+    const stream = new OpenAIProvider({ apiKey: 'test' }).stream(message, {
+      model: 'gpt-6-sol',
+      effort: 'medium',
+      temperature: 0.4,
+    });
+    await stream.next().catch(() => undefined);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).not.toHaveProperty('temperature');
   });
 });
 

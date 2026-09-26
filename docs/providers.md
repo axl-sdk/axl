@@ -127,7 +127,21 @@ same two usage fields, so the rule holds identically on both OpenAI transports
 `openai-responses:` for vision. Chat Completions image pricing is unmodeled.
 
 OpenAI's o-series uses the `developer` role, strips `temperature`, and supports `effort`.
-GPT-5.x uses `system` and supports the same portable option. Exact GPT-5.6 Chat requests with
+GPT-5.x uses `system` and supports the same portable option.
+
+**Sampling under reasoning (all OpenAI reasoning models).** The portable
+`temperature` option is dropped from the request rather than rejected: always
+on o-series and on exact GPT-5.6 Responses requests; on other GPT-5.x requests
+(GPT-5.6 Chat included) when Axl sends a reasoning effort; and on exact GPT-6
+IDs unless the effective effort is `none` (omitting `effort` uses GPT-6's active
+default, so it is dropped). Raw `providerOptions` are different: they merge last
+and are never stripped. On exact GPT-6 IDs Axl checks the final request and
+throws `UnsupportedModelOptionError` before dispatch when a raw field adds a
+forbidden sampling parameter while reasoning is active, or when a raw effort
+override activates reasoning after Axl kept the portable `temperature` (see
+below). On other models the raw field is sent as written.
+
+Exact GPT-5.6 Chat requests with
 `effort: 'max'` use `xhigh` and report the clamp through a `provider_diagnostic`
 event; choose `openai-responses:` for native `max`. For compatibility, unknown GPT-5-shaped IDs retain the older baseline request mapping,
 but never inherit exact pricing or GPT-5.6-specific capabilities.
@@ -148,9 +162,11 @@ Astra maps portable `effort: 'none'` to `low`; Sol and Luna accept `none`. All
 three accept native `max` on Responses and Chat. Their default reasoning is
 active. With active reasoning, `temperature`, `top_p`, and `top_logprobs` are
 invalid on either endpoint; Chat also rejects `logprobs`, and Responses rejects
-`message.output_text.logprobs` in `include`. Axl rejects explicit unsupported
-fields before dispatch. With Sol or Luna at effective `none`, those fields may
-be used where the endpoint accepts them.
+`message.output_text.logprobs` in `include`. The portable `temperature` option
+is dropped in that state, the same as on GPT-5.x. A raw `providerOptions` field
+that sets any of these parameters is rejected with `UnsupportedModelOptionError`
+before dispatch. With Sol or Luna at effective `none`, both the portable option
+and the raw fields are sent where the endpoint accepts them.
 
 For representable direct Standard text calls, Axl estimates GPT-6 cost using
 the exact published input, cached-input, cache-write, and output rows. Above
@@ -1230,8 +1246,8 @@ Third-party providers that omit `Provider.effortResolution()` report nothing.
 #### Provider-specific behavior
 
 - **OpenAI o-series** (o1/o3/o4-mini): Uses `developer` role instead of `system`, strips temperature, sends `reasoning_effort`. `effort: 'none'` sends `reasoning_effort: 'minimal'` (o-series doesn't support `'none'`). `effort: 'max'` sends `'high'` (o-series doesn't support `'xhigh'`).
-- **OpenAI GPT-5.x Chat Completions**: Uses `system`, strips temperature when reasoning is active, and supports parallel tool calls. The compatibility baseline maps GPT-5.2+ `'max'` to `'xhigh'`, reported through a `provider_diagnostic` event. Earlier families retain their lower caps.
-- **OpenAI Responses API**: Uses `reasoning: { effort }`; exact GPT-5.6 IDs accept native `'max'` and omit `temperature` because that family rejects it even when reasoning uses the provider default. Older models keep their documented clamps. `includeThoughts: true` enables reasoning summaries (`reasoning: { summary: 'detailed' }`). Reasoning context is automatically round-tripped via `providerMetadata.openaiReasoningItems`.
+- **OpenAI GPT-5.x Chat Completions**: Uses `system`, strips the portable `temperature` when Axl sends a reasoning effort, and supports parallel tool calls. The compatibility baseline maps GPT-5.2+ `'max'` to `'xhigh'`, reported through a `provider_diagnostic` event. Earlier families retain their lower caps.
+- **OpenAI Responses API**: Uses `reasoning: { effort }`; exact GPT-5.6 IDs accept native `'max'` and omit `temperature` because that family rejects it even when reasoning uses the provider default. Older models keep their documented clamps. Exact GPT-6 IDs strip the portable `temperature` on both endpoints unless the effective effort is `none`, and reject raw sampling overrides while reasoning is active (see [GPT-6 endpoint and pricing rules](#gpt-6-endpoint-and-pricing-rules)). `includeThoughts: true` enables reasoning summaries (`reasoning: { summary: 'detailed' }`). Reasoning context is automatically round-tripped via `providerMetadata.openaiReasoningItems`.
 - **Anthropic Claude 5**: Fable 5.1, Fable 5, and Opus 5.5 always reason; Opus 5 and Sonnet 5 reason by default. These models accept the full active effort vocabulary through adaptive thinking. Opaque thinking blocks are preserved in `providerMetadata` for tool continuations. When Axl trims or summarizes earlier messages, retained turns are projected without thinking signed to the old prefix; text, tool calls, and other provider metadata remain. Model-switch drops alone do not delete stored blocks because a later compatible model may read them. A rebuilt ask summary after another session execution can still reset reasoning; session history is not an exact provider replay log. Axl does not request beta fast-mode or model-fallback headers; if Anthropic reports that a different fallback model served the call, Axl fails before persisting history or estimating cost.
 - **Anthropic Opus 4.8**: Supports adaptive thinking and native `'xhigh'`/`'max'`.
 - **Anthropic Opus 4.7**: Same adaptive-thinking behavior as 4.6. Additionally supports `effort: 'xhigh'` as a first-class tier between `'high'` and `'max'`, sent as `output_config.effort: 'xhigh'`. Same pricing as Opus 4.6 ($5/$25 per 1M tokens).

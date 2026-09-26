@@ -377,15 +377,16 @@ export type ModelTimingStats = {
  * flattened to `EvalItem.error`. Populated on `failed` items only.
  *
  * When a `ProviderError` is found — the thrown value itself or the first one
- * down its `cause` chain — every field comes from it. Otherwise only the thrown
- * value's `name` is recorded. This record never copies `ProviderError.body` or
- * the message: the body can echo prompt text and is redaction-eligible.
+ * down its `cause` chain — every field comes from it. Otherwise a `TimeoutError`
+ * contributes only finite numeric breakdown fields. Other errors contribute
+ * only the thrown value's `name`. This record never copies an error body or
+ * message: either can echo prompt text and is redaction-eligible.
  * `EvalItem.error` keeps the error message as before, which for some providers
  * (a non-JSON error response) embeds the response text — that is outside this
  * record's guarantee.
  */
 export type EvalItemFailure = {
-  /** `'ProviderError'` when one was found, else the thrown value's own `name`. */
+  /** `'ProviderError'` or `'TimeoutError'` when found, else the thrown value's own `name`. */
   name: string;
   /** Adapter/profile name, e.g. `'openai'`. */
   provider?: string;
@@ -395,6 +396,18 @@ export type EvalItemFailure = {
   retryable?: boolean;
   /** Provider request id, when the response carried one. */
   requestId?: string;
+  /** Wall time when the ask timed out; absent when no breakdown was reported. */
+  elapsedMs?: number;
+  /** Graceful work budget consumed after excluded waits. */
+  chargedMs?: number;
+  /** Observed SDK governor wait on completed provider turns. */
+  queuedMs?: number;
+  /** Failed provider attempts and non-governor retry backoff. */
+  retryMs?: number;
+  /** Provider service time. */
+  wireMs?: number;
+  /** Remaining runtime, gate, and tool time. */
+  otherMs?: number;
 };
 
 export type EvalItem = {

@@ -14,7 +14,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { z } from 'zod';
-import { ProviderError } from '@axlsdk/axl';
+import { ProviderError, TimeoutError } from '@axlsdk/axl';
 
 import { dataset } from '../dataset.js';
 import { scorer } from '../scorer.js';
@@ -215,6 +215,42 @@ describe('item.failure capture', () => {
       requestId: 'req_foreign',
     });
     expect(JSON.stringify(item)).not.toContain(SENTINEL);
+  });
+
+  it('keeps finite timeout timing from a wrapped ESM/CJS-compatible error', async () => {
+    const foreign = Object.assign(new Error(SENTINEL), {
+      name: 'TimeoutError',
+      code: 'TIMEOUT',
+      breakdown: {
+        elapsedMs: 63,
+        chargedMs: 12,
+        queuedMs: 50,
+        retryMs: 1,
+        wireMs: Infinity,
+        otherMs: NaN,
+        body: SENTINEL,
+      },
+    });
+    const item = await failWith(new Error('wrapped', { cause: foreign }));
+    expect(item.failure).toEqual({
+      name: 'TimeoutError',
+      elapsedMs: 63,
+      chargedMs: 12,
+      queuedMs: 50,
+      retryMs: 1,
+    });
+    expect(JSON.stringify(item.failure)).not.toContain(SENTINEL);
+  });
+
+  it('keeps ProviderError precedence across a timeout wrapper and leaves missing timing absent', () => {
+    const timeout = new TimeoutError('ctx.ask()', 60);
+    expect(describeItemFailure(timeout)).toEqual({ name: 'TimeoutError' });
+    Object.defineProperty(timeout, 'cause', { value: rateLimited() });
+    expect(describeItemFailure(timeout)).toMatchObject({
+      name: 'ProviderError',
+      status: 429,
+      requestId: 'req_1',
+    });
   });
 
   it('terminates on a cyclic cause chain', () => {

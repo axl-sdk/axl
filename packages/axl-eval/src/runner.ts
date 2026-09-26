@@ -1,5 +1,11 @@
 import type { ArtifactManifest, AxlRuntime, CallTiming, ModelTimingRollup } from '@axlsdk/axl';
-import { AdmissionController, AxlError, ProviderError, RequestCaptureChannel } from '@axlsdk/axl';
+import {
+  AdmissionController,
+  AxlError,
+  ProviderError,
+  RequestCaptureChannel,
+  TimeoutError,
+} from '@axlsdk/axl';
 import type {
   EvalAccounting,
   EvalConfig,
@@ -300,20 +306,48 @@ function isProviderErrorLike(value: unknown): value is ProviderError {
   return candidate.code === 'PROVIDER_ERROR' && candidate.name === 'ProviderError';
 }
 
+/** Accept the ESM or CJS copy of the core timeout class, but not a stalled request. */
+function isTimeoutErrorLike(value: unknown): value is TimeoutError {
+  if (typeof value !== 'object' || value === null) return false;
+  const candidate = value as { code?: unknown; name?: unknown };
+  return (
+    candidate.name === 'TimeoutError' &&
+    (value instanceof TimeoutError || candidate.code === 'TIMEOUT')
+  );
+}
+
+function describeTimeoutFailure(error: TimeoutError): EvalItemFailure {
+  const breakdown: unknown = error.breakdown;
+  if (typeof breakdown !== 'object' || breakdown === null) return { name: 'TimeoutError' };
+  const b = breakdown as Record<string, unknown>;
+  const finite = (value: unknown): value is number =>
+    typeof value === 'number' && Number.isFinite(value);
+  return {
+    name: 'TimeoutError',
+    ...(finite(b.elapsedMs) ? { elapsedMs: b.elapsedMs } : {}),
+    ...(finite(b.chargedMs) ? { chargedMs: b.chargedMs } : {}),
+    ...(finite(b.queuedMs) ? { queuedMs: b.queuedMs } : {}),
+    ...(finite(b.retryMs) ? { retryMs: b.retryMs } : {}),
+    ...(finite(b.wireMs) ? { wireMs: b.wireMs } : {}),
+    ...(finite(b.otherMs) ? { otherMs: b.otherMs } : {}),
+  };
+}
+
 /**
  * The structured cause of an item failure, read from the thrown value before
  * it is flattened to a message.
  *
  * Walks the thrown value and its `cause` chain — bounded in depth, because a
- * cause chain is caller-built data and may be cyclic — and takes EVERY
- * field from the first `ProviderError` it meets. With none, only the thrown
- * value's `name` is kept. Each field is copied by name with a type check, never
- * by spreading the error, so `body` (which can echo prompt text), `message` and
- * any other property never reach the `failure` record. (`item.error` keeps the
- * message as before; for some providers that includes error-response text.)
+ * cause chain is caller-built data and may be cyclic. The first `ProviderError`
+ * takes precedence over any `TimeoutError` in the scanned chain. Without a
+ * provider error, the first timeout contributes finite numeric breakdown
+ * fields. With neither, only the thrown value's `name` is kept. Fields are
+ * copied by name and type, so `body`, `message`, and other data never enter
+ * this record. (`item.error` keeps the message as before.)
  */
 export function describeItemFailure(thrown: unknown): EvalItemFailure | undefined {
   let current: unknown = thrown;
+  let timeoutFailure: EvalItemFailure | undefined;
   // The depth bound is also the cycle guard: a chain that loops back on
   // itself is simply walked until the bound.
   for (let depth = 0; depth <= MAX_CAUSE_DEPTH; depth++) {
@@ -330,8 +364,12 @@ export function describeItemFailure(thrown: unknown): EvalItemFailure | undefine
         ...(typeof requestId === 'string' ? { requestId } : {}),
       };
     }
+    if (timeoutFailure === undefined && isTimeoutErrorLike(current)) {
+      timeoutFailure = describeTimeoutFailure(current);
+    }
     current = (current as { cause?: unknown }).cause;
   }
+  if (timeoutFailure) return timeoutFailure;
   const name = (thrown as { name?: unknown } | null | undefined)?.name;
   return typeof thrown === 'object' && thrown !== null && typeof name === 'string' && name
     ? { name }

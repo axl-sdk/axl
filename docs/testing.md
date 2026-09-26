@@ -509,12 +509,11 @@ result.items[1].failure;
 //   retryMs: 4, wireMs: 20, otherMs: 6 }
 ```
 
-When no `ProviderError` takes precedence, a `TimeoutError` preserves finite numeric
-breakdown fields on `failure`. `elapsedMs` is the ask's wall time including human and
-governor pauses; `chargedMs` is the work counted against that graceful budget.
-`EvalItem.duration` remains full workflow wall time. Reported custom-provider timing earns
-no credit; only waits observed on the ask clock do. Under
-Studio's `trace.redact`, these known numeric fields remain visible and `item.error` is masked.
+When no `ProviderError` takes precedence, a `TimeoutError` preserves its numeric
+[`TimeoutBreakdown`](api-reference.md#timeoutbreakdown-timeouterrorbreakdown) fields on
+`failure`; `chargedMs` is the number that exceeded the budget, and `EvalItem.duration` remains
+full workflow wall time. Under Studio's `trace.redact`, these numeric fields remain visible
+and `item.error` is masked.
 
 `failure` never records `ProviderError.body` or an error message; `item.error` keeps the
 message as before, which for some providers can include error-response text.

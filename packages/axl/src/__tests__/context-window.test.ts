@@ -59,7 +59,7 @@ function createTestContext(provider: TestProvider, init?: Partial<WorkflowContex
   registry.registerInstance('test', provider as any);
   return new WorkflowContext({
     input: init?.input ?? 'test input',
-    executionId: 'test-exec-ctx-window',
+    executionId: init?.executionId ?? 'test-exec-ctx-window',
     metadata: init?.metadata ?? {},
     config: { defaultProvider: 'test', ...init?.config },
     providerRegistry: registry,
@@ -626,5 +626,294 @@ describe('Context Window Management', () => {
       (m: any) => m.role === 'system' && !m.content.includes('Summary'),
     );
     expect(systemMsg?.content).toBe(longSystemPrompt);
+  });
+
+  describe('persisted ask summaries', () => {
+    const SUMMARY_SYSTEM =
+      'Summarize the following conversation concisely, preserving key facts, decisions, and context needed for continuing the conversation.';
+    const isSummaryCall = (call: any) => call.messages[0]?.content === SUMMARY_SYSTEM;
+
+    /** A JSON-backed store that also reverses object key order on every read,
+     * the way a jsonb column or a hand-rolled store might. The ask-summary
+     * boundary must survive that round trip. */
+    class ReorderingJsonStore extends MemoryStore {
+      private static reorder(value: unknown): unknown {
+        if (Array.isArray(value)) return value.map((v) => ReorderingJsonStore.reorder(v));
+        if (value && typeof value === 'object') {
+          return Object.fromEntries(
+            Object.keys(value)
+              .reverse()
+              .map((k) => [k, ReorderingJsonStore.reorder((value as any)[k])]),
+          );
+        }
+        return value;
+      }
+      override async getSession(id: string): Promise<ChatMessage[]> {
+        const raw = JSON.parse(JSON.stringify(await super.getSession(id)));
+        return ReorderingJsonStore.reorder(raw) as ChatMessage[];
+      }
+      override async getSessionMeta(id: string, key: string): Promise<unknown | null> {
+        const value = await super.getSessionMeta(id, key);
+        return value === null
+          ? null
+          : ReorderingJsonStore.reorder(JSON.parse(JSON.stringify(value)));
+      }
+    }
+
+    async function firstExecution(
+      store: MemoryStore,
+      options: { history?: ChatMessage[]; agentName?: string } = {},
+    ) {
+      const history = options.history ?? generateHistory(24, 400);
+      history.push({ role: 'user', content: 'First question' });
+      const provider = new TestProvider([
+        { content: 'Persisted summary.' },
+        { content: 'First answer.' },
+      ]);
+      const ctx = createTestContext(provider, {
+        metadata: { sessionId: 'persisted-session' },
+        sessionHistory: history,
+        stateStore: store,
+      });
+      await ctx.ask(
+        agent({ name: options.agentName ?? 'compact', model: 'test:test-model', maxContext: 3300 }),
+        'First question',
+      );
+      await store.saveSession('persisted-session', history);
+      return { provider, history };
+    }
+
+    async function secondExecution(
+      store: MemoryStore,
+      options: { agentName?: string; edit?: (h: ChatMessage[]) => ChatMessage[] } = {},
+    ) {
+      let history = await store.getSession('persisted-session');
+      if (options.edit) history = options.edit(history);
+      history.push({ role: 'user', content: 'Second question' });
+      const provider = new TestProvider([
+        { content: 'Regenerated summary.' },
+        { content: 'Second answer.' },
+      ]);
+      const events: any[] = [];
+      const ctx = createTestContext(provider, {
+        executionId: 'second-execution',
+        metadata: { sessionId: 'persisted-session' },
+        sessionHistory: history,
+        stateStore: store,
+        onTrace: (event: any) => events.push(event),
+      });
+      await ctx.ask(
+        agent({ name: options.agentName ?? 'compact', model: 'test:test-model', maxContext: 3300 }),
+        'Second question',
+      );
+      return { provider, events, history };
+    }
+
+    it('reuses the persisted summary in a later execution when the tail fits', async () => {
+      const store = new ReorderingJsonStore();
+      const first = await firstExecution(store);
+      const firstTail = (first.provider.calls[1].messages as ChatMessage[]).filter(
+        (m) => m.role !== 'system',
+      );
+
+      const second = await secondExecution(store);
+
+      expect(second.provider.calls.filter(isSummaryCall)).toEqual([]);
+      const sent = second.provider.calls[0].messages as ChatMessage[];
+      expect(sent[0]).toEqual({
+        role: 'system',
+        origin: 'runtime',
+        content: 'Summary of earlier conversation:\nPersisted summary.',
+      });
+      // Exact covered prefix: the whole earlier tail, then everything since.
+      // Each request ends with the ask input; these direct contexts have no
+      // Session dedup marker, so the history's own user turn precedes it.
+      expect(sent.slice(1).map((m) => m.content)).toEqual([
+        ...firstTail.slice(0, -1).map((m) => m.content),
+        'First answer.',
+        'Second question',
+        'Second question',
+      ]);
+      expect(firstTail.at(-2)?.content).toBe('First question');
+      expect(second.events.some((e) => e.data?.purpose === 'summary')).toBe(false);
+    });
+
+    it('regenerates when a session trim changes the covered prefix', async () => {
+      const store = new ReorderingJsonStore();
+      await firstExecution(store);
+
+      const second = await secondExecution(store, { edit: (history) => history.slice(2) });
+
+      const summaryCalls = second.provider.calls.filter(isSummaryCall);
+      expect(summaryCalls).toHaveLength(1);
+      expect(String(summaryCalls[0].messages[1].content)).toContain('Message 2:');
+      expect(String(summaryCalls[0].messages[1].content)).not.toContain('Message 0:');
+      expect(second.provider.calls[1].messages[0].content).toBe(
+        'Summary of earlier conversation:\nRegenerated summary.',
+      );
+    });
+
+    it('does not share a persisted summary with a different agent', async () => {
+      const store = new ReorderingJsonStore();
+      await firstExecution(store, { agentName: 'compact' });
+
+      const second = await secondExecution(store, { agentName: 'other' });
+
+      expect(second.provider.calls.filter(isSummaryCall)).toHaveLength(1);
+      expect(second.provider.calls[1].messages[0].content).toBe(
+        'Summary of earlier conversation:\nRegenerated summary.',
+      );
+      expect(await store.getSessionMeta('persisted-session', 'askSummary:compact')).toMatchObject({
+        summary: 'Persisted summary.',
+      });
+      expect(await store.getSessionMeta('persisted-session', 'askSummary:other')).toMatchObject({
+        summary: 'Regenerated summary.',
+      });
+    });
+
+    it('does not share an in-memory summary with a different agent in one execution', async () => {
+      const provider = new TestProvider([
+        { content: 'Compact summary.' },
+        { content: 'Compact answer.' },
+        { content: 'Other summary.' },
+        { content: 'Other answer.' },
+      ]);
+      const ctx = createTestContext(provider, { sessionHistory: generateHistory(24, 400) });
+
+      await ctx.ask(agent({ name: 'compact', model: 'test:test-model', maxContext: 3300 }), 'One');
+      await ctx.ask(agent({ name: 'other', model: 'test:test-model', maxContext: 3300 }), 'Two');
+
+      expect(provider.calls.filter(isSummaryCall)).toHaveLength(2);
+      expect(provider.calls[3].messages[0].content).toBe(
+        'Summary of earlier conversation:\nOther summary.',
+      );
+    });
+
+    it('stores a prefix hash, never the serialized prefix, and keeps summaryCache intact', async () => {
+      const store = new MemoryStore();
+      await store.saveSessionMeta('persisted-session', 'summaryCache', 'Durable fact.');
+      const history = generateHistory(24, 400);
+      history.push({ role: 'user', content: 'First question' });
+      const provider = new TestProvider([{ content: 'Ask summary.' }, { content: 'Answer.' }]);
+      const ctx = createTestContext(provider, {
+        metadata: { sessionId: 'persisted-session', summaryCache: 'Durable fact.' },
+        sessionHistory: history,
+        stateStore: store,
+      });
+      await ctx.ask(agent({ name: 'compact', model: 'test:test-model', maxContext: 3300 }), 'Q');
+
+      const record = (await store.getSessionMeta('persisted-session', 'askSummary:compact')) as any;
+      expect(Object.keys(record).sort()).toEqual([
+        'coveredCount',
+        'invalidatedThinkingThrough',
+        'prefixHash',
+        'sourceSummary',
+        'summary',
+        'summaryModelUri',
+      ]);
+      expect(record.summary).toBe('Ask summary.');
+      expect(record.prefixHash).toMatch(/^[0-9a-f]{64}$/);
+      expect(JSON.stringify(record)).not.toContain('Message 0:');
+      expect(record.sourceSummary).toBe('Durable fact.');
+      expect(await store.getSessionMeta('persisted-session', 'summaryCache')).toBe('Durable fact.');
+    });
+
+    it('stamps turn 0 on both summary call events', async () => {
+      const events: any[] = [];
+      const provider = new TestProvider([{ content: 'Summary.' }, { content: 'Answer.' }]);
+      const ctx = createTestContext(provider, {
+        sessionHistory: generateHistory(24, 400),
+        onTrace: (event: any) => events.push(event),
+      });
+      await ctx.ask(agent({ model: 'test:test-model', maxContext: 3300 }), 'Question');
+
+      const calls = events.filter(
+        (e) => e.type === 'agent_call_start' || e.type === 'agent_call_end',
+      );
+      expect(calls.map((e) => [e.type, e.data.purpose, e.turn, e.data.turn])).toEqual([
+        ['agent_call_start', 'summary', 0, 0],
+        ['agent_call_end', 'summary', undefined, 0],
+        ['agent_call_start', undefined, 1, 1],
+        ['agent_call_end', undefined, undefined, 1],
+      ]);
+    });
+
+    it('reports client-side thinking removal with the exact removed block count', async () => {
+      const history = generateHistory(24, 400);
+      history[21].providerMetadata = {
+        anthropicThinkingBlocks: [
+          { type: 'thinking', thinking: 'a', signature: 'sig-a' },
+          { type: 'redacted_thinking', data: 'opaque' },
+        ],
+      };
+      history[23].providerMetadata = {
+        anthropicThinkingBlocks: [{ type: 'thinking', thinking: 'b', signature: 'sig-b' }],
+        otherProviderKey: 'keep',
+      };
+      const events: any[] = [];
+      const provider = new TestProvider([{ content: 'Summary.' }, { content: 'Answer.' }]);
+      const ctx = createTestContext(provider, {
+        sessionHistory: history,
+        onTrace: (event: any) => events.push(event),
+      });
+      await ctx.ask(agent({ model: 'test:test-model', maxContext: 3300 }), 'Question');
+
+      const sent = provider.calls[1].messages as ChatMessage[];
+      expect(sent.some((m) => m.content === history[21].content)).toBe(true);
+      expect(sent.some((m) => m.providerMetadata?.anthropicThinkingBlocks)).toBe(false);
+      const diagnostics = events.filter((e) => e.type === 'provider_diagnostic');
+      expect(diagnostics.map((e) => e.data)).toEqual([
+        {
+          kind: 'reasoning_context_reset',
+          provider: 'test',
+          model: 'test-model',
+          droppedBlocks: 3,
+          reasons: { client_prefix_rewrite: 3 },
+        },
+      ]);
+      const order = events.map((e) => `${e.type}:${e.data?.purpose ?? e.turn ?? ''}`);
+      expect(order.indexOf('provider_diagnostic:')).toBeGreaterThan(
+        order.indexOf('agent_call_end:summary'),
+      );
+      expect(order.indexOf('provider_diagnostic:')).toBeLessThan(
+        order.indexOf('agent_call_start:1'),
+      );
+    });
+
+    it('reports thinking removal on a reused persisted summary', async () => {
+      const store = new ReorderingJsonStore();
+      const history = generateHistory(24, 400);
+      history[23].providerMetadata = {
+        anthropicThinkingBlocks: [{ type: 'thinking', thinking: 'old', signature: 'sig-old' }],
+      };
+      await firstExecution(store, { history });
+
+      const second = await secondExecution(store);
+
+      expect(second.provider.calls.filter(isSummaryCall)).toEqual([]);
+      const reused = second.provider.calls[0].messages as ChatMessage[];
+      expect(reused.some((m) => m.content === history[23].content)).toBe(true);
+      expect(reused.some((m) => m.providerMetadata?.anthropicThinkingBlocks)).toBe(false);
+      const diagnostics = second.events.filter((e) => e.type === 'provider_diagnostic');
+      expect(diagnostics.map((e) => [e.data.droppedBlocks, e.data.reasons])).toEqual([
+        [1, { client_prefix_rewrite: 1 }],
+      ]);
+    });
+
+    it('emits no client rewrite diagnostic when no thinking blocks were removed', async () => {
+      const events: any[] = [];
+      const provider = new TestProvider([{ content: 'Summary.' }, { content: 'Answer.' }]);
+      const ctx = createTestContext(provider, {
+        sessionHistory: generateHistory(24, 400),
+        onTrace: (event: any) => events.push(event),
+      });
+      await ctx.ask(agent({ model: 'test:test-model', maxContext: 3300 }), 'Question');
+
+      expect(provider.calls.filter(isSummaryCall)).toHaveLength(1);
+      expect(provider.calls[1].messages[0].content).toBe(
+        'Summary of earlier conversation:\nSummary.',
+      );
+      expect(events.filter((e) => e.type === 'provider_diagnostic')).toEqual([]);
+    });
   });
 });

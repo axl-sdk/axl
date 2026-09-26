@@ -599,11 +599,20 @@ describe.skipIf(!process.env.ANTHROPIC_API_KEY)('latest models: Anthropic live a
     );
     const firstResets = events
       .slice(0, eventsAfterFirst)
-      .filter(
-        (event) =>
-          event.type === 'provider_diagnostic' && event.data.kind === 'reasoning_context_reset',
+      .flatMap((event) =>
+        event.type === 'provider_diagnostic' && event.data.kind === 'reasoning_context_reset'
+          ? [event.data]
+          : [],
       );
-    expect(firstResets).toHaveLength(0);
+    // Axl reports its own removal of the seed's stale thinking once, before
+    // the first compacted call; Anthropic itself reports no reset.
+    const seedThinking = (seed.providerMetadata?.anthropicThinkingBlocks as unknown[]).filter(
+      (block) =>
+        ['thinking', 'redacted_thinking'].includes(String((block as { type?: unknown }).type)),
+    ).length;
+    expect(firstResets.map((reset) => [reset.droppedBlocks, reset.reasons])).toEqual([
+      [seedThinking, { client_prefix_rewrite: seedThinking }],
+    ]);
   }, 300_000);
 
   it.each(['claude-fable-5-1', 'claude-fable-5', 'claude-opus-5', 'claude-sonnet-5'])(

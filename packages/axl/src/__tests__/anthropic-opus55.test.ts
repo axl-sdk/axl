@@ -528,7 +528,24 @@ describe('runtime continuation after Axl context summarization', () => {
       (event) =>
         event.type === 'provider_diagnostic' && event.data.kind === 'reasoning_context_reset',
     );
-    expect(resets).toHaveLength(0);
+    // Anthropic reported no drop; the only resets are Axl's own removal of the
+    // replayed block on the regenerated and the reused projection.
+    expect(resets.map((event) => event.type === 'provider_diagnostic' && event.data)).toEqual([
+      {
+        kind: 'reasoning_context_reset',
+        provider: 'anthropic',
+        model: 'claude-opus-5-5',
+        droppedBlocks: 1,
+        reasons: { client_prefix_rewrite: 1 },
+      },
+      {
+        kind: 'reasoning_context_reset',
+        provider: 'anthropic',
+        model: 'claude-opus-5-5',
+        droppedBlocks: 1,
+        reasons: { client_prefix_rewrite: 1 },
+      },
+    ]);
     expect(JSON.stringify(resets)).not.toMatch(/signed-secret|messages\.|private reasoning/);
   });
 });

@@ -72,14 +72,21 @@ Sessions provide multi-turn conversation state. Each session maintains message h
 
 Session retention and request context are separate decisions. A session's
 `history.maxMessages` may remove old stored turns and retain their rolling
-summary. An agent's `maxContext` instead builds a temporary view for one ask:
-its summary covers an exact prefix, followed by every remaining turn. That
-view does not replace the shared session history. For example, a small-context
+summary. An agent's `maxContext` instead builds a request view for that agent:
+its summary covers an exact prefix, followed by every remaining turn. The
+boundary is kept per agent as session metadata (summary, covered count, and a
+hash of the covered prefix), so later sends reuse it without another summary
+call until the prefix, durable summary, or summary model changes. That view
+does not replace the shared session history. For example, a small-context
 classifier may summarize its request while a later large-context expert still
-receives the full retained history. A known client-side rewrite also removes
-Anthropic thinking signed to the old prefix from the affected request. Axl
-does not store an exact provider replay transcript, so this does not promise
-uninterrupted reasoning context across independent asks or restarts. See
+receives the full retained history. Both summarizers share one prompt and
+provider call (`compaction.ts`). A known client-side rewrite also removes
+Anthropic thinking signed to the old prefix from the affected request; the
+ask-level removal is reported as a `reasoning_context_reset` diagnostic with
+reason `client_prefix_rewrite`, while session-level trimming happens before
+any execution exists and emits no event. Axl does not store an exact provider
+replay transcript, so this does not promise uninterrupted reasoning context
+across independent asks or restarts. See
 [Sessions → Summarization](./api-reference.md#summarization) for the behavior.
 
 ## Provider Architecture

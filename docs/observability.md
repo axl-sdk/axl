@@ -157,7 +157,8 @@ schemas. The full set of types:
 
 When `maxContext` triggers a new context-management summary, the summary model call
 appears under the owning ask as a separate `agent_call_start` / `agent_call_end`
-pair with `data.purpose: 'summary'`, `turn: 1`, and its actual model URI. Its
+pair with `data.purpose: 'summary'`, `turn: 0` (it runs before the ask's
+1-indexed tool loop, so it never shares a turn with a loop call), and its actual model URI. Its
 known cost contributes once to the ask rollup and budget. An unknown-price
 summary marks the ask and budget totals as lower bounds; reusing a cached
 summary makes no provider call and emits no summary pair.
@@ -744,7 +745,7 @@ deduped `console.warn`:
 | `data.kind` | Fires when | Fields |
 |---|---|---|
 | `effort_clamped` | The provider sent a different native level than the requested `effort` | `requested`, `effective` (provider-native string), `cause`, `model`, `provider?` |
-| `reasoning_context_reset` | Anthropic dropped replayed thinking from one completed provider call | `droppedBlocks`, counts by prefix, model, organization, or end-user binding mismatch in `reasons` (or `other` for an unrecognized reason), `model`, `provider?` |
+| `reasoning_context_reset` | Anthropic dropped replayed thinking from one completed provider call, or Axl removed it before the ask's first model turn because a `maxContext` summary rewrote the signed prefix | `droppedBlocks`, counts by prefix, model, organization, or end-user binding mismatch in `reasons` (or `other` for an unrecognized reason), `client_prefix_rewrite` for Axl's own removal, `model`, `provider?` |
 
 ```ts
 for await (const event of stream.lifecycle) {
@@ -762,13 +763,17 @@ for await (const event of stream.lifecycle) {
   or `AXL_DIAGNOSTICS_SILENT=true`. The event is never silenced.
 - Redaction passes the event through unchanged; it carries no prompt or response content.
 - `reasoning_context_reset` is emitted after each affected provider call, including
-  repeated calls within one tool loop. Direct adapter responses and terminal
+  repeated calls within one tool loop. When an ask-level (`maxContext`) summary
+  itself removes Anthropic thinking from carried turns, the ask emits one event
+  with `reasons: { client_prefix_rewrite: n }` before its first `agent_call_start`,
+  whether the summary was generated or reused. Session-level trimming
+  (`history.maxMessages`) runs before the execution exists and is not reported. Direct adapter responses and terminal
   stream chunks carry the same safe counts in `diagnostics.reasoningContextReset`.
   The runtime copies only known numeric counts from provider diagnostics into
   events, including for custom providers. Transformation paths, signed blocks,
   and raw provider bodies are never included.
   Studio's trace list displays only the normalized dropped-block count and safe
-  reason categories, including `other`. Its cost dashboard labels mixed
+  reason categories, including `other` and `client_prefix_rewrite`. Its cost dashboard labels mixed
   priced/unpriced spend as a lower bound.
 - A provider whose `effortResolution()` throws or reports a malformed clamp fails the ask
   with that error.

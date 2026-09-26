@@ -9,7 +9,7 @@ import type { Workflow, AnyWorkflow } from './workflow.js';
 import type { Tool } from './tool.js';
 import type { Agent } from './agent.js';
 import type { Provider } from './providers/types.js';
-import { summarizeModelInput } from './input.js';
+import { buildSummaryPrompt, requestSummary } from './compaction.js';
 import { ProviderRegistry } from './providers/registry.js';
 import { TranscriptionProviderRegistry } from './providers/transcription-registry.js';
 import type { TranscriptionProvider } from './providers/transcription-types.js';
@@ -3072,26 +3072,24 @@ export class AxlRuntime extends EventEmitter {
   /**
    * Summarize a list of chat messages into a concise summary string.
    * Used by Session to summarize dropped messages when history.summarize is enabled.
+   * `previousSummary` is folded in so a rolling summary never loses what it
+   * alone still carries. Shares its prompt and provider call with the
+   * `AgentConfig.maxContext` summarizer (see `compaction.ts`). It runs outside
+   * any workflow execution, so it emits no ask-scoped events.
    */
-  async summarizeMessages(messages: ChatMessage[], modelUri: string): Promise<string> {
+  async summarizeMessages(
+    messages: ChatMessage[],
+    modelUri: string,
+    options?: { previousSummary?: string },
+  ): Promise<string> {
     // Through the facade: a session-history summary is a real paid call and
     // belongs to whatever accounting scope is active, even though it runs
     // before any workflow execution id exists.
     const { provider, model } = this.resolveProvider(modelUri);
-    const response = await provider.chat(
-      [
-        {
-          role: 'system',
-          content:
-            'Summarize the following conversation concisely, preserving key facts, decisions, and context needed for continuing the conversation.',
-        },
-        {
-          role: 'user',
-          content: messages.map((m) => `${m.role}: ${summarizeModelInput(m.content)}`).join('\n'),
-        },
-      ],
-      { model, maxTokens: 1024 },
-    );
+    const response = await requestSummary(provider, {
+      model,
+      prompt: buildSummaryPrompt(messages, options?.previousSummary),
+    });
     return response.content;
   }
 

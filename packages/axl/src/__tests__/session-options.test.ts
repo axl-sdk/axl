@@ -349,16 +349,15 @@ describe('SessionOptions', () => {
 
       await session.send('chat', 'msg4');
 
-      // The first message should be the previous summary as context
-      const [messages] = summarizeFn.mock.calls[0];
-      expect(messages[0]).toEqual({
-        role: 'system',
-        content: 'Previous conversation summary: Old summary',
-      });
-      // Then the 2 dropped messages
-      expect(messages[1]).toEqual({ role: 'user', content: 'msg1' });
-      expect(messages[2]).toEqual({ role: 'assistant', content: 'r1' });
-      expect(messages).toHaveLength(3);
+      // The previous summary is folded in by the shared summary prompt, and
+      // only the 2 dropped messages are summarized.
+      const [messages, modelUri, options] = summarizeFn.mock.calls[0];
+      expect(messages).toEqual([
+        { role: 'user', content: 'msg1' },
+        { role: 'assistant', content: 'r1' },
+      ]);
+      expect(modelUri).toBe('mock:summarizer');
+      expect(options).toEqual({ previousSummary: 'Old summary' });
     });
 
     it('throws if summarize is true but summaryModel is missing', async () => {

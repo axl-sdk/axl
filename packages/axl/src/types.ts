@@ -310,7 +310,9 @@ export type AgentCallStartData = {
   system?: string;
   /** Resolved model parameters sent to the provider for this call. */
   params?: AgentCallParams;
-  /** 1-indexed iteration of the tool-calling loop for this `ctx.ask()` call. */
+  /** 1-indexed iteration of the tool-calling loop for this `ctx.ask()` call;
+   *  `0` for a context-management summary call (`purpose: 'summary'`), which
+   *  runs before and outside that loop. */
   turn: number;
   /** When set, this call is a retry triggered by a failed gate check on the previous turn. */
   retryReason?: 'schema' | 'validate' | 'guardrail';
@@ -342,7 +344,8 @@ export type AgentCallEndData = {
   response: string;
   /** Reasoning/thinking content returned by the provider, when available. */
   thinking?: string;
-  /** 1-indexed iteration of the tool-calling loop. Mirrors the matching `agent_call_start.data.turn`. */
+  /** 1-indexed iteration of the tool-calling loop (`0` for a summary call).
+   *  Mirrors the matching `agent_call_start.data.turn`. */
   turn: number;
   /** Mirrors `agent_call_start.data.retryReason` so cost-attribution consumers
    *  reading `agent_call_end` (cost lives here) can bucket without joining. */
@@ -670,15 +673,21 @@ export type SchemaDiagnosticData =
  * new event type.
  */
 export type ReasoningContextReset = {
-  /** Number of thinking blocks the provider dropped from this call's input. */
+  /** Number of thinking blocks dropped from this call's input. */
   droppedBlocks: number;
-  /** Documented Anthropic reasons and a safe bucket for future reasons; no paths or signed content. */
+  /**
+   * Documented Anthropic reasons, `client_prefix_rewrite` when Axl itself
+   * removed thinking because an `AgentConfig.maxContext` summary rewrote the
+   * prefix those blocks were signed against, and a safe bucket for future
+   * reasons; no paths or signed content.
+   */
   reasons: Partial<
     Record<
       | 'prefix_binding_mismatch'
       | 'model_binding_mismatch'
       | 'organization_binding_mismatch'
       | 'end_user_binding_mismatch'
+      | 'client_prefix_rewrite'
       | 'other',
       number
     >
@@ -955,7 +964,8 @@ type LegacyAxlEventPayloadV1 =
         type: 'agent_call_start';
         agent: string;
         model: string;
-        /** 1-indexed tool-calling loop iteration within the ask. */
+        /** 1-indexed tool-calling loop iteration within the ask; `0` for a
+         *  context-management summary call (`data.purpose: 'summary'`). */
         turn: number;
         /** Request-side payload — prompt, system, params, messages, retry context. */
         data: AgentCallStartData;

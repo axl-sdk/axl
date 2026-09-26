@@ -1,6 +1,5 @@
 import type {
   ChatOptions,
-  Effort,
   EffortResolution,
   ApiKeySource,
   ResolvedThinkingOptions,
@@ -557,7 +556,7 @@ export function estimateDirectOpenAICost(
     ![prompt_tokens, completion_tokens, cached, cacheWrite, audioInput, audioOutput].every(
       (count) => Number.isSafeInteger(count) && count >= 0,
     ) ||
-    (isExactGPT6Model(model) &&
+    (resolveOpenAIModelDescriptor(model).strictUsageTotals &&
       (!Number.isSafeInteger(usage.total_tokens) ||
         usage.total_tokens !== prompt_tokens + completion_tokens)) ||
     cached + cacheWrite + audioInput > prompt_tokens ||
@@ -628,156 +627,283 @@ export function estimateOpenAICost(
   });
 }
 
+// ---------------------------------------------------------------------------
+// OpenAI model descriptors. One table answers every model-dependent request
+// question for BOTH OpenAI endpoints (Chat Completions and Responses), so an
+// exact-model rule cannot be applied by one endpoint and missed by the other.
+// Exact IDs win; otherwise ordered family fallbacks reproduce the historical
+// regex baseline. An unknown ID resolves to a family (or the non-reasoning
+// default) and never inherits an exact model's capabilities or pricing.
+// ---------------------------------------------------------------------------
+
+export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+
+export type OpenAIEndpoint = 'chat' | 'responses';
+
+/**
+ * When a portable `ChatOptions.temperature` is dropped from the synthesized
+ * body. Raw `providerOptions` fields are never stripped; a descriptor with
+ * `validatesFinalBody` rejects them in {@link validateOpenAIFinalRequestBody}.
+ *
+ * - `never` — the portable value is always forwarded.
+ * - `always` — the model rejects sampling even at its default reasoning.
+ * - `when-effort-sent` — stripped only when Axl emits a reasoning effort
+ *   (the historical GPT-5.x baseline).
+ * - `unless-effort-none` — stripped unless the effective effort (the emitted
+ *   one, or the model's declared default) is `none`.
+ */
+export type OpenAISamplingRestriction =
+  | 'never'
+  | 'always'
+  | 'when-effort-sent'
+  | 'unless-effort-none';
+
+/** Chat Completions function-tool constraint. */
+export type OpenAIChatToolPolicy = 'allowed' | 'never' | 'effort-none-only';
+
+export type OpenAIModelDescriptor = {
+  /** Exact model ID, or the family name for a fallback descriptor. */
+  readonly id: string;
+  readonly family: 'gpt-6' | 'gpt-5.6' | 'gpt-5-pro' | 'gpt-5' | 'o-series' | 'default';
+  /** Whether Axl emits a reasoning effort for this model at all. */
+  readonly reasoning: boolean;
+  /**
+   * Wire effort levels each endpoint accepts. A requested level outside the
+   * list walks {@link EFFORT_FALLBACK} to the nearest accepted one: this is
+   * where `max` is either native or mapped to `xhigh`, and where `none` and
+   * `minimal` either pass through, become `minimal`, or become `low`.
+   */
+  readonly efforts: Readonly<Record<OpenAIEndpoint, readonly ReasoningEffort[]>>;
+  /** The model's effort when none is sent. Declared only where it is documented. */
+  readonly defaultEffort?: ReasoningEffort;
+  readonly sampling: Readonly<Record<OpenAIEndpoint, OpenAISamplingRestriction>>;
+  readonly chatTools: OpenAIChatToolPolicy;
+  /**
+   * Axl validates the final merged request (after `providerOptions`) against
+   * this descriptor and rejects forbidden combinations before dispatch.
+   */
+  readonly validatesFinalBody: boolean;
+  /** Pricing requires `total_tokens === prompt_tokens + completion_tokens`. */
+  readonly strictUsageTotals: boolean;
+};
+
+/**
+ * Nearest accepted level for an unsupported one. `high` is terminal: every
+ * descriptor accepts it, and {@link clampToDescriptor} throws if one does not.
+ */
+const EFFORT_FALLBACK: Readonly<Partial<Record<ReasoningEffort, ReasoningEffort>>> = {
+  none: 'minimal',
+  minimal: 'low',
+  low: 'medium',
+  medium: 'high',
+  max: 'xhigh',
+  xhigh: 'high',
+};
+
+const BASE_EFFORTS = ['minimal', 'low', 'medium', 'high'] as const;
+
+function bothEndpoints<T>(value: T): Readonly<Record<OpenAIEndpoint, T>> {
+  return { chat: value, responses: value };
+}
+
+/** GPT-6: native `max` on both endpoints; Axl owns the exact wire contract. */
+function gpt6(
+  id: string,
+  efforts: readonly ReasoningEffort[],
+  chatTools: OpenAIChatToolPolicy,
+): OpenAIModelDescriptor {
+  return {
+    id,
+    family: 'gpt-6',
+    reasoning: true,
+    efforts: bothEndpoints(efforts),
+    defaultEffort: 'medium',
+    sampling: bothEndpoints<OpenAISamplingRestriction>('never'),
+    chatTools,
+    validatesFinalBody: true,
+    strictUsageTotals: true,
+  };
+}
+
+/** GPT-5.6: native `max` on Responses only; Chat Completions caps it at `xhigh`. */
+function gpt56(id: string): OpenAIModelDescriptor {
+  const chat: readonly ReasoningEffort[] = ['none', ...BASE_EFFORTS, 'xhigh'];
+  return {
+    id,
+    family: 'gpt-5.6',
+    reasoning: true,
+    efforts: { chat, responses: [...chat, 'max'] },
+    // Responses rejects temperature even at the provider-default effort.
+    sampling: { chat: 'when-effort-sent', responses: 'always' },
+    chatTools: 'allowed',
+    validatesFinalBody: false,
+    strictUsageTotals: false,
+  };
+}
+
+const OPENAI_EXACT_MODELS: ReadonlyMap<string, OpenAIModelDescriptor> = new Map(
+  [
+    gpt6('gpt-6-astra', ['low', 'medium', 'high', 'xhigh', 'max'], 'never'),
+    gpt6('gpt-6-sol', ['none', 'low', 'medium', 'high', 'xhigh', 'max'], 'effort-none-only'),
+    gpt6('gpt-6-luna', ['none', 'low', 'medium', 'high', 'xhigh', 'max'], 'effort-none-only'),
+    gpt56('gpt-5.6'),
+    gpt56('gpt-5.6-sol'),
+    gpt56('gpt-5.6-terra'),
+    gpt56('gpt-5.6-luna'),
+  ].map((descriptor) => [descriptor.id, descriptor]),
+);
+
+const O_SERIES_DESCRIPTOR: OpenAIModelDescriptor = {
+  id: 'o-series',
+  family: 'o-series',
+  reasoning: true,
+  efforts: bothEndpoints(BASE_EFFORTS),
+  defaultEffort: 'medium',
+  sampling: bothEndpoints('always'),
+  chatTools: 'allowed',
+  validatesFinalBody: false,
+  strictUsageTotals: false,
+};
+
+const GPT_5_PRO_DESCRIPTOR: OpenAIModelDescriptor = {
+  id: 'gpt-5-pro',
+  family: 'gpt-5-pro',
+  reasoning: true,
+  efforts: bothEndpoints(['high']),
+  defaultEffort: 'high',
+  sampling: bothEndpoints('when-effort-sent'),
+  chatTools: 'allowed',
+  validatesFinalBody: false,
+  strictUsageTotals: false,
+};
+
+const DEFAULT_DESCRIPTOR: OpenAIModelDescriptor = {
+  id: 'default',
+  family: 'default',
+  reasoning: false,
+  // Never emitted (the model is not reasoning-capable); keeps the clamp total.
+  efforts: bothEndpoints(BASE_EFFORTS),
+  sampling: bothEndpoints('never'),
+  chatTools: 'allowed',
+  validatesFinalBody: false,
+  strictUsageTotals: false,
+};
+
+/**
+ * GPT-5.x family fallback for IDs without an exact entry, including unknown
+ * snapshots. `none` arrives with gpt-5.1 and `xhigh` with the models after
+ * gpt-5.1-codex-max (gpt-5.2+). Pre-5.1 models default to `medium`.
+ */
+function gpt5FamilyDescriptor(model: string): OpenAIModelDescriptor {
+  const none = /^gpt-5\.[1-9]/.test(model);
+  const xhigh = /^gpt-5\.([2-9]|\d{2,})/.test(model);
+  const efforts: readonly ReasoningEffort[] = [
+    ...(none ? (['none'] as const) : []),
+    ...BASE_EFFORTS,
+    ...(xhigh ? (['xhigh'] as const) : []),
+  ];
+  return {
+    id: 'gpt-5',
+    family: 'gpt-5',
+    reasoning: true,
+    efforts: bothEndpoints(efforts),
+    ...(none ? {} : { defaultEffort: 'medium' as const }),
+    sampling: bothEndpoints('when-effort-sent'),
+    chatTools: 'allowed',
+    validatesFinalBody: false,
+    strictUsageTotals: false,
+  };
+}
+
+/** Ordered family fallbacks; the first match wins after exact IDs. */
+const OPENAI_FAMILY_FALLBACKS: readonly {
+  readonly match: RegExp;
+  readonly describe: (model: string) => OpenAIModelDescriptor;
+}[] = [
+  { match: /^(o1|o3|o4-mini)/, describe: () => O_SERIES_DESCRIPTOR },
+  { match: /^gpt-5-pro/, describe: () => GPT_5_PRO_DESCRIPTOR },
+  { match: /^gpt-5/, describe: gpt5FamilyDescriptor },
+];
+
+/** Resolve the one descriptor both OpenAI endpoints use for `model`. */
+export function resolveOpenAIModelDescriptor(model: string): OpenAIModelDescriptor {
+  const exact = OPENAI_EXACT_MODELS.get(model);
+  if (exact) return exact;
+  const family = OPENAI_FAMILY_FALLBACKS.find((entry) => entry.match.test(model));
+  return family ? family.describe(model) : DEFAULT_DESCRIPTOR;
+}
+
+/** Nearest level `endpoint` accepts for `effort` on this descriptor. */
+function clampToDescriptor(
+  descriptor: OpenAIModelDescriptor,
+  endpoint: OpenAIEndpoint,
+  effort: ReasoningEffort,
+): ReasoningEffort {
+  const accepted = descriptor.efforts[endpoint];
+  let candidate: ReasoningEffort | undefined = effort;
+  while (candidate !== undefined && !accepted.includes(candidate)) {
+    candidate = EFFORT_FALLBACK[candidate];
+  }
+  if (candidate === undefined) {
+    throw new Error(
+      `OpenAI descriptor '${descriptor.id}' accepts no ${endpoint} effort reachable from '${effort}'`,
+    );
+  }
+  return candidate;
+}
+
+/** Whether the portable `temperature` is dropped from the synthesized body. */
+export function stripsPortableSampling(
+  descriptor: OpenAIModelDescriptor,
+  endpoint: OpenAIEndpoint,
+  wireEffort: ReasoningEffort | undefined,
+): boolean {
+  switch (descriptor.sampling[endpoint]) {
+    case 'never':
+      return false;
+    case 'always':
+      return true;
+    case 'when-effort-sent':
+      return wireEffort !== undefined;
+    case 'unless-effort-none':
+      return (wireEffort ?? descriptor.defaultEffort) !== 'none';
+  }
+}
+
 /** Returns true for o-series models (o1, o3, o4-mini) that always reason. */
 export function isOSeriesModel(model: string): boolean {
-  return /^(o1|o3|o4-mini)/.test(model);
+  return resolveOpenAIModelDescriptor(model).family === 'o-series';
 }
 
 /** Returns true for models that accept reasoning_effort. */
 export function supportsReasoningEffort(model: string): boolean {
-  return isOSeriesModel(model) || /^gpt-5/.test(model) || GPT_6_REASONING_MODELS.has(model);
+  return resolveOpenAIModelDescriptor(model).reasoning;
 }
 
-const GPT_6_REASONING_MODELS = new Set(['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna']);
-
-export function isExactGPT6Model(model: string): boolean {
-  return GPT_6_REASONING_MODELS.has(model);
-}
-
-/** Validate only the three exact GPT-6 IDs against the final merged request. */
-export function validateGPT6RequestBody(
-  body: Record<string, unknown>,
-  endpoint: 'openai' | 'openai-responses',
-): void {
-  const model = body.model;
-  if (typeof model !== 'string' || !GPT_6_REASONING_MODELS.has(model)) return;
-  const fail = (option: string, remediation: string): never => {
-    throw new UnsupportedModelOptionError({ provider: endpoint, model, option, remediation });
-  };
-  const rawEffort =
-    endpoint === 'openai'
-      ? body.reasoning_effort
-      : body.reasoning !== null && typeof body.reasoning === 'object'
-        ? (body.reasoning as { effort?: unknown }).effort
-        : undefined;
-  const allowed =
-    model === 'gpt-6-astra'
-      ? ['low', 'medium', 'high', 'xhigh', 'max']
-      : ['none', 'low', 'medium', 'high', 'xhigh', 'max'];
-  if (rawEffort !== undefined && !allowed.includes(rawEffort as string)) {
-    fail('reasoning effort', `Use one of: ${allowed.join(', ')}.`);
-  }
-  // Omitting effort uses the model's active default (medium), not `none`.
-  const activeReasoning = rawEffort !== 'none';
-  if (endpoint === 'openai') {
-    const toolChoice = body.tool_choice;
-    const toolIntent =
-      (Array.isArray(body.tools) && body.tools.length > 0) ||
-      (toolChoice !== undefined &&
-        toolChoice !== null &&
-        toolChoice !== 'none' &&
-        toolChoice !== 'auto');
-    if (toolIntent && (model === 'gpt-6-astra' || activeReasoning)) {
-      fail(
-        'Chat Completions tool calling',
-        model === 'gpt-6-astra'
-          ? `Use openai-responses:${model} for tools.`
-          : `Use openai-responses:${model} for reasoning with tools, or set effective reasoning_effort to 'none'.`,
-      );
-    }
-  }
-  if (activeReasoning) {
-    const forbidden =
-      endpoint === 'openai'
-        ? ['temperature', 'top_p', 'top_logprobs', 'logprobs']
-        : ['temperature', 'top_p', 'top_logprobs'];
-    for (const key of forbidden) {
-      if (body[key] !== undefined)
-        fail(key, `Remove ${key} or set reasoning effort to 'none' on Sol or Luna.`);
-    }
-    if (
-      endpoint === 'openai-responses' &&
-      Array.isArray(body.include) &&
-      body.include.includes('message.output_text.logprobs')
-    ) {
-      fail(
-        'message.output_text.logprobs',
-        'Remove it from include or set reasoning effort to none on Sol or Luna.',
-      );
-    }
-  }
-}
-
-/** Exact GPT-5.6 IDs that support native `max` on the Responses endpoint. */
-const GPT_56_REASONING_MODELS = new Set([
-  'gpt-5.6',
-  'gpt-5.6-sol',
-  'gpt-5.6-terra',
-  'gpt-5.6-luna',
-]);
-
+/** Returns true when the Responses endpoint accepts native `max` for `model`. */
 export function supportsMaxReasoningEffort(model: string): boolean {
-  return GPT_56_REASONING_MODELS.has(model) || GPT_6_REASONING_MODELS.has(model);
+  return resolveOpenAIModelDescriptor(model).efforts.responses.includes('max');
 }
-
-export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
 /** Returns true for models that support reasoning_effort: 'none' (gpt-5.1+). */
 export function supportsReasoningNone(model: string): boolean {
-  return /^gpt-5\.[1-9]/.test(model) || model === 'gpt-6-sol' || model === 'gpt-6-luna';
+  return resolveOpenAIModelDescriptor(model).efforts.responses.includes('none');
 }
 
 /**
  * Returns true for models that support reasoning_effort: 'xhigh'.
  * Per OpenAI docs: "xhigh is supported for all models after gpt-5.1-codex-max."
- * This means gpt-5.2+ (gpt-5.1 itself does NOT support xhigh).
  */
 export function supportsXhigh(model: string): boolean {
-  // gpt-5.2+ — models after gpt-5.1-codex-max
-  return /^gpt-5\.([2-9]|\d{2,})/.test(model) || GPT_6_REASONING_MODELS.has(model);
+  return resolveOpenAIModelDescriptor(model).efforts.responses.includes('xhigh');
 }
 
 /**
- * Clamp reasoning_effort to model-supported range.
- *
- * Model constraints (from OpenAI API reference):
- * - gpt-5-pro: only supports 'high'
- * - gpt-5.1+: supports 'none', 'low', 'medium', 'high'
- * - Pre-gpt-5.1 (o-series, gpt-5, gpt-5-mini, gpt-5-nano): no 'none', default 'medium'
- * - xhigh: only models after gpt-5.1-codex-max (gpt-5.2+)
- * - max: only the exact GPT-5.6 family ids above in the shared/Responses resolver;
- *   Chat Completions applies its endpoint-specific xhigh cap afterward
+ * Clamp reasoning_effort to the levels Responses accepts for `model`. Chat
+ * Completions clamps against its own list in {@link resolveOpenAIChatReasoningEffort}.
  */
 export function clampReasoningEffort(model: string, effort: ReasoningEffort): ReasoningEffort {
-  if (model === 'gpt-6-astra' && (effort === 'none' || effort === 'minimal')) return 'low';
-  // gpt-5-pro only supports 'high'
-  if (model.startsWith('gpt-5-pro')) return 'high';
-
-  // 'none' only supported on gpt-5.1+; clamp to 'minimal' (closest to 'none')
-  if (effort === 'none' && !supportsReasoningNone(model)) return 'minimal';
-
-  // GPT-5.6 Responses adds a distinct max tier. Preserve max→xhigh for every
-  // earlier and unknown sibling; Chat applies its own xhigh cap downstream.
-  if (effort === 'max' && !supportsMaxReasoningEffort(model)) {
-    return clampReasoningEffort(model, 'xhigh');
-  }
-
-  // 'xhigh' only supported on gpt-5.2+
-  if (effort === 'xhigh' && !supportsXhigh(model)) return 'high';
-
-  return effort;
-}
-
-/** Map Effort to OpenAI reasoning_effort wire value. */
-export function effortToReasoningEffort(
-  effort: Exclude<Effort, 'none'>,
-  model?: string,
-): ReasoningEffort {
-  return effort === 'max' && model !== undefined && supportsMaxReasoningEffort(model)
-    ? 'max'
-    : effort === 'max'
-      ? 'xhigh'
-      : effort;
+  return clampToDescriptor(resolveOpenAIModelDescriptor(model), 'responses', effort);
 }
 
 /** Map budgetTokens to nearest OpenAI reasoning_effort. */
@@ -787,32 +913,106 @@ export function budgetToReasoningEffort(budget: number): ReasoningEffort {
   return 'high';
 }
 
-/** Resolve portable thinking controls to the one native OpenAI effort value. */
+function resolveEndpointReasoningEffort(
+  model: string,
+  endpoint: OpenAIEndpoint,
+  resolved: ResolvedThinkingOptions,
+): ReasoningEffort | undefined {
+  const descriptor = resolveOpenAIModelDescriptor(model);
+  if (!descriptor.reasoning) return undefined;
+  const requested: ReasoningEffort | undefined = resolved.hasBudgetOverride
+    ? budgetToReasoningEffort(resolved.thinkingBudget!)
+    : !resolved.thinkingDisabled && resolved.activeEffort
+      ? resolved.activeEffort
+      : resolved.thinkingDisabled
+        ? 'none'
+        : undefined;
+  return requested === undefined ? undefined : clampToDescriptor(descriptor, endpoint, requested);
+}
+
+/** Resolve portable thinking controls to the Responses `reasoning.effort` value. */
 export function resolveOpenAIReasoningEffort(
   model: string,
   resolved: ResolvedThinkingOptions,
 ): ReasoningEffort | undefined {
-  if (!supportsReasoningEffort(model)) return undefined;
-  if (resolved.hasBudgetOverride) {
-    return clampReasoningEffort(model, budgetToReasoningEffort(resolved.thinkingBudget!));
-  }
-  if (!resolved.thinkingDisabled && resolved.activeEffort) {
-    return clampReasoningEffort(model, effortToReasoningEffort(resolved.activeEffort, model));
-  }
-  return resolved.thinkingDisabled ? clampReasoningEffort(model, 'none') : undefined;
+  return resolveEndpointReasoningEffort(model, 'responses', resolved);
 }
 
-/**
- * Chat Completions currently caps GPT-5.6 at `xhigh`; the distinct `max`
- * tier is accepted by Responses. Keep the endpoint difference local so the
- * shared model capability resolver remains correct for Responses.
- */
+/** Resolve portable thinking controls to the Chat Completions `reasoning_effort` value. */
 export function resolveOpenAIChatReasoningEffort(
   model: string,
   resolved: ResolvedThinkingOptions,
 ): ReasoningEffort | undefined {
-  const effort = resolveOpenAIReasoningEffort(model, resolved);
-  return effort === 'max' && !GPT_6_REASONING_MODELS.has(model) ? 'xhigh' : effort;
+  return resolveEndpointReasoningEffort(model, 'chat', resolved);
+}
+
+/**
+ * Validate the final merged request (after `providerOptions`) for descriptors
+ * with `validatesFinalBody`. Portable options are reconciled while the body is
+ * built; anything still forbidden here was injected through a raw
+ * `providerOptions` field and is rejected before dispatch.
+ */
+export function validateOpenAIFinalRequestBody(
+  body: Record<string, unknown>,
+  endpoint: OpenAIEndpoint,
+): void {
+  const model = body.model;
+  if (typeof model !== 'string') return;
+  const descriptor = resolveOpenAIModelDescriptor(model);
+  if (!descriptor.validatesFinalBody) return;
+  const provider = endpoint === 'chat' ? 'openai' : 'openai-responses';
+  const fail = (option: string, remediation: string): never => {
+    throw new UnsupportedModelOptionError({ provider, model, option, remediation });
+  };
+  const rawEffort =
+    endpoint === 'chat'
+      ? body.reasoning_effort
+      : body.reasoning !== null && typeof body.reasoning === 'object'
+        ? (body.reasoning as { effort?: unknown }).effort
+        : undefined;
+  const accepted = descriptor.efforts[endpoint];
+  if (rawEffort !== undefined && !accepted.includes(rawEffort as ReasoningEffort)) {
+    fail('reasoning effort', `Use one of: ${accepted.join(', ')}.`);
+  }
+  // Omitting effort uses the model's declared default, not `none`.
+  const activeReasoning = (rawEffort ?? descriptor.defaultEffort) !== 'none';
+  if (endpoint === 'chat' && descriptor.chatTools !== 'allowed') {
+    const toolChoice = body.tool_choice;
+    const toolIntent =
+      (Array.isArray(body.tools) && body.tools.length > 0) ||
+      (toolChoice !== undefined &&
+        toolChoice !== null &&
+        toolChoice !== 'none' &&
+        toolChoice !== 'auto');
+    if (toolIntent && (descriptor.chatTools === 'never' || activeReasoning)) {
+      fail(
+        'Chat Completions tool calling',
+        descriptor.chatTools === 'never'
+          ? `Use openai-responses:${model} for tools.`
+          : `Use openai-responses:${model} for reasoning with tools, or set effective reasoning_effort to 'none'.`,
+      );
+    }
+  }
+  if (activeReasoning) {
+    const forbidden =
+      endpoint === 'chat'
+        ? ['temperature', 'top_p', 'top_logprobs', 'logprobs']
+        : ['temperature', 'top_p', 'top_logprobs'];
+    for (const key of forbidden) {
+      if (body[key] !== undefined)
+        fail(key, `Remove ${key} or set reasoning effort to 'none' on Sol or Luna.`);
+    }
+    if (
+      endpoint === 'responses' &&
+      Array.isArray(body.include) &&
+      body.include.includes('message.output_text.logprobs')
+    ) {
+      fail(
+        'message.output_text.logprobs',
+        'Remove it from include or set reasoning effort to none on Sol or Luna.',
+      );
+    }
+  }
 }
 
 /**
@@ -850,22 +1050,22 @@ export function resolveOpenAIEffortResolution(
 }
 
 /**
- * OpenAI Chat Completions reasoning emit. Computes `reasoning_effort` for
- * o-series / GPT-5.x models from the unified effort/thinkingBudget knobs and
- * signals when to strip `temperature` (always for o-series; for GPT-5.x only
- * when reasoning is active). Non-reasoning models get neither.
+ * OpenAI Chat Completions reasoning emit. Computes `reasoning_effort` from the
+ * unified effort/thinkingBudget knobs and signals when to strip the portable
+ * `temperature`, both from the model's {@link OpenAIModelDescriptor}.
+ * Non-reasoning models get neither.
  */
 export const openaiReasoningEmit: ReasoningEmit = (body, resolved, model) => {
-  const oSeries = isOSeriesModel(model);
-  const reasoningCapable = supportsReasoningEffort(model);
   const wireEffort = resolveOpenAIChatReasoningEffort(model, resolved);
 
   if (wireEffort) body.reasoning_effort = wireEffort;
 
   return {
-    stripTemperature:
-      oSeries ||
-      (reasoningCapable && wireEffort !== undefined && !GPT_6_REASONING_MODELS.has(model)),
+    stripTemperature: stripsPortableSampling(
+      resolveOpenAIModelDescriptor(model),
+      'chat',
+      wireEffort,
+    ),
   };
 };
 
@@ -926,7 +1126,7 @@ export class OpenAIProvider extends OpenAICompatibleProvider {
   }
 
   protected override validateFinalRequestBody(body: Record<string, unknown>): void {
-    validateGPT6RequestBody(body, 'openai');
+    validateOpenAIFinalRequestBody(body, 'chat');
   }
 
   protected override computeCost(

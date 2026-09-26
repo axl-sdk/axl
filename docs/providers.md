@@ -209,10 +209,14 @@ same-prefix signed thinking and the Opus-to-Fable 5.1 model switch, and
 reported safe reset reasons for an edited system prefix and a Fable-to-Opus
 switch. Further live calls verified edited tool and prior-message prefixes,
 native `error` rejection for a changed prefix, and terminal streamed reset.
-A runtime live case regenerated then reused an automatic `maxContext` summary;
-both continuations retained the signed tool turn and reported one safe reset
-per affected call. The full effort vocabulary and `none` clamp have local
-adapter coverage; live calls exercised `low` and `max`.
+The current runtime live case accepted a compacted tool-use/tool-result tail
+after Axl removed thinking signed to its old prefix; the first compacted call
+reported no reasoning reset. The case made four metered Opus 5.5 calls at an
+Axl usage-based cost estimate of $0.123324. It does not establish exact
+reasoning replay across independent sessions, restarts, or changing prompts
+and tools. See [session summary verification](verification/session-summary-coverage-2026-09-25.md).
+The full effort vocabulary and `none` clamp have local adapter coverage; live
+calls exercised `low` and `max`.
 
 The [Opus 5.5 model page](https://platform.claude.com/docs/en/models/opus-5-5/overview)
 publishes Standard text rates of $4 input, $20 output, $0.20 cache read, $5

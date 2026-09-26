@@ -509,6 +509,7 @@ describe.skipIf(!process.env.ANTHROPIC_API_KEY)('latest models: Anthropic live a
       tools: [acceptanceTool],
       toolChoice: 'none',
       maxTurns: 1,
+      maxTokens: 512,
       maxContext: 3400,
     });
 
@@ -549,8 +550,12 @@ describe.skipIf(!process.env.ANTHROPIC_API_KEY)('latest models: Anthropic live a
       firstRequests.filter((body) => !isSummary(body)).at(-1),
       secondRequests.filter((body) => !isSummary(body)).at(-1),
     ];
-    for (const body of continuations) {
+    for (const [index, body] of continuations.entries()) {
       expect(String(body?.system)).toContain('Summary of earlier conversation');
+      // A second compaction may legitimately summarize the seed tool exchange.
+      // The first compacted request is the provider acceptance check for its
+      // retained text/tool-use/tool-result without stale signed thinking.
+      if (index === 1 && secondSummary) continue;
       const messages = body?.messages as Array<{
         role: string;
         content: string | Array<{ type: string; text?: string; id?: string; tool_use_id?: string }>;

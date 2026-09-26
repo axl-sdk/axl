@@ -1,5 +1,7 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { agent } from '../agent.js';
+import { AxlRuntime } from '../runtime.js';
+import { workflow } from '../workflow.js';
 import { WorkflowContext } from '../context.js';
 import { AnthropicProvider } from '../providers/anthropic.js';
 import { GeminiProvider } from '../providers/gemini.js';
@@ -171,6 +173,44 @@ describe.skipIf(!process.env.OPENAI_API_KEY)('latest models: OpenAI live accepta
       expectMetered(await chat.chat(prompt, { model, maxTokens: 32, effort: 'none' }), 'static');
     },
     60_000,
+  );
+
+  afterEach(() => vi.restoreAllMocks());
+
+  // Owner remediation row: a portable temperature under the default (active)
+  // effort must be stripped from the wire, not rejected, and the provider must
+  // accept the resulting body on both endpoints.
+  it.each([
+    ['openai', 'gpt-6-astra'],
+    ['openai', 'gpt-6-sol'],
+    ['openai', 'gpt-6-luna'],
+    ['openai-responses', 'gpt-6-astra'],
+    ['openai-responses', 'gpt-6-sol'],
+    ['openai-responses', 'gpt-6-luna'],
+  ] as const)(
+    'GPT-6 %s strips a portable temperature under default effort for %s',
+    async (endpoint, model) => {
+      const bodies: Array<Record<string, unknown>> = [];
+      const originalFetch = globalThis.fetch;
+      vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+        bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return originalFetch(input, init);
+      });
+      const provider = endpoint === 'openai' ? chat : responses;
+      const response = await provider.chat(prompt, { model, maxTokens: 64, temperature: 0.2 });
+      expectMetered(response, 'static');
+      expect(bodies).toHaveLength(1);
+      expect(bodies[0].model).toBe(model);
+      expect(bodies[0]).not.toHaveProperty('temperature');
+      expect(bodies[0]).not.toHaveProperty('top_p');
+      // Default effort is active reasoning; no explicit effort was sent.
+      const effort =
+        endpoint === 'openai'
+          ? bodies[0].reasoning_effort
+          : (bodies[0].reasoning as { effort?: unknown } | undefined)?.effort;
+      expect(effort).toBeUndefined();
+    },
+    120_000,
   );
 
   it('Responses non-stream accepts gpt-5.6-luna with native max', async () => {
@@ -613,6 +653,119 @@ describe.skipIf(!process.env.ANTHROPIC_API_KEY)('latest models: Anthropic live a
     expect(firstResets.map((reset) => [reset.droppedBlocks, reset.reasons])).toEqual([
       [seedThinking, { client_prefix_rewrite: seedThinking }],
     ]);
+  }, 300_000);
+
+  // Owner remediation row: a second execution on the same session reuses the
+  // persisted per-agent ask-summary boundary, so the projected prefix is
+  // identical and thinking produced after the boundary stays valid.
+  it('Opus 5.5 reuses a persisted ask-summary boundary across executions with kept thinking', async () => {
+    const model = 'claude-opus-5-5';
+    const signal = AbortSignal.timeout(240_000);
+    const requests: Array<Record<string, unknown>> = [];
+    boundedFetch((body) => requests.push(body));
+    const isSummary = (body: Record<string, unknown>) =>
+      String(body.system).includes('Summarize the following conversation');
+
+    const runtime = new AxlRuntime({ defaultProvider: 'anthropic', diagnostics: { silent: true } });
+    runtime.registerProvider('anthropic', provider);
+    const store = runtime.getStateStore();
+    const sessionId = 'opus-55-live-boundary';
+    await store.saveSession(
+      sessionId,
+      Array.from({ length: 40 }, (_, index) => ({
+        role: index % 2 === 0 ? ('user' as const) : ('assistant' as const),
+        content: `Earlier exchange ${index}: ${'x'.repeat(200)}`,
+      })),
+    );
+    const events: AxlEvent[] = [];
+    runtime.on('trace', (event: AxlEvent) => events.push(event));
+    const worker = agent({
+      name: 'opus-live-boundary',
+      model: `anthropic:${model}`,
+      effort: 'max',
+      maxTurns: 1,
+      maxTokens: 768,
+      maxContext: 3400,
+    });
+    runtime.register(
+      workflow({ name: 'chat', input: z.string(), handler: (ctx) => ctx.ask(worker, ctx.input) }),
+    );
+    const session = runtime.session(sessionId);
+
+    await session.send(
+      'chat',
+      'Find the smallest positive integer n such that n mod 7 = 3, n mod 11 = 5, and n mod 13 = 8. Work it through carefully, then answer with just the number.',
+      { signal },
+    );
+    const firstEnd = requests.length;
+    const eventsAfterFirst = events.length;
+    const firstRequests = requests.slice(0, firstEnd);
+    expect(firstRequests.some(isSummary)).toBe(true);
+
+    const history = await store.getSession(sessionId);
+    const reply = history.at(-1);
+    expect(reply?.role).toBe('assistant');
+    const kept = ((reply?.providerMetadata?.anthropicThinkingBlocks as unknown[]) ?? []).filter(
+      (block) => (block as { type?: unknown }).type === 'thinking',
+    ) as Array<{ signature?: string }>;
+    if (kept.length === 0) {
+      throw new Error(
+        'Opus produced no signed thinking on the compacted first execution; the reuse row cannot be proven by this run',
+      );
+    }
+
+    await session.send('chat', 'Now give n squared mod 17. Answer with just the number.', {
+      signal,
+    });
+    const secondRequests = requests.slice(firstEnd);
+    const callCosts = events
+      .filter((event) => event.type === 'agent_call_end')
+      .map((event) => event.cost);
+    console.info(
+      `[frontier-boundary] calls=${callCosts.length} knownCostUsd=${callCosts
+        .reduce<number>((total, cost) => total + (typeof cost === 'number' ? cost : 0), 0)
+        .toFixed(6)} unpricedCalls=${callCosts.filter((cost) => typeof cost !== 'number').length}`,
+    );
+
+    // Reuse: no second summary call, one model call, same summary prefix.
+    expect(secondRequests.filter(isSummary)).toEqual([]);
+    expect(secondRequests).toHaveLength(1);
+    const body = secondRequests[0];
+    expect(String(body.system)).toContain('Summary of earlier conversation');
+    expect(String(body.system)).toBe(
+      String(firstRequests.filter((request) => !isSummary(request)).at(-1)?.system),
+    );
+    // The kept post-boundary thinking is replayed under drop_block ...
+    const messages = body.messages as Array<{
+      role: string;
+      content: string | Array<{ type: string; signature?: string }>;
+    }>;
+    expect(
+      messages.some(
+        (message) =>
+          message.role === 'assistant' &&
+          Array.isArray(message.content) &&
+          message.content.some(
+            (block) => block.type === 'thinking' && block.signature === kept[0].signature,
+          ),
+      ),
+    ).toBe(true);
+    expect((body.thinking as { block_binding?: unknown }).block_binding).toEqual({
+      prefix_mismatch_behavior: 'drop_block',
+    });
+    // ... and neither Axl nor Anthropic reports a reset on the second execution.
+    const secondResets = events
+      .slice(eventsAfterFirst)
+      .filter(
+        (event) =>
+          event.type === 'provider_diagnostic' && event.data.kind === 'reasoning_context_reset',
+      );
+    expect(secondResets).toEqual([]);
+    expect(
+      events
+        .slice(eventsAfterFirst)
+        .filter((event) => event.type === 'agent_call_end' && event.data.purpose === 'summary'),
+    ).toEqual([]);
   }, 300_000);
 
   it.each(['claude-fable-5-1', 'claude-fable-5', 'claude-opus-5', 'claude-sonnet-5'])(

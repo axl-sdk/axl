@@ -4347,11 +4347,9 @@ export class WorkflowContext<TInput = unknown> {
             scopeSignal?.throwIfAborted();
             const errorMsg = validateResult.reason ?? 'Validation failed';
             lastRetry = { error: errorMsg, output: rawOutput, parsed };
-            if (attempt === maxRetries) {
-              emitVerifyOutcome(false, attempt + 1, errorMsg);
-              if (options?.fallback !== undefined) return options.fallback;
-              throw new ValidationError(parsed, errorMsg, maxRetries);
-            }
+            // The catch below owns the terminal event and `fallback` for a
+            // ValidationError; handling them here too emitted two events.
+            if (attempt === maxRetries) throw new ValidationError(parsed, errorMsg, maxRetries);
             continue;
           }
         }

@@ -400,7 +400,7 @@ export type EvalItemFailure = {
   elapsedMs?: number;
   /** Graceful work budget consumed after excluded waits. */
   chargedMs?: number;
-  /** Observed SDK governor wait on completed provider turns. */
+  /** Reported governor wait summed over completed provider turns (diagnostic only). */
   queuedMs?: number;
   /** Failed provider attempts and non-governor retry backoff. */
   retryMs?: number;

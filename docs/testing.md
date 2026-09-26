@@ -498,7 +498,7 @@ result.summary.itemErrorRate;
 
 Each failed item says why on `item.failure`, taken from the first `ProviderError` on the
 thrown value or its `cause` chain, and the CLI
-groups the failed items by it (`Failure causes: 5 × 429 (openai), 1 × other`):
+groups the failed items by it (`Failure causes: 5 × 429 (openai), 1 × timeout, 1 × other`):
 
 ```ts
 result.items[0].failure;
@@ -510,10 +510,10 @@ result.items[1].failure;
 ```
 
 When no `ProviderError` takes precedence, a `TimeoutError` preserves finite numeric
-breakdown fields on `failure`. `elapsedMs` is the ask's elapsed timeout time after
-`awaitHuman` exclusion and before governor credit; `chargedMs` is the work counted against
-that graceful budget. `EvalItem.duration` remains full workflow wall time, including queue
-and human waits. Missing custom-provider timing earns no inferred queue credit. Under
+breakdown fields on `failure`. `elapsedMs` is the ask's wall time including human and
+governor pauses; `chargedMs` is the work counted against that graceful budget.
+`EvalItem.duration` remains full workflow wall time. Reported custom-provider timing earns
+no credit; only waits observed on the ask clock do. Under
 Studio's `trace.redact`, these known numeric fields remain visible and `item.error` is masked.
 
 `failure` never records `ProviderError.body` or an error message; `item.error` keeps the

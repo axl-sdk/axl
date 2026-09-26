@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { currentAskClock, pauseAskClocks, pausedAskClockMs, runWithAskClock } from './ask-clock.js';
 import { randomUUID } from 'node:crypto';
 import { z, ZodError } from 'zod';
 import type {
@@ -123,14 +124,6 @@ const signalStorage = new AsyncLocalStorage<AbortSignal>();
  * accounting from non-cooperative losers. */
 const hardSignalStorage = new AsyncLocalStorage<AbortSignal>();
 
-/** Active graceful ask budgets in this async branch. `awaitHuman` pauses all
- * enclosing budgets so a nested human gate cannot consume a parent's budget. */
-type AskTimeoutTracker = {
-  humanWaitMs: number;
-  activeHumanWaits: number;
-  humanWaitStartedAt?: number;
-};
-const timeoutTrackerStorage = new AsyncLocalStorage<AskTimeoutTracker[]>();
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 function composeAbortSignals(...signals: Array<AbortSignal | undefined>): AbortSignal | undefined {
@@ -165,15 +158,6 @@ function raceWithAbortSignal<T>(promise: Promise<T>, signal?: AbortSignal): Prom
       (error) => finish(() => reject(error)),
     );
   });
-}
-
-function pausedHumanWaitMs(tracker: AskTimeoutTracker, now = Date.now()): number {
-  return (
-    tracker.humanWaitMs +
-    (tracker.activeHumanWaits > 0 && tracker.humanWaitStartedAt !== undefined
-      ? now - tracker.humanWaitStartedAt
-      : 0)
-  );
 }
 
 type BranchDrainState = {
@@ -1774,9 +1758,9 @@ export class WorkflowContext<TInput = unknown> {
     },
     sessionHistory: ChatMessage[] = normalizeSessionHistory(this.sessionHistory),
   ): Promise<unknown> {
-    const tracker: AskTimeoutTracker = { humanWaitMs: 0, activeHumanWaits: 0 };
-    const enclosing = timeoutTrackerStorage.getStore() ?? [];
-    return timeoutTrackerStorage.run([...enclosing, tracker], () =>
+    // The ask-clock scope wraps the whole ask, including every streaming
+    // `next()`, so governor waits reached on iterator advancement are seen.
+    return runWithAskClock(() =>
       this.executeAgentCallImpl(
         agent,
         input,
@@ -2182,16 +2166,12 @@ export class WorkflowContext<TInput = unknown> {
       );
     }
     const startTime = Date.now();
-    const timeoutTracker = timeoutTrackerStorage.getStore()?.at(-1);
+    const askClock = currentAskClock();
     // Per-ask latency attribution, summed over completed turns. `turns` counts
     // only turns whose provider actually reported timing — zero means the
     // provider is uninstrumented, and the TimeoutError message stays bare
     // rather than blaming the remainder on tools and gates.
     const timingTotals = { turns: 0, queuedMs: 0, retryMs: 0, wireMs: 0 };
-    // Only this ask's completed provider turns can pause its graceful clock.
-    // Keep the diagnostic sum above unchanged; malformed custom timing earns
-    // no clock credit.
-    let queuedCreditMs = 0;
 
     // Streaming + validate is supported as of the unified event model
     // (spec §4.1). With pipeline events landing in PR 2, retry boundaries
@@ -2235,9 +2215,12 @@ export class WorkflowContext<TInput = unknown> {
 
       // Timeout check
       const now = Date.now();
-      const elapsedMs =
-        now - startTime - (timeoutTracker ? pausedHumanWaitMs(timeoutTracker, now) : 0);
-      const chargedMs = Math.max(0, elapsedMs - Math.min(queuedCreditMs, Math.max(0, elapsedMs)));
+      // Paused time is observed directly (awaitHuman gates and SDK governor
+      // waits recorded on this ask's clock), never inferred from reported
+      // provider timing, so a custom provider's `queuedMs` earns no credit.
+      const elapsedMs = now - startTime;
+      const pausedMs = askClock ? pausedAskClockMs(askClock, now) : 0;
+      const chargedMs = Math.max(0, elapsedMs - Math.min(pausedMs, Math.max(0, elapsedMs)));
       if (chargedMs > timeoutMs) {
         throw new TimeoutError(
           'ctx.ask()',
@@ -2809,9 +2792,6 @@ export class WorkflowContext<TInput = unknown> {
         timingTotals.queuedMs += response.timing.queuedMs;
         timingTotals.retryMs += response.timing.retryMs;
         timingTotals.wireMs += response.timing.wireMs;
-        if (Number.isFinite(response.timing.queuedMs) && response.timing.queuedMs > 0) {
-          queuedCreditMs += response.timing.queuedMs;
-        }
       }
 
       // Snapshot of what we actually sent the provider this turn (excluding the
@@ -4803,12 +4783,7 @@ export class WorkflowContext<TInput = unknown> {
   // ── ctx.awaitHuman() ──────────────────────────────────────────────────
 
   async awaitHuman(options: AwaitHumanOptions): Promise<HumanDecision> {
-    const trackers = timeoutTrackerStorage.getStore();
-    const startedAt = Date.now();
-    for (const tracker of trackers ?? []) {
-      if (tracker.activeHumanWaits++ === 0) tracker.humanWaitStartedAt = startedAt;
-    }
-    try {
+    return pauseAskClocks(async () => {
       if (this.spanManager) {
         return await this.spanManager.withSpanAsync(
           'axl.ctx.awaitHuman',
@@ -4825,16 +4800,7 @@ export class WorkflowContext<TInput = unknown> {
         );
       }
       return await this._awaitHumanImpl(options);
-    } finally {
-      const finishedAt = Date.now();
-      for (const tracker of trackers ?? []) {
-        tracker.activeHumanWaits--;
-        if (tracker.activeHumanWaits === 0 && tracker.humanWaitStartedAt !== undefined) {
-          tracker.humanWaitMs += finishedAt - tracker.humanWaitStartedAt;
-          tracker.humanWaitStartedAt = undefined;
-        }
-      }
-    }
+    });
   }
 
   private async _awaitHumanImpl(options: AwaitHumanOptions): Promise<HumanDecision> {

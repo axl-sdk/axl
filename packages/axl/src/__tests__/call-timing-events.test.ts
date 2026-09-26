@@ -315,7 +315,9 @@ describe('TimeoutError breakdown (AC-5)', () => {
     expect(timeout.message).toContain('wire 5ms');
     expect(timeout.breakdown).toMatchObject({ queuedMs: 40, retryMs: 0, wireMs: 5 });
     expect(timeout.breakdown!.elapsedMs).toBeGreaterThan(50);
-    expect(timeout.breakdown!.chargedMs).toBe(timeout.breakdown!.elapsedMs - 40);
+    // Reported `queuedMs` is diagnostic only: this custom provider bypasses
+    // the SDK governor, so no wait was observed and nothing is credited.
+    expect(timeout.breakdown!.chargedMs).toBe(timeout.breakdown!.elapsedMs);
     // The message shows the number actually compared with the budget, so a
     // reader never sees elapsed > timeout with a large queued figure and
     // concludes the governor exclusion did not apply.
@@ -361,7 +363,7 @@ describe('TimeoutError breakdown (AC-5)', () => {
     expect(callEnds(traces)).toHaveLength(2);
     const { breakdown } = err as TimeoutError;
     expect(breakdown).toMatchObject({ queuedMs: 55, retryMs: 300, wireMs: 20 });
-    expect(breakdown!.chargedMs).toBe(breakdown!.elapsedMs - 55);
+    expect(breakdown!.chargedMs).toBe(breakdown!.elapsedMs);
     expect((err as TimeoutError).message).toContain('queued 55ms');
     expect((err as TimeoutError).message).toContain('retries 300ms');
     expect((err as TimeoutError).message).toContain('wire 20ms');

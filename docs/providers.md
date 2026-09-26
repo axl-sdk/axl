@@ -551,8 +551,8 @@ below.
   separate from the 2 retries for `503`/`529`/network errors. A call against a
   saturated account can take several minutes, without holding a permit. Use an ask
   `signal: AbortSignal.timeout(...)` to bound that whole wait. The graceful ask
-  `timeout` is checked between turns and excludes observed governor wait from completed
-  provider turns owned by that ask; `stallTimeout` starts only after dispatch.
+  `timeout` is checked between turns and excludes governor wait observed in `fetchWithRetry`,
+  on every enclosing ask; `stallTimeout` starts only after dispatch.
   `RateLimitConfig.acquireTimeoutMs` is a separate cap on initial admission wait.
   `AdmissionController` can stop the next dispatch when spend closes. When the retry budget runs out,
   the last `429` surfaces as a `ProviderError` with its raw body and `retryAfterMs`.
@@ -801,9 +801,10 @@ What that means differs by transport, because headers mean different things:
 
 Either way, time spent downloading or draining a body lands in `agent_call_end.duration`
 and in the `other` remainder of a `TimeoutError` breakdown, never in `queuedMs`.
-`queuedMs` remains a diagnostic. For `ctx.ask.timeout`, only observed governor wait from
-that ask's completed turns earns credit: a parent still charges the time its tool waits on a
-nested ask, and sibling asks have independent clocks. `TimeoutError.breakdown.chargedMs`
+`queuedMs` remains a diagnostic. For `ctx.ask.timeout`, credit comes from the governor waits
+`fetchWithRetry` observes, recorded on every enclosing ask exactly like `awaitHuman`: a parent
+is credited while a nested ask in its tool queues, and sibling asks have independent clocks.
+A custom adapter that runs its own queue outside `fetchWithRetry` earns no credit. `TimeoutError.breakdown.chargedMs`
 shows the resulting budget time; `EvalItem.duration` and `agent_call_end.duration` remain
 wall-clock durations that include queue wait.
 
@@ -818,10 +819,9 @@ request the same window runs from dispatch through completion. A silent request 
 
 Use an ask or context `signal` for a strict total SLA, including the 429 brake,
 retry backoff, and limiter queue. The cumulative `timeout` is checked between turns: it
-excludes `awaitHuman` wait and observed governor wait from that ask's completed provider
-turns, but provider service, tool/gate work, and non-governor retry/backoff remain charged.
-A parent ask still charges a tool's time waiting on a nested ask; sibling asks do not share
-credit. Missing timing from a custom provider means no inferred governor credit.
+excludes `awaitHuman` wait and governor wait observed in `fetchWithRetry`, on every enclosing
+ask, but provider service, tool/gate work, and non-governor retry/backoff remain charged.
+Sibling asks do not share credit. Reported custom-provider timing earns no credit.
 `RateLimitConfig.acquireTimeoutMs` separately bounds initial queue admission. Provider
 transports receive the composed signal; the first context, branch, or ask signal to abort wins
 and its exact external reason propagates unchanged. Custom providers should pass `ChatOptions.signal` to their

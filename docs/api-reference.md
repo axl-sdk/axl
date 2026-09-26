@@ -201,7 +201,7 @@ const myAgent = agent({
 | `stop` | `string[]` | — | Stop sequences — generation stops when any sequence is encountered. Not supported by the `openai-responses` provider (silently ignored) |
 | `providerOptions` | `Record<string, unknown>` | — | Provider-specific options shallow-merged into the raw API request body via `Object.assign`. Not portable across providers. See [shallow merge caveat](providers.md#provideroptions) |
 | `maxTurns` | `number` | `25` | Maximum tool-call loop iterations before throwing `MaxTurnsError`. **A "turn" in axl is one provider call inside a single `ctx.ask()`** — not a user↔assistant exchange. Schema/validate/guardrail retries also consume turns. See [Sessions → Turns vs. Exchanges](#turns-vs-exchanges) |
-| `timeout` | `string` | `defaults.timeout`, else `'60s'` | Graceful cumulative between-turn work budget. The current provider turn and ordinary tool work finish before Axl decides whether to start another turn. It excludes `awaitHuman` wait and, unconditionally, observed SDK governor wait from this ask's completed provider turns: first-permit queueing, configured spacing, adaptive pacing, 429 pauses, and re-acquisition. No governor credit is inferred when provider timing is missing. A parent ask still charges the time its tool waits on a nested ask, and sibling asks have independent clocks. Provider service, gates, tools, and non-governor retry/backoff count. Use `signal: AbortSignal.timeout(...)` for a strict wall-clock deadline. |
+| `timeout` | `string` | `defaults.timeout`, else `'60s'` | Graceful cumulative between-turn work budget. The current provider turn and ordinary tool work finish before Axl decides whether to start another turn. It excludes `awaitHuman` wait and, unconditionally, SDK governor wait observed at the `fetchWithRetry` chokepoint: first-permit queueing, configured spacing, adaptive pacing, 429 pauses, and re-acquisition. Both pauses apply to every enclosing ask, so a parent is credited while a nested ask in its tool queues, and overlapping pauses count once. Sibling asks have independent clocks. Reported `CallTiming.queuedMs` is diagnostic only and never earns credit; a custom adapter is credited exactly when it routes through `fetchWithRetry`. Provider service, gates, tools, and non-governor retry/backoff count. Use `signal: AbortSignal.timeout(...)` for a strict wall-clock deadline. |
 | `stallTimeout` | `string` | `defaults.stallTimeout`, else unset | Opt-in hard provider-request stall limit. See [Ask deadlines, cancellation, and stalled requests](#ask-deadlines-cancellation-and-stalled-requests). |
 | `maxContext` | `number` | — | Estimated token limit for context window management |
 | `version` | `string` | — | Prompt version label attached to trace events |
@@ -540,7 +540,7 @@ const data = await ctx.ask(myAgent, 'Extract the user profile', {
 | `toolChoice` | `'auto' \| 'none' \| 'required' \| { type: 'function', function: { name } }` | agent config | Override tool choice for this call |
 | `stop` | `string[]` | agent config | Override stop sequences for this call |
 | `providerOptions` | `Record<string, unknown>` | agent config | Override provider-specific options for this call. Shallow-merged; see [caveat](providers.md#provideroptions) |
-| `timeout` | `string` | agent config → `defaults.timeout` → `'60s'` | Override the graceful cumulative between-turn work budget. The current provider turn and ordinary tool work finish; `awaitHuman` wait and observed SDK governor wait from this ask's completed turns are excluded. It does not interrupt an active turn. |
+| `timeout` | `string` | agent config → `defaults.timeout` → `'60s'` | Override the graceful cumulative between-turn work budget. The current provider turn and ordinary tool work finish; `awaitHuman` wait and observed SDK governor wait are excluded, on this ask and every enclosing ask. It does not interrupt an active turn. |
 | `stallTimeout` | `string` | agent config → `defaults.stallTimeout` → unset | Opt-in hard limit for a provider request that makes no progress. Streaming resets the idle clock on every chunk; non-streaming uses a dispatch-to-completion limit. |
 | `signal` | `AbortSignal` | — | Per-ask hard cancellation/deadline. Composed with the context/branch signal; first abort wins and nested asks inherit it. |
 
@@ -562,13 +562,13 @@ These controls deliberately cover different failure modes:
 
 | Need | Use | Behavior |
 |---|---|---|
-| Let active work finish but stop more turns | `timeout` | Graceful 60-second default; cumulative and checked between provider turns and retries. It excludes `awaitHuman` wait and observed SDK governor wait from this ask's completed provider turns. |
+| Let active work finish but stop more turns | `timeout` | Graceful 60-second default; cumulative and checked between provider turns and retries. It excludes `awaitHuman` wait and observed SDK governor wait, on every enclosing ask. |
 | Stop a stuck provider request | `stallTimeout` | Opt-in. On streams, aborts after an idle gap with no chunk (every chunk resets it); on non-stream calls, aborts if dispatch-to-completion exceeds it. It covers provider work only, never tools or `awaitHuman`. Start with `'120s'` unless your provider/model evidence supports a different idle window; this is guidance, not an SDK default. |
 | Enforce a strict wall-clock SLA or cancel now | `signal` | Hard-aborts an in-flight request and discards any partial response. Use `AbortSignal.timeout()` for a deadline. |
 
 Neither `timeout` nor `stallTimeout` interrupts an active 429 pause, limiter queue,
-or transport backoff. Observed governor wait is excluded from the graceful budget only when
-reported by a completed turn owned by that ask; missing provider timing earns no credit. A
+or transport backoff. Governor wait is excluded from the graceful budget only when observed in `fetchWithRetry`;
+reported provider timing earns no credit. A
 single provider turn can outlast either value. `RateLimitConfig.acquireTimeoutMs` separately
 bounds initial admission wait; pass an ask or context `signal` to cap the whole wall-clock wait.
 
@@ -2558,9 +2558,9 @@ All errors extend `AxlError`.
 ### `TimeoutBreakdown` (`TimeoutError.breakdown`)
 
 Where a timed-out `ctx.ask()`'s budget went, summed over its completed provider turns.
-Exported from `@axlsdk/axl`. `elapsedMs` is the `Date.now()` delta from ask start after
-subtracting `awaitHuman` pauses; it still includes observed governor wait. It is not the full
-workflow wall duration reported by `EvalItem.duration`.
+Exported from `@axlsdk/axl`. `elapsedMs` is the plain `Date.now()` delta from ask start,
+including `awaitHuman` and governor pauses. It is not the full workflow wall duration reported
+by `EvalItem.duration`.
 
 **Present only when at least one completed turn reported provider [`timing`](#calltiming).**
 Otherwise `.breakdown` is `undefined` and the message is the bare prefix — an all-zero
@@ -2568,16 +2568,15 @@ breakdown would blame tools and gates for a budget the provider simply never mea
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `elapsedMs` | `number` | Ask elapsed time at the check, with `awaitHuman` wait removed and before governor credit |
-| `chargedMs` | `number` | Required graceful-budget measurement: `elapsedMs` less eligible observed governor wait, capped at `elapsedMs`. This is the value compared with `timeout` |
-| `queuedMs` | `number` | Sum of `CallTiming.queuedMs` as a diagnostic; credit applies only to finite, non-negative queue timing from this ask's completed turns. Missing timing earns no credit, and total credit cannot exceed `elapsedMs` |
+| `elapsedMs` | `number` | Wall clock from ask start to the check, including paused time |
+| `chargedMs` | `number` | Required graceful-budget measurement: `elapsedMs` less `awaitHuman` and observed governor pauses, clamped to `[0, elapsedMs]`. This is the value compared with `timeout` |
+| `queuedMs` | `number` | Sum of `CallTiming.queuedMs` over completed turns, as a diagnostic. It never feeds `chargedMs`: credit comes from waits observed on the ask clock, so it may differ from the credited amount (an uncompleted turn's queue, or a nested ask's) |
 | `retryMs` | `number` | Sum of `CallTiming.retryMs` — failed provider attempts and their non-governor backoff |
 | `wireMs` | `number` | Sum of `CallTiming.wireMs` — provider time |
 | `otherMs` | `number` | `elapsedMs` minus the three timing sums: tools, gates, runtime work, response-body download, and any async `apiKey` callback. Clamped at `0` |
 
-Only this ask's completed provider turns earn queue credit. A parent ask still charges the
-time its tool spends waiting on a nested ask, and sibling asks do not share credit.
-Gate-retry turns (schema / validate / guardrail) count as completed turns. A turn that threw
+Governor waits pause every enclosing ask clock, so a parent is credited while a nested ask in
+its tool queues; sibling asks do not share credit. Gate-retry turns (schema / validate / guardrail) count as completed turns. A turn that threw
 contributes no timing — a failed provider call ends the ask, so no later turn can reach the
 timeout check.
 
@@ -2683,7 +2682,7 @@ Per-item result from an eval run. `scores` provides quick numeric access; `score
 | `cost` | `number?` | Measured generation spend for this item — a view of `accounting.breakdown.generation`. A case that threw **after** a paid call still carries that charge. Not a caller-reported figure (see `callerReport`) |
 | `scorerCost` | `number?` | Measured judging spend for this item — a view of `accounting.breakdown.judging` |
 | `outcome` | `EvalItemOutcome?` | `'completed'`, `'failed'`, `'cancelled'`, `'budget_skipped'` (never started) or `'budget_interrupted'` (stopped mid-flight when its next call was denied). Absent on pre-0.24 artifacts, where it can be derived as `error ? 'failed' : 'completed'` |
-| `failure` | `EvalItemFailure?` | Structured cause of a `failed` item, captured before the thrown value is flattened to `error`. A `ProviderError` found in the thrown value or bounded `cause` chain takes precedence and supplies `name`, `provider?`, `status?`, `retryable?`, and `requestId?`; otherwise a recognized `TimeoutError` contributes its finite `elapsedMs?`, `chargedMs?`, `queuedMs?`, `retryMs?`, `wireMs?`, and `otherMs?` breakdown fields. `elapsedMs` is ask elapsed time after `awaitHuman` exclusion and before governor credit; `chargedMs` is the graceful budget consumed. `EvalItem.duration` remains full workflow wall time. No provider timing means no inferred queue credit. `failure` never records `ProviderError.body` or the error message; `item.error` keeps the message as before. Studio redaction keeps the known failure fields and masks `item.error`. Absent on other outcomes and legacy artifacts. Carried through `rescore`. `EvalItemFailure` is exported from `@axlsdk/eval` |
+| `failure` | `EvalItemFailure?` | Structured cause of a `failed` item, captured before the thrown value is flattened to `error`. A `ProviderError` found in the thrown value or bounded `cause` chain takes precedence and supplies `name`, `provider?`, `status?`, `retryable?`, and `requestId?`; otherwise a recognized `TimeoutError` contributes its finite `elapsedMs?`, `chargedMs?`, `queuedMs?`, `retryMs?`, `wireMs?`, and `otherMs?` breakdown fields. `elapsedMs` is ask wall time including paused waits; `chargedMs` is the graceful budget consumed. `EvalItem.duration` remains full workflow wall time. `failure` never records `ProviderError.body` or the error message; `item.error` keeps the message as before. Studio redaction keeps the known failure fields and masks `item.error`. Absent on other outcomes and legacy artifacts. Carried through `rescore`. `EvalItemFailure` is exported from `@axlsdk/eval` |
 | `accounting` | `Accounting?` | This item's measured spend across generation **and** judging, with `breakdown` splitting the two. A child scope that finalizes with an operation still in flight records it `abandoned` locally while the run scope still receives the real settlement, so an item and its run can disagree about one operation — **do not reconcile by subtraction**; the run-level `knownCost` is authoritative |
 | `callerReport` | `{ cost?, metadata? }?` | What the `executeWorkflow` callback claimed, kept for inspection and **never** folded into any total. `cost` is the callback's returned number (invalid values are dropped with a warning); `metadata` holds reserved diagnostic keys (`models`, `tokens`, …) that would otherwise have overridden the runtime's own |
 | `scoreDetails` | `Record<string, ScorerDetail>?` | Rich per-scorer data — includes `metadata` (e.g., LLM reasoning), per-scorer `duration`, and `cost` |

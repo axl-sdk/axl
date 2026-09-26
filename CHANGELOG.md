@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.3] - 2026-09-25
+
 ### Fixed
 
 - `AdmissionDeniedError` now passes the workflow-context recovery boundaries unwrapped, as documented. `ctx.verify` no longer retries it, wraps it in a `VerifyError` / `ValidationError`, or returns `fallback` for it; a denial thrown by `ctx.ask`'s or `ctx.verify`'s `validate` is no longer treated as a validation failure; and `ctx.race` rejects with it instead of discarding the branch.

@@ -925,6 +925,7 @@ describe('ctx.ask timeout and deadline contract (spec 23)', () => {
           name: 'built-in-two',
           model: 'controlled:gpt-4o',
           system: 'test',
+          timeout: '30ms',
           stallTimeout: '50ms',
         }),
         'two',
@@ -942,6 +943,337 @@ describe('ctx.ask timeout and deadline contract (spec 23)', () => {
       expect(secondEnd).toMatchObject({ timing: { queuedMs: 100 } });
     } finally {
       globalThis.fetch = originalFetch;
+      vi.useRealTimers();
+    }
+  });
+
+  it('credits a completed built-in provider turn queued behind one permit before a tool continuation', async () => {
+    vi.useFakeTimers();
+    const originalFetch = globalThis.fetch;
+    try {
+      const firstFetchEntered = deferred<void>();
+      const releaseFirst = deferred<void>();
+      let fetches = 0;
+      globalThis.fetch = (async () => {
+        const index = fetches++;
+        if (index === 0) {
+          firstFetchEntered.resolve();
+          await releaseFirst.promise;
+        }
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () =>
+            index === 1
+              ? {
+                  choices: [
+                    {
+                      message: {
+                        role: 'assistant',
+                        content: null,
+                        tool_calls: [
+                          {
+                            id: 'next',
+                            type: 'function',
+                            function: { name: 'next_turn', arguments: '{}' },
+                          },
+                        ],
+                      },
+                      finish_reason: 'tool_calls',
+                    },
+                  ],
+                  usage,
+                }
+              : openAIResponse,
+          text: async () => '',
+        };
+      }) as typeof fetch;
+      const provider = new OpenAIProvider({ apiKey: 'test-key', rateLimit: { maxConcurrent: 1 } });
+      const nextTurn = tool({
+        name: 'next_turn',
+        description: 'force another provider turn',
+        input: z.object({}),
+        handler: async () => 'done',
+      });
+      const ctx = context(provider);
+      const blocker = ctx.ask(baseAgent({ name: 'blocker' }), 'hold');
+      await firstFetchEntered.promise;
+      const asked = ctx.ask(
+        baseAgent({ name: 'queued', timeout: '30ms', tools: [nextTurn] }),
+        'go',
+      );
+      await vi.advanceTimersByTimeAsync(50);
+      releaseFirst.resolve();
+      await expect(blocker).resolves.toBe('built-in response');
+      await expect(asked).resolves.toBe('built-in response');
+      expect(fetches).toBe(3);
+    } finally {
+      globalThis.fetch = originalFetch;
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([NaN, Infinity, -10])(
+    'does not credit malformed custom queuedMs %s',
+    async (queuedMs) => {
+      vi.useFakeTimers();
+      try {
+        const nextTurn = tool({
+          name: 'next_turn',
+          description: 'force another provider turn',
+          input: z.object({}),
+          handler: async () => 'done',
+        });
+        const provider = {
+          name: 'controlled',
+          chat: async () => {
+            await wait(40);
+            return {
+              content: '',
+              tool_calls: [
+                { id: 'next', type: 'function', function: { name: 'next_turn', arguments: '{}' } },
+              ],
+              usage,
+              timing: { queuedMs, attempts: 1, retryMs: 0, ttfbMs: 0, wireMs: 0 },
+            };
+          },
+          stream: async function* () {},
+        };
+        const asked = context(provider).ask(
+          baseAgent({ timeout: '30ms', tools: [nextTurn] }),
+          'go',
+        );
+        const rejected = expect(asked).rejects.toBeInstanceOf(TimeoutError);
+        await vi.advanceTimersByTimeAsync(40);
+        await rejected;
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it('clamps an oversized finite custom queue report to elapsed time', async () => {
+    vi.useFakeTimers();
+    try {
+      let calls = 0;
+      const nextTurn = tool({
+        name: 'next_turn',
+        description: 'force another provider turn',
+        input: z.object({}),
+        handler: async () => 'done',
+      });
+      const provider = {
+        name: 'controlled',
+        chat: async () => {
+          calls++;
+          if (calls === 2) return { content: 'completed', usage };
+          await wait(40);
+          return {
+            content: '',
+            tool_calls: [
+              { id: 'next', type: 'function', function: { name: 'next_turn', arguments: '{}' } },
+            ],
+            usage,
+            timing: { queuedMs: 1000, attempts: 1, retryMs: 0, ttfbMs: 0, wireMs: 0 },
+          };
+        },
+        stream: async function* () {},
+      };
+      const asked = context(provider).ask(baseAgent({ timeout: '30ms', tools: [nextTurn] }), 'go');
+      await vi.advanceTimersByTimeAsync(40);
+      await expect(asked).resolves.toBe('completed');
+      expect(calls).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps the charged budget cumulative across completed provider turns', async () => {
+    vi.useFakeTimers();
+    try {
+      let calls = 0;
+      const nextTurn = tool({
+        name: 'next_turn',
+        description: 'force another provider turn',
+        input: z.object({}),
+        handler: async () => 'done',
+      });
+      const provider = {
+        name: 'controlled',
+        chat: async () => {
+          calls++;
+          await wait(calls === 1 ? 50 : 30);
+          return {
+            content: '',
+            tool_calls: [
+              {
+                id: `next-${calls}`,
+                type: 'function',
+                function: { name: 'next_turn', arguments: '{}' },
+              },
+            ],
+            usage,
+            timing: {
+              queuedMs: calls === 1 ? 40 : 0,
+              attempts: 1,
+              retryMs: 0,
+              ttfbMs: 0,
+              wireMs: 0,
+            },
+          };
+        },
+        stream: async function* () {},
+      };
+      const asked = context(provider).ask(baseAgent({ timeout: '35ms', tools: [nextTurn] }), 'go');
+      const rejected = expect(asked).rejects.toBeInstanceOf(TimeoutError);
+      await vi.advanceTimersByTimeAsync(80);
+      await rejected;
+      expect(calls).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not credit a parent ask for a nested ask queued inside its tool', async () => {
+    vi.useFakeTimers();
+    try {
+      const child = baseAgent({ name: 'child', model: 'controlled:child', timeout: '30ms' });
+      const callChild = tool({
+        name: 'call_child',
+        description: 'nested ask',
+        input: z.object({}),
+        handler: async (_input, toolCtx) => toolCtx.ask(child, 'go'),
+      });
+      let outerCalls = 0;
+      const provider = {
+        name: 'controlled',
+        chat: async (_messages: unknown, options: { model: string }) => {
+          if (options.model === 'child') {
+            await wait(50);
+            return {
+              content: 'child done',
+              usage,
+              timing: { queuedMs: 50, attempts: 1, retryMs: 0, ttfbMs: 0, wireMs: 0 },
+            };
+          }
+          outerCalls++;
+          return {
+            content: '',
+            usage,
+            tool_calls: [
+              { id: 'child', type: 'function', function: { name: 'call_child', arguments: '{}' } },
+            ],
+            timing: { queuedMs: 0, attempts: 1, retryMs: 0, ttfbMs: 0, wireMs: 0 },
+          };
+        },
+        stream: async function* () {},
+      };
+      const asked = context(provider).ask(baseAgent({ timeout: '30ms', tools: [callChild] }), 'go');
+      const rejected = expect(asked).rejects.toBeInstanceOf(TimeoutError);
+      await vi.advanceTimersByTimeAsync(50);
+      await rejected;
+      expect(outerCalls).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not apply one sibling ask’s queued credit to another sibling', async () => {
+    vi.useFakeTimers();
+    try {
+      const nextTurn = tool({
+        name: 'next_turn',
+        description: 'force another provider turn',
+        input: z.object({}),
+        handler: async () => 'done',
+      });
+      const provider = {
+        name: 'controlled',
+        chat: async (_messages: unknown, options: { model: string }) => {
+          await wait(50);
+          if (options.model === 'queued') {
+            return {
+              content: 'queued done',
+              usage,
+              timing: { queuedMs: 50, attempts: 1, retryMs: 0, ttfbMs: 0, wireMs: 0 },
+            };
+          }
+          return {
+            content: '',
+            usage,
+            tool_calls: [
+              { id: 'next', type: 'function', function: { name: 'next_turn', arguments: '{}' } },
+            ],
+            timing: { queuedMs: 0, attempts: 1, retryMs: 0, ttfbMs: 0, wireMs: 0 },
+          };
+        },
+        stream: async function* () {},
+      };
+      const ctx = context(provider);
+      const queued = ctx.ask(
+        baseAgent({ name: 'queued', model: 'controlled:queued', timeout: '30ms' }),
+        'go',
+      );
+      const working = ctx.ask(
+        baseAgent({
+          name: 'working',
+          model: 'controlled:working',
+          timeout: '30ms',
+          tools: [nextTurn],
+        }),
+        'go',
+      );
+      const rejected = expect(working).rejects.toBeInstanceOf(TimeoutError);
+      await vi.advanceTimersByTimeAsync(50);
+      await expect(queued).resolves.toBe('queued done');
+      await rejected;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('credits a streaming turn whose reported queue wait occurs on iterator advancement', async () => {
+    vi.useFakeTimers();
+    try {
+      let calls = 0;
+      const nextTurn = tool({
+        name: 'next_turn',
+        description: 'force another provider turn',
+        input: z.object({}),
+        handler: async () => 'done',
+      });
+      const provider = {
+        name: 'controlled',
+        chat: async () => ({ content: 'unused', usage }),
+        stream: async function* () {
+          calls++;
+          if (calls === 1) {
+            // Async-generator work starts only when ctx.ask advances next().
+            await wait(50);
+            yield {
+              type: 'tool_call_delta' as const,
+              id: 'next',
+              name: 'next_turn',
+              arguments: '{}',
+            };
+            yield {
+              type: 'done' as const,
+              timing: { queuedMs: 50, attempts: 1, retryMs: 0, ttfbMs: 0, wireMs: 0 },
+            };
+          } else {
+            yield { type: 'text_delta' as const, content: 'completed' };
+            yield { type: 'done' as const };
+          }
+        },
+      };
+      const ctx = context(provider);
+      void ctx.events;
+      const asked = ctx.ask(baseAgent({ timeout: '30ms', tools: [nextTurn] }), 'go');
+      await vi.advanceTimersByTimeAsync(50);
+      await expect(asked).resolves.toBe('completed');
+      expect(calls).toBe(2);
+    } finally {
       vi.useRealTimers();
     }
   });

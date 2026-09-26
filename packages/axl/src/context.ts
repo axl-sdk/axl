@@ -2188,6 +2188,10 @@ export class WorkflowContext<TInput = unknown> {
     // provider is uninstrumented, and the TimeoutError message stays bare
     // rather than blaming the remainder on tools and gates.
     const timingTotals = { turns: 0, queuedMs: 0, retryMs: 0, wireMs: 0 };
+    // Only this ask's completed provider turns can pause its graceful clock.
+    // Keep the diagnostic sum above unchanged; malformed custom timing earns
+    // no clock credit.
+    let queuedCreditMs = 0;
 
     // Streaming + validate is supported as of the unified event model
     // (spec §4.1). With pipeline events landing in PR 2, retry boundaries
@@ -2233,13 +2237,15 @@ export class WorkflowContext<TInput = unknown> {
       const now = Date.now();
       const elapsedMs =
         now - startTime - (timeoutTracker ? pausedHumanWaitMs(timeoutTracker, now) : 0);
-      if (elapsedMs > timeoutMs) {
+      const chargedMs = Math.max(0, elapsedMs - Math.min(queuedCreditMs, Math.max(0, elapsedMs)));
+      if (chargedMs > timeoutMs) {
         throw new TimeoutError(
           'ctx.ask()',
           timeoutMs,
           timingTotals.turns > 0
             ? {
                 elapsedMs,
+                chargedMs,
                 queuedMs: timingTotals.queuedMs,
                 retryMs: timingTotals.retryMs,
                 wireMs: timingTotals.wireMs,
@@ -2803,6 +2809,9 @@ export class WorkflowContext<TInput = unknown> {
         timingTotals.queuedMs += response.timing.queuedMs;
         timingTotals.retryMs += response.timing.retryMs;
         timingTotals.wireMs += response.timing.wireMs;
+        if (Number.isFinite(response.timing.queuedMs) && response.timing.queuedMs > 0) {
+          queuedCreditMs += response.timing.queuedMs;
+        }
       }
 
       // Snapshot of what we actually sent the provider this turn (excluding the

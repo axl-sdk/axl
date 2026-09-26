@@ -306,6 +306,8 @@ export class NoConsensus extends AxlError {
 export type TimeoutBreakdown = {
   /** Wall clock consumed by the operation when it timed out. */
   elapsedMs: number;
+  /** Graceful work budget consumed after human and observed governor waits. */
+  chargedMs: number;
   /** Sum of `CallTiming.queuedMs` — self-imposed rate-limiter wait. */
   queuedMs: number;
   /** Sum of `CallTiming.retryMs` — failed provider attempts and their backoff. */

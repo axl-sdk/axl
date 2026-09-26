@@ -94,6 +94,291 @@ describe('GeminiProvider', () => {
   });
 
   describe('chat()', () => {
+    describe('dated Standard pricing', () => {
+      afterEach(() => vi.restoreAllMocks());
+
+      const usage = {
+        promptTokenCount: 100,
+        cachedContentTokenCount: 20,
+        candidatesTokenCount: 30,
+        thoughtsTokenCount: 10,
+        totalTokenCount: 140,
+      };
+      const expectedCost = (input: number, cached: number, output: number) =>
+        80 * input + 20 * cached + 40 * output;
+
+      it.each(['gemini-3.6-flash', 'gemini-3.7-flash', 'gemini-3.8-flash'])(
+        'switches exact %s rates at the UTC transport boundary',
+        async (model) => {
+          let now = Date.parse('2026-12-31T23:59:59.999Z');
+          vi.spyOn(Date, 'now').mockImplementation(() => now);
+          mockFetch({ json: () => Promise.resolve(makeGeminiResponse('ok', usage)) });
+          const provider = new GeminiProvider();
+          const ask = () => provider.chat([{ role: 'user', content: 'Hello' }], { model });
+
+          expect((await ask()).cost).toBeCloseTo(expectedCost(0.75e-6, 0.075e-6, 3.75e-6), 12);
+          now = Date.parse('2027-01-01T00:00:00.000Z');
+          expect((await ask()).cost).toBeCloseTo(expectedCost(1.5e-6, 0.15e-6, 7.5e-6), 12);
+          now = Date.parse('2027-01-02T00:00:00.000Z');
+          expect((await ask()).cost).toBeCloseTo(expectedCost(1.5e-6, 0.15e-6, 7.5e-6), 12);
+        },
+      );
+
+      it.each(['gemini-3.8-flash-2027-01-01', 'constructor', 'toString'])(
+        'leaves unknown model %s unpriced at the successor boundary',
+        async (model) => {
+          vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2027-01-01T00:00:00.000Z'));
+          mockFetch({ json: () => Promise.resolve(makeGeminiResponse('ok', usage)) });
+          const result = await new GeminiProvider().chat([{ role: 'user', content: 'Hello' }], {
+            model,
+          });
+          expect(result.cost).toBeUndefined();
+        },
+      );
+
+      it('uses the post-wait dispatch clock and keeps that rate through completion', async () => {
+        let now = Date.parse('2026-12-31T23:59:59.999Z');
+        vi.spyOn(Date, 'now').mockImplementation(() => now);
+        const fetchMock = mockFetch({
+          json: () => {
+            now = Date.parse('2027-01-02T00:00:00.000Z');
+            return Promise.resolve(makeGeminiResponse('ok', usage));
+          },
+        });
+        const provider = new GeminiProvider();
+        const options = {
+          model: 'gemini-3.8-flash',
+          dispatchAdmission: {
+            beforeDispatch: () => {
+              now = Date.parse('2027-01-01T00:00:00.000Z');
+            },
+          },
+        };
+        const response = await provider.chat([{ role: 'user', content: 'Hello' }], options);
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        expect(response.cost).toBeCloseTo(expectedCost(1.5e-6, 0.15e-6, 7.5e-6), 12);
+      });
+
+      it('selects after a governor queue wait, then retains the selected rate', async () => {
+        let now = Date.parse('2026-12-31T23:59:59.999Z');
+        vi.spyOn(Date, 'now').mockImplementation(() => now);
+        let releaseFirst!: (response: Response) => void;
+        let firstDispatched!: () => void;
+        const firstDispatch = new Promise<void>((resolve) => {
+          firstDispatched = resolve;
+        });
+        const firstResponse = new Promise<Response>((resolve) => {
+          releaseFirst = resolve;
+        });
+        const response = () =>
+          new Response(JSON.stringify(makeGeminiResponse('ok', usage)), {
+            headers: { 'content-type': 'application/json' },
+          });
+        const fetchMock = vi
+          .fn()
+          .mockImplementationOnce(() => {
+            firstDispatched();
+            return firstResponse;
+          })
+          .mockImplementation(() => Promise.resolve(response()));
+        globalThis.fetch = fetchMock as typeof fetch;
+        const provider = new GeminiProvider({ rateLimit: { maxConcurrent: 1, adaptive: false } });
+        const first = provider.chat([{ role: 'user', content: 'first' }], {
+          model: 'gemini-3.8-flash',
+        });
+        await firstDispatch;
+        const second = provider.chat([{ role: 'user', content: 'second' }], {
+          model: 'gemini-3.8-flash',
+        });
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        now = Date.parse('2027-01-01T00:00:00.000Z');
+        releaseFirst(response());
+        expect((await first).cost).toBeCloseTo(expectedCost(0.75e-6, 0.075e-6, 3.75e-6), 12);
+        expect((await second).cost).toBeCloseTo(expectedCost(1.5e-6, 0.15e-6, 7.5e-6), 12);
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+      });
+
+      it.each(['generateContent', 'Interactions'])(
+        'uses the billed %s retry dispatch when a 503 crosses the UTC boundary',
+        async (transport) => {
+          vi.useFakeTimers();
+          vi.setSystemTime(Date.parse('2026-12-31T23:59:59.999Z'));
+          try {
+            const responseBody =
+              transport === 'generateContent'
+                ? makeGeminiResponse('ok', usage)
+                : {
+                    model: 'gemini-3.8-flash',
+                    status: 'completed',
+                    steps: [],
+                    usage: {
+                      total_input_tokens: 100,
+                      total_output_tokens: 30,
+                      total_thought_tokens: 10,
+                      total_cached_tokens: 20,
+                      total_tokens: 140,
+                      input_tokens_by_modality: [{ modality: 'image', tokens: 100 }],
+                    },
+                  };
+            const fetchMock = vi
+              .fn()
+              .mockResolvedValueOnce(new Response('', { status: 503 }))
+              .mockResolvedValueOnce(
+                new Response(JSON.stringify(responseBody), {
+                  headers: { 'content-type': 'application/json' },
+                }),
+              );
+            globalThis.fetch = fetchMock as typeof fetch;
+            const dispatches: number[] = [];
+            const messages =
+              transport === 'Interactions'
+                ? [{ role: 'user' as const, content: [geminiFileImage()] }]
+                : [{ role: 'user' as const, content: 'Hello' }];
+            const pending = new GeminiProvider().chat(messages, {
+              model: 'gemini-3.8-flash',
+              requestLifecycle: { onDispatch: () => dispatches.push(Date.now()) },
+            });
+            await vi.advanceTimersByTimeAsync(2000);
+            const response = await pending;
+            expect(fetchMock).toHaveBeenCalledTimes(2);
+            expect(dispatches).toHaveLength(2);
+            expect(dispatches[0]).toBeLessThan(Date.parse('2027-01-01T00:00:00.000Z'));
+            expect(dispatches[1]).toBeGreaterThanOrEqual(Date.parse('2027-01-01T00:00:00.000Z'));
+            expect(response.cost).toBeCloseTo(expectedCost(1.5e-6, 0.15e-6, 7.5e-6), 12);
+          } finally {
+            vi.useRealTimers();
+          }
+        },
+      );
+
+      it('uses the successor rate on an Interactions image call', async () => {
+        vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2027-01-01T00:00:00.000Z'));
+        mockFetch({
+          json: () =>
+            Promise.resolve({
+              model: 'gemini-3.8-flash',
+              status: 'completed',
+              steps: [],
+              usage: {
+                total_input_tokens: 100,
+                total_output_tokens: 30,
+                total_thought_tokens: 10,
+                total_cached_tokens: 20,
+                total_tokens: 140,
+                input_tokens_by_modality: [{ modality: 'image', tokens: 100 }],
+              },
+            }),
+        });
+        const result = await new GeminiProvider().chat(
+          [{ role: 'user', content: [geminiFileImage()] }],
+          { model: 'gemini-3.8-flash' },
+        );
+        expect(result.cost).toBeCloseTo(expectedCost(1.5e-6, 0.15e-6, 7.5e-6), 12);
+      });
+
+      it.each([
+        ['gemini-3.7-flash', 100 * 1.5e-6 + 30 * 7.5e-6],
+        ['gemini-3.8-flash', undefined],
+      ])(
+        'keeps %s recorded-audio pricing model-specific after the boundary',
+        async (model, cost) => {
+          vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2027-01-01T00:00:00.000Z'));
+          mockFetch({
+            json: () =>
+              Promise.resolve({
+                model,
+                status: 'completed',
+                steps: [],
+                usage: {
+                  total_input_tokens: 100,
+                  total_output_tokens: 30,
+                  total_tokens: 130,
+                  input_tokens_by_modality: [
+                    { modality: 'text', tokens: 60 },
+                    { modality: 'audio', tokens: 40 },
+                  ],
+                },
+              }),
+          });
+          const result = await new GeminiProvider().chat(
+            [
+              {
+                role: 'user',
+                content: [
+                  {
+                    type: 'audio',
+                    source: { type: 'bytes', data: new Uint8Array([1, 2]), mediaType: 'audio/wav' },
+                  },
+                ],
+              },
+            ],
+            { model },
+          );
+          if (cost === undefined) expect(result.cost).toBeUndefined();
+          else expect(result.cost).toBeCloseTo(cost, 12);
+        },
+      );
+
+      it.each(['generateContent', 'Interactions'])(
+        'keeps the %s streaming rate selected at dispatch across completion',
+        async (transport) => {
+          let now = Date.parse('2026-12-31T23:59:59.999Z');
+          vi.spyOn(Date, 'now').mockImplementation(() => now);
+          const encoder = new TextEncoder();
+          const frame =
+            transport === 'generateContent'
+              ? {
+                  modelVersion: 'gemini-3.8-flash',
+                  candidates: [{ content: { role: 'model', parts: [{ text: 'ok' }] } }],
+                  usageMetadata: { ...usage, serviceTier: 'SERVICE_TIER_STANDARD' },
+                }
+              : {
+                  event_type: 'interaction.completed',
+                  interaction: {
+                    model: 'gemini-3.8-flash',
+                    status: 'completed',
+                    steps: [],
+                    usage: {
+                      total_input_tokens: 100,
+                      total_output_tokens: 30,
+                      total_thought_tokens: 10,
+                      total_cached_tokens: 20,
+                      total_tokens: 140,
+                      input_tokens_by_modality: [{ modality: 'image', tokens: 100 }],
+                    },
+                  },
+                };
+          mockFetch({
+            body: new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify(frame)}\n\n`));
+                controller.close();
+              },
+            }),
+          });
+          const messages =
+            transport === 'Interactions'
+              ? [{ role: 'user' as const, content: [geminiFileImage()] }]
+              : [{ role: 'user' as const, content: 'Hello' }];
+          const chunks = [];
+          for await (const chunk of new GeminiProvider().stream(messages, {
+            model: 'gemini-3.8-flash',
+            requestLifecycle: {
+              onDispatch: () => {
+                now = Date.parse('2027-01-02T00:00:00.000Z');
+              },
+            },
+          }))
+            chunks.push(chunk);
+          const done = chunks.at(-1);
+          expect(done?.type).toBe('done');
+          if (done?.type === 'done') {
+            expect(done.cost).toBeCloseTo(expectedCost(0.75e-6, 0.075e-6, 3.75e-6), 12);
+          }
+        },
+      );
+    });
+
     it('sends correct URL and headers', async () => {
       const fetchMock = mockFetch({
         json: () => Promise.resolve(makeGeminiResponse('Hello!')),

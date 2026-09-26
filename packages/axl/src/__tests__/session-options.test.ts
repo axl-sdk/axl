@@ -41,6 +41,49 @@ describe('SessionOptions', () => {
   // ═══════════════════════════════════════════════════════════════════════
 
   describe('history.maxMessages', () => {
+    it.each([false, true])(
+      'invalidates retained Anthropic thinking after a prefix rewrite (summarize=%s)',
+      async (summarize) => {
+        const sessionId = `sess-thinking-${summarize}`;
+        await store.saveSession(sessionId, [
+          { role: 'user', content: 'old question' },
+          { role: 'assistant', content: 'old answer' },
+          { role: 'user', content: 'recent question' },
+          {
+            role: 'assistant',
+            content: 'recent answer',
+            providerMetadata: {
+              anthropicThinkingBlocks: [
+                { type: 'thinking', thinking: 'stale', signature: 'old-signature' },
+              ],
+              otherProviderKey: 'preserved',
+            },
+          },
+        ]);
+        let sentHistory: ChatMessage[] = [];
+        runtime = createMockRuntime({
+          execute: vi.fn((_name: string, _input: unknown, opts: any) => {
+            sentHistory = [...opts.metadata.sessionHistory];
+            return Promise.resolve('new answer');
+          }),
+        });
+        const session = new Session(sessionId, runtime, store, {
+          history: {
+            maxMessages: 2,
+            summarize,
+            ...(summarize ? { summaryModel: 'mock:summarizer' } : {}),
+          },
+        });
+
+        await session.send('chat', 'next question');
+
+        expect(sentHistory[1].providerMetadata).toEqual({ otherProviderKey: 'preserved' });
+        expect((await session.history())[1].providerMetadata).toEqual({
+          otherProviderKey: 'preserved',
+        });
+      },
+    );
+
     it('trims history to maxMessages before each send()', async () => {
       let callCount = 0;
       const capturedHistories: ChatMessage[][] = [];
@@ -306,16 +349,15 @@ describe('SessionOptions', () => {
 
       await session.send('chat', 'msg4');
 
-      // The first message should be the previous summary as context
-      const [messages] = summarizeFn.mock.calls[0];
-      expect(messages[0]).toEqual({
-        role: 'system',
-        content: 'Previous conversation summary: Old summary',
-      });
-      // Then the 2 dropped messages
-      expect(messages[1]).toEqual({ role: 'user', content: 'msg1' });
-      expect(messages[2]).toEqual({ role: 'assistant', content: 'r1' });
-      expect(messages).toHaveLength(3);
+      // The previous summary is folded in by the shared summary prompt, and
+      // only the 2 dropped messages are summarized.
+      const [messages, modelUri, options] = summarizeFn.mock.calls[0];
+      expect(messages).toEqual([
+        { role: 'user', content: 'msg1' },
+        { role: 'assistant', content: 'r1' },
+      ]);
+      expect(modelUri).toBe('mock:summarizer');
+      expect(options).toEqual({ previousSummary: 'Old summary' });
     });
 
     it('throws if summarize is true but summaryModel is missing', async () => {

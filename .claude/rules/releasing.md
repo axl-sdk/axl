@@ -27,6 +27,17 @@ subscriber-friendly presentation.
 push, tag, merge, or publish without it. (Ordinary feature-branch commits need no
 approval — see `CLAUDE.md`; this gate is for the release bump itself.)
 
+## Time-bounded pricing gates
+
+- **Gemini Flash successor pricing (2026-12-01).** `packages/axl/src/providers/gemini.ts`
+  encodes a dated successor rate table (`GEMINI_FLASH_SUCCESSOR_PRICING`) for Gemini
+  3.6/3.7/3.8 Flash Standard that Google has published to take effect 2027-01-01. Before
+  cutting any release on or after 2026-12-01, re-verify Google's published Gemini
+  3.6/3.7/3.8 Flash Standard rates for 2027-01-01 against
+  https://ai.google.dev/gemini-api/docs/pricing and update `GEMINI_FLASH_SUCCESSOR_PRICING`
+  (or expire/remove it if Google has cancelled or changed the increase) before bumping the
+  version. See the block comment on `GEMINI_FLASH_SUCCESSOR_PRICING` for the rationale.
+
 1. Bump the version in all four `packages/*/package.json` together.
 2. Move `CHANGELOG.md` `[Unreleased]` → the new version (Keep a Changelog format).
    **0.x SemVer**: patch = features *and* fixes; bump minor *only* for breaking changes.

@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Graceful ask timeouts no longer credit a governor wait during pre-turn context summarization against later provider turns. The ask's timeout starts after context projection, and only waits after that start reduce its charged time.
+- **Context summaries no longer repeat on every turn.** An agent's `maxContext` summary is now remembered per agent with the session, so later `send()` calls reuse it for free until the summarized messages, the session's rolling summary, or the summary model change. Summaries never skip messages, never overwrite the session's `summaryCache`, and never shrink another agent's view. `persist: false` sessions keep nothing and regenerate each turn; `session.fork()` regenerates on its first tight ask. Live-verified on Claude Opus 5.5 with reasoning carried across two executions and no reset.
+- Session summaries from `history.maxMessages` now reach every later request, even when the agent has no `maxContext` or its history fits.
+- Both summarizers (`history.maxMessages` and `maxContext`) use one prompt and one provider call. `AxlRuntime.summarizeMessages()` takes an optional `{ previousSummary }` instead of a leading system message.
+- When a summary or trim rewrites the conversation prefix, Axl removes Anthropic thinking signed to the old prefix from the request and keeps text, tool calls, and other providers' metadata. A `maxContext` removal is reported once per ask as `reasoning_context_reset` with reason `client_prefix_rewrite`.
+- Anthropic reset diagnostics also count organization and end-user binding mismatches, with `other` for unrecognized reasons. Only these fixed counts reach events and Studio, even from custom providers.
+- GPT-6 (`gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`) now drops a portable `temperature` while reasoning is active, matching GPT-5.x, instead of throwing. Raw `providerOptions` that re-add forbidden sampling fields under active reasoning are still rejected before dispatch. Live-verified on both endpoints and all three IDs.
+- Anthropic's thinking-binding beta is now driven by a per-model capability flag rather than a separate model list. Only Claude Opus 5.5 and Fable 5.1 carry it, per Anthropic's preserved-thinking documentation.
+
+### Added
+
+- `maxContext` summary calls appear in traces as their own `agent_call_start` / `agent_call_end` pair with `data.purpose: 'summary'` and `turn: 0`. Their cost counts once toward the ask and budget; an unpriced summary marks totals as a lower bound.
+- Exact GPT-6 Astra, Sol, and Luna support on OpenAI Responses and Chat Completions, with endpoint-aware reasoning, typed pre-dispatch errors for unsupported Chat tool or sampling combinations, and Standard text pricing including cache and the 272K long-context boundary. Unsupported billing stays unpriced. See `docs/providers.md` for the verified combinations and remaining limits.
+- Claude Opus 5.5 support with always-on adaptive thinking, five effort levels, a low-floor clamp for `none`, and Standard pricing. Opus 5.5 and Fable 5.1 reject forced tool choice before dispatch. Signed thinking replay uses Anthropic's binding beta with `drop_block` recovery, and each affected call reports safe dropped-block counts.
+- Gemini 3.8 Flash certification and dated Standard pricing for exact Gemini 3.6/3.7/3.8 Flash IDs. The published 2027-01-01 successor rate is applied at dispatch and re-verified before any release on or after 2026-12-01. Recorded audio stays unpriced pending a model-specific rate. Studio shows reset counts and labels mixed priced/unpriced spend as a lower bound.
+
 ## [0.25.0] - 2026-09-26
 
 ### Changed

@@ -131,7 +131,7 @@ schemas. The full set of types:
 | `workflow_start` / `workflow_end` | Workflow lifecycle | `input` / `status`, `duration`, `result?`, `error?`, `aborted?` |
 | `transcription_start` / `transcription_end` | A dedicated `ctx.transcribe()` operation; v2-only and paired by `transcriptionId` | Source descriptor (kind, byte count only for bytes sources, media type), transcript text/error when unredacted, normalized usage/pricing, Gemini cleanup outcome, and safe provider-failure status/retry/request-id fields. Raw audio/base64/provider-file references and provider bodies are always absent; `trace.redact` scrubs transcript/error content. |
 | `ask_start` / `ask_end` | Bound every `ctx.ask()` call (one pair per invocation, including nested). | `prompt` on start; `outcome: { ok: true, result } \| { ok: false, error }`, `cost`, `duration`, and `unpriced?: boolean` on end |
-| `agent_call_start` / `agent_call_end` | Per LLM call (every loop turn of `ctx.ask()`). `_start` fires before the request; `_end` after the response. | `_start` `data`: `prompt`, `system?`, `params`, `turn`, `retryReason?`, `toolNames?`, and `messages?` (full trace only). `_end` `data`: `response`, `thinking?`, `turn`, `retryReason?`. On the error path, `_end` also carries `error` (message), plus `status` + `retryable` when the thrown error was a `ProviderError` (the raw `ProviderError.body` is intentionally **not** emitted — see [security.md](./security.md)) |
+| `agent_call_start` / `agent_call_end` | Per LLM call, including context-management summary generation. `_start` fires before the request; `_end` after the response or failure. | `_start` `data`: `prompt`, `system?`, `params`, `turn`, `retryReason?`, `toolNames?`, `messages?` (full trace only), and `purpose?: 'summary'`. `_end` `data`: `response`, `thinking?`, `turn`, `retryReason?`, and the same optional `purpose`. On the error path, `_end` also carries `error` (a fixed safe message for summaries), plus `status` + `retryable` when the thrown error was a `ProviderError` (the raw `ProviderError.body` is intentionally **not** emitted — see [security.md](./security.md)) |
 | `token` | Streaming text chunk (stream-only, never persisted to `ExecutionInfo.events`) | `data: string` |
 | `tool_call_rejected` | Unavailable tool, invalid JSON, or invalid local arguments before execution starts; no start/end pair | `reason`, `requestedTool`, plus `availableTools`, generic `message`, or structural `issues` by reason |
 | `tool_call_start` / `tool_call_end` | Accepted tool invocation lifecycle | `_start` `data`: validated `args`, `requestedTool?`. `_end` `data`: same `args`, `requestedTool?`, and discriminated `outcome` (`succeeded`, `failed`, `denied`, `cancelled`) |
@@ -154,6 +154,12 @@ schemas. The full set of types:
 | `done` / `error` | Terminal workflow markers (wrap their payload under `data` — `done.data = { result }`, `error.data = { message, name?, code? }`) | see signatures |
 
 `AxlStream.fullText` commits on `pipeline(committed)` and discards the in-progress buffer on `pipeline(failed)` or `ask_end({ok: false})`, so retried attempts' tokens never leak into the committed text.
+
+A `maxContext` summary call shows up under its ask as its own
+`agent_call_start` / `agent_call_end` pair with `data.purpose: 'summary'`,
+`turn: 0`, and the summary model's URI. Its cost counts once toward the ask and
+budget; an unpriced summary marks both as lower bounds. Reusing a remembered
+summary makes no call and emits no pair.
 
 ### Tool lifecycle outcomes and trace completeness
 
@@ -739,6 +745,7 @@ deduped `console.warn`:
 | `data.kind` | Fires when | Fields |
 |---|---|---|
 | `effort_clamped` | The provider sent a different native level than the requested `effort` | `requested`, `effective` (provider-native string), `cause`, `model`, `provider?` |
+| `reasoning_context_reset` | Anthropic dropped replayed thinking from one completed provider call, or Axl removed it before the ask's first model turn because a `maxContext` summary rewrote the signed prefix | `droppedBlocks`, counts by prefix, model, organization, or end-user binding mismatch in `reasons` (or `other` for an unrecognized reason), `client_prefix_rewrite` for Axl's own removal, `model`, `provider?` |
 
 ```ts
 for await (const event of stream.lifecycle) {
@@ -755,6 +762,16 @@ for await (const event of stream.lifecycle) {
 - The warning is deduped per distinct clamp and silenced by `AxlConfig.diagnostics.silent`
   or `AXL_DIAGNOSTICS_SILENT=true`. The event is never silenced.
 - Redaction passes the event through unchanged; it carries no prompt or response content.
+- `reasoning_context_reset` fires once per affected provider call, including
+  repeated calls in one tool loop, and once per ask with
+  `reasons: { client_prefix_rewrite: n }` before the first `agent_call_start`
+  when a `maxContext` summary removed Anthropic thinking itself. Session-level
+  trimming (`history.maxMessages`) happens before the execution and is not
+  reported. Adapter responses and terminal stream chunks carry the same counts
+  in `diagnostics.reasoningContextReset`. Only fixed numeric counts reach
+  events, even from custom providers; signed blocks and raw bodies never do.
+  Studio shows the count and reason categories, and labels mixed
+  priced/unpriced spend as a lower bound.
 - A provider whose `effortResolution()` throws or reports a malformed clamp fails the ask
   with that error.
 

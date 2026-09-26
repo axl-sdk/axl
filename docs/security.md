@@ -164,6 +164,10 @@ and assess that retention period before submitting sensitive recordings.
 Provider failures retain only safe HTTP diagnostics—status, retryability,
 optional retry delay, and optional request ID—on the boundary error and event;
 the raw error body remains confined to the non-enumerable cause.
+Reasoning-reset events copy only dropped-block counts and fixed reason categories
+from provider diagnostics, including an `other` bucket for unrecognized reasons.
+Signed thinking, transformation paths, and raw provider response bodies never
+enter those events or Studio trace labels.
 
 - API keys configured in `axl.config.ts` or environment variables are **never** included in LLM prompts or logged in traces.
 - Tools marked with `sensitive: true` have their return values redacted from LLM context in subsequent calls.

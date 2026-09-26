@@ -98,8 +98,10 @@ function assertExhaustive(ev: AxlEvent): string {
       switch (ev.data.kind) {
         case 'effort_clamped':
           return `${ev.data.requested}->${ev.data.effective}`;
+        case 'reasoning_context_reset':
+          return String(ev.data.droppedBlocks);
         default: {
-          const _exhaustiveProviderDiag: never = ev.data.kind;
+          const _exhaustiveProviderDiag: never = ev.data;
           return _exhaustiveProviderDiag;
         }
       }

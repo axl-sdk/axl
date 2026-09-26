@@ -11,11 +11,11 @@ import type {
 } from './types.js';
 import {
   estimateDirectOpenAICost,
-  isOSeriesModel,
-  supportsReasoningEffort,
-  supportsMaxReasoningEffort,
+  resolveOpenAIModelDescriptor,
   resolveOpenAIReasoningEffort,
   resolveOpenAIEffortResolution,
+  stripsPortableSampling,
+  validateOpenAIFinalRequestBody,
 } from './openai.js';
 import { reportedTokenCount } from './openai-compatible.js';
 import { resolveThinkingOptions, resolveApiKey, type ApiKeySource } from './types.js';
@@ -396,18 +396,12 @@ export class OpenAIResponsesProvider implements Provider {
       typeof options.providerOptions?.model === 'string'
         ? options.providerOptions.model
         : options.model;
-    const oSeries = isOSeriesModel(effectiveModel);
-    const reasoningCapable = supportsReasoningEffort(effectiveModel);
+    const descriptor = resolveOpenAIModelDescriptor(effectiveModel);
+    const reasoningCapable = descriptor.reasoning;
     const resolved = resolveThinkingOptions(options);
     const { includeThoughts } = resolved;
     const wireEffort = resolveOpenAIReasoningEffort(effectiveModel, resolved);
-
-    // GPT-5.6 Responses rejects temperature even when no explicit effort is
-    // supplied because reasoning is active by default for that family.
-    const stripTemp =
-      oSeries ||
-      supportsMaxReasoningEffort(effectiveModel) ||
-      (reasoningCapable && wireEffort !== undefined);
+    const stripTemp = stripsPortableSampling(descriptor, 'responses', wireEffort);
 
     // Extract system messages → instructions
     const systemMessages = messages.filter((m) => m.role === 'system');
@@ -470,6 +464,8 @@ export class OpenAIResponsesProvider implements Provider {
     if (options.providerOptions) {
       Object.assign(body, options.providerOptions);
     }
+
+    validateOpenAIFinalRequestBody(body, 'responses');
 
     return body;
   }

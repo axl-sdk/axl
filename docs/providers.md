@@ -10,12 +10,14 @@ OpenAI's, Anthropic's, and Gemini's own endpoints an identifiable quota or spend
 [Rate limiting](#rate-limiting).
 
 The base catalog and pricing were reviewed against first-party documentation on
-August 3, 2026; native image transport and the current GPT-5.6, Claude Opus 5,
-and Gemini 3.8 Flash parameter seams were refreshed on September 2. Exact known
+August 3, 2026; native image transport was refreshed on September 2, and the
+GPT-6, Claude Opus 5.5, and Gemini 3.8 Flash contracts were checked on September 25.
+Exact known
 IDs receive their documented parameter and pricing behavior. Other IDs may pass
 through to the provider but remain unpriced and do not inherit model-specific
-behavior. See the [catalog verification](./verification/latest-provider-models-2026-08-03.md)
-and [native image refresh](./verification/native-image-catalog-2026-09-02.md).
+behavior. See the [catalog verification](./verification/latest-provider-models-2026-08-03.md),
+[native image refresh](./verification/native-image-catalog-2026-09-02.md), and
+[frontier refresh verification](./verification/frontier-model-refresh-2026-09-25.md).
 
 ## OpenAI — Responses API (preferred)
 
@@ -25,6 +27,9 @@ models below use the `openai-responses:` prefix and share `openai` configuration
 
 ```
 openai-responses:gpt-5.6        # Alias of GPT-5.6 Sol
+openai-responses:gpt-6-astra    # GPT-6 highest capability
+openai-responses:gpt-6-sol      # GPT-6 balanced reasoning
+openai-responses:gpt-6-luna     # GPT-6 efficient reasoning
 openai-responses:gpt-5.6-sol    # Highest-capability GPT-5.6 variant
 openai-responses:gpt-5.6-terra  # Balanced GPT-5.6 variant
 openai-responses:gpt-5.6-luna   # Fast GPT-5.6 variant
@@ -42,6 +47,9 @@ Responses adapter does not support, such as stop sequences.
 
 ```
 openai:gpt-5.6                  # Alias of GPT-5.6 Sol
+openai:gpt-6-astra              # GPT-6 text; tools require Responses
+openai:gpt-6-sol                # GPT-6 text; Chat tools require explicit none effort
+openai:gpt-6-luna               # GPT-6 text; Chat tools require explicit none effort
 openai:gpt-5.6-sol              # Highest-capability GPT-5.6 variant
 openai:gpt-5.6-terra            # Balanced GPT-5.6 variant
 openai:gpt-5.6-luna             # Fast GPT-5.6 variant
@@ -119,10 +127,57 @@ same two usage fields, so the rule holds identically on both OpenAI transports
 `openai-responses:` for vision. Chat Completions image pricing is unmodeled.
 
 OpenAI's o-series uses the `developer` role, strips `temperature`, and supports `effort`.
-GPT-5.x uses `system` and supports the same portable option. Exact GPT-5.6 Chat requests with
+GPT-5.x uses `system` and supports the same portable option.
+
+**Sampling under reasoning (all OpenAI reasoning models).** While reasoning is
+active, the portable `temperature` option is dropped from the request, not
+rejected. That means always on o-series and exact GPT-5.6 Responses; on other
+GPT-5.x when Axl sends an effort; and on exact GPT-6 IDs unless the effective
+effort is `none` (GPT-6 reasons by default, so omitting `effort` drops it). Raw
+`providerOptions` merge last and are never stripped: on exact GPT-6 IDs a raw
+field that re-adds a forbidden sampling parameter under active reasoning fails
+before dispatch with `UnsupportedModelOptionError`; on other models it is sent
+as written.
+
+Exact GPT-5.6 Chat requests with
 `effort: 'max'` use `xhigh` and report the clamp through a `provider_diagnostic`
 event; choose `openai-responses:` for native `max`. For compatibility, unknown GPT-5-shaped IDs retain the older baseline request mapping,
 but never inherit exact pricing or GPT-5.6-specific capabilities.
+
+### GPT-6 endpoint and pricing rules
+
+The exact `gpt-6-astra`, `gpt-6-sol`, and `gpt-6-luna` IDs support the existing
+text, structured-output, streaming, and function-tool paths. Prefer
+`openai-responses:` for tools: Astra tool calling requires Responses, while Sol
+and Luna Chat Completions function tools require an explicitly effective
+`reasoning_effort: 'none'`. Axl checks the final request after `providerOptions`
+merges and throws `UnsupportedModelOptionError` before dispatch for a forbidden
+combination. The error names the provider, effective model, rejected option,
+and an `openai-responses:` remedy. Unknown GPT-6-like IDs pass through without
+inheriting these exact-model rules or pricing.
+
+Astra maps portable `effort: 'none'` to `low`; Sol and Luna accept `none`. All
+three accept native `max` on Responses and Chat. Their default reasoning is
+active. With active reasoning, `temperature`, `top_p`, and `top_logprobs` are
+invalid on either endpoint; Chat also rejects `logprobs`, and Responses rejects
+`message.output_text.logprobs` in `include`. The portable `temperature` option
+is dropped in that state, the same as on GPT-5.x. A raw `providerOptions` field
+that sets any of these parameters is rejected with `UnsupportedModelOptionError`
+before dispatch. With Sol or Luna at effective `none`, both the portable option
+and the raw fields are sent where the endpoint accepts them.
+
+Axl prices direct Standard GPT-6 text calls from the published input,
+cached-input, cache-write, and output rows. Above 272,000 **total input
+tokens**, the long-context row prices the whole call, including cache buckets
+and output. Non-Standard processing, regional billing, hosted tools, unverified
+media, missing usage, and unknown model IDs stay unpriced. `OPENAI_PRICING`
+keeps its public flat shape. Sources: the
+[GPT-6 model guidance](https://developers.openai.com/api/docs/guides/latest-model)
+and [Standard pricing](https://developers.openai.com/api/docs/pricing), checked
+September 25, 2026. The verified live combinations and remaining limits (no
+invoice comparison for long-context or cache-write billing) are in the
+[frontier verification record](./verification/frontier-model-refresh-2026-09-25.md)
+and its [remediation follow-up](./verification/frontier-owner-remediation-2026-09-26.md).
 
 ## Anthropic
 
@@ -134,6 +189,7 @@ documents text and image inputs only. Neither ever falls back to transcription.
 
 ```
 anthropic:claude-fable-5-1      # Highest-capability Claude; thinking always on
+anthropic:claude-opus-5-5       # Opus 5.5; adaptive thinking always on
 anthropic:claude-fable-5        # Previous Fable; thinking always on
 anthropic:claude-opus-5         # Claude 5 flagship; thinking on by default
 anthropic:claude-sonnet-5       # Claude 5 balanced; thinking on by default
@@ -145,6 +201,38 @@ anthropic:claude-sonnet-4-5     # Balanced
 anthropic:claude-haiku-4-5      # Fast and affordable
 anthropic:claude-opus-4-5       # Previous gen
 ```
+
+Opus 5.5 supports `low`, `medium`, `high`, `xhigh`, and `max` with adaptive
+thinking always on; the default is `medium`, and `none` uses `low` with an
+`effort_clamped` diagnostic. Opus 5.5 and Fable 5.1 reject `toolChoice:
+'required'` and named choices before dispatch; use `auto` or `none`. Raw
+overrides that disable thinking, set an invalid effort, or add non-default
+sampling are rejected the same way.
+
+**Thinking continuity.** On these two models a thinking block is valid only
+while everything before it is unchanged. When a request replays thinking, Axl
+sends Anthropic's binding beta with the `drop_block` policy, so an invalidated
+block is dropped by the provider while its text and tool calls survive, and
+the call reports safe per-reason counts in `diagnostics` and a
+`provider_diagnostic { kind: 'reasoning_context_reset' }`. When Axl itself
+rewrites the prefix (a summary or trim), it removes the stale blocks first and
+reports the ask-level case with reason `client_prefix_rewrite`. Set
+`providerOptions.thinking.block_binding.prefix_mismatch_behavior: 'error'` to
+fail instead of recovering. Signed content never appears in diagnostics.
+Live-verified: same-prefix replay, both Opus/Fable switch directions, edited
+system, tool, and message prefixes, the native `error` opt-out, streamed reset,
+a compacted tool exchange, and reuse of a remembered summary across two
+executions with reasoning kept (see the
+[frontier](./verification/frontier-model-refresh-2026-09-25.md),
+[session summary](./verification/session-summary-coverage-2026-09-25.md), and
+[remediation](./verification/frontier-owner-remediation-2026-09-26.md) records).
+This does not promise reasoning continuity across restarts or prompt and tool
+changes. Live calls used `low` and `max`; other levels have adapter coverage.
+
+The [Opus 5.5 model page](https://platform.claude.com/docs/en/models/opus-5-5/overview)
+publishes Standard text rates of $4 input, $20 output, $0.20 cache read, $5
+five-minute cache write, and $8 one-hour cache write per million tokens.
+Unmodeled billing modes remain unpriced.
 
 `claude-mythos-5-1` and `claude-mythos-5` are priced but have no capability entry:
 they are limited-availability models whose per-model thinking semantics are not
@@ -188,6 +276,26 @@ billing a rate it cannot verify; Google recommends `gemini-3.8-flash` instead.
 Because unpriced spend is reported but not enforced, a `ctx.budget()` cost limit
 will not trip on this model — the budget flags `unpriced` instead. Pin a priced
 model if you need a hard cost cap. See [Gemini deprecations](https://ai.google.dev/gemini-api/docs/deprecations).
+
+For exact `gemini-3.6-flash`, `gemini-3.7-flash`, and `gemini-3.8-flash`, direct
+Standard token estimates use Google's published promotional input/cache-read/output
+rates of $0.75/$0.075/$3.75 per million tokens through 2026-12-31 UTC, then
+$1.50/$0.15/$7.50 beginning 2027-01-01 UTC. Axl selects the rate at dispatch
+of the returned transport attempt, after any rate-governor or retry wait, and
+keeps it for that attempt's result or stream. Non-Standard tiers and unmodeled
+charges remain unpriced. The published 2027-01-01 successor rate is encoded
+ahead of its effective date and is re-verified against Google's pricing page
+before any release cut on or after 2026-12-01 (see `.claude/rules/releasing.md`).
+The [Google price page](https://ai.google.dev/gemini-api/docs/pricing) does not
+establish a distinct recorded-audio input rate for 3.8 Flash, so calls with
+positive audio tokens remain unpriced. The
+[3.8 model card](https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash)
+lists video and PDF input upstream; Axl's public `ModelInput` currently covers
+text, image, and recorded audio only. Selected exact 3.8 live calls accepted
+GenerateContent text, schema, tools, and streaming plus Interactions image
+and recorded audio. The audio response reported positive input tokens and
+remains unpriced. See the [dated verification record](./verification/frontier-model-refresh-2026-09-25.md)
+for the tested combinations and remaining limits.
 
 Gemini [requires every `functionResponse.response` to be a JSON
 object](https://ai.google.dev/api/generate-content#FunctionResponse). Axl parses canonical
@@ -1017,7 +1125,7 @@ const solution = await ctx.ask(reasoner, problem, { effort: 'low' });
 | `temperature` | provider default | Controls randomness (0.0–2.0). Stripped automatically for reasoning models and when thinking is active on Anthropic. |
 | `maxTokens` | `4096` | Maximum completion tokens per call. |
 | `effort` | — | Unified effort level controlling reasoning depth across all providers (see below). |
-| `thinkingBudget` | — | Explicit thinking token budget (advanced). Overrides effort-based allocation. Set to `0` to disable thinking while keeping `effort` for output control (Anthropic). |
+| `thinkingBudget` | — | Explicit thinking token budget (advanced). Overrides effort-based allocation. `0` disables thinking only where the model permits it; Opus 5.5 and Fable 5.1 use adaptive thinking at `low`. |
 | `includeThoughts` | — | Return reasoning summaries in responses. Supported on OpenAI Responses API and Gemini. No-op on Anthropic. |
 | `toolChoice` | — | Controls whether and how the model uses tools (see below). |
 | `stop` | — | Stop sequences — generation stops when any sequence is encountered (see below). |
@@ -1071,6 +1179,8 @@ agent({ model: 'google:gemini-2.5-pro', effort: 'high', includeThoughts: true })
 | **OpenAI** (GPT-5.2+ baseline) | `reasoning_effort: 'none'` | `reasoning_effort: 'low'` | `reasoning_effort: 'medium'` | `reasoning_effort: 'high'` | `reasoning_effort: 'xhigh'` | `reasoning_effort: 'xhigh'` | nearest effort level* |
 | **OpenAI Chat** (GPT-5.6) | `reasoning_effort: 'none'` | `reasoning_effort: 'low'` | `reasoning_effort: 'medium'` | `reasoning_effort: 'high'` | `reasoning_effort: 'xhigh'` | capped to `'xhigh'` | nearest effort level* |
 | **OpenAI Responses** (GPT-5.6) | `reasoning.effort: 'none'` | `reasoning.effort: 'low'` | `reasoning.effort: 'medium'` | `reasoning.effort: 'high'` | `reasoning.effort: 'xhigh'` | `reasoning.effort: 'max'` | nearest effort level* |
+| **OpenAI Chat / Responses** (GPT-6 Astra) | `low` (clamped) | `low` | `medium` | `high` | `xhigh` | `max` | nearest effort level* |
+| **OpenAI Chat / Responses** (GPT-6 Sol/Luna) | `none` | `low` | `medium` | `high` | `xhigh` | `max` | nearest effort level* |
 | **Anthropic** (Claude 5) | model-specific minimum/default | adaptive + `effort: 'low'` | adaptive + `effort: 'medium'` | adaptive + `effort: 'high'` | adaptive + `effort: 'xhigh'` | adaptive + `effort: 'max'` | unsupported |
 | **Anthropic** (Opus 4.8 / 4.7) | disabled | adaptive + `effort: 'low'` | adaptive + `effort: 'medium'` | adaptive + `effort: 'high'` | adaptive + `effort: 'xhigh'` | adaptive + `effort: 'max'` | manual `budget_tokens` |
 | **Anthropic** (4.6) | disabled | adaptive + `effort: 'low'` | adaptive + `effort: 'medium'` | adaptive + `effort: 'high'` | capped to `'high'`◊ | adaptive + `effort: 'max'`† | manual `budget_tokens` |
@@ -1098,9 +1208,9 @@ agent({ model: 'google:gemini-2.5-pro', effort: 'high', includeThoughts: true })
 
 ⊗ Reasoning on self-hosted runtimes is configured at the server (launch flags / `chat_template_kwargs`), so `effort` is generally a no-op; inline `<think>` output is captured.
 
-† Anthropic `effort: 'max'` only supported on Opus 4.8, 4.7, and 4.6. On Sonnet 4.6 and Opus 4.5, capped to `'high'`.
+† Among Claude 4 models, Anthropic `effort: 'max'` is supported on Opus 4.8, 4.7, and 4.6. On Sonnet 4.6 and Opus 4.5, capped to `'high'`.
 
-◊ Anthropic `effort: 'xhigh'` is only supported on Opus 4.8 and 4.7 (positioned between `'high'` and `'max'`). On other Anthropic models and on Gemini 3.x, it clamps to `'high'`.
+◊ Among Claude 4 models, Anthropic `effort: 'xhigh'` is supported on Opus 4.8 and 4.7 (between `'high'` and `'max'`). Claude 5 supports it; other Anthropic models and Gemini 3.x clamp to `'high'`.
 
 ⁑ OpenAI pre-gpt-5.1 models (o-series, gpt-5, gpt-5-mini, gpt-5-nano) do not support `reasoning_effort: 'none'`. Axl clamps to `'minimal'` — the lowest supported value.
 
@@ -1137,9 +1247,9 @@ Third-party providers that omit `Provider.effortResolution()` report nothing.
 #### Provider-specific behavior
 
 - **OpenAI o-series** (o1/o3/o4-mini): Uses `developer` role instead of `system`, strips temperature, sends `reasoning_effort`. `effort: 'none'` sends `reasoning_effort: 'minimal'` (o-series doesn't support `'none'`). `effort: 'max'` sends `'high'` (o-series doesn't support `'xhigh'`).
-- **OpenAI GPT-5.x Chat Completions**: Uses `system`, strips temperature when reasoning is active, and supports parallel tool calls. The compatibility baseline maps GPT-5.2+ `'max'` to `'xhigh'`, reported through a `provider_diagnostic` event. Earlier families retain their lower caps.
-- **OpenAI Responses API**: Uses `reasoning: { effort }`; exact GPT-5.6 IDs accept native `'max'` and omit `temperature` because that family rejects it even when reasoning uses the provider default. Older models keep their documented clamps. `includeThoughts: true` enables reasoning summaries (`reasoning: { summary: 'detailed' }`). Reasoning context is automatically round-tripped via `providerMetadata.openaiReasoningItems`.
-- **Anthropic Claude 5**: Fable 5.1 and Fable 5 always reason; Opus 5 and Sonnet 5 reason by default. All four accept the full active effort vocabulary through adaptive thinking. Opaque thinking blocks are preserved in `providerMetadata` for tool continuations. Axl does not request beta fast-mode or model-fallback headers; if Anthropic reports that a different fallback model served the call, Axl fails before persisting history or estimating cost.
+- **OpenAI GPT-5.x Chat Completions**: Uses `system`, strips the portable `temperature` when Axl sends a reasoning effort, and supports parallel tool calls. The compatibility baseline maps GPT-5.2+ `'max'` to `'xhigh'`, reported through a `provider_diagnostic` event. Earlier families retain their lower caps.
+- **OpenAI Responses API**: Uses `reasoning: { effort }`; exact GPT-5.6 IDs accept native `'max'` and omit `temperature` because that family rejects it even when reasoning uses the provider default. Older models keep their documented clamps. Exact GPT-6 IDs strip the portable `temperature` on both endpoints unless the effective effort is `none`, and reject raw sampling overrides while reasoning is active (see [GPT-6 endpoint and pricing rules](#gpt-6-endpoint-and-pricing-rules)). `includeThoughts: true` enables reasoning summaries (`reasoning: { summary: 'detailed' }`). Reasoning context is automatically round-tripped via `providerMetadata.openaiReasoningItems`.
+- **Anthropic Claude 5**: Fable 5.1, Fable 5, and Opus 5.5 always reason; Opus 5 and Sonnet 5 reason by default. All accept the full active effort vocabulary through adaptive thinking. Opaque thinking blocks are kept in `providerMetadata` for continuations. A summary or trim removes thinking signed to the old prefix and keeps text, tool calls, and other providers' metadata; the `maxContext` case is reported as `reasoning_context_reset` with reason `client_prefix_rewrite` (see [Opus 5.5](#anthropic) above). A model switch does not delete stored blocks, since a compatible model may read them later. Axl does not request beta fast-mode or model-fallback headers; if Anthropic reports that a fallback model served the call, Axl fails before persisting history or estimating cost.
 - **Anthropic Opus 4.8**: Supports adaptive thinking and native `'xhigh'`/`'max'`.
 - **Anthropic Opus 4.7**: Same adaptive-thinking behavior as 4.6. Additionally supports `effort: 'xhigh'` as a first-class tier between `'high'` and `'max'`, sent as `output_config.effort: 'xhigh'`. Same pricing as Opus 4.6 ($5/$25 per 1M tokens).
 - **Anthropic 4.6** (Opus 4.6, Sonnet 4.6): `effort` enables adaptive thinking (`thinking: { type: "adaptive" }` + `output_config: { effort }`). Temperature stripped when thinking active. `thinkingBudget: 0` + `effort` sends only `output_config.effort` (no thinking block, temperature allowed). `effort: 'xhigh'` clamps to `'high'` (4.6 doesn't expose a distinct xhigh tier).
@@ -1553,14 +1663,14 @@ frontier family is current:
   date and source beside each adapter table or profile.
 - Add only documented IDs and snapshot formats. Keep unknown IDs pass-through but unpriced.
 - Recheck every billed category, modifier, and effective-dated rate; missing billing data must
-  remain unknown rather than becoming an inferred zero.
+  remain unknown rather than becoming an inferred zero. Encode a published successor rate
+  when its effective date is confirmed, as for Gemini Flash above.
 - Add unit fixtures, run both live integration gates, and save a dated result under
   `docs/verification/`, including any credential-gated gaps.
 
-Promotional rates currently in effect, to re-verify (record the then-current value; do not
-encode the expiry as a code-side transition):
+Promotional rates currently in effect, to re-verify against the first-party pages:
 
 | Model | Promotional rate | Announced through |
 |-------|------------------|-------------------|
 | `gpt-5.6-sol` | $4 / $20 (cache write $5) | at least November 21, 2026 |
-| `gemini-3.6-flash`, `gemini-3.7-flash`, `gemini-3.8-flash` | $0.75 / $3.75 | December 31, 2026 |
+| `gemini-3.6-flash`, `gemini-3.7-flash`, `gemini-3.8-flash` | $0.75 / $3.75; dated successor encoded above | December 31, 2026 |

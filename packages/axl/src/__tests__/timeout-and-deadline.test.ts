@@ -6,6 +6,7 @@ import { StallTimeoutError, TimeoutError } from '../errors.js';
 import { ProviderRegistry } from '../providers/registry.js';
 import { OpenAIProvider } from '../providers/openai.js';
 import { tool } from '../tool.js';
+import type { ChatMessage } from '../types.js';
 
 /**
  * Contract tests for spec 23.  The provider deliberately waits on the signal
@@ -55,6 +56,7 @@ function context(provider: object, options: Record<string, unknown> = {}) {
     awaitHumanHandler: options.awaitHumanHandler as never,
     signal: options.signal as AbortSignal | undefined,
     onTrace: options.onTrace as never,
+    sessionHistory: options.sessionHistory as ChatMessage[] | undefined,
   });
   return ctx;
 }
@@ -137,6 +139,80 @@ describe('ctx.ask timeout and deadline contract (spec 23)', () => {
       await rejected;
       expect(calls).toHaveLength(1);
     } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not credit a pre-timeout summary governor wait to later ask turns', async () => {
+    vi.useFakeTimers();
+    const originalFetch = globalThis.fetch;
+    try {
+      const entered = deferred();
+      const release = deferred();
+      let fetches = 0;
+      globalThis.fetch = (async () => {
+        if (fetches++ === 0) {
+          entered.resolve();
+          await release.promise;
+        }
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => openAIResponse,
+          text: async () => '',
+        };
+      }) as typeof fetch;
+
+      const summaryProvider = new OpenAIProvider({
+        apiKey: 'test-key',
+        rateLimit: { maxConcurrent: 1, adaptive: false },
+      });
+      const blocker = summaryProvider.chat([{ role: 'user', content: 'hold' }], {
+        model: 'gpt-4o',
+      });
+      await entered.promise;
+
+      let mainCalls = 0;
+      const mainProvider = {
+        name: 'controlled',
+        chat: async () => {
+          mainCalls++;
+          if (mainCalls === 1) {
+            await wait(40);
+            return {
+              content: '',
+              tool_calls: [
+                { id: 'next', type: 'function', function: { name: 'next_turn', arguments: '{}' } },
+              ],
+              usage,
+            };
+          }
+          return { content: 'must not dispatch', usage };
+        },
+      };
+      const nextTurn = tool({
+        name: 'next_turn',
+        description: 'force another turn',
+        input: z.object({}),
+        handler: async () => 'done',
+      });
+      const ask = context(mainProvider, {
+        extraProviders: { openai: summaryProvider },
+        config: { contextManagement: { summaryModel: 'openai:gpt-4o' } },
+        sessionHistory: [{ role: 'user', content: 'Earlier conversation.' }],
+      }).ask(baseAgent({ maxContext: 500, timeout: '30ms', tools: [nextTurn] }), 'go');
+      const rejected = expect(ask).rejects.toBeInstanceOf(TimeoutError);
+
+      await vi.advanceTimersByTimeAsync(50);
+      release.resolve();
+      await blocker;
+      await vi.advanceTimersByTimeAsync(40);
+      await rejected;
+      expect(mainCalls).toBe(1);
+      expect(fetches).toBe(2);
+    } finally {
+      globalThis.fetch = originalFetch;
       vi.useRealTimers();
     }
   });

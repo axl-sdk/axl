@@ -211,6 +211,7 @@ export type {
   SchemaCheckData,
   SchemaDiagnosticData,
   ProviderDiagnosticData,
+  ReasoningContextReset,
   ValidateData,
   StringDeltaData,
   AskOptions,
@@ -267,6 +268,7 @@ export {
   ToolFailure,
   InvalidModelInputError,
   UnsupportedModelInputError,
+  UnsupportedModelOptionError,
   AdmissionDeniedError,
   isAdmissionDeniedError,
 } from './errors.js';

@@ -1,5 +1,6 @@
 import type { ChatMessage, HandoffRecord } from './types.js';
 import { clearSessionInput, prepareSessionInput, registerSessionInput } from './session-input.js';
+import { withoutAnthropicThinking } from './compaction.js';
 import type { StateStore } from './state/types.js';
 import type { AxlRuntime } from './runtime.js';
 import type { AxlStream } from './stream.js';
@@ -111,21 +112,23 @@ export class Session {
           throw new Error('SessionOptions.history.summaryModel is required when summarize is true');
         }
         const messagesToDrop = history.slice(0, history.length - maxMessages);
-        // Include existing summary as context for the new summarization
-        const toSummarize: ChatMessage[] = cachedSummary
-          ? [
-              { role: 'system', content: `Previous conversation summary: ${cachedSummary}` },
-              ...messagesToDrop,
-            ]
-          : messagesToDrop;
-        const summary = await this.runtime.summarizeMessages(toSummarize, summaryModel);
+        // Fold the existing summary into the new one. This runs before any
+        // workflow execution exists, so it emits no ask-scoped events, and the
+        // thinking removal below is likewise not reported as a diagnostic.
+        const summary = await this.runtime.summarizeMessages(
+          messagesToDrop,
+          summaryModel,
+          cachedSummary ? { previousSummary: cachedSummary } : undefined,
+        );
         await this.store.saveSessionMeta(this.sessionId, 'summaryCache', summary);
         // Update local reference so the workflow receives the fresh summary
         cachedSummary = summary;
       }
       const trimmed = history.slice(-maxMessages);
       history.length = 0;
-      history.push(...trimmed);
+      // Summarizing or dropping old turns rewrites the signed prefix for every
+      // retained Anthropic thinking block. Keep other provider metadata.
+      history.push(...trimmed.map(withoutAnthropicThinking));
     }
 
     const userMessage: ChatMessage = { role: 'user', content: preparedInput.content };
@@ -138,6 +141,9 @@ export class Session {
       sessionId: this.sessionId,
       sessionHistory: history,
       ...(cachedSummary ? { summaryCache: cachedSummary } : {}),
+      // An opted-out session must leave nothing at rest, including the
+      // agent-scoped ask-summary records the runtime would otherwise cache.
+      ...(this.options.persist === false ? { sessionPersist: false } : {}),
     };
     return { history, metadata };
   }
@@ -315,6 +321,10 @@ export class Session {
         if (summaryCache !== null) {
           await this.store.saveSessionMeta(newId, 'summaryCache', summaryCache);
         }
+
+        // Per-agent ask summaries (`askSummary:<agent>`) are not copied:
+        // StateStore cannot enumerate metadata keys, so the fork's first
+        // over-budget ask regenerates its summary from the copied history.
 
         const handoffHistory = await this.store.getSessionMeta(this.sessionId, 'handoffHistory');
         if (handoffHistory !== null) {

@@ -20,6 +20,7 @@ import type {
   ChatMessage,
   ToolCallMessage,
   ProviderResponse,
+  ReasoningContextReset,
   CallTiming,
   AgentCallInfo,
   AgentCallParams,
@@ -61,6 +62,19 @@ import {
 } from './input.js';
 import type { ModelInput } from './input.js';
 import { sessionHistoryForAsk } from './session-input.js';
+import {
+  anthropicThinkingBlockCount,
+  askSummaryMetaKey,
+  buildSummaryPrompt,
+  parseAskSummaryRecord,
+  requestSummary,
+  summaryContextMessage,
+  summaryPrefixHash,
+  SUMMARY_MAX_TOKENS,
+  SUMMARY_SYSTEM_PROMPT,
+  withoutAnthropicThinking,
+} from './compaction.js';
+import type { AskSummaryRecord } from './compaction.js';
 import type { Agent } from './agent.js';
 import { parsePartialJson } from './partial-json.js';
 import { StreamingWalker } from './streaming-walker.js';
@@ -910,7 +924,14 @@ export class WorkflowContext<TInput = unknown> {
    *  suppresses late branch events after bounded finalization. */
   private readonly workflowLifecycleState: WorkflowLifecycleState;
   private signal?: AbortSignal;
-  private summaryCache?: string;
+  /** Durable summary of messages removed by Session.history.maxMessages. */
+  private sessionSummary?: string;
+  /** Per-agent `maxContext` summaries, keyed by agent name. `null` records a
+   *  store lookup that found nothing. Mirrored to session metadata
+   *  (`askSummary:<agent>`) when this execution belongs to a session, so a
+   *  later execution can reuse the same exact-prefix boundary. Never the
+   *  durable `sessionSummary`. */
+  private readonly askSummaries = new Map<string, AskSummaryRecord | null>();
   /** Consecutive provider calls with promptCache on that wrote to the cache
    *  without reading from it (prefix changes per call), and consecutive calls
    *  with no cache activity at all (prefix below the model's minimum, which
@@ -1125,9 +1146,10 @@ export class WorkflowContext<TInput = unknown> {
       startEmitted: false,
       endEmitted: false,
     };
-    // Restore cached summary from session metadata (survives across requests)
+    // Legacy summaryCache metadata may contain unique context from an older
+    // ask-level write, so retain it as opaque durable session context.
     if (init.metadata?.summaryCache) {
-      this.summaryCache = init.metadata.summaryCache as string;
+      this.sessionSummary = init.metadata.summaryCache as string;
     }
   }
 
@@ -1968,6 +1990,10 @@ export class WorkflowContext<TInput = unknown> {
       messages.push({ role: 'system', content: systemPrompt });
     }
 
+    const cachedSummaryMessage: ChatMessage | undefined = this.sessionSummary
+      ? summaryContextMessage(this.sessionSummary)
+      : undefined;
+
     // Include session history (with context window management)
     const maxContext = agent._config.maxContext;
     if (maxContext && sessionHistory.length > 0) {
@@ -2008,23 +2034,53 @@ export class WorkflowContext<TInput = unknown> {
           },
         });
       }
-      if (historyEstimate.tokens > availableForHistory) {
+      const summaryTokens = cachedSummaryMessage
+        ? estimateMessagesTokens([cachedSummaryMessage]).tokens
+        : 0;
+      if (historyEstimate.tokens + summaryTokens > availableForHistory) {
         // Need to summarize: find the split point
-        const summarizedMessages = await this.summarizeHistory(
+        const projection = await this.summarizeHistory(
+          agent._name,
+          modelUri,
           provider,
           model,
           sessionHistory,
           availableForHistory,
         );
-        for (const msg of summarizedMessages) {
+        // A completed summary is charged before the ask's first model turn.
+        // Stop here if that charge exhausted the budget, while preserving
+        // finish_and_stop's existing behavior within an active tool loop.
+        if (this.budgetContext?.exceeded && this.budgetContext.policy !== 'warn') {
+          const { limit, totalCost: spent, policy } = this.budgetContext;
+          throw new BudgetExceededError(limit, spent, policy);
+        }
+        // The projection rewrote the prefix Anthropic signed its thinking
+        // against, so Axl itself removed those blocks. Report it the same way
+        // a provider-side drop is reported, before the first model turn.
+        if (projection.removedThinkingBlocks > 0) {
+          this.emitEvent({
+            type: 'provider_diagnostic',
+            agent: agent._name,
+            data: {
+              kind: 'reasoning_context_reset',
+              ...(provider.name ? { provider: provider.name } : {}),
+              model: typeof providerOptions?.model === 'string' ? providerOptions.model : model,
+              droppedBlocks: projection.removedThinkingBlocks,
+              reasons: { client_prefix_rewrite: projection.removedThinkingBlocks },
+            },
+          });
+        }
+        for (const msg of projection.messages) {
           messages.push(msg);
         }
       } else {
+        if (cachedSummaryMessage) messages.push(cachedSummaryMessage);
         for (const msg of sessionHistory) {
           messages.push(msg);
         }
       }
     } else {
+      if (cachedSummaryMessage) messages.push(cachedSummaryMessage);
       for (const msg of sessionHistory) {
         messages.push(msg);
       }
@@ -2167,6 +2223,9 @@ export class WorkflowContext<TInput = unknown> {
     }
     const startTime = Date.now();
     const askClock = currentAskClock();
+    // Context summarization runs before this timer starts, but can itself wait
+    // on the governor. Credit only pauses observed after this point.
+    const pausedAtStartMs = askClock ? pausedAskClockMs(askClock, startTime) : 0;
     // Per-ask latency attribution, summed over completed turns. `turns` counts
     // only turns whose provider actually reported timing — zero means the
     // provider is uninstrumented, and the TimeoutError message stays bare
@@ -2219,7 +2278,9 @@ export class WorkflowContext<TInput = unknown> {
       // waits recorded on this ask's clock), never inferred from reported
       // provider timing, so a custom provider's `queuedMs` earns no credit.
       const elapsedMs = now - startTime;
-      const pausedMs = askClock ? pausedAskClockMs(askClock, now) : 0;
+      const pausedMs = askClock
+        ? Math.max(0, pausedAskClockMs(askClock, now) - pausedAtStartMs)
+        : 0;
       const chargedMs = Math.max(0, elapsedMs - Math.min(pausedMs, Math.max(0, elapsedMs)));
       if (chargedMs > timeoutMs) {
         throw new TimeoutError(
@@ -2608,6 +2669,7 @@ export class WorkflowContext<TInput = unknown> {
                   usage: chunk.usage,
                   cost: chunk.cost,
                   providerMetadata: chunk.providerMetadata,
+                  diagnostics: chunk.diagnostics,
                   timing: chunk.timing,
                 };
               }
@@ -2792,6 +2854,41 @@ export class WorkflowContext<TInput = unknown> {
         timingTotals.queuedMs += response.timing.queuedMs;
         timingTotals.retryMs += response.timing.retryMs;
         timingTotals.wireMs += response.timing.wireMs;
+      }
+
+      const reasoningReset = response.diagnostics?.reasoningContextReset;
+      if (
+        reasoningReset &&
+        Number.isSafeInteger(reasoningReset.droppedBlocks) &&
+        reasoningReset.droppedBlocks > 0
+      ) {
+        // A custom provider's diagnostics are untrusted event input. Copy only
+        // known numeric counts so extra fields cannot reach traces or Studio.
+        const reasons: ReasoningContextReset['reasons'] = {};
+        for (const reason of [
+          'prefix_binding_mismatch',
+          'model_binding_mismatch',
+          'organization_binding_mismatch',
+          'end_user_binding_mismatch',
+          'client_prefix_rewrite',
+          'other',
+        ] as const) {
+          const count = reasoningReset.reasons?.[reason];
+          if (typeof count === 'number' && Number.isSafeInteger(count) && count > 0) {
+            reasons[reason] = count;
+          }
+        }
+        this.emitEvent({
+          type: 'provider_diagnostic',
+          agent: agent._name,
+          data: {
+            kind: 'reasoning_context_reset',
+            ...(provider.name ? { provider: provider.name } : {}),
+            model: typeof providerOptions?.model === 'string' ? providerOptions.model : model,
+            droppedBlocks: reasoningReset.droppedBlocks,
+            reasons,
+          },
+        });
       }
 
       // Snapshot of what we actually sent the provider this turn (excluding the
@@ -3764,48 +3861,97 @@ export class WorkflowContext<TInput = unknown> {
     return defs;
   }
 
+  /** Session id for session-scoped ask-summary persistence, when this
+   *  execution belongs to a session and has a store to persist into. */
+  private askSummarySessionId(): string | undefined {
+    const sessionId = this.metadata?.sessionId;
+    if (this.metadata?.sessionPersist === false) return undefined;
+    return this.stateStore && typeof sessionId === 'string' && sessionId.length > 0
+      ? sessionId
+      : undefined;
+  }
+
+  /** This agent's ask summary: the in-memory copy first, else the session's
+   *  persisted record (read once per execution). */
+  private async loadAskSummary(agentName: string): Promise<AskSummaryRecord | undefined> {
+    if (this.askSummaries.has(agentName)) return this.askSummaries.get(agentName) ?? undefined;
+    const sessionId = this.askSummarySessionId();
+    const stored = sessionId
+      ? parseAskSummaryRecord(
+          await this.stateStore!.getSessionMeta(sessionId, askSummaryMetaKey(agentName)),
+        )
+      : undefined;
+    this.askSummaries.set(agentName, stored ?? null);
+    return stored;
+  }
+
+  private async saveAskSummary(agentName: string, record: AskSummaryRecord): Promise<void> {
+    this.askSummaries.set(agentName, record);
+    const sessionId = this.askSummarySessionId();
+    if (!sessionId) return;
+    const key = askSummaryMetaKey(agentName);
+    try {
+      await this.stateStore!.saveSessionMeta(sessionId, key, record);
+    } catch (error) {
+      // The record is a cache: this execution already holds the projection it
+      // paid for, and the next execution simply regenerates. Failing the ask
+      // here would waste the summary; hiding the failure would mask a broken
+      // store. Report it and continue.
+      this.emitEvent({
+        type: 'log',
+        agent: agentName,
+        data: {
+          warning:
+            `Could not persist ask summary '${key}' for session '${sessionId}'; ` +
+            `later executions will regenerate it. ` +
+            (error instanceof Error ? error.message : String(error)),
+        },
+      });
+    }
+  }
+
   /**
-   * Summarize old messages to fit within context window.
-   * Keeps recent messages intact, summarizes older ones.
+   * Project `history` into `availableTokens` for one agent's request: a summary
+   * of an exact covered prefix followed by every later message. Reuses the
+   * agent's cached boundary (in memory or persisted for the session) while the
+   * covered prefix, durable session summary, and summary model are unchanged
+   * and the whole tail fits; otherwise generates a new summary. Also reports how
+   * many Anthropic thinking blocks the projection removed from carried turns.
    */
   private async summarizeHistory(
+    agentName: string,
+    modelUri: string,
     provider: Provider,
     model: string,
     history: ChatMessage[],
     availableTokens: number,
-  ): Promise<ChatMessage[]> {
-    // If we have a cached summary and the history hasn't grown much, reuse it
-    if (this.summaryCache) {
-      const summaryMsg: ChatMessage = {
-        role: 'system',
-        origin: 'runtime',
-        content: `Summary of earlier conversation:\n${this.summaryCache}`,
-      };
+  ): Promise<{ messages: ChatMessage[]; removedThinkingBlocks: number }> {
+    const summaryModelUri = this.config.contextManagement?.summaryModel ?? modelUri;
+    const cache = await this.loadAskSummary(agentName);
+    // A cached summary covers one exact prefix. Its tail may grow, but it may
+    // never slide forward past that boundary without a new summary call.
+    if (
+      cache &&
+      cache.sourceSummary === this.sessionSummary &&
+      cache.summaryModelUri === summaryModelUri &&
+      cache.coveredCount <= history.length &&
+      cache.prefixHash === summaryPrefixHash(history, cache.coveredCount)
+    ) {
+      const summaryMsg = summaryContextMessage(cache.summary);
       const summaryTokens = estimateTokens(summarizeModelInput(summaryMsg.content)) + 4;
-      const remaining = availableTokens - summaryTokens;
-
-      // Find how many recent messages fit
-      let recentTokens = 0;
-      let splitIdx = history.length;
-      for (let i = history.length - 1; i >= 0; i--) {
-        const msgTokens = estimateTokens(summarizeModelInput(history[i].content)) + 4;
-        if (recentTokens + msgTokens > remaining) break;
-        recentTokens += msgTokens;
-        splitIdx = i;
-      }
-
-      // Anchor the reused tail on a user turn, shrinking it forward so it stays
-      // inside `remaining`. With no user turn left to anchor on, decline: the
-      // fall-through regenerates a summary that covers the newer turns.
-      //
-      // No clamp here on purpose. `splitIdx === history.length` means not even
-      // the newest message fits beside this summary, and the correct response
-      // is to fall through and regenerate — clamping instead would make this
-      // branch total and pin the first summary forever, silently hiding
-      // everything said after it.
-      splitIdx = nextUserTurn(history, splitIdx) ?? history.length;
-      if (splitIdx < history.length) {
-        return [summaryMsg, ...history.slice(splitIdx)];
+      const tail = history.slice(cache.coveredCount);
+      const tailTokens = estimateMessagesTokens(tail).tokens;
+      if (
+        summaryTokens + tailTokens <= availableTokens &&
+        (tail.length === 0 || tail[0].role === 'user')
+      ) {
+        let removedThinkingBlocks = 0;
+        const projected = tail.map((message, index) => {
+          if (cache.coveredCount + index >= cache.invalidatedThinkingThrough) return message;
+          removedThinkingBlocks += anthropicThinkingBlockCount(message);
+          return withoutAnthropicThinking(message);
+        });
+        return { messages: [summaryMsg, ...projected], removedThinkingBlocks };
       }
     }
 
@@ -3855,20 +4001,20 @@ export class WorkflowContext<TInput = unknown> {
       splitIdx = history.length;
     }
 
-    // Nothing to summarize: the whole history is "recent". After the anchoring
-    // above this is reachable only when history[0] is itself a user turn, so
-    // returning the history unchanged keeps the request user-first.
-    if (splitIdx === 0) return history;
+    // If only the durable summary made the request overflow, fold it together
+    // with the history. Returning raw history here would silently omit it.
+    if (splitIdx === 0 && this.sessionSummary) splitIdx = history.length;
+    if (splitIdx === 0) return { messages: history, removedThinkingBlocks: 0 };
 
     const oldMessages = history.slice(0, splitIdx);
 
     // Summarize old messages using the configured summary model or the same model
-    const summaryModelUri = this.config.contextManagement?.summaryModel;
+    const configuredSummaryModelUri = this.config.contextManagement?.summaryModel;
     let summaryProvider: Provider;
     let summaryModel: string;
 
-    if (summaryModelUri) {
-      const resolved = this.resolveProviderUri(summaryModelUri);
+    if (configuredSummaryModelUri) {
+      const resolved = this.resolveProviderUri(configuredSummaryModelUri);
       summaryProvider = resolved.provider;
       summaryModel = resolved.model;
     } else {
@@ -3876,37 +4022,104 @@ export class WorkflowContext<TInput = unknown> {
       summaryModel = model;
     }
 
-    const oldContent = oldMessages
-      .map((m) => `${m.role}: ${summarizeModelInput(m.content)}`)
-      .join('\n');
+    const summaryPrompt = buildSummaryPrompt(oldMessages, this.sessionSummary);
+    const summaryStart = Date.now();
+    // Turn 0: the summary runs before, and outside, the ask's 1-indexed tool
+    // loop, so its call pair never shares a turn number with a loop call.
+    this.emitEvent({
+      type: 'agent_call_start',
+      agent: agentName,
+      model: summaryModelUri,
+      turn: 0,
+      data: {
+        purpose: 'summary',
+        prompt: summaryPrompt,
+        system: SUMMARY_SYSTEM_PROMPT,
+        params: { maxTokens: SUMMARY_MAX_TOKENS },
+        turn: 0,
+      },
+    });
 
-    const summaryResponse = await summaryProvider.chat(
-      [
-        {
-          role: 'system',
-          content:
-            'Summarize the following conversation concisely, preserving key facts, decisions, and context needed for continuing the conversation.',
+    let summaryResponse: ProviderResponse;
+    try {
+      this.currentSignal?.throwIfAborted();
+      summaryResponse = await requestSummary(summaryProvider, {
+        model: summaryModel,
+        prompt: summaryPrompt,
+        signal: this.currentSignal,
+      });
+    } catch (error) {
+      const providerError = error instanceof ProviderError ? error : undefined;
+      this.emitEvent({
+        type: 'agent_call_end',
+        agent: agentName,
+        model: summaryModelUri,
+        duration: Date.now() - summaryStart,
+        ...(providerError?.timing ? { timing: providerError.timing } : {}),
+        data: {
+          purpose: 'summary',
+          response: '',
+          turn: 0,
+          // Provider errors may echo the summarized history, so the event
+          // uses a fixed projection even when trace redaction is disabled.
+          error: 'Context-management summary call failed',
+          ...(providerError
+            ? { status: providerError.status, retryable: providerError.retryable }
+            : {}),
         },
-        { role: 'user', content: oldContent },
-      ],
-      { model: summaryModel, maxTokens: 1024, signal: this.currentSignal },
-    );
-
-    this.summaryCache = summaryResponse.content;
-
-    // Persist summary cache to session metadata so it survives across requests
-    const sessionId = this.metadata?.sessionId as string | undefined;
-    if (sessionId && this.stateStore) {
-      await this.stateStore.saveSessionMeta(sessionId, 'summaryCache', this.summaryCache);
+      });
+      throw error;
     }
 
-    const summaryMsg: ChatMessage = {
-      role: 'system',
-      origin: 'runtime',
-      content: `Summary of earlier conversation:\n${summaryResponse.content}`,
-    };
+    // Accounting has already settled via the scoped provider facade. This
+    // leaf feeds the ask/event rollup; the separate budget rail needs one
+    // charge. Unknown-cost completed work remains an explicit lower bound.
+    if (isUsableCost(summaryResponse.cost)) this._accumulateBudgetCost(summaryResponse.cost);
+    this.emitEvent({
+      type: 'agent_call_end',
+      agent: agentName,
+      model: summaryModelUri,
+      cost: summaryResponse.cost,
+      ...(!isUsableCost(summaryResponse.cost) ? { unpriced: true } : {}),
+      tokens: summaryResponse.usage
+        ? {
+            input: summaryResponse.usage.prompt_tokens,
+            output: summaryResponse.usage.completion_tokens,
+            reasoning: summaryResponse.usage.reasoning_tokens,
+            cached: summaryResponse.usage.cached_tokens,
+            cacheWrite: summaryResponse.usage.cache_write_tokens,
+          }
+        : undefined,
+      duration: Date.now() - summaryStart,
+      ...(summaryResponse.timing ? { timing: summaryResponse.timing } : {}),
+      data: { purpose: 'summary', response: summaryResponse.content, turn: 0 },
+    });
 
-    return [summaryMsg, ...history.slice(splitIdx)];
+    // An unhashable prefix (cyclic custom metadata) cannot prove a later
+    // match, so it is simply not cached and the next ask regenerates.
+    const prefixHash = summaryPrefixHash(history, splitIdx);
+    if (prefixHash) {
+      await this.saveAskSummary(agentName, {
+        summary: summaryResponse.content,
+        coveredCount: splitIdx,
+        prefixHash,
+        ...(this.sessionSummary !== undefined ? { sourceSummary: this.sessionSummary } : {}),
+        summaryModelUri,
+        invalidatedThinkingThrough: history.length,
+      });
+    }
+
+    const tail = history.slice(splitIdx);
+    return {
+      messages: [
+        summaryContextMessage(summaryResponse.content),
+        ...tail.map(withoutAnthropicThinking),
+      ],
+      removedThinkingBlocks: tail.reduce(
+        (count, message) => count + anthropicThinkingBlockCount(message),
+        0,
+      ),
+    };
   }
 
   // ── ctx.checkpoint() ────────────────────────────────────────────────

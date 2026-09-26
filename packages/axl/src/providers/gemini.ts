@@ -14,7 +14,7 @@ import type {
   ResolvedThinkingOptions,
 } from './types.js';
 import { resolveThinkingOptions, resolveApiKey, type ApiKeySource } from './types.js';
-import { fetchWithRetry } from './retry.js';
+import { fetchWithRetry, type FetchWithRetryOptions } from './retry.js';
 import { CallTimingRecorder, withCallTiming, withChatTiming } from './call-timing.js';
 import { buildProviderError, ProviderError } from './errors.js';
 import type { RateLimitConfig } from './rate-limiter.js';
@@ -256,12 +256,10 @@ function parseGeminiFunctionResponse(content: string): Record<string, unknown> {
 
 // ---------------------------------------------------------------------------
 // Per-token Standard-tier pricing (USD) for supported current Gemini models.
-// Reviewed 2026-09-03 against https://ai.google.dev/gemini-api/docs/pricing.
-// Promotional rates are recorded at their current value, never as a
-// forward-dated transition -- an announced revert can be cancelled, and a
-// clock-gated table then silently misprices from the date it predicted.
-// The 3.6/3.7/3.8 Flash promotion is announced through 2026-12-31 ($1.50 /
-// $0.15 / $7.50 after); re-verify then rather than encoding the change here.
+// Reviewed 2026-09-25 against https://ai.google.dev/gemini-api/docs/pricing.
+// The exact 3.6/3.7/3.8 Flash Standard rows have published promotional and
+// successor rates. Resolve the applicable schedule at each transport attempt's
+// dispatch; only the returned attempt contributes usage and cost.
 // Model ids deliberately match exactly: a date/version suffix can change the
 // billing contract, so an unknown sibling must remain unpriced.
 // ---------------------------------------------------------------------------
@@ -278,12 +276,10 @@ type GeminiRate = {
    * billed at `input`, and text/image tokens are never billed at this rate — on
    * 2.5 Flash the two differ by more than 3x.
    *
-   * Reviewed 2026-09-08 against https://ai.google.dev/gemini-api/docs/pricing:
-   * Gemini 3.7 Flash publishes ONE input price ($0.75 / 1M through
-   * 2026-12-31) with no separate audio row, so audio bills at the input rate;
-   * Gemini 2.5 Flash publishes "$0.30 (text / image / video), $1.00 (audio)".
-   * The announced 2027-01-01 increase is deliberately not encoded (a
-   * clock-gated table silently misprices if the change is cancelled).
+   * Reviewed 2026-09-25 against https://ai.google.dev/gemini-api/docs/pricing:
+   * Gemini 3.7 Flash publishes one input price (including audio); Gemini 2.5
+   * Flash publishes "$0.30 (text / image / video), $1.00 (audio)". The
+   * 3.7 Flash audio rate follows its dated Standard input price below.
    */
   audioInput?: number;
 };
@@ -322,6 +318,58 @@ const GEMINI_PRICING: Record<string, GeminiRate> = {
   'gemini-3.8-flash': { input: 0.75e-6, cached: 0.075e-6, output: 3.75e-6 },
 };
 
+/**
+ * Dated successor Standard rates for the 3.6/3.7/3.8 Flash line, published by
+ * Google to take effect 2027-01-01. `geminiRatesAtDispatch` below switches to
+ * this table once the transport dispatches on or after that date.
+ *
+ * This is a clock-gated pricing table, which is a real hazard: Anthropic's
+ * Sonnet 5 had a scheduled 2026-09-01 price increase that was cancelled before
+ * it took effect, and a forward-dated gate for it would have silently
+ * overcharged every call made after the date it predicted (see the dated
+ * review comment on `estimateAnthropicCost`). That argument still applies
+ * here in principle — if Google cancels or revises this successor pricing
+ * before 2027-01-01, this table will misprice calls made on/after that date
+ * until corrected.
+ *
+ * We encode it anyway, deliberately reversing the Anthropic precedent for
+ * this specific case, because the failure direction is opposite and this is
+ * a budget-enforcement rail (`ctx.budget()`), not just a cost display: the
+ * published successor rates are *higher* than current rates, so encoding
+ * them fails toward overcounting spend against a budget. Overcounting is the
+ * safe side for a budget rail (it can only make `ctx.budget()` stop early or
+ * under-report headroom, never let unpriced/under-priced spend sail past a
+ * cap); the Anthropic case was unsafe because encoding an announced increase
+ * that never landed would have *overcharged* observed cost with no
+ * corresponding rail benefit. If Google cancels this increase before
+ * 2027-01-01, remove or correct this table before that date; if this
+ * revalidation lapses, `GEMINI_PRICING` (the current, safe-by-default table)
+ * remains authoritative through this file staying unmodified.
+ *
+ * Required re-verification: `.claude/rules/releasing.md` gates any release
+ * cut on or after 2026-12-01 on re-checking Google's published Gemini
+ * 3.6/3.7/3.8 Flash Standard rates for 2027-01-01 against
+ * https://ai.google.dev/gemini-api/docs/pricing and updating or expiring
+ * these rows accordingly.
+ */
+const GEMINI_FLASH_SUCCESSOR_PRICING: Readonly<Record<string, GeminiRate>> = {
+  ...GEMINI_PRICING,
+  'gemini-3.6-flash': { input: 1.5e-6, cached: 0.15e-6, output: 7.5e-6 },
+  'gemini-3.7-flash': {
+    input: 1.5e-6,
+    cached: 0.15e-6,
+    output: 7.5e-6,
+    audioInput: 1.5e-6,
+  },
+  'gemini-3.8-flash': { input: 1.5e-6, cached: 0.15e-6, output: 7.5e-6 },
+};
+
+const GEMINI_FLASH_SUCCESSOR_START_MS = Date.UTC(2027, 0, 1);
+
+function geminiRatesAtDispatch(at: number): Readonly<Record<string, GeminiRate>> {
+  return at < GEMINI_FLASH_SUCCESSOR_START_MS ? GEMINI_PRICING : GEMINI_FLASH_SUCCESSOR_PRICING;
+}
+
 type GeminiPriceUsage = {
   inputTokens: number;
   /** Billed output: candidate tokens plus thought tokens, counted exactly once. */
@@ -343,7 +391,22 @@ type GeminiPricingContext = {
   model: string;
   serviceTier?: unknown;
   eligibleRequest: boolean;
+  /** Captured on each transport dispatch; the returned attempt owns the billed usage. */
+  rates?: Readonly<Record<string, GeminiRate>>;
 };
+
+function geminiPricingTimingObserver(
+  context: GeminiPricingContext,
+  recorder: CallTimingRecorder,
+): NonNullable<FetchWithRetryOptions['timing']> {
+  return {
+    ...recorder.observer,
+    onDispatch: (attempt, at) => {
+      context.rates = geminiRatesAtDispatch(at);
+      recorder.observer.onDispatch?.(attempt, at);
+    },
+  };
+}
 
 type NormalizedGeminiUsage = {
   usage: NonNullable<ProviderResponse['usage']>;
@@ -472,8 +535,12 @@ function isEligibleGeminiPricing(
   );
 }
 
-function estimateGeminiCost(model: string, usage: GeminiPriceUsage): number | undefined {
-  const pricing = GEMINI_PRICING[model];
+function estimateGeminiCost(
+  model: string,
+  usage: GeminiPriceUsage,
+  rates: GeminiPricingContext['rates'],
+): number | undefined {
+  const pricing = rates && Object.hasOwn(rates, model) ? rates[model] : undefined;
   const cached = usage.cachedTokens ?? 0;
   if (
     !pricing ||
@@ -977,7 +1044,7 @@ export class GeminiProvider implements Provider {
       {
         governor: this.governorFor(pricingContext.model),
         provider: this.name,
-        timing: recorder.observer,
+        timing: geminiPricingTimingObserver(pricingContext, recorder),
         admission: options.dispatchAdmission,
       },
     );
@@ -1025,7 +1092,7 @@ export class GeminiProvider implements Provider {
       {
         governor: this.governorFor(pricingContext.model),
         provider: this.name,
-        timing: recorder.observer,
+        timing: geminiPricingTimingObserver(pricingContext, recorder),
         admission: options.dispatchAdmission,
       },
     );
@@ -1071,7 +1138,7 @@ export class GeminiProvider implements Provider {
       {
         governor: this.governorFor(pricingContext.model),
         provider: this.name,
-        timing: recorder.observer,
+        timing: geminiPricingTimingObserver(pricingContext, recorder),
         admission: options.dispatchAdmission,
       },
     );
@@ -1111,7 +1178,7 @@ export class GeminiProvider implements Provider {
       {
         governor: this.governorFor(pricingContext.model),
         provider: this.name,
-        timing: recorder.observer,
+        timing: geminiPricingTimingObserver(pricingContext, recorder),
         admission: options.dispatchAdmission,
       },
     );
@@ -1388,7 +1455,7 @@ export class GeminiProvider implements Provider {
     ) {
       return undefined;
     }
-    return estimateGeminiCost(effectiveModel, normalized.pricingUsage);
+    return estimateGeminiCost(effectiveModel, normalized.pricingUsage, pricingContext.rates);
   }
 
   /**
@@ -2198,7 +2265,7 @@ export class GeminiProvider implements Provider {
         json.usageMetadata?.serviceTier !== undefined &&
           !isDefinitiveStandardGeminiResponseTier(json.usageMetadata.serviceTier),
       )
-        ? estimateGeminiCost(effectiveModel, normalized.pricingUsage)
+        ? estimateGeminiCost(effectiveModel, normalized.pricingUsage, pricingContext.rates)
         : undefined;
 
     // Attach raw Gemini parts as providerMetadata so they can be sent back
@@ -2325,7 +2392,7 @@ export class GeminiProvider implements Provider {
           hasDefinitiveStandardResponseTier,
           hasInvalidResponseTier,
         )
-          ? estimateGeminiCost(effectiveModel, normalizedUsage.pricingUsage)
+          ? estimateGeminiCost(effectiveModel, normalizedUsage.pricingUsage, pricingContext.rates)
           : undefined;
       yield {
         type: 'done',

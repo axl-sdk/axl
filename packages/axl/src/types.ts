@@ -300,7 +300,9 @@ export type AgentCallParams = {
  * for completion.
  */
 export type AgentCallStartData = {
-  /** Original user prompt passed to `ctx.ask()`. Does not include retry feedback or tool results. */
+  /** Context-management summarizer call, separate from the ask's tool loop. */
+  purpose?: 'summary';
+  /** Original ask prompt, or summarized history when `purpose === 'summary'`. */
   prompt: string;
   /** Bounded rich-input shape; omitted for legacy string calls. */
   input?: ModelInputDescriptor;
@@ -308,7 +310,9 @@ export type AgentCallStartData = {
   system?: string;
   /** Resolved model parameters sent to the provider for this call. */
   params?: AgentCallParams;
-  /** 1-indexed iteration of the tool-calling loop for this `ctx.ask()` call. */
+  /** 1-indexed iteration of the tool-calling loop for this `ctx.ask()` call;
+   *  `0` for a context-management summary call (`purpose: 'summary'`), which
+   *  runs before and outside that loop. */
   turn: number;
   /** When set, this call is a retry triggered by a failed gate check on the previous turn. */
   retryReason?: 'schema' | 'validate' | 'guardrail';
@@ -334,11 +338,14 @@ export type AgentCallStartData = {
  * (top-level on the event) when partial usage is available.
  */
 export type AgentCallEndData = {
+  /** Mirrors `agent_call_start.data.purpose` for cost attribution without a join. */
+  purpose?: 'summary';
   /** Final LLM response content for this turn. Empty string on error. */
   response: string;
   /** Reasoning/thinking content returned by the provider, when available. */
   thinking?: string;
-  /** 1-indexed iteration of the tool-calling loop. Mirrors the matching `agent_call_start.data.turn`. */
+  /** 1-indexed iteration of the tool-calling loop (`0` for a summary call).
+   *  Mirrors the matching `agent_call_start.data.turn`. */
   turn: number;
   /** Mirrors `agent_call_start.data.retryReason` so cost-attribution consumers
    *  reading `agent_call_end` (cost lives here) can bucket without joining. */
@@ -665,16 +672,46 @@ export type SchemaDiagnosticData =
  * The union is `kind`-discriminated so later provider cliffs can join without a
  * new event type.
  */
-export type ProviderDiagnosticData = {
-  kind: 'effort_clamped';
-  /** Provider name (`provider.name`), when the adapter exposes one. */
-  provider?: string;
-  /** The model the request is actually sent to (after any `providerOptions.model`). */
-  model: string;
-  requested: Effort;
-  effective: string;
-  cause: string;
+export type ReasoningContextReset = {
+  /** Number of thinking blocks dropped from this call's input. */
+  droppedBlocks: number;
+  /**
+   * Documented Anthropic reasons, `client_prefix_rewrite` when Axl itself
+   * removed thinking because an `AgentConfig.maxContext` summary rewrote the
+   * prefix those blocks were signed against, and a safe bucket for future
+   * reasons; no paths or signed content.
+   */
+  reasons: Partial<
+    Record<
+      | 'prefix_binding_mismatch'
+      | 'model_binding_mismatch'
+      | 'organization_binding_mismatch'
+      | 'end_user_binding_mismatch'
+      | 'client_prefix_rewrite'
+      | 'other',
+      number
+    >
+  >;
 };
+
+export type ProviderDiagnosticData =
+  | {
+      kind: 'effort_clamped';
+      /** Provider name (`provider.name`), when the adapter exposes one. */
+      provider?: string;
+      /** The model the request is actually sent to (after any `providerOptions.model`). */
+      model: string;
+      requested: Effort;
+      effective: string;
+      cause: string;
+    }
+  | {
+      kind: 'reasoning_context_reset';
+      provider?: string;
+      model: string;
+      droppedBlocks: number;
+      reasons: ReasoningContextReset['reasons'];
+    };
 
 /** Data shape for legacy `guardrail` events. Replaced by `pipeline` in PR 2. */
 export type GuardrailData = {
@@ -927,7 +964,8 @@ type LegacyAxlEventPayloadV1 =
         type: 'agent_call_start';
         agent: string;
         model: string;
-        /** 1-indexed tool-calling loop iteration within the ask. */
+        /** 1-indexed tool-calling loop iteration within the ask; `0` for a
+         *  context-management summary call (`data.purpose: 'summary'`). */
         turn: number;
         /** Request-side payload — prompt, system, params, messages, retry context. */
         data: AgentCallStartData;
@@ -1566,6 +1604,8 @@ export type ProviderResponse = {
   costProvenance?: 'provider_reported' | 'price_table_estimate';
   /** Provider-specific opaque metadata that needs to round-trip through conversation history. */
   providerMetadata?: Record<string, unknown>;
+  /** Safe per-call provider diagnostics, excluding raw provider content. */
+  diagnostics?: { reasoningContextReset?: ReasoningContextReset };
   /** Per-call latency breakdown. Absent on providers that don't instrument it. */
   timing?: CallTiming;
 };

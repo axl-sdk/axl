@@ -194,10 +194,10 @@ const myAgent = agent({
 | `temperature` | `number` | provider default | LLM sampling temperature |
 | `maxTokens` | `number` | `4096` | Maximum tokens in the LLM response |
 | `effort` | `Effort` | — | Unified effort level: `'none'` \| `'low'` \| `'medium'` \| `'high'` \| `'xhigh'` \| `'max'`. Exact model and endpoint capabilities determine whether a tier is sent, clamped, or omitted. GPT-5.6 supports native `'max'` on Responses; Chat sends `'xhigh'` and reports the clamp via a `provider_diagnostic` event. Claude 5 supports native `'max'`; earlier families keep their documented caps |
-| `thinkingBudget` | `number` | — | Explicit thinking token budget (advanced). Overrides effort-based allocation. Set to `0` to disable thinking while keeping effort |
+| `thinkingBudget` | `number` | — | Explicit thinking token budget (advanced). Overrides effort-based allocation. On models that allow it, `0` disables thinking while keeping effort; Claude Opus 5.5 and Fable 5.1 instead use adaptive thinking at the low floor. |
 | `promptCache` | `boolean` | `false` | Opt in to caching the agent's stable prefix (system prompt + tool definitions). Anthropic: one `cache_control` breakpoint on the first system block, so runtime-injected summaries and the user turn are never cached. OpenAI and Gemini cache automatically — no-op there. Off by default because a prefix that changes every call (a `system` built from `ctx.metadata`) pays the write premium with no reads. See [providers.md#prompt-caching](providers.md#prompt-caching) |
 | `includeThoughts` | `boolean` | — | Return reasoning summaries in responses. Supported on OpenAI Responses API and Gemini |
-| `toolChoice` | `'auto' \| 'none' \| 'required' \| { type: 'function', function: { name } }` | — | Tool choice strategy: `'auto'` lets the model decide, `'none'` forbids tool use, `'required'` forces at least one tool call, or specify a function name to force a specific tool |
+| `toolChoice` | `'auto' \| 'none' \| 'required' \| { type: 'function', function: { name } }` | — | Tool choice strategy: `'auto'` lets the model decide, `'none'` forbids tool use, `'required'` forces at least one tool call, or specify a function name to force a specific tool. Claude Opus 5.5 and Fable 5.1 reject forced choices before dispatch. |
 | `stop` | `string[]` | — | Stop sequences — generation stops when any sequence is encountered. Not supported by the `openai-responses` provider (silently ignored) |
 | `providerOptions` | `Record<string, unknown>` | — | Provider-specific options shallow-merged into the raw API request body via `Object.assign`. Not portable across providers. See [shallow merge caveat](providers.md#provideroptions) |
 | `maxTurns` | `number` | `25` | Maximum tool-call loop iterations before throwing `MaxTurnsError`. **A "turn" in axl is one provider call inside a single `ctx.ask()`** — not a user↔assistant exchange. Schema/validate/guardrail retries also consume turns. See [Sessions → Turns vs. Exchanges](#turns-vs-exchanges) |
@@ -573,6 +573,9 @@ These controls deliberately cover different failure modes:
 | Provider service time, including streamed content | Waiting in Axl's rate governor: queue, spacing, adaptive pacing, and 429 pauses |
 | Tool execution and schema / validate / guardrail retries | Waiting in `awaitHuman` |
 | Transport retries and backoff for 503 / 529 / network errors | |
+
+The ask's graceful timer starts after context projection, including any summary call. Waits
+during that preparation cannot reduce the budget charged to later turns.
 
 An excluded wait is excluded for the ask doing the waiting and for every ask enclosing it, so a
 parent is not charged while a nested ask inside its tool sits in the queue. Sibling asks never
@@ -1690,11 +1693,11 @@ const result = await session.send('HandleSupport', { msg: 'Help me' });
 | `session.history()` | Get the last persisted message history snapshot from the store. Does **not** await in-flight `send()`/`stream()` — returns the previously committed state, which may be stale by one exchange |
 | `session.handoffs()` | Get the handoff history for this session. Same snapshot semantics as `history()` |
 | `session.end()` | Close the session and delete history from the store. Serialized: queues behind any in-flight `send`/`stream` so the delete is the final state |
-| `session.fork(newId, { overwrite? })` | Create a copy of this session with a new ID. Copies: history, `summaryCache`, `handoffHistory`, and session-scoped key-value memory entries (vector embeddings are NOT copied — re-embed on the fork if you need semantic recall). Acquires both source and target locks so it captures a committed snapshot and does not race a concurrent `runtime.session(newId).send(...)`. Throws if `newId === source id` or if the target id already has history (pass `{ overwrite: true }` to replace it) |
+| `session.fork(newId, { overwrite? })` | Create a copy of this session with a new ID. Copies: history, `summaryCache`, `handoffHistory`, and session-scoped key-value memory entries (vector embeddings are NOT copied — re-embed on the fork if you need semantic recall). Per-agent `maxContext` summaries are not copied; the fork regenerates on its first tight ask. Acquires both source and target locks so it captures a committed snapshot and does not race a concurrent `runtime.session(newId).send(...)`. Throws if `newId === source id` or if the target id already has history (pass `{ overwrite: true }` to replace it) |
 
 ### What's stored
 
-A session's persisted state is a flat `ChatMessage[]` of `user` and `assistant` turns, keyed by `sessionId` in the configured `StateStore`. The persisted `user` turn is the workflow input: a string as-is, an ordered `ModelInput` as its context-safe text projection (`question\n[audio audio/wav]`, the same rendering `summarizeModelInput` produces), and any other application object as JSON. An array counts as `ModelInput` only when it is non-empty and every element carries a `type` of `text`, `image`, or `audio`; any other array (including `[]`) is an application value and is persisted as JSON. Media is per-call evidence, never session state, so inline base64 is never persisted or re-sent as text on later turns, and a malformed part fails with `InvalidModelInputError` before the workflow runs. Summarization caches and handoff history are stored alongside as session metadata. The `Session` object itself holds no message cache — every `send()`/`stream()` reads history from the store, mutates it during execution, and writes it back. Calling `runtime.session(id)` does not pre-load anything and does not check whether the id exists.
+A session's persisted state is a flat `ChatMessage[]` of `user` and `assistant` turns, keyed by `sessionId` in the configured `StateStore`. The persisted `user` turn is the workflow input: a string as-is, an ordered `ModelInput` as its context-safe text projection (`question\n[audio audio/wav]`, the same rendering `summarizeModelInput` produces), and any other application object as JSON. An array counts as `ModelInput` only when it is non-empty and every element carries a `type` of `text`, `image`, or `audio`; any other array (including `[]`) is an application value and is persisted as JSON. Media is per-call evidence, never session state, so inline base64 is never persisted or re-sent as text on later turns, and a malformed part fails with `InvalidModelInputError` before the workflow runs. Session retention summaries, per-agent ask-level summaries (`askSummary:<agentName>`), and handoff history are stored alongside as session metadata. The `Session` object itself holds no message cache — every `send()`/`stream()` reads history from the store, mutates it during execution, and writes it back. Calling `runtime.session(id)` does not pre-load anything and does not check whether the id exists.
 
 By default, the request sent by `ctx.ask()` contains a matching current session input once. When the just-recorded current turn is still unchanged at the end of history and the ask input has the same normalized structure, `ctx.ask()` omits that one turn from its request-local history snapshot before appending the normal ask content. Rich inputs compare their ordered parts and media source data, not their lossy text projection. Application objects match only when the ask is exactly their `JSON.stringify(...)` string. Equal inputs on later `send()` calls remain distinct, as do a second sequential ask after an assistant reply, whitespace/case changes, and manually supplied `sessionHistory`. Child contexts still start with empty history. `deduplicateInput: false` restores the prior request shape without changing what the session persists.
 
@@ -1715,7 +1718,7 @@ These are different concepts in axl:
 
 | Term | Meaning |
 |------|---------|
-| **Turn** | One iteration of the tool-call loop inside a single `ctx.ask()` — i.e., one provider HTTP call. Capped by `AgentConfig.maxTurns` (default 25). Schema/validate/guardrail retries each consume a turn. Stamped on `agent_call_start`/`agent_call_end` events as `turn: N` |
+| **Turn** | One iteration of the tool-call loop inside a single `ctx.ask()` — i.e., one provider HTTP call. Capped by `AgentConfig.maxTurns` (default 25). Schema/validate/guardrail retries each consume a turn. Stamped on `agent_call_start`/`agent_call_end` events as `turn: N` (N ≥ 1); a standalone context-management summary call has `data.purpose: 'summary'` and `turn: 0` because it runs before and outside this loop |
 | **Exchange** (or "round") | One user↔assistant round-trip at the session level — roughly one `session.send()` call. An exchange can internally invoke multiple `ctx.ask()` calls, each running its own turn loop |
 
 If you are coming from other LLM SDKs where "turn" means a conversational round-trip, mentally rename axl's `maxTurns` to "max provider calls per ask".
@@ -1760,10 +1763,13 @@ The `AxlRuntime` extends `EventEmitter`. Subscribe to lifecycle signals:
 
 Two independent summarization paths exist:
 
-- **Session-level** (controlled here via `history.maxMessages` + `history.summarize`). Triggers when persisted history exceeds `maxMessages`. Drops the oldest excess messages, summarizes them with `summaryModel`, and stores the rolling summary as session metadata so it carries across `send()` calls.
-- **Ask-level** (controlled by `AgentConfig.maxContext`). Triggers inside `ctx.ask()` when the prompt + history would exceed the agent's configured context window. Independent of `SessionOptions`.
+- **Session-level** (`history.maxMessages` + `history.summarize`). When stored history exceeds `maxMessages`, the oldest messages are dropped and, with `summarize: true`, condensed into a rolling summary stored as session metadata (`summaryCache`). That summary is included in every later request for every agent. It runs inside `send()`/`stream()` before the workflow starts, so it emits no ask-scoped events; its cost still lands in the active accounting scope. Trimming also removes Anthropic thinking from the retained turns (their signed prefix changed); that removal is not reported.
+- **Ask-level** (`AgentConfig.maxContext`). When one agent's request would not fit its window, Axl summarizes the oldest part of the retained history and sends that summary followed by **every** later message, nothing skipped. This is a view for that agent only: it never changes stored history, never overwrites `summaryCache`, and never shrinks another agent's view, so a small-window classifier and a large-window expert can share one session.
+  - **Reuse.** The summary is remembered per agent, in memory and (in a session) as metadata under `askSummary:<agentName>`, keyed by a hash of the messages it covers. Later asks and later `send()` calls reuse it with no summary call while those messages, the session's rolling summary, and the summary model are unchanged and the newer messages still fit. Otherwise Axl summarizes again, folding in the old summary.
+  - **Reasoning.** If the new summary invalidates Anthropic thinking signed to the old prefix, Axl removes those blocks and emits one `provider_diagnostic` `reasoning_context_reset` with reason `client_prefix_rewrite` before the first model turn.
+  - **Persistence.** `persist: false` sessions store no summaries and regenerate each `send()`. If saving the summary fails, the ask continues and emits a `log` event with a `warning`; the next execution regenerates.
 
-Both can fire in the same `send()`.
+Both use the same summary prompt and provider call. Both can fire in the same `send()`.
 
 ---
 
@@ -2118,6 +2124,14 @@ Anthropic cache creation is included in
 each bucket at its actual multiplier. Aggregate-only cache-write usage remains observable but
 is deliberately unpriced.
 
+`ProviderResponse.diagnostics?.reasoningContextReset` and the terminal stream
+`done.diagnostics` carry the same `ReasoningContextReset`: `droppedBlocks` plus
+per-reason counts (`prefix_binding_mismatch`, `model_binding_mismatch`,
+`organization_binding_mismatch`, `end_user_binding_mismatch`, `other`, and
+`client_prefix_rewrite` for removals Axl made itself before a `maxContext`
+summary). Never the signed block, transformation path, or raw response.
+Custom providers may omit `diagnostics`.
+
 `audio_input_tokens` / `audio_output_tokens` are the audio share of
 `prompt_tokens` / `completion_tokens`, populated on every lane that reports the
 split — `openai:` and `openrouter:` from `prompt_tokens_details.audio_tokens` /
@@ -2329,8 +2343,8 @@ import type { AxlEvent, AxlEventType, AxlEventOf, AskScoped } from '@axlsdk/axl'
 | `transcription_end` | — | `transcriptionId`, `model?`, `duration`, `cost?`, `tokens?`, `data: { status, provider?, model?, audio?, text?, usage?, pricingStatus?, cleanupStatus?, error?, errorCode?, providerError?: { status, retryable, retryAfterMs?, requestId? } }` | Exactly once after transcription completes, fails, or aborts. Provider failures retain only safe HTTP diagnostics. `text` is present on an unredacted successful event and scrubbed by `trace.redact`; raw audio/base64/reference/provider body are never emitted. |
 | `ask_start` | `AskScoped` | `prompt: string` | Top of every `ctx.ask()` |
 | `ask_end` | `AskScoped` | `outcome: { ok: true, result } \| { ok: false, error }`, `cost`, `duration` | Every `ctx.ask()` exit. Ask-internal failures surface here, NOT via the workflow-level `error` event |
-| `agent_call_start` | `AskScoped` | `agent: string`, `model: string`, `turn: number`, `data: AgentCallStartData` | Before each LLM call (one per loop turn) |
-| `agent_call_end` | `AskScoped` | `agent: string`, `model: string`, `cost?: number`, `unpriced?: boolean`, `duration: number`, `timing?: CallTiming`, `data: AgentCallEndData` | After each LLM call settles. `unpriced` marks an explicit unknown-cost lower bound, including a dispatched stalled request abandoned without usage. `timing` is present whenever the provider reported one — including the error path, when the provider returned a response (a non-2xx, or a mid-stream failure). It is absent when there was nothing to measure: a connection-level failure, an abort, or a non-provider throw. `status` is not a proxy for this — see [`ProviderError` fields](#providererror-fields) |
+| `agent_call_start` | `AskScoped` | `agent: string`, `model: string`, `turn: number`, `data: AgentCallStartData` | Before each LLM call, including context-management summary generation (`data.purpose: 'summary'`) |
+| `agent_call_end` | `AskScoped` | `agent: string`, `model: string`, `cost?: number`, `unpriced?: boolean`, `duration: number`, `timing?: CallTiming`, `data: AgentCallEndData` | After each LLM call settles, including context-management summary generation. `unpriced` marks an explicit unknown-cost lower bound, including a completed unknown-price summary or a dispatched stalled request abandoned without usage. `timing` is present whenever the provider reported one — including the error path, when the provider returned a response (a non-2xx, or a mid-stream failure). It is absent when there was nothing to measure: a connection-level failure, an abort, or a non-provider throw. `status` is not a proxy for this — see [`ProviderError` fields](#providererror-fields) |
 | `token` | `AskScoped` | `data: string` | Streaming text chunk. **Stream-only** — never persisted to `ExecutionInfo.events` |
 | `tool_call_rejected` | `AskScoped` | `tool: string`, `callId: string`, `data: ToolCallRejectedData` | Provider request rejected before execution starts; no start/end pair |
 | `tool_call_start` | `AskScoped` | `tool: string`, `callId: string`, `data: ToolCallStartDataV2` | After availability, JSON, and local argument validation succeeds |
@@ -2344,7 +2358,7 @@ import type { AxlEvent, AxlEventType, AxlEventOf, AskScoped } from '@axlsdk/axl'
 | `string_delta` | `AskScoped` | `attempt: number`, `data: StringDeltaData` (`{ path: string, delta: string }`) | Per-chunk character-level deltas inside string VALUES of progressive structured output. Same gating as `partial_object` (schema set, no tools, root is `ZodObject`). **Important:** `handoffs: [...]` configured on an agent registers as tools internally, so a router agent never emits `string_delta` — only the handoff target (or any leaf agent with no tools and a schema) does. `path` is an RFC 6901 JSON Pointer to the string field (`/summary`, `/sources/0/title`); `delta` is the unescaped chars added in this chunk. Designed for chat-style typewriter rendering of long string fields — see `AxlStream.stringStream` / `AxlEventBus.stringStream` view helpers below. Stream-only; never persisted to `ExecutionInfo.events` |
 | `verify` | `AskScoped` | `data: VerifyData` | `ctx.verify()` completes (pass or fail) |
 | `schema_diagnostic` | `AskScoped` | `data: SchemaDiagnosticData` (`kind`-discriminated) | A silent structured-output cliff was detected (oversized appended/tool schema, dropped `.refine()`s, streaming disabled, or `schemaPrompt:'none'` with no guidance). One per ask per cliff. Threshold + silencing via `AxlConfig.diagnostics`. See [observability.md#schema-diagnostics](./observability.md#schema-diagnostics) |
-| `provider_diagnostic` | `AskScoped` | `data: ProviderDiagnosticData` (`kind`-discriminated) | The resolved provider could not honor a portable request knob verbatim. First kind: `effort_clamped` (`requested`, provider-native `effective`, `cause`, `model`, `provider?`). One per ask, emitted before the ask's first `agent_call_start`; `agent_call_start` keeps reporting the *requested* effort. Silencing via `AxlConfig.diagnostics` suppresses only the paired `console.warn`. See [observability.md#provider-diagnostics](./observability.md#provider-diagnostics) |
+| `provider_diagnostic` | `AskScoped` | `data: ProviderDiagnosticData` (`kind`-discriminated) | `effort_clamped` reports requested and effective effort once per ask before dispatch. `reasoning_context_reset` reports safe dropped-thinking reason counts once per affected Anthropic provider call after completion, and once per ask before its first model turn when an ask-level summary removed thinking itself (`reasons.client_prefix_rewrite`). Silencing via `AxlConfig.diagnostics` suppresses only the paired effort warning. See [observability.md#provider-diagnostics](./observability.md#provider-diagnostics) |
 | `guardrail` / `schema_check` / `validate` | `Partial<AskScoped>` | `data: GuardrailData/SchemaCheckData/ValidateData` | Per-gate retry events emitted alongside `pipeline` |
 | `log` | `Partial<AskScoped>` | `data: unknown` | `ctx.log()` user event |
 | `memory_remember` / `memory_recall` / `memory_forget` | `Partial<AskScoped>` | `data: MemoryEventData` | Memory ops audit |
@@ -2377,7 +2391,8 @@ Populated at dispatch time, before the provider responds. Lets consumers render 
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `prompt` | `string` | Original user prompt passed to `ctx.ask()`. Does not include retry feedback or tool results |
+| `prompt` | `string` | Original ask prompt, or summarized history when `purpose === 'summary'`. Ordinary calls do not include retry feedback or tool results |
+| `purpose` | `'summary'?` | Present for a generated context-management summary; its `prompt` is the summarized history and its `turn` is `0` because it runs before and outside the ask's tool loop. Cached summary reuse emits no call pair |
 | `system` | `string?` | Resolved system prompt (dynamic selectors evaluated at call time) |
 | `params` | `AgentCallParams?` | Resolved model parameters sent to the provider: `{ temperature?, maxTokens?, effort?, thinkingBudget?, includeThoughts?, toolChoice?, stop? }` |
 | `turn` | `number` | 1-indexed iteration of the tool-calling loop for this `ctx.ask()` call |
@@ -2392,8 +2407,9 @@ Populated when the provider returns (success or recoverable failure). Pair invar
 | Field | Type | Description |
 |-------|------|-------------|
 | `response` | `string` | Final LLM response content for this turn. Empty string on error |
+| `purpose` | `'summary'?` | Mirrors the matching start event for context-management summary calls, so cost can be attributed without joining events |
 | `thinking` | `string?` | Reasoning/thinking content returned by the provider, when available |
-| `turn` | `number` | 1-indexed iteration of the tool-calling loop. Mirrors the matching `agent_call_start.data.turn` |
+| `turn` | `number` | 1-indexed iteration of the tool-calling loop (`0` for a `purpose: 'summary'` call). Mirrors the matching `agent_call_start.data.turn` |
 | `retryReason` | `'schema' \| 'validate' \| 'guardrail'?` | Mirrors `agent_call_start.data.retryReason` so cost-attribution consumers reading `agent_call_end` (where `cost` lives) can bucket without joining |
 | `error` | `string?` | Provider error message when the call threw (network failure, 4xx/5xx, abort, etc). Mutually exclusive with `response` content. Subject to `config.trace.redact` |
 | `status` | `number?` | HTTP status when the throw was a `ProviderError` (`0` for network failures). Mirrors `ProviderError.status`; omitted for non-provider errors. The raw error `body` is **not** on the event (redaction-eligible) |
@@ -2560,6 +2576,7 @@ All errors extend `AxlError`.
 | `ProviderError` | provider adapters (via `ctx.ask()`) | Non-2xx HTTP response, or a normalized network failure (`status: 0`). `code: 'PROVIDER_ERROR'`. Includes `.provider`, `.status`, `.retryable`, `.retryAfterMs?`, `.requestId?`, `.body?`, `.timing?`. Message is the provider's text verbatim (no prefix). |
 | `InvalidModelInputError` | `ctx.ask()`, `ctx.delegate()`, `agent.ask()` | Malformed `ModelInput`. `code: 'INVALID_MODEL_INPUT'`. Invalid inputs fail before dispatch and the message never includes raw media. |
 | `UnsupportedModelInputError` | rich `ctx.ask()` / `ctx.delegate()` | Axl cannot safely map the provider/source/composition, or the effective model ID is empty. `code: 'UNSUPPORTED_MODEL_INPUT'`; includes safe `.provider`, `.model`, `.modality`, and optional `.source`, never the raw locator or bytes. `.modality` is typed `string` and is today `'image'` or `'audio'`, derived from the **offending part** — a mixed input whose audio part is rejected reports `'audio'`, and one whose image part is rejected reports `'image'`. The unsupported *feature* is named in `.message` only; it is not a retained field. For catalog-capable transports, an upstream model-capability rejection is instead a `ProviderError`. |
+| `UnsupportedModelOptionError` | model-specific provider option/tool guards | Local pre-dispatch rejection. `code: 'UNSUPPORTED_MODEL_OPTION'`; includes safe `.provider`, effective `.model`, rejected `.option`, and actionable `.remediation`. GPT-6 Chat tool and reasoning/sampling combinations use this error. |
 | `TranscriptionOperationError` | `ctx.transcribe()` | Safe transcription boundary error. `code: 'TRANSCRIPTION_PROVIDER_ERROR'`; includes `.provider`, `.model`, accounting/cleanup fields, and provider-safe `.status?`, `.retryable?`, `.retryAfterMs?`, `.requestId?`. The original error remains available as a non-enumerable `.cause`; raw provider bodies never enter events. |
 | `AxlError` / `INVALID_HUMAN_DECISION` | approval handlers, `runtime.resolveDecision()` | Untyped decision is not the exact plain-object approval/denial union; rejected before resolver/store mutation |
 | `AxlError` / `PENDING_DECISION_NOT_FOUND` | `runtime.resolveDecision()` | No active or persisted pending request exists, or another concurrent resolution already won |

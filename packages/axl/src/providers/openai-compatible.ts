@@ -926,8 +926,13 @@ export class OpenAICompatibleProvider implements Provider {
       if (!userKeys.includes(key)) delete body[key];
     }
 
+    this.validateFinalRequestBody(body);
+
     return body;
   }
+
+  /** Native subclasses may reject model-invalid fields after providerOptions merge. */
+  protected validateFinalRequestBody(_body: Record<string, unknown>): void {}
 
   protected formatMessage(msg: ChatMessage, model: string): Record<string, unknown> {
     const modalities = this.inputModalities(model);

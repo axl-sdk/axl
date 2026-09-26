@@ -318,6 +318,40 @@ const GEMINI_PRICING: Record<string, GeminiRate> = {
   'gemini-3.8-flash': { input: 0.75e-6, cached: 0.075e-6, output: 3.75e-6 },
 };
 
+/**
+ * Dated successor Standard rates for the 3.6/3.7/3.8 Flash line, published by
+ * Google to take effect 2027-01-01. `geminiRatesAtDispatch` below switches to
+ * this table once the transport dispatches on or after that date.
+ *
+ * This is a clock-gated pricing table, which is a real hazard: Anthropic's
+ * Sonnet 5 had a scheduled 2026-09-01 price increase that was cancelled before
+ * it took effect, and a forward-dated gate for it would have silently
+ * overcharged every call made after the date it predicted (see the dated
+ * review comment on `estimateAnthropicCost`). That argument still applies
+ * here in principle — if Google cancels or revises this successor pricing
+ * before 2027-01-01, this table will misprice calls made on/after that date
+ * until corrected.
+ *
+ * We encode it anyway, deliberately reversing the Anthropic precedent for
+ * this specific case, because the failure direction is opposite and this is
+ * a budget-enforcement rail (`ctx.budget()`), not just a cost display: the
+ * published successor rates are *higher* than current rates, so encoding
+ * them fails toward overcounting spend against a budget. Overcounting is the
+ * safe side for a budget rail (it can only make `ctx.budget()` stop early or
+ * under-report headroom, never let unpriced/under-priced spend sail past a
+ * cap); the Anthropic case was unsafe because encoding an announced increase
+ * that never landed would have *overcharged* observed cost with no
+ * corresponding rail benefit. If Google cancels this increase before
+ * 2027-01-01, remove or correct this table before that date; if this
+ * revalidation lapses, `GEMINI_PRICING` (the current, safe-by-default table)
+ * remains authoritative through this file staying unmodified.
+ *
+ * Required re-verification: `.claude/rules/releasing.md` gates any release
+ * cut on or after 2026-12-01 on re-checking Google's published Gemini
+ * 3.6/3.7/3.8 Flash Standard rates for 2027-01-01 against
+ * https://ai.google.dev/gemini-api/docs/pricing and updating or expiring
+ * these rows accordingly.
+ */
 const GEMINI_FLASH_SUCCESSOR_PRICING: Readonly<Record<string, GeminiRate>> = {
   ...GEMINI_PRICING,
   'gemini-3.6-flash': { input: 1.5e-6, cached: 0.15e-6, output: 7.5e-6 },

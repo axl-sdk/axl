@@ -272,7 +272,9 @@ rates of $0.75/$0.075/$3.75 per million tokens through 2026-12-31 UTC, then
 $1.50/$0.15/$7.50 beginning 2027-01-01 UTC. Axl selects the rate at dispatch
 of the returned transport attempt, after any rate-governor or retry wait, and
 keeps it for that attempt's result or stream. Non-Standard tiers and unmodeled
-charges remain unpriced.
+charges remain unpriced. The published 2027-01-01 successor rate is encoded
+ahead of its effective date and is re-verified against Google's pricing page
+before any release cut on or after 2026-12-01 (see `.claude/rules/releasing.md`).
 The [Google price page](https://ai.google.dev/gemini-api/docs/pricing) does not
 establish a distinct recorded-audio input rate for 3.8 Flash, so calls with
 positive audio tokens remain unpriced. The

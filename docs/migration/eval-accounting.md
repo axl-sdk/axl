@@ -96,8 +96,10 @@ every wrapping boundary intact:
 - it is not a `validate` failure in `ctx.ask` or `ctx.verify`, is not retried by
   `ctx.verify`, and never yields its `fallback`,
 - `ctx.budget()` rejects with it rather than returning `budgetExceeded: true`, and
-- `ctx.spawn`, `ctx.map`, and `ctx.race` reject with it (cancelling their remaining
-  branches) rather than recording `{ ok: false }` or throwing `QuorumNotMet`.
+- `ctx.spawn`, `ctx.map`, and `ctx.race` reject with it rather than recording
+  `{ ok: false }` or throwing `QuorumNotMet`. `ctx.race` and quorum-mode
+  `spawn` / `map` also cancel their remaining branches; in default mode,
+  in-flight siblings run on and are refused at their next admission check.
 
 If you catch broadly around `ctx.ask` or a tool call and translate errors into a
 model-visible message, rethrow `AdmissionDeniedError` so the run actually stops.

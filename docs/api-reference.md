@@ -1727,7 +1727,7 @@ The `AxlRuntime` extends `EventEmitter`. Subscribe to lifecycle signals:
 
 Two independent summarization paths exist:
 
-- **Session-level** (controlled here via `history.maxMessages` + `history.summarize`). Triggers when persisted history exceeds `maxMessages`. Drops the oldest excess messages, summarizes them with `summaryModel`, and stores the rolling summary as session metadata so it carries across `send()` calls.
+- **Session-level** (controlled here via `history.maxMessages` + `history.summarize`). Triggers when persisted history exceeds `maxMessages`. Drops the oldest excess messages, summarizes them with `summaryModel`, and stores the rolling summary as session metadata. The summary is included in later model requests even when the agent has no `maxContext` limit or its retained history fits within that limit.
 - **Ask-level** (controlled by `AgentConfig.maxContext`). Triggers inside `ctx.ask()` when the prompt + history would exceed the agent's configured context window. Independent of `SessionOptions`.
 
 Both can fire in the same `send()`.

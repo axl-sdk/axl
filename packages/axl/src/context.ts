@@ -1984,6 +1984,14 @@ export class WorkflowContext<TInput = unknown> {
       messages.push({ role: 'system', content: systemPrompt });
     }
 
+    const cachedSummaryMessage: ChatMessage | undefined = this.summaryCache
+      ? {
+          role: 'system',
+          origin: 'runtime',
+          content: `Summary of earlier conversation:\n${this.summaryCache}`,
+        }
+      : undefined;
+
     // Include session history (with context window management)
     const maxContext = agent._config.maxContext;
     if (maxContext && sessionHistory.length > 0) {
@@ -2024,7 +2032,10 @@ export class WorkflowContext<TInput = unknown> {
           },
         });
       }
-      if (historyEstimate.tokens > availableForHistory) {
+      const summaryTokens = cachedSummaryMessage
+        ? estimateMessagesTokens([cachedSummaryMessage]).tokens
+        : 0;
+      if (historyEstimate.tokens + summaryTokens > availableForHistory) {
         // Need to summarize: find the split point
         const summarizedMessages = await this.summarizeHistory(
           agent._name,
@@ -2045,11 +2056,13 @@ export class WorkflowContext<TInput = unknown> {
           messages.push(msg);
         }
       } else {
+        if (cachedSummaryMessage) messages.push(cachedSummaryMessage);
         for (const msg of sessionHistory) {
           messages.push(msg);
         }
       }
     } else {
+      if (cachedSummaryMessage) messages.push(cachedSummaryMessage);
       for (const msg of sessionHistory) {
         messages.push(msg);
       }

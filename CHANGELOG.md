@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Session summaries produced by `history.maxMessages` now reach later model requests even when `AgentConfig.maxContext` is unset or the retained history fits its limit.
 - Anthropic reasoning-reset diagnostics now count organization and end-user binding mismatches, as well as unrecognized future dropped-thinking reasons. Runtime events copy only fixed numeric reason counts from provider diagnostics, keeping extra custom-provider fields out of SDK and Studio traces.
 
 ### Added

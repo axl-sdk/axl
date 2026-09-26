@@ -128,6 +128,38 @@ describe('Sessions E2E', () => {
     expect(contents).toContain('reply-3');
   });
 
+  it('passes a stored maxMessages summary to an agent without maxContext', async () => {
+    const provider = MockProvider.fn((messages) => ({
+      content: String(messages[0]?.content).startsWith('Summarize the following conversation')
+        ? 'The user chose blue.'
+        : 'reply',
+    }));
+    const { runtime } = createTestRuntime(provider);
+    const a = agent({ name: 'summary-agent', model: 'mock:test' });
+    runtime.register(
+      workflow({
+        name: 'summary-wf',
+        input: z.string(),
+        handler: (ctx) => ctx.ask(a, ctx.input),
+      }),
+    );
+
+    const session = runtime.session('summary-session', {
+      history: { maxMessages: 2, summarize: true, summaryModel: 'mock:test' },
+    });
+    await session.send('summary-wf', 'first');
+    await session.send('summary-wf', 'second');
+    await session.send('summary-wf', 'third');
+
+    expect(
+      provider.calls.some(
+        (call) =>
+          call.messages[0]?.content === 'Summary of earlier conversation:\nThe user chose blue.',
+      ),
+    ).toBe(true);
+    await runtime.shutdown();
+  });
+
   it('session.end() then session.send() throws', async () => {
     const { runtime } = createTestRuntime();
     const a = agent({ name: 'end-agent', model: 'mock:test', system: 'test' });

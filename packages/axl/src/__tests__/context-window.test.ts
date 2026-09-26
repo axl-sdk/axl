@@ -69,6 +69,27 @@ function generateHistory(messageCount: number, charsPerMessage = 200): ChatMessa
 // ═════════════════════════════════════════════════════════════════════════
 
 describe('Context Window Management', () => {
+  it.each([undefined, 10000])(
+    'includes a stored session summary when maxContext is %s and history fits',
+    async (maxContext) => {
+      const provider = new TestProvider([{ content: 'response' }]);
+      const ctx = createTestContext(provider, {
+        metadata: { summaryCache: 'The user chose blue.' },
+        sessionHistory: [{ role: 'user', content: 'What color did I choose?' }],
+      });
+      await ctx.ask(agent({ model: 'test:test-model', maxContext }), 'Please answer');
+
+      expect(provider.calls[0].messages).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            role: 'system',
+            content: 'Summary of earlier conversation:\nThe user chose blue.',
+          }),
+        ]),
+      );
+    },
+  );
+
   it('passes through history unchanged when it fits in context', async () => {
     const provider = new TestProvider([{ content: 'response' }]);
     const shortHistory: ChatMessage[] = [

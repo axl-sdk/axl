@@ -604,6 +604,9 @@ function ProviderDiagnosticBody({ event }: { event: HistoricalAxlEvent }) {
         {diagnostic.reasons.end_user_binding_mismatch
           ? ` · ${diagnostic.reasons.end_user_binding_mismatch} end-user mismatch`
           : ''}
+        {diagnostic.reasons.client_prefix_rewrite
+          ? ` · ${diagnostic.reasons.client_prefix_rewrite} removed by context summary`
+          : ''}
         {diagnostic.reasons.other ? ` · ${diagnostic.reasons.other} other reason` : ''}
       </p>
     );

@@ -550,8 +550,9 @@ below.
 - **Rate limits have their own retry budget,** `maxRateLimitRetries` (default 8),
   separate from the 2 retries for `503`/`529`/network errors. A call against a
   saturated account can take several minutes, without holding a permit. Use an ask
-  `signal: AbortSignal.timeout(...)` to bound that wait: `timeout` only stops a later
-  provider turn and `stallTimeout` runs only during a dispatched request.
+  `signal: AbortSignal.timeout(...)` to bound that whole wait. The graceful ask
+  `timeout` does not count governor wait (see [Ask deadlines](api-reference.md#ask-deadlines-cancellation-and-stalled-requests)); `stallTimeout` starts only after dispatch.
+  `RateLimitConfig.acquireTimeoutMs` is a separate cap on initial admission wait.
   `AdmissionController` can stop the next dispatch when spend closes. When the retry budget runs out,
   the last `429` surfaces as a `ProviderError` with its raw body and `retryAfterMs`.
 - **Then the scope paces itself** (see "Adaptive pacing" below) and returns to unpaced
@@ -799,6 +800,10 @@ What that means differs by transport, because headers mean different things:
 
 Either way, time spent downloading or draining a body lands in `agent_call_end.duration`
 and in the `other` remainder of a `TimeoutError` breakdown, never in `queuedMs`.
+`queuedMs` remains a diagnostic. The graceful ask `timeout` excludes governor wait directly
+(see [Ask deadlines](api-reference.md#ask-deadlines-cancellation-and-stalled-requests));
+`TimeoutError.breakdown.chargedMs` shows what it charged. `EvalItem.duration` and
+`agent_call_end.duration` remain wall-clock durations that include queue wait.
 
 #### Stalled requests and cancellation
 
@@ -810,10 +815,11 @@ request the same window runs from dispatch through completion. A silent request 
 `StallTimeoutError` (a `TimeoutError` subtype); any partial streamed result is discarded.
 
 Use an ask or context `signal` for a strict total SLA, including the 429 brake,
-retry backoff, and limiter queue. `timeout` is checked between turns, so an
-in-flight transport retry loop may outlast it. Provider transports receive the
-composed signal; the first context, branch, or ask signal to abort wins and its exact external
-reason propagates unchanged. Custom providers should pass `ChatOptions.signal` to their
+retry backoff, and limiter queue. The graceful `timeout` is checked between turns and does not count governor or
+`awaitHuman` wait ([what it counts](api-reference.md#ask-deadlines-cancellation-and-stalled-requests)).
+`RateLimitConfig.acquireTimeoutMs` separately bounds initial queue admission. Provider
+transports receive the composed signal; the first context, branch, or ask signal to abort wins
+and its exact external reason propagates unchanged. Custom providers should pass `ChatOptions.signal` to their
 transport. Axl starts a custom provider's opt-in stall timer conservatively when its method is
 entered; precise dispatch/retry lifecycle reporting is an internal built-in-adapter capability,
 not part of the custom `Provider` contract. Full public semantics and the

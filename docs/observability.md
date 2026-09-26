@@ -332,8 +332,10 @@ of delivery, while time a consumer spends paused after a yielded delta is not.
 
 A `ctx.ask()` that times out uses the same numbers: when at least one completed turn
 reported timing, `TimeoutError.message` appends `(elapsed …: queued …, retries …, wire …,
-other …)` and `TimeoutError.breakdown` carries the figures programmatically, so a budget
-consumed by self-imposed pacing is visible without guessing.
+other …, charged …)` and `TimeoutError.breakdown` carries the figures programmatically.
+`charged` is the value compared with the budget, so a message whose `elapsed` exceeds the
+timeout while `queued` is large is read correctly: the governor wait was excluded, and the
+remaining work still overran. The `axl-eval` failure-causes line groups such items as `timeout`.
 
 ### Failure surfacing — `ask_end` vs. `error`
 

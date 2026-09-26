@@ -277,7 +277,7 @@ describe('TimeoutError breakdown (AC-5)', () => {
     return {
       name: 'mock',
       async chat(): Promise<ProviderResponse> {
-        await new Promise((r) => setTimeout(r, 80));
+        await new Promise((r) => setTimeout(r, 100));
         return {
           content: '',
           tool_calls: [{ id: 't1', type: 'function', function: { name: 'noop', arguments: '{}' } }],
@@ -315,6 +315,13 @@ describe('TimeoutError breakdown (AC-5)', () => {
     expect(timeout.message).toContain('wire 5ms');
     expect(timeout.breakdown).toMatchObject({ queuedMs: 40, retryMs: 0, wireMs: 5 });
     expect(timeout.breakdown!.elapsedMs).toBeGreaterThan(50);
+    // Reported `queuedMs` is diagnostic only: this custom provider bypasses
+    // the SDK governor, so no wait was observed and nothing is credited.
+    expect(timeout.breakdown!.chargedMs).toBe(timeout.breakdown!.elapsedMs);
+    // The message shows the number actually compared with the budget, so a
+    // reader never sees elapsed > timeout with a large queued figure and
+    // concludes the governor exclusion did not apply.
+    expect(timeout.message).toContain(`charged ${timeout.breakdown!.chargedMs}ms`);
     // `other` is the residual: elapsed minus the three measured buckets.
     expect(timeout.breakdown!.otherMs).toBe(timeout.breakdown!.elapsedMs - 40 - 0 - 5);
   });
@@ -328,7 +335,7 @@ describe('TimeoutError breakdown (AC-5)', () => {
     ];
     // Turn 1 is fast so the between-turns check passes; turn 2 blows the
     // budget, so exactly two turns complete before the throw.
-    const delays = [5, 100];
+    const delays = [5, 120];
     let i = 0;
     const provider: Provider = {
       name: 'mock',
@@ -356,6 +363,7 @@ describe('TimeoutError breakdown (AC-5)', () => {
     expect(callEnds(traces)).toHaveLength(2);
     const { breakdown } = err as TimeoutError;
     expect(breakdown).toMatchObject({ queuedMs: 55, retryMs: 300, wireMs: 20 });
+    expect(breakdown!.chargedMs).toBe(breakdown!.elapsedMs);
     expect((err as TimeoutError).message).toContain('queued 55ms');
     expect((err as TimeoutError).message).toContain('retries 300ms');
     expect((err as TimeoutError).message).toContain('wire 20ms');

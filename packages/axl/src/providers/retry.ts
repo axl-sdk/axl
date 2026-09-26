@@ -6,6 +6,7 @@
 
 import type { DispatchAdmission } from '../accounting.js';
 import type { RateLimiter } from './rate-limiter.js';
+import { pauseAskClocks } from '../ask-clock.js';
 import { ScopeGovernor } from './governor-pool.js';
 import { classifySafely } from './quota.js';
 import { buildProviderError, parseRetryAfter } from './errors.js';
@@ -298,9 +299,11 @@ export async function fetchWithRetry(
   let dispatchedAt = 0;
   let headersAt = 0;
 
+  // Every self-imposed wait also pauses the enclosing asks' graceful clocks:
+  // queueing on the SDK's own governor is not the workflow's work.
   const waitSelfImposed = async (wait: () => Promise<void>): Promise<void> => {
     const start = Date.now();
-    await wait();
+    await pauseAskClocks(wait);
     const waited = Date.now() - start;
     queuedMs += waited;
     if (dispatches > 0) queuedAfterFirstDispatchMs += waited;

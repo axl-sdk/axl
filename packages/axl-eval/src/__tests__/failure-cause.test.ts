@@ -14,7 +14,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { z } from 'zod';
-import { ProviderError } from '@axlsdk/axl';
+import { ProviderError, TimeoutError } from '@axlsdk/axl';
 
 import { dataset } from '../dataset.js';
 import { scorer } from '../scorer.js';
@@ -217,6 +217,42 @@ describe('item.failure capture', () => {
     expect(JSON.stringify(item)).not.toContain(SENTINEL);
   });
 
+  it('keeps finite timeout timing from a wrapped ESM/CJS-compatible error', async () => {
+    const foreign = Object.assign(new Error(SENTINEL), {
+      name: 'TimeoutError',
+      code: 'TIMEOUT',
+      breakdown: {
+        elapsedMs: 63,
+        chargedMs: 12,
+        queuedMs: 50,
+        retryMs: 1,
+        wireMs: Infinity,
+        otherMs: NaN,
+        body: SENTINEL,
+      },
+    });
+    const item = await failWith(new Error('wrapped', { cause: foreign }));
+    expect(item.failure).toEqual({
+      name: 'TimeoutError',
+      elapsedMs: 63,
+      chargedMs: 12,
+      queuedMs: 50,
+      retryMs: 1,
+    });
+    expect(JSON.stringify(item.failure)).not.toContain(SENTINEL);
+  });
+
+  it('keeps ProviderError precedence across a timeout wrapper and leaves missing timing absent', () => {
+    const timeout = new TimeoutError('ctx.ask()', 60);
+    expect(describeItemFailure(timeout)).toEqual({ name: 'TimeoutError' });
+    Object.defineProperty(timeout, 'cause', { value: rateLimited() });
+    expect(describeItemFailure(timeout)).toMatchObject({
+      name: 'ProviderError',
+      status: 429,
+      requestId: 'req_1',
+    });
+  });
+
   it('terminates on a cyclic cause chain', () => {
     const a = new Error('a');
     const b = new Error('b', { cause: a });
@@ -314,19 +350,20 @@ describe('formatFailureCauses (AC8)', () => {
     retryable: true,
   });
 
-  // E-08: 5 × 429, 3 × 503, 2 × network, 2 × plain Error.
+  // E-08: 5 × 429, 3 × 503, 2 × network, 1 × timeout, 2 × plain Error.
   it('groups by status and provider, most frequent first, summing to the failed count', () => {
     const result = resultWithFailures([
       ...Array.from({ length: 5 }, () => pe(429)),
       ...Array.from({ length: 3 }, () => pe(503, 'anthropic')),
       pe(0),
       pe(0),
+      { name: 'TimeoutError', elapsedMs: 100, chargedMs: 70, queuedMs: 30 },
       { name: 'Error' },
       undefined,
     ]);
 
     expect(formatFailureCauses(result)).toBe(
-      '  Failure causes: 5 × 429 (openai), 3 × 503 (anthropic), 2 × network (openai), 2 × other',
+      '  Failure causes: 5 × 429 (openai), 3 × 503 (anthropic), 2 × network (openai), 2 × other, 1 × timeout',
     );
   });
 

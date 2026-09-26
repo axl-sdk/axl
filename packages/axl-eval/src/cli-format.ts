@@ -68,12 +68,13 @@ export function formatCoverageLine(result: EvalResult): string | undefined {
 
 /**
  * Group a run's `failed` items by structured cause, most frequent first:
- * `  Failure causes: 5 × 429 (openai), 3 × 503 (openai), 2 × network (openai), 2 × other`.
+ * `  Failure causes: 5 × 429 (openai), 3 × 503 (openai), 2 × network (openai), 1 × timeout, 2 × other`.
  *
- * A rate-limit storm and a genuine model or tool failure call for different
- * fixes, and without this they print as one undifferentiated count. A status of
- * `0` is a network-level failure; an item with no provider status (a plain
- * throw, a pre-0.24 artifact) is `other`, so the counts always sum to
+ * A rate-limit storm, a graceful ask timeout, and a genuine model or tool
+ * failure call for different fixes, and without this they print as one
+ * undifferentiated count. A status of `0` is a network-level failure; a
+ * `TimeoutError` with no provider status is `timeout`; an item with neither (a
+ * plain throw, a pre-0.24 artifact) is `other`, so the counts always sum to
  * `coverage.items.failed`.
  */
 export function formatFailureCauses(result: EvalResult): string | undefined {
@@ -85,6 +86,8 @@ export function formatFailureCauses(result: EvalResult): string | undefined {
     if (f?.status !== undefined) {
       const status = f.status === 0 ? 'network' : String(f.status);
       label = f.provider ? `${status} (${f.provider})` : status;
+    } else if (f?.name === 'TimeoutError') {
+      label = 'timeout';
     }
     counts.set(label, (counts.get(label) ?? 0) + 1);
   }

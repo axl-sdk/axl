@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-09-26
+
+### Changed
+
+- **`ctx.ask()` `timeout` no longer counts time spent waiting on Axl's own rate governor** (queue, spacing, adaptive pacing, 429 pauses), the same way it already excluded `awaitHuman`. The exclusion applies to the waiting ask and every ask enclosing it. A long local queue no longer fails an otherwise healthy multi-turn ask; `signal`, `stallTimeout`, and `acquireTimeoutMs` are unchanged. See [Ask deadlines](docs/api-reference.md#ask-deadlines-cancellation-and-stalled-requests).
+- `TimeoutError` now reports `chargedMs`, the number compared with the budget, in both `.breakdown` and the message suffix (`…, charged Nms)`); `elapsedMs` is plain wall time. Failed eval items keep these numbers on `failure`, Studio preserves them under redaction, and the `axl-eval` failure-causes line groups them as `timeout`.
+- **Source-breaking type:** `TimeoutBreakdown.chargedMs` is required, so code constructing that type must add it. Ship in the next 0.x minor.
+
 ## [0.24.3] - 2026-09-25
 
 ### Fixed

@@ -301,7 +301,7 @@ export function sanitizeRichInputFailure(event: HistoricalAxlEvent): HistoricalA
  *
  * Preserved fields (structural / metrics):
  *   scores (numeric), duration, cost, scorerCost
- *   failure (projected to name/provider/status/retryable/requestId — see
+ *   failure (projected to known structural and finite timing keys — see
  *            projectItemFailure; any other key is dropped)
  *   scoreDetails[*].{score, duration, cost, skipped} (but not metadata)
  *   metadata (execution metadata: models, tokens, agentCalls, workflows)
@@ -337,7 +337,7 @@ function redactItemMetadata(
 }
 
 /**
- * Project `EvalItem.failure` onto its five known keys, each only when present
+ * Project `EvalItem.failure` onto its known keys, each only when present
  * with the type `@axlsdk/eval` writes. The runner never records a body or
  * message there, but an imported artifact is stored verbatim and a newer writer
  * could add a key — an allowlist keeps either from becoming a leak. Without a
@@ -353,6 +353,18 @@ function projectItemFailure(failure: unknown): EvalItemFailure | undefined {
     ...(typeof f.status === 'number' && Number.isFinite(f.status) ? { status: f.status } : {}),
     ...(typeof f.retryable === 'boolean' ? { retryable: f.retryable } : {}),
     ...(typeof f.requestId === 'string' ? { requestId: f.requestId } : {}),
+    ...(typeof f.elapsedMs === 'number' && Number.isFinite(f.elapsedMs)
+      ? { elapsedMs: f.elapsedMs }
+      : {}),
+    ...(typeof f.chargedMs === 'number' && Number.isFinite(f.chargedMs)
+      ? { chargedMs: f.chargedMs }
+      : {}),
+    ...(typeof f.queuedMs === 'number' && Number.isFinite(f.queuedMs)
+      ? { queuedMs: f.queuedMs }
+      : {}),
+    ...(typeof f.retryMs === 'number' && Number.isFinite(f.retryMs) ? { retryMs: f.retryMs } : {}),
+    ...(typeof f.wireMs === 'number' && Number.isFinite(f.wireMs) ? { wireMs: f.wireMs } : {}),
+    ...(typeof f.otherMs === 'number' && Number.isFinite(f.otherMs) ? { otherMs: f.otherMs } : {}),
   };
 }
 

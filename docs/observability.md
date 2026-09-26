@@ -142,7 +142,7 @@ schemas. The full set of types:
 | `delegate` | `ctx.delegate()` routes to a candidate (including the single-agent short-circuit) | `candidates`, `selected?`, `routerModel?`, `reason` (`'routed'` \| `'single_candidate'`) |
 | `handoff_start` | Fires BEFORE the target ask begins, on every handoff. **Not** AskScoped — spans two asks via `fromAskId` / `toAskId`. | `source`, `target`, `mode`, `message?` (roundtrip only) |
 | `handoff_return` | Fires AFTER control returns to source. **Roundtrip mode only** (oneway terminates at target). **Not** AskScoped. | `source`, `target`, `duration` |
-| `verify` | `ctx.verify()` completes (pass or fail) | `attempts`, `passed`, `lastError?` |
+| `verify` | `ctx.verify()` completes (pass or fail); not emitted when an admission denial, overflow, or cancellation interrupts it | `attempts`, `passed`, `lastError?` |
 | `pipeline` | Retry/validation lifecycle (multi-state via `status`: `start` / `committed` / `failed`). Emitted alongside the legacy `guardrail` / `schema_check` / `validate` gate events | `status`, `stage` (`'initial' \| 'schema' \| 'validate' \| 'guardrail'`), `attempt`, `maxAttempts`, `reason?` (only on `status: 'failed'`) |
 | `partial_object` | Progressive structured output — emitted at string-safe boundaries when `ctx.ask()` has a `schema` and no tools. **Stream-only** — never persisted to `ExecutionInfo.events` | `attempt`, `data: { object: unknown }` (DeepPartial of the schema type) |
 | `string_delta` | Per-chunk character-level deltas inside string VALUES of progressive structured output. Same gating as `partial_object` (schema set, no tools, root is `ZodObject`). **Stream-only** — never persisted. Designed for chat-style typewriter rendering of long string fields via the `stringStream` view helper | `attempt`, `data: { path, delta }` (`path` = RFC 6901 JSON Pointer; `delta` = unescaped chars added in this chunk) |
@@ -340,8 +340,10 @@ of delivery, while time a consumer spends paused after a yielded delta is not.
 
 A `ctx.ask()` that times out uses the same numbers: when at least one completed turn
 reported timing, `TimeoutError.message` appends `(elapsed …: queued …, retries …, wire …,
-other …)` and `TimeoutError.breakdown` carries the figures programmatically, so a budget
-consumed by self-imposed pacing is visible without guessing.
+other …, charged …)` and `TimeoutError.breakdown` carries the figures programmatically.
+`charged` is the value compared with the budget, so a message whose `elapsed` exceeds the
+timeout while `queued` is large is read correctly: the governor wait was excluded, and the
+remaining work still overran. The `axl-eval` failure-causes line groups such items as `timeout`.
 
 ### Failure surfacing — `ask_end` vs. `error`
 

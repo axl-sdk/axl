@@ -498,14 +498,25 @@ result.summary.itemErrorRate;
 
 Each failed item says why on `item.failure`, taken from the first `ProviderError` on the
 thrown value or its `cause` chain, and the CLI
-groups the failed items by it (`Failure causes: 5 × 429 (openai), 1 × other`):
+groups the failed items by it (`Failure causes: 5 × 429 (openai), 1 × timeout, 1 × other`):
 
 ```ts
 result.items[0].failure;
 // { name: 'ProviderError', provider: 'openai', status: 429, retryable: true, requestId: 'req_…' }
+
+result.items[1].failure;
+// { name: 'TimeoutError', elapsedMs: 100, chargedMs: 30, queuedMs: 70,
+//   retryMs: 4, wireMs: 20, otherMs: 6 }
 ```
 
-`failure` never records `ProviderError.body`; `item.error` keeps the error message as before, which for some providers can include error-response text.
+When no `ProviderError` takes precedence, a `TimeoutError` preserves its numeric
+[`TimeoutBreakdown`](api-reference.md#timeoutbreakdown-timeouterrorbreakdown) fields on
+`failure`; `chargedMs` is the number that exceeded the budget, and `EvalItem.duration` remains
+full workflow wall time. Under Studio's `trace.redact`, these numeric fields remain visible
+and `item.error` is masked.
+
+`failure` never records `ProviderError.body` or an error message; `item.error` keeps the
+message as before, which for some providers can include error-response text.
 
 To test the gate, have the workflow throw for chosen items — a `ProviderError` with
 `status: 429` reproduces a rate-limit storm without a provider. From the CLI,

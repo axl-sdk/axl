@@ -133,10 +133,9 @@ export type ScorerDetail = {
 
 /**
  * Why a `failed` item's workflow failed. Client mirror of `@axlsdk/eval`'s
- * `EvalItemFailure`: every field comes from the first `ProviderError` on the
- * thrown value or its `cause` chain, or only the thrown `name` when there was
- * none. It never carries `ProviderError.body` or the message (the message stays
- * on `EvalItem.error`). Structural only, so redaction passes it through.
+ * `EvalItemFailure`: provider details take precedence; a timeout can carry
+ * finite numeric timing evidence. It never carries the error body or message
+ * (the message stays on `EvalItem.error`). Redaction projects known keys only.
  */
 export type EvalItemFailure = {
   name: string;
@@ -145,6 +144,12 @@ export type EvalItemFailure = {
   status?: number;
   retryable?: boolean;
   requestId?: string;
+  elapsedMs?: number;
+  chargedMs?: number;
+  queuedMs?: number;
+  retryMs?: number;
+  wireMs?: number;
+  otherMs?: number;
 };
 
 export type EvalItem = {

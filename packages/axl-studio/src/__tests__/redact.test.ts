@@ -885,6 +885,49 @@ describe('redactEvalResult', () => {
     expect(JSON.stringify(out)).not.toContain('SENTINEL');
   });
 
+  it('preserves finite timeout evidence while dropping unsafe imported breakdown fields', () => {
+    const result = makeResult([
+      makeItem({
+        error: 'SENTINEL_MESSAGE',
+        failure: {
+          name: 'TimeoutError',
+          elapsedMs: 63,
+          chargedMs: 12,
+          queuedMs: 50,
+          retryMs: 1,
+          wireMs: 10,
+          otherMs: 2,
+          message: 'SENTINEL_MESSAGE',
+          body: 'SENTINEL_BODY',
+          breakdown: { secret: 'SENTINEL_BREAKDOWN' },
+          clock: { secret: 'SENTINEL_CLOCK' },
+        },
+      }),
+      makeItem({
+        failure: {
+          name: 'TimeoutError',
+          elapsedMs: Infinity,
+          chargedMs: NaN,
+          queuedMs: 'SENTINEL_QUEUE',
+          retryMs: -Infinity,
+        },
+      }),
+    ]);
+    const out = redactEvalResult(result, true);
+    expect(out.items[0].error).toBe('[redacted]');
+    expect(out.items[0].failure).toEqual({
+      name: 'TimeoutError',
+      elapsedMs: 63,
+      chargedMs: 12,
+      queuedMs: 50,
+      retryMs: 1,
+      wireMs: 10,
+      otherMs: 2,
+    });
+    expect(out.items[1].failure).toEqual({ name: 'TimeoutError' });
+    expect(JSON.stringify(out)).not.toContain('SENTINEL');
+  });
+
   it('drops failure fields of the wrong type, and a failure with no string name', () => {
     const result = makeResult([
       makeItem({

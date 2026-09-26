@@ -6,6 +6,7 @@ import { StallTimeoutError, TimeoutError } from '../errors.js';
 import { ProviderRegistry } from '../providers/registry.js';
 import { OpenAIProvider } from '../providers/openai.js';
 import { tool } from '../tool.js';
+import type { ChatMessage } from '../types.js';
 
 /**
  * Contract tests for spec 23.  The provider deliberately waits on the signal
@@ -42,6 +43,11 @@ function abortableWait(signal: AbortSignal | undefined, ms = 10_000): Promise<ne
 function context(provider: object, options: Record<string, unknown> = {}) {
   const registry = new ProviderRegistry();
   registry.registerInstance('controlled', provider as never);
+  for (const [name, extra] of Object.entries(
+    (options.extraProviders as Record<string, object> | undefined) ?? {},
+  )) {
+    registry.registerInstance(name, extra as never);
+  }
   const ctx = new WorkflowContext({
     input: 'test',
     executionId: crypto.randomUUID(),
@@ -50,6 +56,7 @@ function context(provider: object, options: Record<string, unknown> = {}) {
     awaitHumanHandler: options.awaitHumanHandler as never,
     signal: options.signal as AbortSignal | undefined,
     onTrace: options.onTrace as never,
+    sessionHistory: options.sessionHistory as ChatMessage[] | undefined,
   });
   return ctx;
 }
@@ -132,6 +139,80 @@ describe('ctx.ask timeout and deadline contract (spec 23)', () => {
       await rejected;
       expect(calls).toHaveLength(1);
     } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not credit a pre-timeout summary governor wait to later ask turns', async () => {
+    vi.useFakeTimers();
+    const originalFetch = globalThis.fetch;
+    try {
+      const entered = deferred();
+      const release = deferred();
+      let fetches = 0;
+      globalThis.fetch = (async () => {
+        if (fetches++ === 0) {
+          entered.resolve();
+          await release.promise;
+        }
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => openAIResponse,
+          text: async () => '',
+        };
+      }) as typeof fetch;
+
+      const summaryProvider = new OpenAIProvider({
+        apiKey: 'test-key',
+        rateLimit: { maxConcurrent: 1, adaptive: false },
+      });
+      const blocker = summaryProvider.chat([{ role: 'user', content: 'hold' }], {
+        model: 'gpt-4o',
+      });
+      await entered.promise;
+
+      let mainCalls = 0;
+      const mainProvider = {
+        name: 'controlled',
+        chat: async () => {
+          mainCalls++;
+          if (mainCalls === 1) {
+            await wait(40);
+            return {
+              content: '',
+              tool_calls: [
+                { id: 'next', type: 'function', function: { name: 'next_turn', arguments: '{}' } },
+              ],
+              usage,
+            };
+          }
+          return { content: 'must not dispatch', usage };
+        },
+      };
+      const nextTurn = tool({
+        name: 'next_turn',
+        description: 'force another turn',
+        input: z.object({}),
+        handler: async () => 'done',
+      });
+      const ask = context(mainProvider, {
+        extraProviders: { openai: summaryProvider },
+        config: { contextManagement: { summaryModel: 'openai:gpt-4o' } },
+        sessionHistory: [{ role: 'user', content: 'Earlier conversation.' }],
+      }).ask(baseAgent({ maxContext: 500, timeout: '30ms', tools: [nextTurn] }), 'go');
+      const rejected = expect(ask).rejects.toBeInstanceOf(TimeoutError);
+
+      await vi.advanceTimersByTimeAsync(50);
+      release.resolve();
+      await blocker;
+      await vi.advanceTimersByTimeAsync(40);
+      await rejected;
+      expect(mainCalls).toBe(1);
+      expect(fetches).toBe(2);
+    } finally {
+      globalThis.fetch = originalFetch;
       vi.useRealTimers();
     }
   });
@@ -925,6 +1006,7 @@ describe('ctx.ask timeout and deadline contract (spec 23)', () => {
           name: 'built-in-two',
           model: 'controlled:gpt-4o',
           system: 'test',
+          timeout: '30ms',
           stallTimeout: '50ms',
         }),
         'two',
@@ -940,6 +1022,385 @@ describe('ctx.ask timeout and deadline contract (spec 23)', () => {
         (event) => event.type === 'agent_call_end' && event.agent === 'built-in-two',
       );
       expect(secondEnd).toMatchObject({ timing: { queuedMs: 100 } });
+    } finally {
+      globalThis.fetch = originalFetch;
+      vi.useRealTimers();
+    }
+  });
+
+  it('credits a completed built-in provider turn queued behind one permit before a tool continuation', async () => {
+    vi.useFakeTimers();
+    const originalFetch = globalThis.fetch;
+    try {
+      const firstFetchEntered = deferred<void>();
+      const releaseFirst = deferred<void>();
+      let fetches = 0;
+      globalThis.fetch = (async () => {
+        const index = fetches++;
+        if (index === 0) {
+          firstFetchEntered.resolve();
+          await releaseFirst.promise;
+        }
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () =>
+            index === 1
+              ? {
+                  choices: [
+                    {
+                      message: {
+                        role: 'assistant',
+                        content: null,
+                        tool_calls: [
+                          {
+                            id: 'next',
+                            type: 'function',
+                            function: { name: 'next_turn', arguments: '{}' },
+                          },
+                        ],
+                      },
+                      finish_reason: 'tool_calls',
+                    },
+                  ],
+                  usage,
+                }
+              : openAIResponse,
+          text: async () => '',
+        };
+      }) as typeof fetch;
+      const provider = new OpenAIProvider({ apiKey: 'test-key', rateLimit: { maxConcurrent: 1 } });
+      const nextTurn = tool({
+        name: 'next_turn',
+        description: 'force another provider turn',
+        input: z.object({}),
+        handler: async () => 'done',
+      });
+      const ctx = context(provider);
+      const blocker = ctx.ask(baseAgent({ name: 'blocker' }), 'hold');
+      await firstFetchEntered.promise;
+      const asked = ctx.ask(
+        baseAgent({ name: 'queued', timeout: '30ms', tools: [nextTurn] }),
+        'go',
+      );
+      await vi.advanceTimersByTimeAsync(50);
+      releaseFirst.resolve();
+      await expect(blocker).resolves.toBe('built-in response');
+      await expect(asked).resolves.toBe('built-in response');
+      expect(fetches).toBe(3);
+    } finally {
+      globalThis.fetch = originalFetch;
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([NaN, Infinity, -10, 40, 1000])(
+    'does not credit custom-reported queuedMs %s: only observed SDK waits pause the clock',
+    async (queuedMs) => {
+      vi.useFakeTimers();
+      try {
+        const nextTurn = tool({
+          name: 'next_turn',
+          description: 'force another provider turn',
+          input: z.object({}),
+          handler: async () => 'done',
+        });
+        const provider = {
+          name: 'controlled',
+          chat: async () => {
+            await wait(40);
+            return {
+              content: '',
+              tool_calls: [
+                { id: 'next', type: 'function', function: { name: 'next_turn', arguments: '{}' } },
+              ],
+              usage,
+              timing: { queuedMs, attempts: 1, retryMs: 0, ttfbMs: 0, wireMs: 0 },
+            };
+          },
+          stream: async function* () {},
+        };
+        const asked = context(provider).ask(
+          baseAgent({ timeout: '30ms', tools: [nextTurn] }),
+          'go',
+        );
+        const rejected = expect(asked).rejects.toBeInstanceOf(TimeoutError);
+        await vi.advanceTimersByTimeAsync(40);
+        await rejected;
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it('keeps the charged budget cumulative: observed queue is credited, provider work on later turns is not', async () => {
+    vi.useFakeTimers();
+    const originalFetch = globalThis.fetch;
+    try {
+      const firstFetchEntered = deferred<void>();
+      const releaseFirst = deferred<void>();
+      let fetches = 0;
+      const toolTurn = {
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: null,
+              tool_calls: [
+                { id: 'next', type: 'function', function: { name: 'next_turn', arguments: '{}' } },
+              ],
+            },
+            finish_reason: 'tool_calls',
+          },
+        ],
+        usage,
+      };
+      globalThis.fetch = (async () => {
+        const index = fetches++;
+        if (index === 0) {
+          firstFetchEntered.resolve();
+          await releaseFirst.promise;
+          return {
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => openAIResponse,
+            text: async () => '',
+          };
+        }
+        // Every turn of the queued ask does 20ms of provider work and asks
+        // for another turn; two of them exceed the 30ms budget.
+        await wait(20);
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => toolTurn,
+          text: async () => '',
+        };
+      }) as typeof fetch;
+      const provider = new OpenAIProvider({ apiKey: 'test-key', rateLimit: { maxConcurrent: 1 } });
+      const nextTurn = tool({
+        name: 'next_turn',
+        description: 'force another provider turn',
+        input: z.object({}),
+        handler: async () => 'done',
+      });
+      const ctx = context(provider);
+      const blocker = ctx.ask(baseAgent({ name: 'blocker' }), 'hold');
+      await firstFetchEntered.promise;
+      const asked = ctx.ask(
+        baseAgent({ name: 'queued', timeout: '30ms', tools: [nextTurn] }),
+        'go',
+      );
+      const rejected = expect(asked).rejects.toBeInstanceOf(TimeoutError);
+      // 50ms queued behind the blocker: credited, so turn 1 (20ms) may start.
+      await vi.advanceTimersByTimeAsync(50);
+      releaseFirst.resolve();
+      await expect(blocker).resolves.toBe('built-in response');
+      await vi.advanceTimersByTimeAsync(100);
+      await rejected;
+      // Blocker + two 20ms turns; the third turn is refused at 40ms charged.
+      expect(fetches).toBe(3);
+    } finally {
+      globalThis.fetch = originalFetch;
+      vi.useRealTimers();
+    }
+  });
+
+  it('credits a parent ask for a nested ask queued on the governor inside its tool, like awaitHuman', async () => {
+    vi.useFakeTimers();
+    const originalFetch = globalThis.fetch;
+    try {
+      const firstFetchEntered = deferred<void>();
+      const releaseFirst = deferred<void>();
+      let fetches = 0;
+      globalThis.fetch = (async () => {
+        const index = fetches++;
+        if (index === 0) {
+          firstFetchEntered.resolve();
+          await releaseFirst.promise;
+        }
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => openAIResponse,
+          text: async () => '',
+        };
+      }) as typeof fetch;
+      // One permit: the blocker holds it while the child queues.
+      const provider = new OpenAIProvider({ apiKey: 'test-key', rateLimit: { maxConcurrent: 1 } });
+      const child = baseAgent({ name: 'child', model: 'child:gpt-4o', timeout: '30ms' });
+      let outerTurns = 0;
+      const callChild = tool({
+        name: 'call_child',
+        description: 'nested ask',
+        input: z.object({}),
+        handler: async (_input, toolCtx) => {
+          outerTurns++;
+          return toolCtx.ask(child, 'go');
+        },
+      });
+      const parentProvider = {
+        name: 'controlled',
+        chat: async () =>
+          outerTurns === 0
+            ? {
+                content: '',
+                usage,
+                tool_calls: [
+                  { id: 'c', type: 'function', function: { name: 'call_child', arguments: '{}' } },
+                ],
+              }
+            : { content: 'parent done', usage },
+        stream: async function* () {},
+      };
+      const ctx = context(parentProvider, { extraProviders: { child: provider } });
+      const blocker = ctx.ask(baseAgent({ name: 'blocker', model: 'child:gpt-4o' }), 'hold');
+      await firstFetchEntered.promise;
+      const parent = ctx.ask(baseAgent({ timeout: '30ms', tools: [callChild] }), 'go');
+      // Parent tool time is all governor queue here; it must not charge the parent.
+      await vi.advanceTimersByTimeAsync(50);
+      releaseFirst.resolve();
+      await expect(blocker).resolves.toBe('built-in response');
+      await expect(parent).resolves.toBe('parent done');
+      expect(fetches).toBe(2);
+    } finally {
+      globalThis.fetch = originalFetch;
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not apply one sibling ask’s queued credit to another sibling', async () => {
+    vi.useFakeTimers();
+    try {
+      const nextTurn = tool({
+        name: 'next_turn',
+        description: 'force another provider turn',
+        input: z.object({}),
+        handler: async () => 'done',
+      });
+      const provider = {
+        name: 'controlled',
+        chat: async (_messages: unknown, options: { model: string }) => {
+          await wait(50);
+          if (options.model === 'queued') {
+            return {
+              content: 'queued done',
+              usage,
+              timing: { queuedMs: 50, attempts: 1, retryMs: 0, ttfbMs: 0, wireMs: 0 },
+            };
+          }
+          return {
+            content: '',
+            usage,
+            tool_calls: [
+              { id: 'next', type: 'function', function: { name: 'next_turn', arguments: '{}' } },
+            ],
+            timing: { queuedMs: 0, attempts: 1, retryMs: 0, ttfbMs: 0, wireMs: 0 },
+          };
+        },
+        stream: async function* () {},
+      };
+      const ctx = context(provider);
+      const queued = ctx.ask(
+        baseAgent({ name: 'queued', model: 'controlled:queued', timeout: '30ms' }),
+        'go',
+      );
+      const working = ctx.ask(
+        baseAgent({
+          name: 'working',
+          model: 'controlled:working',
+          timeout: '30ms',
+          tools: [nextTurn],
+        }),
+        'go',
+      );
+      const rejected = expect(working).rejects.toBeInstanceOf(TimeoutError);
+      await vi.advanceTimersByTimeAsync(50);
+      await expect(queued).resolves.toBe('queued done');
+      await rejected;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('credits a streaming turn whose governor wait is reached only when the iterator advances', async () => {
+    vi.useFakeTimers();
+    const originalFetch = globalThis.fetch;
+    try {
+      const firstFetchEntered = deferred<void>();
+      const releaseFirst = deferred<void>();
+      let fetches = 0;
+      const encoder = new TextEncoder();
+      const sse = (lines: string[]) =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              for (const line of lines) controller.enqueue(encoder.encode(`${line}\n`));
+              controller.close();
+            },
+          }),
+          { status: 200, headers: { 'content-type': 'text/event-stream' } },
+        );
+      globalThis.fetch = (async () => {
+        const index = fetches++;
+        if (index === 0) {
+          firstFetchEntered.resolve();
+          await releaseFirst.promise;
+        }
+        return index === 1
+          ? sse([
+              'data: ' +
+                JSON.stringify({
+                  choices: [
+                    {
+                      delta: {
+                        tool_calls: [
+                          {
+                            index: 0,
+                            id: 'next',
+                            type: 'function',
+                            function: { name: 'next_turn', arguments: '{}' },
+                          },
+                        ],
+                      },
+                    },
+                  ],
+                }),
+              'data: ' +
+                JSON.stringify({ choices: [{ delta: {}, finish_reason: 'tool_calls' }], usage }),
+              'data: [DONE]',
+            ])
+          : sse([
+              'data: ' + JSON.stringify({ choices: [{ delta: { content: 'completed' } }] }),
+              'data: ' + JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }], usage }),
+              'data: [DONE]',
+            ]);
+      }) as typeof fetch;
+      const provider = new OpenAIProvider({ apiKey: 'test-key', rateLimit: { maxConcurrent: 1 } });
+      const nextTurn = tool({
+        name: 'next_turn',
+        description: 'force another provider turn',
+        input: z.object({}),
+        handler: async () => 'done',
+      });
+      const ctx = streamingContext(provider);
+      const blocker = ctx.ask(baseAgent({ name: 'blocker' }), 'hold');
+      await firstFetchEntered.promise;
+      // The queued ask's generator only reaches the governor when ctx.ask
+      // advances next(); the pause must still land on this ask's clock.
+      const asked = ctx.ask(
+        baseAgent({ name: 'queued', timeout: '30ms', tools: [nextTurn] }),
+        'go',
+      );
+      await vi.advanceTimersByTimeAsync(50);
+      releaseFirst.resolve();
+      await expect(blocker).resolves.toBe('completed');
+      await expect(asked).resolves.toBe('completed');
+      expect(fetches).toBe(3);
     } finally {
       globalThis.fetch = originalFetch;
       vi.useRealTimers();

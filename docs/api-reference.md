@@ -201,7 +201,7 @@ const myAgent = agent({
 | `stop` | `string[]` | — | Stop sequences — generation stops when any sequence is encountered. Not supported by the `openai-responses` provider (silently ignored) |
 | `providerOptions` | `Record<string, unknown>` | — | Provider-specific options shallow-merged into the raw API request body via `Object.assign`. Not portable across providers. See [shallow merge caveat](providers.md#provideroptions) |
 | `maxTurns` | `number` | `25` | Maximum tool-call loop iterations before throwing `MaxTurnsError`. **A "turn" in axl is one provider call inside a single `ctx.ask()`** — not a user↔assistant exchange. Schema/validate/guardrail retries also consume turns. See [Sessions → Turns vs. Exchanges](#turns-vs-exchanges) |
-| `timeout` | `string` | `defaults.timeout`, else `'60s'` | Graceful overall between-turn budget. The in-flight provider turn, including its transport retries and 429 backoff, and ordinary tool finish; after expiry Axl refuses the next turn with `TimeoutError`. `awaitHuman` wait time is excluded; other tool work, limiter queueing, and retry backoff count when the next turn is checked. Use `signal: AbortSignal.timeout(...)` for a strict deadline. |
+| `timeout` | `string` | `defaults.timeout`, else `'60s'` | Graceful work budget for an ask, checked before each new provider turn. Time spent waiting on Axl's rate governor or on `awaitHuman` does not count. Use `signal` for a hard wall-clock deadline. Details: [Ask deadlines](#ask-deadlines-cancellation-and-stalled-requests). |
 | `stallTimeout` | `string` | `defaults.stallTimeout`, else unset | Opt-in hard provider-request stall limit. See [Ask deadlines, cancellation, and stalled requests](#ask-deadlines-cancellation-and-stalled-requests). |
 | `maxContext` | `number` | — | Estimated token limit for context window management |
 | `version` | `string` | — | Prompt version label attached to trace events |
@@ -416,7 +416,7 @@ Admission is checked at two points: when an operation opens (the provider facade
 
 `extends AxlError`, `code: 'ADMISSION_DENIED'`, fields `{ limit, knownSpend, operation: { kind, model? } }`.
 
-Raised before the request leaves the process, so it never accompanies a charge. It is **never** wrapped in a `ProviderError` or a `TranscriptionOperationError`, never auto-retried by the transport, and never treated as an abort. It is distinct from `BudgetExceededError`, which is `ctx.budget()`'s own workflow-scoped policy and keeps its existing semantics.
+Raised before the request leaves the process, so it never accompanies a charge. It is **never** wrapped in a `ProviderError` or a `TranscriptionOperationError`, never auto-retried by the transport, and never treated as an abort. The same instance passes every recovery boundary in the workflow context unwrapped and unretried: tool handler retries and failure-to-model conversion, `ctx.ask`'s `validate`, `ctx.verify` (retries, `validate`, and `fallback`), `ctx.budget` (never reported as `budgetExceeded`), and `ctx.spawn` / `ctx.map` / `ctx.race`, which reject with it instead of folding it into a `{ ok: false }` result or `QuorumNotMet`. `ctx.race` and quorum-mode `spawn` / `map` also cancel their remaining branches; default-mode `spawn` / `map` own no cancellation signal, so in-flight siblings run on (and are refused at their next admission check) while `map` starts no further items. It is distinct from `BudgetExceededError`, which is `ctx.budget()`'s own workflow-scoped policy and keeps its existing semantics.
 
 ### `externalOperation(descriptor, fn)` / `ctx.withExternalOperation(descriptor, fn)`
 
@@ -540,7 +540,7 @@ const data = await ctx.ask(myAgent, 'Extract the user profile', {
 | `toolChoice` | `'auto' \| 'none' \| 'required' \| { type: 'function', function: { name } }` | agent config | Override tool choice for this call |
 | `stop` | `string[]` | agent config | Override stop sequences for this call |
 | `providerOptions` | `Record<string, unknown>` | agent config | Override provider-specific options for this call. Shallow-merged; see [caveat](providers.md#provideroptions) |
-| `timeout` | `string` | agent config → `defaults.timeout` → `'60s'` | Override the graceful overall between-turn budget. The current provider turn and ordinary tool work are allowed to finish; `awaitHuman` wait is excluded. |
+| `timeout` | `string` | agent config → `defaults.timeout` → `'60s'` | Override the graceful work budget. The active turn always finishes. Details: [Ask deadlines](#ask-deadlines-cancellation-and-stalled-requests). |
 | `stallTimeout` | `string` | agent config → `defaults.stallTimeout` → unset | Opt-in hard limit for a provider request that makes no progress. Streaming resets the idle clock on every chunk; non-streaming uses a dispatch-to-completion limit. |
 | `signal` | `AbortSignal` | — | Per-ask hard cancellation/deadline. Composed with the context/branch signal; first abort wins and nested asks inherit it. |
 
@@ -552,6 +552,8 @@ applicable per-call, agent, and internal defaults.
 
 **Retry mechanics:** All output retries (guardrail, schema, validate) use **accumulating context** — the LLM's failed response is appended as an assistant message, followed by a **user** message explaining the error (a user turn, not a system message: providers hoist system messages out of the conversation, which would leave the request ending on the rejected attempt). On subsequent retries, the LLM sees all prior failed attempts, giving it increasing context for self-correction. Failed responses are **not** persisted to session history; only the final successful response is recorded. Supply `retryFeedback` to write that user message yourself, or to stop retrying — see [Custom retry feedback](#custom-retry-feedback). See the [Output Pipeline](#output-pipeline) for the full gate-by-gate flow.
 
+**Cancellation and admission inside `validate`:** a validator that throws `AdmissionDeniedError`, or throws after this ask's signal (context, branch, or per-ask `signal`) was aborted, is not a validation failure: the error propagates as-is, without a corrective turn or a `ValidationError`.
+
 **Streaming + validate:** As of 0.16.0, `validate` and token streaming (via `runtime.stream()`) coexist — validate runs against the buffered response after streaming completes. (Pre-0.16.0 this combination threw `INVALID_CONFIG`.) For structured output, the typed result is still only available after the full response arrives.
 
 #### Ask deadlines, cancellation, and stalled requests
@@ -560,13 +562,29 @@ These controls deliberately cover different failure modes:
 
 | Need | Use | Behavior |
 |---|---|---|
-| Let active work finish but stop more turns | `timeout` | Graceful 60-second default; checked between provider turns and retries. It excludes only time spent in `awaitHuman`. |
+| Let active work finish but stop more turns | `timeout` | Graceful 60-second default. Cumulative across turns and retries, checked before each new provider turn; never interrupts the active turn. What counts is listed below. |
 | Stop a stuck provider request | `stallTimeout` | Opt-in. On streams, aborts after an idle gap with no chunk (every chunk resets it); on non-stream calls, aborts if dispatch-to-completion exceeds it. It covers provider work only, never tools or `awaitHuman`. Start with `'120s'` unless your provider/model evidence supports a different idle window; this is guidance, not an SDK default. |
 | Enforce a strict wall-clock SLA or cancel now | `signal` | Hard-aborts an in-flight request and discards any partial response. Use `AbortSignal.timeout()` for a deadline. |
 
-Neither `timeout` nor `stallTimeout` interrupts a 429 pause, limiter queue, or
-transport backoff. A single provider turn can therefore outlast either value.
-Pass an ask or context `signal` to cap the whole wait.
+**What `timeout` counts.** The budget measures work, not waiting on Axl itself:
+
+| Counts against the budget | Does not count |
+|---|---|
+| Provider service time, including streamed content | Waiting in Axl's rate governor: queue, spacing, adaptive pacing, and 429 pauses |
+| Tool execution and schema / validate / guardrail retries | Waiting in `awaitHuman` |
+| Transport retries and backoff for 503 / 529 / network errors | |
+
+The ask's graceful timer starts after context projection, including any summary call. Waits
+during that preparation cannot reduce the budget charged to later turns.
+
+An excluded wait is excluded for the ask doing the waiting and for every ask enclosing it, so a
+parent is not charged while a nested ask inside its tool sits in the queue. Sibling asks never
+share credit. Only waits Axl performs itself are excluded: a custom adapter's own queue counts
+unless it goes through `fetchWithRetry`, and the `queuedMs` a provider reports is diagnostic only.
+
+Neither `timeout` nor `stallTimeout` interrupts an active 429 pause, limiter queue, or
+transport backoff, so a single provider turn can outlast either value. `RateLimitConfig.acquireTimeoutMs`
+separately bounds the initial queue wait; an ask or context `signal` caps the whole wall-clock wait.
 
 ```typescript
 // One interactive request must not outlive the HTTP request budget.
@@ -708,6 +726,8 @@ const results = await ctx.spawn(3, (i) => ctx.ask(agent, prompts[i]), { quorum: 
 
 **Returns:** `Promise<Result<T>[]>` where `Result<T>` is `{ ok: true, value: T } | { ok: false, error: string }`.
 
+**Rejects** (instead of recording `{ ok: false }`) when a task throws `AdmissionDeniedError` or `EventStreamOverflowError`, or when a task fails after the scope the spawn runs in (the workflow, an enclosing `hard_stop` budget, race, or quorum) was aborted. The promise rejects with that task's error; with `quorum`, the remaining tasks are cancelled. Tasks cancelled by the spawn's own quorum are still not failures.
+
 ---
 
 ### `ctx.vote(results, options)`
@@ -804,6 +824,13 @@ See [Validated Data Extraction](use-cases.md#validated-data-extraction) for more
 
 **Throws:** `VerifyError` (schema failure) or `ValidationError` (validate failure) if retries exhausted and no fallback provided. When `fn()` throws a `VerifyError` or `ValidationError`, `verify` re-throws the original error (not a new wrapper) after retries are exhausted.
 
+**Stops are not retried:** retries and `fallback` recover from bad output only. `verify` rethrows immediately — unwrapped, without another attempt, and never substituting `fallback` — when:
+
+- `fn` or `validate` throws `AdmissionDeniedError` (or `EventStreamOverflowError`);
+- the scope `verify` runs in (the workflow signal, an enclosing `hard_stop` budget, race, or quorum branch) is aborted. The error `fn` or `validate` threw is rethrown as-is; if an attempt was merely invalid, the signal's abort reason is thrown. Inside a `hard_stop` budget this lets the budget report `{ value: null, budgetExceeded: true }` rather than the fallback.
+
+An ask's own `timeout` / `stallTimeout` failure is a per-call failure, not a cancelled scope, so it is still retried. An interrupted `verify` emits no `verify` trace event — it reached no pass/fail outcome.
+
 **Retry mechanics:** `ctx.verify()` is **not** conversation-aware. It is a plain loop that calls your function, validates the return value (schema then validate), and on failure passes a `VerifyRetry` context to your next call. What you do with that context is entirely up to you — `ctx.verify()` does not modify any LLM conversation or session history. This makes it suitable for retrying any async operation, not just LLM calls.
 
 ---
@@ -839,6 +866,11 @@ if (result.budgetExceeded) {
 
 - **`unpriced`** — `true` when the block included work with unknown cost, such as an unpriced model or a dispatched stalled call abandoned without usage. `totalCost` is then a **lower bound** (the unknown component is omitted). The same condition is readable mid-block via [`ctx.getBudgetStatus().unpriced`](#ctxgetbudgetstatus), and Axl logs a one-time `console.warn` per budget block when it happens.
 - ⚠️ **`unpriced` is observability only — cost limits / `hard_stop` are NOT enforced on unknown spend.** The enforcement rail never sees that cost, so a `hard_stop` budget does **not** govern unpriced models (e.g. Bedrock, self-hosted) or abandoned non-cooperative work. Treat `unpriced: true` as "this limit could not be enforced for part of this block."
+
+**Only its own stop is `budgetExceeded`.** The block returns `{ value: null, budgetExceeded: true }` when `fn` fails because this budget was exceeded (including its own `hard_stop` abort). It rejects with the original error instead when:
+
+- `fn` throws `AdmissionDeniedError` (or `EventStreamOverflowError`) — even if the budget is also exceeded, the run-level stop keeps its identity;
+- the scope the budget runs in (the workflow signal, an enclosing race/quorum branch, or an outer `hard_stop` budget) was aborted — a caller cancellation is not reported as budget exhaustion.
 
 **Nesting:** Budget blocks can be nested. Inner budgets roll their costs — **and their `unpriced` lower-bound flag** — up to the parent.
 
@@ -983,6 +1015,8 @@ const fastest = await ctx.race([
 
 **Returns:** `Promise<T>` — the first valid result.
 
+**Rejects** with a branch's error — cancelling the other branches — when a branch or `validate` throws `AdmissionDeniedError` or `EventStreamOverflowError`, or when a branch fails after the scope the race runs in was aborted. Branches cancelled because another branch won are still ignored.
+
 ---
 
 ### `ctx.parallel(fns)`
@@ -1016,6 +1050,8 @@ const results = await ctx.map(reviews, async (review) => {
 | `quorum` | `number` | — | Resolve when this many items succeed. Remaining work is cancelled. Throws `QuorumNotMet` if not met |
 
 **Returns:** `Promise<Result<U>[]>` — results in the same order as `items`. Some may be `{ ok: false }` if they errored.
+
+**Rejects** (instead of recording `{ ok: false }`) when an item throws `AdmissionDeniedError` or `EventStreamOverflowError`, or when an item fails after the scope the map runs in was aborted. No further items start, and with `quorum` the in-flight items are cancelled. Items cancelled by the map's own quorum are still not failures.
 
 ---
 
@@ -1998,7 +2034,7 @@ const runtime3 = new AxlRuntime({
 |-------|------|-------------|
 | `maxConcurrent` | `number` | Max requests in flight per scope (one model on one account, see above). Finite integer ≥ 1; invalid values disable the cap (with a `console.warn`). `1` serializes (a throughput floor, not a deadlock — permits aren't held across a nested `ctx.ask()`) |
 | `minIntervalMs` | `number` | Minimum ms between successive request *grants* (global spacing, no burst bucket) |
-| `acquireTimeoutMs` | `number` | If set, a call queued longer than this for its **first** permit rejects (fail loud) instead of hanging on a misconfigured cap. A call arriving during a rate-limit pause starts this clock only once the pause ends; a call already queued when a pause begins keeps its clock running through it. Once queued, the clock also counts adaptive-pacing waits and the time spent behind priority retriers (each spaced by the adaptive interval), so a tight value can reject calls that pacing is only delaying. A retry's re-acquire after a rate-limit 429 is exempt |
+| `acquireTimeoutMs` | `number` | If set, a call queued longer than this for its **first** permit rejects (fail loud) instead of hanging on a misconfigured cap. A call arriving during a rate-limit pause starts this clock only once the pause ends; a call already queued when a pause begins keeps its clock running through it. Once queued, the clock also counts adaptive-pacing waits and the time spent behind priority retriers (each spaced by the adaptive interval), so a tight value can reject calls that pacing is only delaying. A retry's re-acquire after a rate-limit 429 is exempt. This admission bound is separate from `ctx.ask.timeout`, which is checked between turns and does not cap the queue. |
 | `adaptive` | `boolean` | Default `true` on every built-in chat provider. A rate-limit 429 pauses the scope for the exponential backoff (lengthened, never shortened, by `Retry-After`/`retry-after-ms`; clamped at 60 s), retries on `maxRateLimitRetries`, then paces the scope adaptively until it stops being throttled. Spend-cap 429s fail fast only on first-party OpenAI and Anthropic (their default origins); elsewhere every 429 counts as a rate limit. `false` restores the plain path: a 429 shares the transient budget and nothing pauses or paces. Two blocks on one scope: `true` wins. Ignored by a directly constructed `RateLimiter`. Details: [providers.md → Rate limiting](providers.md#rate-limiting) |
 | `maxRateLimitRetries` | `number` | Default `8`. Retries after a rate-limit 429 where `adaptive` applies, separate from the 2 transient (`503`/`529`/network) retries. Integer ≥ 0; invalid values warn and use the default. Two blocks on one scope: the smaller wins |
 
@@ -2533,7 +2569,7 @@ All errors extend `AxlError`.
 | `ValidationError` | `ctx.ask()`, `ctx.verify()` | Post-schema business rule validation failed after all retries. Includes `.lastOutput`, `.reason`, `.retries` |
 | `QuorumNotMet` | `ctx.spawn()`, `ctx.map()` | Fewer tasks succeeded than the required quorum. Includes `.results` |
 | `NoConsensus` | `ctx.vote()` | No successful results to vote on, unanimous vote failed, or invalid strategy/option combination |
-| `TimeoutError` | `ctx.ask()` | Graceful between-turn `timeout` expired. The message names the agent. When at least one completed turn reported provider `timing`, it appends `(elapsed Nms: queued Nms, retries Nms, wire Nms, other Nms)` and `.breakdown` (`TimeoutBreakdown`) carries the same numbers. With no instrumented turn, the message is the bare prefix plus agent name and `.breakdown` is `undefined` |
+| `TimeoutError` | `ctx.ask()` | Graceful between-turn `timeout` expired. The message names the agent. When at least one completed turn reported provider `timing`, it appends `(elapsed Nms: queued Nms, retries Nms, wire Nms, other Nms, charged Nms)`, where `charged` is the number compared with the budget; `.breakdown` (`TimeoutBreakdown`) carries the same fields. With no instrumented completed turn, the message is the bare prefix plus agent name and `.breakdown` is `undefined`. |
 | `StallTimeoutError` | `ctx.ask()` | A dispatched provider request exceeded `stallTimeout` without streaming progress (or exceeded the non-stream dispatch-to-completion limit). Extends `TimeoutError`, names the agent, and is distinguishable with `instanceof StallTimeoutError`. |
 | `MaxTurnsError` | `ctx.ask()` | Agent exceeded its configured `maxTurns` |
 | `BudgetExceededError` | `ctx.budget()` | Budget exceeded with `hard_stop` policy. Includes `.limit`, `.spent`, `.policy` |
@@ -2551,8 +2587,8 @@ All errors extend `AxlError`.
 
 ### `TimeoutBreakdown` (`TimeoutError.breakdown`)
 
-Where a timed-out `ctx.ask()`'s elapsed budget went, summed over the turns that completed
-before the timeout fired. Exported from `@axlsdk/axl`.
+Where a timed-out `ctx.ask()`'s time went, summed over its completed provider turns.
+Exported from `@axlsdk/axl`.
 
 **Present only when at least one completed turn reported provider [`timing`](#calltiming).**
 Otherwise `.breakdown` is `undefined` and the message is the bare prefix — an all-zero
@@ -2560,15 +2596,16 @@ breakdown would blame tools and gates for a budget the provider simply never mea
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `elapsedMs` | `number` | Wall clock consumed by the ask when it timed out |
-| `queuedMs` | `number` | Sum of `CallTiming.queuedMs` — self-imposed rate-limiter wait |
-| `retryMs` | `number` | Sum of `CallTiming.retryMs` — failed provider attempts and their backoff |
+| `elapsedMs` | `number` | Wall clock from ask start to the check, including excluded waits |
+| `chargedMs` | `number` | `elapsedMs` minus excluded waits. This is the number compared with `timeout` |
+| `queuedMs` | `number` | Sum of `CallTiming.queuedMs` over completed turns. Diagnostic only; it can differ from the wait excluded in `chargedMs` |
+| `retryMs` | `number` | Sum of `CallTiming.retryMs` — failed provider attempts and their non-governor backoff |
 | `wireMs` | `number` | Sum of `CallTiming.wireMs` — provider time |
-| `otherMs` | `number` | `elapsedMs` minus the three sums: tools, gates, runtime work, response-body download, and any async `apiKey` callback. Clamped at `0` |
+| `otherMs` | `number` | `elapsedMs` minus the three timing sums: tools, gates, runtime work, response-body download, and any async `apiKey` callback. Clamped at `0` |
 
-Every completed turn of the ask contributes, gate-retry turns (schema / validate / guardrail)
-included, since each is a separate provider call. A turn that threw contributes nothing — a
-failed provider call ends the ask, so no later turn can reach the timeout check.
+Gate-retry turns (schema / validate / guardrail) count as completed turns. A turn that threw
+contributes no timing — a failed provider call ends the ask, so no later turn can reach the
+timeout check.
 
 ### `ProviderError` fields
 
@@ -2672,7 +2709,7 @@ Per-item result from an eval run. `scores` provides quick numeric access; `score
 | `cost` | `number?` | Measured generation spend for this item — a view of `accounting.breakdown.generation`. A case that threw **after** a paid call still carries that charge. Not a caller-reported figure (see `callerReport`) |
 | `scorerCost` | `number?` | Measured judging spend for this item — a view of `accounting.breakdown.judging` |
 | `outcome` | `EvalItemOutcome?` | `'completed'`, `'failed'`, `'cancelled'`, `'budget_skipped'` (never started) or `'budget_interrupted'` (stopped mid-flight when its next call was denied). Absent on pre-0.24 artifacts, where it can be derived as `error ? 'failed' : 'completed'` |
-| `failure` | `EvalItemFailure?` | Structured cause of a `failed` item, captured before the thrown value is flattened to `error`: `{ name, provider?, status?, retryable?, requestId? }`. When a `ProviderError` is found (the thrown value, or the first one down its `cause` chain, walked to a bounded depth) every field comes from it; otherwise only the thrown value's `name`. Identified structurally (`code: 'PROVIDER_ERROR'` + `name: 'ProviderError'`) so a second loaded copy of `@axlsdk/axl` still matches. `failure` never records `ProviderError.body` (nor the message); `item.error` keeps the error message as before, which for some providers can include error-response text. Absent on other outcomes, on pre-0.24 artifacts, and for a thrown value with no `name`. Carried through `rescore` with the item's outcome. `EvalItemFailure` is exported from `@axlsdk/eval` |
+| `failure` | `EvalItemFailure?` | Structured cause of a `failed` item, captured before the thrown value is flattened to `error`. A `ProviderError` found in the thrown value or bounded `cause` chain takes precedence and supplies `name`, `provider?`, `status?`, `retryable?`, and `requestId?`; otherwise a recognized `TimeoutError` contributes its finite `elapsedMs?`, `chargedMs?`, `queuedMs?`, `retryMs?`, `wireMs?`, and `otherMs?` breakdown fields. `chargedMs` is the number that exceeded the budget; `EvalItem.duration` remains full workflow wall time. `failure` never records `ProviderError.body` or the error message; `item.error` keeps the message as before. Studio redaction keeps the known failure fields and masks `item.error`. Absent on other outcomes and legacy artifacts. Carried through `rescore`. `EvalItemFailure` is exported from `@axlsdk/eval` |
 | `accounting` | `Accounting?` | This item's measured spend across generation **and** judging, with `breakdown` splitting the two. A child scope that finalizes with an operation still in flight records it `abandoned` locally while the run scope still receives the real settlement, so an item and its run can disagree about one operation — **do not reconcile by subtraction**; the run-level `knownCost` is authoritative |
 | `callerReport` | `{ cost?, metadata? }?` | What the `executeWorkflow` callback claimed, kept for inspection and **never** folded into any total. `cost` is the callback's returned number (invalid values are dropped with a warning); `metadata` holds reserved diagnostic keys (`models`, `tokens`, …) that would otherwise have overridden the runtime's own |
 | `scoreDetails` | `Record<string, ScorerDetail>?` | Rich per-scorer data — includes `metadata` (e.g., LLM reasoning), per-scorer `duration`, and `cost` |

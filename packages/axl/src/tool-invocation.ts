@@ -1,8 +1,8 @@
 import {
-  isAdmissionDeniedError,
   isEventStreamOverflowError,
   isToolFailureError,
   rethrowEventStreamOverflow,
+  rethrowUnrecoverable,
   ToolModelOutputError,
 } from './errors.js';
 import { openOperation } from './accounting.js';
@@ -454,11 +454,10 @@ export async function executeAcceptedTool(options: {
       }
     }
   } catch (error) {
-    rethrowEventStreamOverflow(error);
     // A budget stop is not a tool failure: it must escape the agent loop with
     // its own identity rather than being fed back to the model as an error
     // result and prompting yet another turn.
-    if (isAdmissionDeniedError(error)) throw error;
+    rethrowUnrecoverable(error);
     const abort = cancellationError(signal, error);
     if (abort !== undefined) return cancellation('handler', abort);
     return failed('handler', error, { attempts });

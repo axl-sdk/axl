@@ -16,9 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Both drop the portable `temperature` and reject non-default raw sampling.
   - Replayed thinking uses the binding beta with `drop_block` under adaptive thinking. With thinking off, the beta and `block_binding` are not sent, and a prefix edit Axl did not make is surfaced as the provider's 400.
 - Standard pricing for both models:
-  - Sonnet 5.5 is $2/$10 per million tokens.
+  - Sonnet 5.5 is $2/$10 per million tokens, with cache reads at 5% of input ($0.10).
   - Haiku 5.5 has two rate cards: $0.10/$0.50 up to a 100,000-token prompt and $0.50/$2.50 above it, with every component of a long prompt billed on the higher card.
-  - Two unpublished rules are estimated so cost is never understated. See `docs/providers.md`.
+  - Which tokens count toward the Haiku 5.5 split is not published, so Axl counts every prompt token and cost is never understated. See `docs/providers.md`.
 
 ### Changed
 

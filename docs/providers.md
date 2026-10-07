@@ -310,20 +310,17 @@ publishes Standard text rates of $4 input, $20 output, $0.20 cache read, $5
 five-minute cache write, and $8 one-hour cache write per million tokens.
 Unmodeled billing modes remain unpriced.
 
-Sonnet 5.5 is priced at $2 input and $10 output per million tokens, with a 10%
-cache read. Haiku 5.5 has two rate cards: $0.10 input / $0.50 output when the
+Sonnet 5.5 is priced at $2 input and $10 output per million tokens, with a 5%
+cache read ($0.10 per million tokens). Haiku 5.5 has two rate cards: $0.10 input / $0.50 output when the
 prompt is at most 100,000 tokens, and $0.50 / $2.50 above that. On the higher
 card every component of the call is billed at the higher rate, output included.
-Both cards use a 10% cache read and the standard 1.25x / 2x cache writes. Two of
-these rules are estimates, chosen so Axl never understates cost:
-- **Haiku 5.5 prompt size.** Anthropic does not say which tokens count toward
-  the 100,000-token split. Axl counts uncached input, cache reads, and both
-  cache-write TTLs, but not output. If invoices show that cache reads or writes
-  do not count, cache-heavy prompts near the split are over-estimated, and the
-  rule should be narrowed.
-- **Sonnet 5.5 cache read.** The pricing table lists $0.20 per million tokens
-  (10%), but the prompt-caching guide says 5%. Axl uses 10%. If invoices show
-  5%, set `cacheReadMultiplier: 0.05` on the rate row.
+Both cards use a 10% cache read and the standard 1.25x / 2x cache writes.
+
+One rule is an estimate, chosen so Axl never understates cost: Anthropic does
+not say which tokens count toward Haiku 5.5's 100,000-token split. Axl counts
+uncached input, cache reads, and both cache-write TTLs, but not output. If
+invoices show that cache reads or writes do not count, cache-heavy prompts near
+the split are over-estimated, and the rule should be narrowed.
 
 `claude-mythos-5-1` and `claude-mythos-5` are priced but have no capability entry:
 they are limited-availability models whose per-model thinking semantics are not
@@ -1617,14 +1614,14 @@ either discard Axl's breakpoint or stack a second one beside the caller's. Verif
 
 | Operation | Multiplier |
 |-----------|-----------|
-| Cache read (hit) | **10%** of input rate — but **5%** on Claude Opus 5.5 and **2.5%** on Claude Fable 5.1 and Mythos 5.1 |
+| Cache read (hit) | **10%** of input rate — but **5%** on Claude Opus 5.5 and Sonnet 5.5, and **2.5%** on Claude Fable 5.1 and Mythos 5.1 |
 | Cache write — 5-minute TTL (default) | **125%** of input rate |
 | Cache write — 1-hour TTL | **200%** of input rate |
 
 The cache-read multiplier is per-model (`cacheReadMultiplier` on the rate row in
 `providers/anthropic.ts`), defaulting to 10%. Cache-write multipliers are uniform
 across models. Check the source rather than assuming 10% when sizing a
-cache-heavy workload on Opus 5.5 or the Fable/Mythos 5.1 line. Haiku 5.5 also has a
+cache-heavy workload on Opus 5.5, Sonnet 5.5, or the Fable/Mythos 5.1 line. Haiku 5.5 also has a
 prompt-length rate card (see [Anthropic](#anthropic)).
 
 Axl reads the 5-minute and 1-hour creation buckets when Anthropic provides them and prices

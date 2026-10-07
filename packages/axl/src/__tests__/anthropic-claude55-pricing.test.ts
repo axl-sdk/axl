@@ -50,7 +50,12 @@ const ROWS: Array<[id: string, model: string, usage: Usage, cost: number]> = [
   ['P6b 1h writes past the boundary', HAIKU, [90000, 0, 0, 10001, 0], 0.055001],
   ['P7 both TTLs together cross the split', HAIKU, [99000, 0, 500, 501, 10], 0.0503385],
   ['P8 output never counts toward the split', HAIKU, [100000, 0, 0, 0, 500000], 0.26],
-  ['P10 sonnet 5.5 with 0.1x read and both TTLs', SONNET, [10000, 40000, 5000, 1000, 2000], 0.0645],
+  [
+    'P10 sonnet 5.5 with 0.05x read and both TTLs',
+    SONNET,
+    [10000, 40000, 5000, 1000, 2000],
+    0.0605,
+  ],
   ['P11 sonnet 5.5 is flat above 200K', SONNET, [200001, 0, 0, 0, 1000], 0.410002],
   ['P12 opus 5.5 unchanged', 'claude-opus-5-5', [10000, 40000, 0, 0, 0], 0.048],
   ['P13 sonnet 5 unchanged', 'claude-sonnet-5', [10000, 40000, 0, 0, 0], 0.028],

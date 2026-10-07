@@ -426,10 +426,10 @@ type AnthropicRate = AnthropicRateCard & {
 const DEFAULT_CACHE_READ_MULTIPLIER = 0.1;
 
 const ANTHROPIC_RATES: Record<string, AnthropicRate> = {
-  // The pricing table, the Haiku 5.5 page, and the migration guide list the
-  // Sonnet 5.5 cache read at $0.20 (0.1x); the prompt-caching prose says
-  // 0.05x. The default 0.1x is used because it never understates cost.
-  'claude-sonnet-5-5': { input: 2e-6, output: 10e-6 },
+  // Sonnet 5.5 cache reads are 0.05x ($0.10/MTok): the pricing table, its
+  // footnote, the models overview, and the prompt-caching guide agree
+  // (re-checked 2026-10-07).
+  'claude-sonnet-5-5': { input: 2e-6, output: 10e-6, cacheReadMultiplier: 0.05 },
   'claude-haiku-5-5': {
     input: 0.1e-6,
     output: 0.5e-6,

@@ -136,7 +136,18 @@ describe.each(['claude-opus-5-5', 'claude-fable-5-1'])('%s keeps every guard', (
     [{ tool_choice: { type: 'tool', name: 'calc' } }, 'forced tool choice'],
     [{ thinking: { type: 'disabled' } }, 'manual or disabled thinking'],
     [{ thinking: { type: 'enabled', budget_tokens: 2048 } }, 'manual or disabled thinking'],
+    [{ thinking: { type: 'between_tools' } }, 'manual or disabled thinking'],
     [{ output_config: { effort: 'none' } }, 'output_config.effort'],
+    // Both invalid: the thinking contract is reported first.
+    [
+      { thinking: { type: 'disabled' }, output_config: { effort: 'none' } },
+      'manual or disabled thinking',
+    ],
+    // A caller binding is validated even when nothing is replayed.
+    [
+      { thinking: { type: 'adaptive', block_binding: { prefix_mismatch_behavior: 'retry' } } },
+      'thinking.block_binding',
+    ],
     [{ temperature: 0.3 }, 'temperature'],
     [{ top_p: 0.5 }, 'top_p'],
     [{ top_k: 20 }, 'top_k'],

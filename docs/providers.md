@@ -277,6 +277,8 @@ unchanged. Axl handles this for you in most cases.
   blocks first and reports the ask-level case with reason `client_prefix_rewrite`.
 - To fail instead of recovering, set
   `providerOptions.thinking.block_binding.prefix_mismatch_behavior: 'error'`.
+  Only `'error'` and `'drop_block'` are accepted; any other value is rejected
+  before dispatch.
 
 **What is verified.** Live-verified: same-prefix replay, both Opus/Fable switch
 directions, edited system, tool, and message prefixes, the native `error` opt-out,

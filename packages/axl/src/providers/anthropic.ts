@@ -1294,12 +1294,8 @@ export class AnthropicProvider implements Provider {
       const thinking = body.thinking;
       const outputConfig = body.output_config;
       const effort = isRecord(outputConfig) ? outputConfig.effort : undefined;
-      if (
-        outputConfig !== undefined &&
-        (!isRecord(outputConfig) || (effort !== undefined && !isNativeClaudeEffort(effort)))
-      ) {
-        reject('output_config.effort', 'Use low, medium, high, xhigh, or max effort.');
-      }
+      // Thinking shape first, then effort validity, then the off-shape effort
+      // ceiling, which needs a valid effort to compare.
       if (thinking !== undefined && offShape === undefined) {
         if (
           !isRecord(thinking) ||
@@ -1330,18 +1326,27 @@ export class AnthropicProvider implements Provider {
               `Send thinking: { type: '${offShape}' } with no other fields.`,
             );
           }
-          if (
-            effort !== undefined &&
-            capability.disableAt &&
-            !isEffortAtOrBelow(effort as Exclude<Effort, 'none'>, capability.disableAt)
-          ) {
-            reject(
-              'output_config.effort',
-              `Thinking can be turned off only at effort '${capability.disableAt}' or below; ` +
-                `lower the effort or use adaptive thinking.`,
-            );
-          }
         }
+      }
+      if (
+        outputConfig !== undefined &&
+        (!isRecord(outputConfig) || (effort !== undefined && !isNativeClaudeEffort(effort)))
+      ) {
+        reject('output_config.effort', 'Use low, medium, high, xhigh, or max effort.');
+      }
+      if (
+        offShape !== undefined &&
+        isRecord(thinking) &&
+        thinking.type === offShape &&
+        effort !== undefined &&
+        capability.disableAt &&
+        !isEffortAtOrBelow(effort as Exclude<Effort, 'none'>, capability.disableAt)
+      ) {
+        reject(
+          'output_config.effort',
+          `Thinking can be turned off only at effort '${capability.disableAt}' or below; ` +
+            `lower the effort or use adaptive thinking.`,
+        );
       }
     }
 
@@ -1360,13 +1365,11 @@ export class AnthropicProvider implements Provider {
       }
     }
 
-    if (
-      capability.thinkingBinding === true &&
-      isFinalThinkingAdaptive(capability, body) &&
-      hasReplayedThinking(body)
-    ) {
+    if (capability.thinkingBinding === true && isFinalThinkingAdaptive(capability, body)) {
       const thinking = isRecord(body.thinking) ? body.thinking : { type: 'adaptive' };
       const binding = thinking.block_binding;
+      // A caller binding is validated whether or not anything is replayed; it
+      // still sends the beta header (see requiresBindingBeta).
       if (
         binding !== undefined &&
         (!isRecord(binding) ||
@@ -1375,10 +1378,12 @@ export class AnthropicProvider implements Provider {
       ) {
         reject('thinking.block_binding', "Use prefix_mismatch_behavior: 'error' or 'drop_block'.");
       }
-      body.thinking = {
-        ...thinking,
-        block_binding: binding ?? { prefix_mismatch_behavior: 'drop_block' },
-      };
+      if (hasReplayedThinking(body)) {
+        body.thinking = {
+          ...thinking,
+          block_binding: binding ?? { prefix_mismatch_behavior: 'drop_block' },
+        };
+      }
     }
   }
 

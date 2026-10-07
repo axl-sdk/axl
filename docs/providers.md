@@ -34,6 +34,7 @@ provider section below lists every supported ID and its specifics.
 - Use `openai-responses:` for OpenAI agents that use tools, reasoning, or structured
   output. See [OpenAI — Responses API](#openai--responses-api-preferred).
 - Claude 5.x models and GPT-6 (while reasoning is active) drop `temperature`. Tune `effort` instead.
+- Claude Fable 5.1 is the maximum-capability Claude tier, priced above Opus. Choose it only when Opus 5.5 falls short.
 - Claude model details, including the forced tool choice and thinking-off differences
   between tiers, are in [Anthropic](#anthropic).
 - Cost is estimated only for exact known IDs. See [Cost Estimation](#cost-estimation).
@@ -232,7 +233,7 @@ table to choose, then read the notes below it.
 |---|---|---|---|---|
 | Use it for | Maximum capability | Hardest work | General agents | Judges, routers, sub-agents |
 | Thinking | Always on | Always on | On by default | On by default |
-| Default effort (none sent) | Not documented | `medium` | `high` | `medium` |
+| Default effort (none sent) | `high` | `medium` | `high` | `medium` |
 | `effort: 'none'` | Becomes `low`, with an `effort_clamped` diagnostic | Becomes `low`, with an `effort_clamped` diagnostic | Thinking off as `between_tools` | Thinking off as `disabled` |
 | `toolChoice: 'required'` or a named tool | Rejected before dispatch | Rejected before dispatch | Rejected before dispatch | Accepted; thinking is skipped on that turn |
 | Thinking off allowed at | Never | Never | Effort `high` or below | Effort `high` or below |
@@ -1223,7 +1224,7 @@ const solution = await ctx.ask(reasoner, problem, { effort: 'low' });
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `temperature` | provider default | Controls randomness (0.0–2.0) on models that accept sampling. Dropped automatically on reasoning models (GPT-5.6, GPT-6 while reasoning, Claude 5.x, Gemini 3.x) and when thinking is active on older Claude models. |
+| `temperature` | provider default | Controls randomness (0.0–2.0) on models that accept sampling. Dropped automatically where the model rejects it: OpenAI reasoning models while reasoning (GPT-6 unless effort is `none`, GPT-5.6 on Responses always), Claude 5.x and Opus 4.7/4.8, Gemini 3.5 Flash-Lite and 3.6 Flash, and Claude 4.6 while thinking. See each provider section for details. |
 | `maxTokens` | `4096` | Maximum completion tokens per call. |
 | `effort` | — | Unified effort level controlling reasoning depth across all providers (see below). |
 | `thinkingBudget` | — | Explicit thinking token budget (advanced). Overrides effort-based allocation. `0` disables thinking only where the model permits it; Opus 5.5 and Fable 5.1 use adaptive thinking at `low`, and Sonnet 5.5 / Haiku 5.5 keep adaptive thinking above effort `high`. |
@@ -1484,7 +1485,7 @@ Controls whether the model calls tools when tools are available:
 
 ```typescript
 const coder = agent({
-  model: 'openai-responses:gpt-5.6',
+  model: 'openai-responses:gpt-6-sol',
   system: 'You are a coding assistant.',
   tools: [runTests, writeCode],
 });
@@ -1511,7 +1512,7 @@ Stop sequences tell the model to stop generating when it produces any of the spe
 
 ```typescript
 const agent = agent({
-  model: 'openai-responses:gpt-5.6',
+  model: 'anthropic:claude-sonnet-5-5',
   system: 'Generate markdown sections.',
   stop: ['\n---', '\n## '],  // stop at section breaks
 });

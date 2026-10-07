@@ -2856,7 +2856,7 @@ Configuration for `llmScorer()`.
 | `model` | `string` | required | Provider:model URI (e.g., `anthropic:claude-haiku-5-5`) |
 | `system` | `string` | required | System prompt for the judge LLM |
 | `schema` | `z.ZodType<{ score: number; ... }>` | `z.object({ score: z.number(), reasoning: z.string() })` | Response schema — converted to JSON Schema and included in the prompt so the LLM knows the exact structure to produce |
-| `temperature` | `number` | `0.2` | Low for scoring consistency |
+| `temperature` | `number` | `0.2` | Low for scoring consistency. Dropped on models that reject sampling (Claude 5.x, GPT-6 while reasoning); tune `effort` instead. |
 | `maxTokens` | `number` | provider default | Cap on response tokens |
 | `effort` | `Effort` | provider default | Unified reasoning/thinking level (`'none' \| 'low' \| 'medium' \| 'high' \| 'xhigh' \| 'max'`). On reasoning-capable judges (GPT-5.x and GPT-6, Claude Opus 4.5+, Sonnet 4.6+, and the Claude 5.x family, Gemini 3.x), `'high'` or `'max'` materially improves calibration. Provider-specific mapping (`xhigh` clamps, `none` semantics, etc.) lives on the [`Effort`](#effort) type — judges follow the same rules as agents |
 | `thinkingBudget` | `number` | — | Precise thinking-token budget override; `0` disables thinking while keeping `effort` for output control (Anthropic). On other providers, simply disables reasoning |

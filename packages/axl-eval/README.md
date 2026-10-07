@@ -226,7 +226,7 @@ Different LLM scorers can use different providers — each resolves independentl
 
 ```typescript
 const qualityJudge = llmScorer({ name: 'quality', model: 'openai:gpt-4o', ... });
-const safetyJudge = llmScorer({ name: 'safety', model: 'anthropic:claude-sonnet-4-5-20250514', ... });
+const safetyJudge = llmScorer({ name: 'safety', model: 'anthropic:claude-sonnet-5-5', ... });
 ```
 
 LLM scorers also accept the conditional `applies` predicate described in [Conditional scorers](#conditional-scorers-applies) — the most valuable place to use it, since a skipped judge makes no provider call at all.

@@ -212,14 +212,9 @@ type ClaudeCapability = {
   disableAt?: Exclude<Effort, 'none'>;
   /**
    * The `thinking` shape that turns thinking off on an `adaptive-default-on`
-   * model. Absent means `{ type: 'disabled' }` with no off-shape validation
-   * (Opus 5 / Sonnet 5). When set, the final body is also validated against
-   * the model's off-shape contract: `thinking.type` must be `adaptive` or this
-   * shape, the off-shape object carries only `type` (so no `block_binding`),
-   * `output_config.effort` is one of the five levels and, under the
-   * off-shape, at or below `disableAt`.
+   * model. Absent means `{ type: 'disabled' }`.
    */
-  offShape?: 'disabled' | 'between_tools';
+  offShape?: 'between_tools';
   /** The model rejects `tool_choice` `any`/`tool`; fail before dispatch. Absent means allowed. */
   forcedToolChoice?: 'rejected';
   /**
@@ -231,11 +226,15 @@ type ClaudeCapability = {
    */
   defaultOnlySampling?: true;
   /**
-   * The model accepts only adaptive thinking: a final-body `thinking` that is
-   * not `{ type: 'adaptive' }` (or carries `budget_tokens`), or an
-   * `output_config.effort` outside the native levels, fails before dispatch.
+   * Validate the final body's `thinking` and `output_config` against the
+   * model's thinking contract before dispatch. `output_config.effort` must be
+   * one of the five native levels. `thinking` must be `adaptive` without
+   * `budget_tokens` or, on an `adaptive-default-on` model, exactly the
+   * off-shape (`offShape ?? 'disabled'`, no other fields, so no
+   * `block_binding`) at an effort at or below `disableAt`. An
+   * `adaptive-always-on` model has no off-shape.
    */
-  adaptiveOnly?: true;
+  strictThinking?: true;
   /**
    * The model runs Anthropic's preserved-thinking prefix check, so a request
    * that replays thinking under adaptive thinking carries the
@@ -266,6 +265,7 @@ const CLAUDE_CAPABILITIES: Record<string, ClaudeCapability> = {
     offShape: 'between_tools',
     forcedToolChoice: 'rejected',
     defaultOnlySampling: true,
+    strictThinking: true,
     thinkingBinding: true,
   },
   // Thinking off is `disabled`, only at effort high or below. Forced tool
@@ -276,8 +276,8 @@ const CLAUDE_CAPABILITIES: Record<string, ClaudeCapability> = {
     manualBudget: false,
     stripTemperature: true,
     disableAt: 'high',
-    offShape: 'disabled',
     defaultOnlySampling: true,
+    strictThinking: true,
     thinkingBinding: true,
   },
   'claude-opus-5-5': {
@@ -287,7 +287,7 @@ const CLAUDE_CAPABILITIES: Record<string, ClaudeCapability> = {
     stripTemperature: true,
     forcedToolChoice: 'rejected',
     defaultOnlySampling: true,
-    adaptiveOnly: true,
+    strictThinking: true,
     thinkingBinding: true,
   },
   'claude-fable-5-1': {
@@ -297,7 +297,7 @@ const CLAUDE_CAPABILITIES: Record<string, ClaudeCapability> = {
     stripTemperature: true,
     forcedToolChoice: 'rejected',
     defaultOnlySampling: true,
-    adaptiveOnly: true,
+    strictThinking: true,
     thinkingBinding: true,
   },
   'claude-fable-5': {
@@ -1279,40 +1279,32 @@ export class AnthropicProvider implements Provider {
       }
     }
 
-    if (capability.adaptiveOnly) {
-      if (
-        body.thinking !== undefined &&
-        (!isRecord(body.thinking) ||
-          body.thinking.type !== 'adaptive' ||
-          body.thinking.budget_tokens !== undefined)
-      ) {
-        reject(
-          'manual or disabled thinking',
-          "Use thinking: { type: 'adaptive' } and output_config.effort.",
-        );
-      }
-      const outputConfig = body.output_config;
-      if (
-        outputConfig !== undefined &&
-        (!isRecord(outputConfig) ||
-          (outputConfig.effort !== undefined && !isNativeClaudeEffort(outputConfig.effort)))
-      ) {
-        reject('output_config.effort', 'Use low, medium, high, xhigh, or max effort.');
-      }
-    }
-
-    if (capability.offShape) {
-      const offShape = capability.offShape;
+    if (capability.strictThinking) {
+      const offShape =
+        capability.thinking === 'adaptive-always-on'
+          ? undefined
+          : (capability.offShape ?? 'disabled');
       const thinking = body.thinking;
       const outputConfig = body.output_config;
       const effort = isRecord(outputConfig) ? outputConfig.effort : undefined;
-      if (outputConfig !== undefined && !isRecord(outputConfig)) {
-        reject('output_config', 'Use an output_config object.');
-      }
-      if (effort !== undefined && !isNativeClaudeEffort(effort)) {
+      if (
+        outputConfig !== undefined &&
+        (!isRecord(outputConfig) || (effort !== undefined && !isNativeClaudeEffort(effort)))
+      ) {
         reject('output_config.effort', 'Use low, medium, high, xhigh, or max effort.');
       }
-      if (thinking !== undefined) {
+      if (thinking !== undefined && offShape === undefined) {
+        if (
+          !isRecord(thinking) ||
+          thinking.type !== 'adaptive' ||
+          thinking.budget_tokens !== undefined
+        ) {
+          reject(
+            'manual or disabled thinking',
+            "Use thinking: { type: 'adaptive' } and output_config.effort.",
+          );
+        }
+      } else if (thinking !== undefined) {
         if (!isRecord(thinking) || (thinking.type !== 'adaptive' && thinking.type !== offShape)) {
           reject(
             'thinking.type',

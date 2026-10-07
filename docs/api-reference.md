@@ -171,10 +171,9 @@ Define an agent with a model, system prompt, tools, and optional handoffs.
 import { agent } from '@axlsdk/axl';
 
 const myAgent = agent({
-  model: 'openai-responses:gpt-5.6',
+  model: 'openai-responses:gpt-6-sol',
   system: 'You are a helpful assistant.',
   tools: [search, calculator],
-  temperature: 0.7,
   maxTokens: 8192,
   effort: 'high',
   maxTurns: 10,
@@ -185,7 +184,7 @@ const myAgent = agent({
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `name` | `string` | model string or `Agent_N` | Display name used in traces |
-| `model` | `string \| (ctx) => string` | **required** | Provider URI (e.g., `'openai:gpt-4o'`, `'anthropic:claude-sonnet-4-6'`). Function form enables dynamic model routing |
+| `model` | `string \| (ctx) => string` | **required** | Provider URI (e.g., `'openai-responses:gpt-6-sol'`, `'anthropic:claude-sonnet-5-5'`). Function form enables dynamic model routing |
 | `system` | `string \| (ctx) => string` | **required** | System prompt. Function form enables per-request customization |
 | `tools` | `Tool[]` | `[]` | Tools this agent can call. Acts as an ACL — the agent cannot call tools not in this list |
 | `handoffs` | `HandoffDescriptor[] \| (ctx) => HandoffDescriptor[]` | `[]` | Agents this agent can hand off to. Function form receives `{ metadata?: Record<string, unknown> }` for dynamic routing (see below) |
@@ -222,7 +221,7 @@ The `handoffs` option accepts a function for runtime-conditional routing. The fu
 ```typescript
 const router = agent({
   name: 'support-router',
-  model: 'openai-responses:gpt-5-mini',
+  model: 'openai-responses:gpt-6-luna',
   system: 'Route to the right specialist.',
   handoffs: (ctx) => {
     const base = [
@@ -701,7 +700,7 @@ const result = await ctx.delegate(
   customerMessage,
   {
     schema: z.object({ answer: z.string(), category: z.string() }),
-    routerModel: 'openai-responses:gpt-5-mini',
+    routerModel: 'openai-responses:gpt-6-luna',
   },
 );
 ```
@@ -901,8 +900,8 @@ Lazy `AxlEventBus` exposing every `AxlEvent` emitted by this context (and its ch
 // self-contained.
 const outlineSchema = z.object({ outline: z.array(z.string()) });
 const draftSchema = z.object({ draft: z.string() });
-const planner = agent({ model: 'openai:gpt-4o', system: 'Plan an outline.' });
-const writer = agent({ model: 'openai:gpt-4o', system: 'Write the draft.' });
+const planner = agent({ model: 'openai-responses:gpt-6-sol', system: 'Plan an outline.' });
+const writer = agent({ model: 'openai-responses:gpt-6-sol', system: 'Write the draft.' });
 
 const wf = workflow({
   name: 'two-step',
@@ -1412,7 +1411,7 @@ User-defined validation functions that run at the agent boundary, before and aft
 
 ```typescript
 const safe = agent({
-  model: 'openai-responses:gpt-5.6',
+  model: 'openai-responses:gpt-6-sol',
   system: 'You are a helpful assistant.',
   guardrails: {
     input: async (prompt, ctx) => {
@@ -1665,7 +1664,7 @@ const session = runtime.session('user-123', {
   history: {
     maxMessages: 100,
     summarize: true,
-    summaryModel: 'openai-responses:gpt-5-mini',
+    summaryModel: 'openai-responses:gpt-6-luna',
   },
   deduplicateInput: true,
   persist: true,
@@ -1680,7 +1679,7 @@ const result = await session.send('HandleSupport', { msg: 'Help me' });
 |--------|------|---------|-------------|
 | `history.maxMessages` | `number` | — | Keep the last N messages. Older messages are trimmed (or summarized if `summarize` is `true`) |
 | `history.summarize` | `boolean` | `false` | When `true` and `maxMessages` is exceeded, summarize old messages instead of dropping them |
-| `history.summaryModel` | `string` | — | Model URI for summarization (e.g., `'openai:gpt-4o-mini'`). **Required** when `summarize` is `true` |
+| `history.summaryModel` | `string` | — | Model URI for summarization (e.g., `'anthropic:claude-haiku-5-5'`). **Required** when `summarize` is `true` |
 | `deduplicateInput` | `boolean` | `true` | Send the current session input once when the workflow passes that same normalized input to `ctx.ask()`. Set to `false` to preserve the legacy duplicate request |
 | `persist` | `boolean` | `true` | Save session history to the state store. When `false`, history exists only in memory for the session lifetime |
 
@@ -2854,7 +2853,7 @@ Configuration for `llmScorer()`.
 |-------|------|---------|-------------|
 | `name` | `string` | required | Unique scorer name |
 | `description` | `string` | required | What this scorer evaluates |
-| `model` | `string` | required | Provider:model URI (e.g., `openai:gpt-4o`) |
+| `model` | `string` | required | Provider:model URI (e.g., `anthropic:claude-haiku-5-5`) |
 | `system` | `string` | required | System prompt for the judge LLM |
 | `schema` | `z.ZodType<{ score: number; ... }>` | `z.object({ score: z.number(), reasoning: z.string() })` | Response schema — converted to JSON Schema and included in the prompt so the LLM knows the exact structure to produce |
 | `temperature` | `number` | `0.2` | Low for scoring consistency |

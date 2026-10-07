@@ -20,6 +20,24 @@ behavior. See the [catalog verification](./verification/latest-provider-models-2
 [native image refresh](./verification/native-image-catalog-2026-09-02.md), and
 [frontier refresh verification](./verification/frontier-model-refresh-2026-09-25.md).
 
+## Choosing a model
+
+Pick by the job, not the brand. These are the models the docs and examples use. Each
+provider section below lists every supported ID and its specifics.
+
+| You need | Anthropic | OpenAI (Responses) | Google | xAI |
+|---|---|---|---|---|
+| **General agents and workflows** | `anthropic:claude-sonnet-5-5` | `openai-responses:gpt-6-sol` | `google:gemini-3.8-flash` | `xai:grok-4.5` |
+| **Fast and cheap**: judges, routers, sub-agents, summaries | `anthropic:claude-haiku-5-5` | `openai-responses:gpt-6-luna` | `google:gemini-3.8-flash` | — |
+| **Hardest reasoning** | `anthropic:claude-opus-5-5` | `openai-responses:gpt-6-astra` | — | — |
+
+- Use `openai-responses:` for OpenAI agents that use tools, reasoning, or structured
+  output. See [OpenAI — Responses API](#openai--responses-api-preferred).
+- Claude 5.x models and GPT-6 (while reasoning is active) drop `temperature`. Tune `effort` instead.
+- Claude model details, including the forced tool choice and thinking-off differences
+  between tiers, are in [Anthropic](#anthropic).
+- Cost is estimated only for exact known IDs. See [Cost Estimation](#cost-estimation).
+
 ## OpenAI — Responses API (preferred)
 
 The Responses API is the preferred OpenAI integration. It supports prompt caching, native
@@ -205,61 +223,73 @@ anthropic:claude-haiku-4-5      # Fast and affordable
 anthropic:claude-opus-4-5       # Previous gen
 ```
 
-Opus 5.5 supports `low`, `medium`, `high`, `xhigh`, and `max` with adaptive
-thinking always on; the default is `medium`, and `none` uses `low` with an
-`effort_clamped` diagnostic. Opus 5.5 and Fable 5.1 reject `toolChoice:
-'required'` and named choices before dispatch; use `auto` or `none`. Raw
-overrides that disable thinking or set an invalid effort are rejected the same way.
+### Comparing the current Claude models
 
-Sonnet 5.5 and Haiku 5.5 think adaptively by default, accept all five effort
-levels, and default to `high` (Sonnet) and `medium` (Haiku) when no effort is
-sent. `effort: 'none'` turns thinking off with each model's own shape: Haiku 5.5
-sends `thinking: { type: 'disabled' }`, and Sonnet 5.5 sends `thinking: { type:
-'between_tools' }`, which keeps short progress-update thinking between tool
-calls. That means `thinking_content` can still appear on Sonnet 5.5 under
-`'none'`. Neither is reported as a clamp. Both models allow thinking off only at
-effort `high` or below. `thinkingBudget: 0` with `xhigh` or `max` therefore
-keeps adaptive thinking at the requested level. Haiku 5.5 accepts `toolChoice:
-'required'` and named choices, and the provider skips thinking on that turn.
-Sonnet 5.5 rejects them before dispatch, like Opus 5.5. Under thinking off, raw
-`providerOptions` are rejected before dispatch when they:
-- use a thinking shape other than the model's own,
-- add any field besides `type` to that shape, including `block_binding`, or
-- set an effort above `high`.
+All four accept `effort` levels `low` through `max` (adaptive thinking). Use this
+table to choose, then read the notes below it.
 
-On a model whose thinking stays on by default, a small `maxTokens` cap can be
-used up by thinking. Raise the cap or lower the effort. The probes and live rows
-behind these rules, and what remains unverified, are recorded in the
+| | Fable 5.1 | Opus 5.5 | Sonnet 5.5 | Haiku 5.5 |
+|---|---|---|---|---|
+| Use it for | Maximum capability | Hardest work | General agents | Judges, routers, sub-agents |
+| Thinking | Always on | Always on | On by default | On by default |
+| Default effort (none sent) | Not documented | `medium` | `high` | `medium` |
+| `effort: 'none'` | Becomes `low`, with an `effort_clamped` diagnostic | Becomes `low`, with an `effort_clamped` diagnostic | Thinking off as `between_tools` | Thinking off as `disabled` |
+| `toolChoice: 'required'` or a named tool | Rejected before dispatch | Rejected before dispatch | Rejected before dispatch | Accepted; thinking is skipped on that turn |
+| Thinking off allowed at | Never | Never | Effort `high` or below | Effort `high` or below |
+
+Notes that apply to the table:
+
+- For Fable 5.1 and Opus 5.5, use `toolChoice: 'auto'` or `'none'`. Raw overrides
+  that disable thinking or set an invalid effort are rejected before dispatch.
+- Sonnet 5.5 under `effort: 'none'` sends `thinking: { type: 'between_tools' }`,
+  which keeps short progress-update thinking between tool calls. So
+  `thinking_content` can still appear. Neither off shape is reported as a clamp.
+- `thinkingBudget: 0` with `xhigh` or `max` keeps adaptive thinking at the
+  requested level on Sonnet 5.5 and Haiku 5.5.
+- Under thinking off, raw `providerOptions` are rejected before dispatch when they:
+  - use a thinking shape other than the model's own,
+  - add any field besides `type` to that shape, including `block_binding`, or
+  - set an effort above `high`.
+- On a model whose thinking stays on by default, a small `maxTokens` cap can be
+  used up by thinking. Raise the cap or lower the effort.
+- All four accept only default sampling. A portable `temperature` is dropped. Raw
+  `providerOptions` sampling fails before dispatch unless `temperature` is `1` or
+  `top_p` is `0.99`. The two cannot be sent together, and `top_k` is not accepted.
+
+The probes and live rows behind these rules, and what remains unverified, are
+recorded in the
 [Claude 5.5 family verification](./verification/claude-5-5-family-2026-10.md).
 
-All four models (Opus 5.5, Fable 5.1, Sonnet 5.5, Haiku 5.5) accept only
-default sampling. A portable `temperature` is dropped. Raw `providerOptions`
-sampling fails before dispatch unless `temperature` is `1` or `top_p` is
-`0.99`. The two cannot be sent together, and `top_k` is not accepted.
+### Thinking continuity
 
-**Thinking continuity.** On these four models a thinking block is valid only
-while everything before it is unchanged. When a request replays thinking under
-adaptive thinking, Axl sends Anthropic's binding beta with the `drop_block` policy, so an invalidated
-block is dropped by the provider while its text and tool calls survive, and
-the call reports safe per-reason counts in `diagnostics` and a
-`provider_diagnostic { kind: 'reasoning_context_reset' }`. When Axl itself
-rewrites the prefix (a summary or trim), it removes the stale blocks first and
-reports the ask-level case with reason `client_prefix_rewrite`. Set
-`providerOptions.thinking.block_binding.prefix_mismatch_behavior: 'error'` to
-fail instead of recovering. Signed content never appears in diagnostics.
-Live-verified: same-prefix replay, both Opus/Fable switch directions, edited
-system, tool, and message prefixes, the native `error` opt-out, streamed reset,
-a compacted tool exchange, and reuse of a remembered summary across two
-executions with reasoning kept (see the
+On these four models a thinking block is valid only while everything before it is
+unchanged. Axl handles this for you in most cases.
+
+**Under adaptive thinking:**
+- When a request replays thinking, Axl sends Anthropic's binding beta with the
+  `drop_block` policy. The provider drops an invalidated block while its text and
+  tool calls survive.
+- The call reports safe per-reason counts in `diagnostics` and a
+  `provider_diagnostic { kind: 'reasoning_context_reset' }`. Signed content never
+  appears in diagnostics.
+- When Axl itself rewrites the prefix (a summary or trim), it removes the stale
+  blocks first and reports the ask-level case with reason `client_prefix_rewrite`.
+- To fail instead of recovering, set
+  `providerOptions.thinking.block_binding.prefix_mismatch_behavior: 'error'`.
+
+**What is verified.** Live-verified: same-prefix replay, both Opus/Fable switch
+directions, edited system, tool, and message prefixes, the native `error` opt-out,
+streamed reset, a compacted tool exchange, and reuse of a remembered summary across
+two executions with reasoning kept (see the
 [frontier](./verification/frontier-model-refresh-2026-09-25.md),
 [session summary](./verification/session-summary-coverage-2026-09-25.md), and
 [remediation](./verification/frontier-owner-remediation-2026-09-26.md) records).
 This does not promise reasoning continuity across restarts or prompt and tool
 changes. Live calls used `low` and `max`; other levels have adapter coverage.
 
-Anthropic accepts `block_binding` only with adaptive thinking. When Sonnet 5.5
-or Haiku 5.5 run with thinking off, Axl replays signed blocks unchanged and
-sends neither the beta nor `block_binding`. Two consequences follow:
+**With thinking off (Sonnet 5.5 and Haiku 5.5).** Anthropic accepts `block_binding`
+only with adaptive thinking, so Axl replays signed blocks unchanged and sends
+neither the beta nor `block_binding`. Two consequences follow:
 - An append-only tool loop continues normally.
 - A prefix change Axl did not make itself fails as a provider `400`
   (`ProviderError`) on accounts created on or after 2026-08-31, because
@@ -271,6 +301,8 @@ sends neither the beta nor `block_binding`. Two consequences follow:
 Axl's own summaries and trims still remove stale blocks first. Thinking blocks
 are also bound to the API account. Replaying them through a different account
 drops them silently.
+
+### Anthropic pricing notes
 
 The [Opus 5.5 model page](https://platform.claude.com/docs/en/models/opus-5-5/overview)
 publishes Standard text rates of $4 input, $20 output, $0.20 cache read, $5
@@ -300,16 +332,21 @@ them, requesting an `effort` on them emits a `provider_diagnostic` with
 `effective: 'unset'` — the knob is dropped, and you are told. Arbitrary unpriced
 IDs remain silent pass-through.
 
-`claude-sonnet-4-5` is deprecated on Anthropic-operated APIs and retires November 30,
-2026; migrate to `claude-sonnet-5-5`. `claude-haiku-4-5` is still active;
-`claude-haiku-5-5` is its newer replacement. Haiku 5.5 thinks by default, so
-set `effort: 'none'` or `'low'` when migrating latency-sensitive Haiku 4.5
-workloads. `claude-opus-4-1` retired August 5, 2026. Claude Opus 4, Sonnet 4,
-Sonnet 3.7, Sonnet/Haiku 3.5, and all Claude 3 models previously shown here are
-retired on the first-party API. Migrate Opus workloads to `claude-opus-4-8` or
-later, Sonnet workloads to `claude-sonnet-5-5`, and Haiku workloads to
-`claude-haiku-5-5`. Axl does not enforce
-these lifecycle dates with a runtime allowlist: arbitrary IDs remain pass-through.
+### Migrating from older Claude models
+
+- `claude-sonnet-4-5` is deprecated on Anthropic-operated APIs and retires
+  November 30, 2026. Migrate to `claude-sonnet-5-5`.
+- `claude-haiku-4-5` is still active; `claude-haiku-5-5` is its newer replacement.
+  Haiku 5.5 thinks by default, so set `effort: 'none'` or `'low'` when migrating
+  latency-sensitive Haiku 4.5 workloads.
+- `claude-opus-4-1` retired August 5, 2026. Claude Opus 4, Sonnet 4, Sonnet 3.7,
+  Sonnet/Haiku 3.5, and all Claude 3 models previously shown here are retired on
+  the first-party API. Migrate Opus workloads to `claude-opus-4-8` or later,
+  Sonnet workloads to `claude-sonnet-5-5`, and Haiku workloads to
+  `claude-haiku-5-5`.
+
+Axl does not enforce these lifecycle dates with a runtime allowlist: arbitrary IDs
+remain pass-through.
 [Anthropic-operated and partner-cloud schedules can differ](https://platform.claude.com/docs/en/about-claude/model-deprecations).
 
 ## Google Gemini

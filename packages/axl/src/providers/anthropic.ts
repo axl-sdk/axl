@@ -97,6 +97,24 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+/**
+ * Whether the final request runs adaptive thinking: an explicit
+ * `{ type: 'adaptive' }`, or no `thinking` on a model that thinks adaptively by
+ * default. Anthropic accepts `block_binding` only under adaptive thinking.
+ */
+function isFinalThinkingAdaptive(
+  capability: ClaudeCapability,
+  body: Record<string, unknown>,
+): boolean {
+  const thinking = body.thinking;
+  if (thinking === undefined) {
+    return (
+      capability.thinking === 'adaptive-default-on' || capability.thinking === 'adaptive-always-on'
+    );
+  }
+  return isRecord(thinking) && thinking.type === 'adaptive';
+}
+
 function hasReplayedThinking(body: Record<string, unknown>): boolean {
   return (
     Array.isArray(body.messages) &&
@@ -185,8 +203,31 @@ type ClaudeCapability = {
   stripTemperature?: boolean;
   disableAt?: Exclude<Effort, 'none'>;
   /**
-   * Requires the `thinking-binding-controls-2026-08-01` beta and final-body
-   * validation/`block_binding` injection when replaying thinking blocks.
+   * The `thinking` shape that turns thinking off on an `adaptive-default-on`
+   * model. Absent means `{ type: 'disabled' }`.
+   */
+  offShape?: 'disabled' | 'between_tools';
+  /** The model rejects `tool_choice` `any`/`tool`; fail before dispatch. Absent means allowed. */
+  forcedToolChoice?: 'rejected';
+  /**
+   * The model rejects non-default raw sampling. Final-body `temperature` may
+   * only be 1, `top_p` must be within 0.99–1, and `top_k` is rejected.
+   * Independent of `stripTemperature`, which governs only
+   * the portable `temperature` option.
+   */
+  defaultOnlySampling?: true;
+  /**
+   * The model accepts only adaptive thinking: a final-body `thinking` that is
+   * not `{ type: 'adaptive' }` (or carries `budget_tokens`), or an
+   * `output_config.effort` outside the native levels, fails before dispatch.
+   */
+  adaptiveOnly?: true;
+  /**
+   * The model runs Anthropic's preserved-thinking prefix check, so a request
+   * that replays thinking under adaptive thinking carries the
+   * `thinking-binding-controls-2026-08-01` beta and a `block_binding`
+   * (`drop_block` unless the caller set one). Under a non-adaptive final
+   * `thinking` neither is sent: the provider rejects `block_binding` there.
    * Verified per-model against
    * https://platform.claude.com/docs/en/build-with-claude/preserved-thinking
    * (2026-09-25): that doc names Claude Opus 5.5 and Claude Fable 5.1 only —
@@ -206,6 +247,9 @@ const CLAUDE_CAPABILITIES: Record<string, ClaudeCapability> = {
     effortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
     manualBudget: false,
     stripTemperature: true,
+    forcedToolChoice: 'rejected',
+    defaultOnlySampling: true,
+    adaptiveOnly: true,
     thinkingBinding: true,
   },
   'claude-fable-5-1': {
@@ -213,6 +257,9 @@ const CLAUDE_CAPABILITIES: Record<string, ClaudeCapability> = {
     effortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
     manualBudget: false,
     stripTemperature: true,
+    forcedToolChoice: 'rejected',
+    defaultOnlySampling: true,
+    adaptiveOnly: true,
     thinkingBinding: true,
   },
   'claude-fable-5': {
@@ -538,7 +585,7 @@ function resolveClaudeThinking(
         };
       }
       return {
-        thinking: { type: 'disabled' },
+        thinking: { type: capability.offShape ?? 'disabled' },
         outputConfig: activeEffort ? { effort: activeEffort } : undefined,
         stripTemperature: true,
       };
@@ -1140,71 +1187,94 @@ export class AnthropicProvider implements Provider {
   }
 
   private requiresBindingBeta(body: Record<string, unknown>): boolean {
+    const capability = resolveClaudeCapability(String(body.model));
     const thinking = body.thinking;
     return (
-      resolveClaudeCapability(String(body.model))?.thinkingBinding === true &&
+      capability?.thinkingBinding === true &&
+      isFinalThinkingAdaptive(capability, body) &&
       (hasReplayedThinking(body) || (isRecord(thinking) && thinking.block_binding !== undefined))
     );
   }
 
+  /**
+   * Validate the final body (after `providerOptions`) against the effective
+   * model's capability, then inject `block_binding` where it applies. Every
+   * rule is gated on its own capability field and is a no-op when unset, so a
+   * model only gets the guards its provider contract calls for.
+   */
   private validateAndBindFinalBody(body: Record<string, unknown>): void {
     const model = typeof body.model === 'string' ? body.model : '';
-    if (resolveClaudeCapability(model)?.thinkingBinding !== true) return;
+    const capability = resolveClaudeCapability(model);
+    if (!capability) return;
     const reject = (option: string, remediation: string): never => {
       throw new UnsupportedModelOptionError({ provider: this.name, model, option, remediation });
     };
-    const toolChoice = body.tool_choice;
-    if (isRecord(toolChoice) && (toolChoice.type === 'any' || toolChoice.type === 'tool')) {
-      reject('forced tool choice', "Use toolChoice: 'auto' or 'none' on this model.");
+
+    if (capability.forcedToolChoice === 'rejected') {
+      const toolChoice = body.tool_choice;
+      if (isRecord(toolChoice) && (toolChoice.type === 'any' || toolChoice.type === 'tool')) {
+        reject('forced tool choice', "Use toolChoice: 'auto' or 'none' on this model.");
+      }
     }
+
+    if (capability.adaptiveOnly) {
+      if (
+        body.thinking !== undefined &&
+        (!isRecord(body.thinking) ||
+          body.thinking.type !== 'adaptive' ||
+          body.thinking.budget_tokens !== undefined)
+      ) {
+        reject(
+          'manual or disabled thinking',
+          "Use thinking: { type: 'adaptive' } and output_config.effort.",
+        );
+      }
+      const outputConfig = body.output_config;
+      if (
+        outputConfig !== undefined &&
+        (!isRecord(outputConfig) ||
+          (outputConfig.effort !== undefined &&
+            !['low', 'medium', 'high', 'xhigh', 'max'].includes(String(outputConfig.effort))))
+      ) {
+        reject('output_config.effort', 'Use low, medium, high, xhigh, or max effort.');
+      }
+    }
+
+    if (capability.defaultOnlySampling) {
+      if (body.temperature !== undefined && body.temperature !== 1) {
+        reject('temperature', 'Omit temperature or use the default value 1.');
+      }
+      if (
+        body.top_p !== undefined &&
+        (typeof body.top_p !== 'number' || body.top_p < 0.99 || body.top_p > 1)
+      ) {
+        reject('top_p', 'Omit top_p or use a value from 0.99 to 1.');
+      }
+      if (body.top_k !== undefined) {
+        reject('top_k', 'Omit top_k on this model.');
+      }
+    }
+
     if (
-      body.thinking !== undefined &&
-      (!isRecord(body.thinking) ||
-        body.thinking.type !== 'adaptive' ||
-        body.thinking.budget_tokens !== undefined)
+      capability.thinkingBinding === true &&
+      isFinalThinkingAdaptive(capability, body) &&
+      hasReplayedThinking(body)
     ) {
-      reject(
-        'manual or disabled thinking',
-        "Use thinking: { type: 'adaptive' } and output_config.effort.",
-      );
+      const thinking = isRecord(body.thinking) ? body.thinking : { type: 'adaptive' };
+      const binding = thinking.block_binding;
+      if (
+        binding !== undefined &&
+        (!isRecord(binding) ||
+          (binding.prefix_mismatch_behavior !== 'error' &&
+            binding.prefix_mismatch_behavior !== 'drop_block'))
+      ) {
+        reject('thinking.block_binding', "Use prefix_mismatch_behavior: 'error' or 'drop_block'.");
+      }
+      body.thinking = {
+        ...thinking,
+        block_binding: binding ?? { prefix_mismatch_behavior: 'drop_block' },
+      };
     }
-    const outputConfig = body.output_config;
-    if (
-      outputConfig !== undefined &&
-      (!isRecord(outputConfig) ||
-        (outputConfig.effort !== undefined &&
-          !['low', 'medium', 'high', 'xhigh', 'max'].includes(String(outputConfig.effort))))
-    ) {
-      reject('output_config.effort', 'Use low, medium, high, xhigh, or max effort.');
-    }
-    if (body.temperature !== undefined && body.temperature !== 1) {
-      reject('temperature', 'Omit temperature or use the default value 1.');
-    }
-    if (
-      body.top_p !== undefined &&
-      (typeof body.top_p !== 'number' || body.top_p < 0.99 || body.top_p > 1)
-    ) {
-      reject('top_p', 'Omit top_p or use a value from 0.99 to 1.');
-    }
-    if (body.top_k !== undefined) {
-      reject('top_k', 'Omit top_k on this model.');
-    }
-    const replayed = hasReplayedThinking(body);
-    if (!replayed) return;
-    const thinking = isRecord(body.thinking) ? body.thinking : { type: 'adaptive' };
-    const binding = thinking.block_binding;
-    if (
-      binding !== undefined &&
-      (!isRecord(binding) ||
-        (binding.prefix_mismatch_behavior !== 'error' &&
-          binding.prefix_mismatch_behavior !== 'drop_block'))
-    ) {
-      reject('thinking.block_binding', "Use prefix_mismatch_behavior: 'error' or 'drop_block'.");
-    }
-    body.thinking = {
-      ...thinking,
-      block_binding: binding ?? { prefix_mismatch_behavior: 'drop_block' },
-    };
   }
 
   /** Extract a human-readable message from an API error response body. */

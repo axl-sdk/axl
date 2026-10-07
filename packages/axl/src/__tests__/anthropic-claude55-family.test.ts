@@ -27,7 +27,10 @@ afterEach(() => {
 });
 
 const hi = [{ role: 'user' as const, content: 'hi' }];
-const OFF_SHAPE = { [HAIKU]: 'disabled', [SONNET]: 'between_tools' } as const;
+const OFF_SHAPE: Record<string, 'disabled' | 'between_tools'> = {
+  [HAIKU]: 'disabled',
+  [SONNET]: 'between_tools',
+};
 
 // ---------------------------------------------------------------------------
 // 1. Effort / thinking shape (AC2)
@@ -101,43 +104,45 @@ describe('effort grid regressions and schema asks', () => {
     },
   );
 
-  it.each(['claude-sonnet-5', 'claude-opus-5'])(
-    'T-R1 %s none still sends disabled',
-    async (model) => {
-      const fetcher = installFetch({});
-      await provider().chat(hi, { model, effort: 'none' });
-      expect(captured(fetcher).body.thinking).toEqual({ type: 'disabled' });
-    },
-  );
+  describe.each(MODES)('%s', (mode) => {
+    it.each(['claude-sonnet-5', 'claude-opus-5'])(
+      'T-R1 %s none still sends disabled',
+      async (model) => {
+        const fetcher = installFetch({});
+        await run(mode, hi, { model, effort: 'none' });
+        expect(captured(fetcher).body.thinking).toEqual({ type: 'disabled' });
+      },
+    );
 
-  it.each(['claude-opus-5-5', 'claude-fable-5-1'])(
-    'T-R2 %s none still clamps to adaptive low',
-    async (model) => {
-      const fetcher = installFetch({});
-      await provider().chat(hi, { model, effort: 'none' });
-      expect(captured(fetcher).body).toMatchObject({
-        thinking: { type: 'adaptive' },
-        output_config: { effort: 'low' },
-      });
-      expect(provider().effortResolution({ model, effort: 'none' })).toMatchObject({
-        effective: 'low',
-        clamped: true,
-      });
-    },
-  );
+    it.each(['claude-opus-5-5', 'claude-fable-5-1'])(
+      'T-R2 %s none still clamps to adaptive low',
+      async (model) => {
+        const fetcher = installFetch({});
+        await run(mode, hi, { model, effort: 'none' });
+        expect(captured(fetcher).body).toMatchObject({
+          thinking: { type: 'adaptive' },
+          output_config: { effort: 'low' },
+        });
+        expect(provider().effortResolution({ model, effort: 'none' })).toMatchObject({
+          effective: 'low',
+          clamped: true,
+        });
+      },
+    );
 
-  it('T-R3 opus-4-6 low + thinkingBudget 0 keeps the 4.6 path', async () => {
-    const fetcher = installFetch({});
-    await provider().chat(hi, {
-      model: 'claude-opus-4-6',
-      effort: 'low',
-      thinkingBudget: 0,
-      temperature: 0.3,
+    it('T-R3 opus-4-6 low + thinkingBudget 0 keeps the 4.6 path', async () => {
+      const fetcher = installFetch({});
+      await run(mode, hi, {
+        model: 'claude-opus-4-6',
+        effort: 'low',
+        thinkingBudget: 0,
+        temperature: 0.3,
+      });
+      const { body } = captured(fetcher);
+      expect(body).not.toHaveProperty('thinking');
+      expect(body.output_config).toEqual({ effort: 'low' });
+      expect(body.temperature).toBe(0.3);
     });
-    const { body } = captured(fetcher);
-    expect(body).not.toHaveProperty('thinking');
-    expect(body.output_config).toEqual({ effort: 'low' });
-    expect(body.temperature).toBe(0.3);
   });
 });
 
@@ -242,6 +247,7 @@ describe('tool choice', () => {
       const forced = agent({
         name: 'sonnet-forced',
         model: `anthropic:${SONNET}`,
+        system: 'Answer briefly.',
         tools: [calc],
         toolChoice: 'required',
       });
@@ -253,7 +259,12 @@ describe('tool choice', () => {
       });
       expect((error as { remediation: string }).remediation).toContain('auto');
 
-      const plain = agent({ name: 'sonnet-plain', model: `anthropic:${SONNET}`, tools: [calc] });
+      const plain = agent({
+        name: 'sonnet-plain',
+        model: `anthropic:${SONNET}`,
+        system: 'Answer briefly.',
+        tools: [calc],
+      });
       await expect(
         ctx.ask(plain, 'go', { toolChoice: { type: 'function', function: { name: 'calc' } } }),
       ).rejects.toMatchObject({
@@ -297,25 +308,27 @@ describe('portable temperature (T-TE1..4)', () => {
 const STRICT_MODELS = [HAIKU, SONNET, 'claude-opus-5-5', 'claude-fable-5-1'];
 
 describe.each(STRICT_MODELS)('%s raw sampling (T-PO1..7)', (model) => {
-  it.each([[{ temperature: 1 }], [{ top_p: 0.99 }]])('accepts %j', async (providerOptions) => {
-    const fetcher = installFetch({});
-    await provider().chat(hi, { model, providerOptions });
-    expect(captured(fetcher).body).toMatchObject(providerOptions);
-  });
-
-  it.each([
-    [{ temperature: 0.7 }, 'temperature'],
-    [{ top_p: 1 }, 'top_p'],
-    [{ top_k: 5 }, 'top_k'],
-    [{ temperature: 1, top_p: 0.99 }, 'temperature and top_p'],
-  ] as const)('rejects %j before dispatch', async (providerOptions, option) => {
-    const fetcher = installFetch({});
-    await expect(provider().chat(hi, { model, providerOptions })).rejects.toMatchObject({
-      name: 'UnsupportedModelOptionError',
-      model,
-      option,
+  describe.each(MODES)('%s', (mode) => {
+    it.each([[{ temperature: 1 }], [{ top_p: 0.99 }]])('accepts %j', async (providerOptions) => {
+      const fetcher = installFetch({});
+      await run(mode, hi, { model, providerOptions });
+      expect(captured(fetcher).body).toMatchObject(providerOptions);
     });
-    expect(fetcher).not.toHaveBeenCalled();
+
+    it.each([
+      [{ temperature: 0.7 }, 'temperature'],
+      [{ top_p: 1 }, 'top_p'],
+      [{ top_k: 5 }, 'top_k'],
+      [{ temperature: 1, top_p: 0.99 }, 'temperature and top_p'],
+    ] as const)('rejects %j before dispatch', async (providerOptions, option) => {
+      const fetcher = installFetch({});
+      await expect(run(mode, hi, { model, providerOptions })).rejects.toMatchObject({
+        name: 'UnsupportedModelOptionError',
+        model,
+        option,
+      });
+      expect(fetcher).not.toHaveBeenCalled();
+    });
   });
 });
 
@@ -442,73 +455,75 @@ describe('raw off-shape combinations (R4b, T-PO8..14)', () => {
 // ---------------------------------------------------------------------------
 
 describe('catalog admission (C1..C5)', () => {
-  it.each([HAIKU, SONNET])('C1 admits %s with a thinking control', async (model) => {
-    const fetcher = installFetch({});
-    await provider().chat(hi, { model, effort: 'low', temperature: 0.2 });
-    expect(captured(fetcher).body).toMatchObject({
-      thinking: { type: 'adaptive' },
-      output_config: { effort: 'low' },
-    });
-    expect(captured(fetcher).body).not.toHaveProperty('temperature');
-  });
-
-  it.each([
-    'claude-haiku-5-5-20261007',
-    'claude-haiku-5-5-latest',
-    'claude-haiku-5-5@20261007',
-    'claude-sonnet-5-5-20261007',
-    'claude-haiku-5-5-1m',
-    'Claude-Haiku-5-5',
-    ' claude-sonnet-5-5',
-    'claude-sonnet-5-5 ',
-  ])('C2/C5 %j gets no capability and no price', async (model) => {
-    const fetcher = installFetch({ usage: { input_tokens: 1000, output_tokens: 1000 } });
-    const result = await provider().chat(hi, {
-      model,
-      effort: 'low',
-      temperature: 0.2,
-      tools,
-      toolChoice: 'required',
-    });
-    const { body, headers } = captured(fetcher);
-    expect(body).not.toHaveProperty('thinking');
-    expect(body).not.toHaveProperty('output_config');
-    expect(body.temperature).toBe(0.2);
-    expect(body.tool_choice).toEqual({ type: 'any' });
-    expect(headers['anthropic-beta']).toBeUndefined();
-    expect(result.cost).toBeUndefined();
-  });
-
-  it('C3 claude-sonnet-5 keeps its own rules', async () => {
-    const fetcher = installFetch({});
-    await provider().chat(hi, {
-      model: 'claude-sonnet-5',
-      effort: 'max',
-      thinkingBudget: 0,
-      providerOptions: { top_k: 5 },
-    });
-    // Sonnet 5 disables thinking up to max and has no raw sampling guard.
-    expect(captured(fetcher).body).toMatchObject({
-      thinking: { type: 'disabled' },
-      output_config: { effort: 'max' },
-      top_k: 5,
-    });
-  });
-
-  it('C4 claude-haiku-4-5 keeps the legacy manual-thinking path', async () => {
-    const fetcher = installFetch({});
-    await provider().chat(hi, { model: 'claude-haiku-4-5', effort: 'low', maxTokens: 100 });
-    expect(captured(fetcher).body.thinking).toEqual({ type: 'enabled', budget_tokens: 1024 });
-    expect(captured(fetcher).headers['anthropic-beta']).toBeUndefined();
-  });
-
-  it('never sends the binding beta without replayed thinking (T-B7, QR8)', async () => {
-    for (const model of [HAIKU, SONNET]) {
+  describe.each(MODES)('%s', (mode) => {
+    it.each([HAIKU, SONNET])('C1 admits %s with a thinking control', async (model) => {
       const fetcher = installFetch({});
-      await provider().chat(hi, { model, effort: 'high' });
+      await run(mode, hi, { model, effort: 'low', temperature: 0.2 });
+      expect(captured(fetcher).body).toMatchObject({
+        thinking: { type: 'adaptive' },
+        output_config: { effort: 'low' },
+      });
+      expect(captured(fetcher).body).not.toHaveProperty('temperature');
+    });
+
+    it.each([
+      'claude-haiku-5-5-20261007',
+      'claude-haiku-5-5-latest',
+      'claude-haiku-5-5@20261007',
+      'claude-sonnet-5-5-20261007',
+      'claude-haiku-5-5-1m',
+      'Claude-Haiku-5-5',
+      ' claude-sonnet-5-5',
+      'claude-sonnet-5-5 ',
+    ])('C2/C5 %j gets no capability and no price', async (model) => {
+      const fetcher = installFetch({ usage: { input_tokens: 1000, output_tokens: 1000 } });
+      const result = await run(mode, hi, {
+        model,
+        effort: 'low',
+        temperature: 0.2,
+        tools,
+        toolChoice: 'required',
+      });
+      const { body, headers } = captured(fetcher);
+      expect(body).not.toHaveProperty('thinking');
+      expect(body).not.toHaveProperty('output_config');
+      expect(body.temperature).toBe(0.2);
+      expect(body.tool_choice).toEqual({ type: 'any' });
+      expect(headers['anthropic-beta']).toBeUndefined();
+      expect(result.cost).toBeUndefined();
+    });
+
+    it('C3 claude-sonnet-5 keeps its own rules', async () => {
+      const fetcher = installFetch({});
+      await run(mode, hi, {
+        model: 'claude-sonnet-5',
+        effort: 'max',
+        thinkingBudget: 0,
+        providerOptions: { top_k: 5 },
+      });
+      // Sonnet 5 disables thinking up to max and has no raw sampling guard.
+      expect(captured(fetcher).body).toMatchObject({
+        thinking: { type: 'disabled' },
+        output_config: { effort: 'max' },
+        top_k: 5,
+      });
+    });
+
+    it('C4 claude-haiku-4-5 keeps the legacy manual-thinking path', async () => {
+      const fetcher = installFetch({});
+      await run(mode, hi, { model: 'claude-haiku-4-5', effort: 'low', maxTokens: 100 });
+      expect(captured(fetcher).body.thinking).toEqual({ type: 'enabled', budget_tokens: 1024 });
       expect(captured(fetcher).headers['anthropic-beta']).toBeUndefined();
-      expect(captured(fetcher).body.thinking).toEqual({ type: 'adaptive' });
-      expect(captured(fetcher).raw).not.toContain(BINDING_BETA);
-    }
+    });
+
+    it('never sends the binding beta without replayed thinking (T-B7, QR8)', async () => {
+      for (const model of [HAIKU, SONNET]) {
+        const fetcher = installFetch({});
+        await run(mode, hi, { model, effort: 'high' });
+        expect(captured(fetcher).headers['anthropic-beta']).toBeUndefined();
+        expect(captured(fetcher).body.thinking).toEqual({ type: 'adaptive' });
+        expect(captured(fetcher).raw).not.toContain(BINDING_BETA);
+      }
+    });
   });
 });

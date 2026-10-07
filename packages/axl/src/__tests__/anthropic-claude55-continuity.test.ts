@@ -28,7 +28,10 @@ afterEach(() => {
   globalThis.fetch = originalFetch;
 });
 
-const OFF_SHAPE = { [HAIKU]: 'disabled', [SONNET]: 'between_tools' } as const;
+const OFF_SHAPE: Record<string, 'disabled' | 'between_tools'> = {
+  [HAIKU]: 'disabled',
+  [SONNET]: 'between_tools',
+};
 const DROP_BLOCK = { prefix_mismatch_behavior: 'drop_block' };
 
 /** First turn on `model` returns signed thinking + tool_use; returns the history it produced. */
@@ -327,6 +330,7 @@ describe('T-B14 haiku none + maxContext summary', () => {
       const worker = agent({
         name: 'haiku-summary',
         model: `anthropic:${HAIKU}`,
+        system: 'Answer briefly.',
         effort: 'none',
         maxContext: 2700,
       });

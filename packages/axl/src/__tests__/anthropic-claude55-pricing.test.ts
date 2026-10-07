@@ -119,7 +119,11 @@ describe('wire usage reaches the tiered card', () => {
         providerRegistry: registry,
         _forceStreaming: stream,
       });
-      const worker = agent({ name: 'haiku-budget', model: `anthropic:${HAIKU}` });
+      const worker = agent({
+        name: 'haiku-budget',
+        model: `anthropic:${HAIKU}`,
+        system: 'Answer briefly.',
+      });
       const result = await ctx.budget({ cost: '$0.03' }, () => ctx.ask(worker, 'x'));
       expect(result.totalCost).toBeCloseTo(0.03825005, 12);
       expect(result.budgetExceeded).toBe(true);

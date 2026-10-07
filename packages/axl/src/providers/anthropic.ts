@@ -400,7 +400,7 @@ function resolveClaudeCapability(model: string): ClaudeCapability | undefined {
   );
 }
 
-type AnthropicRate = {
+type AnthropicRateCard = {
   input: number;
   output: number;
   /**
@@ -410,10 +410,31 @@ type AnthropicRate = {
   cacheReadMultiplier?: number;
 };
 
+type AnthropicRate = AnthropicRateCard & {
+  /**
+   * A second rate card for long prompts. The prompt is uncached input plus
+   * cache reads plus both cache-write TTLs (output never counts); a prompt
+   * strictly above `aboveTokens` prices every component, output included, on
+   * `card`. Anthropic does not define which tokens make up the "prompt" for
+   * this split, so the widest reading is used: it can only select the higher
+   * card, never understate cost.
+   */
+  longPrompt?: { aboveTokens: number; card: AnthropicRateCard };
+};
+
 /** Cache-read multiplier when a rate does not override it. */
 const DEFAULT_CACHE_READ_MULTIPLIER = 0.1;
 
 const ANTHROPIC_RATES: Record<string, AnthropicRate> = {
+  // The pricing table, the Haiku 5.5 page, and the migration guide list the
+  // Sonnet 5.5 cache read at $0.20 (0.1x); the prompt-caching prose says
+  // 0.05x. The default 0.1x is used because it never understates cost.
+  'claude-sonnet-5-5': { input: 2e-6, output: 10e-6 },
+  'claude-haiku-5-5': {
+    input: 0.1e-6,
+    output: 0.5e-6,
+    longPrompt: { aboveTokens: 100_000, card: { input: 0.5e-6, output: 2.5e-6 } },
+  },
   'claude-opus-5-5': { input: 4e-6, output: 20e-6, cacheReadMultiplier: 0.05 },
   'claude-fable-5-1': { input: 10e-6, output: 50e-6, cacheReadMultiplier: 0.025 },
   'claude-fable-5': { input: 10e-6, output: 50e-6 },
@@ -507,10 +528,11 @@ export function estimateAnthropicCost(
   }
 
   const cacheWriteTotal = safeTokenSum(cacheWrite5m, cacheWrite1h);
-  if (
-    cacheWriteTotal === undefined ||
-    safeTokenSum(usage.inputTokens, cacheRead, cacheWriteTotal) === undefined
-  ) {
+  const promptTokens =
+    cacheWriteTotal === undefined
+      ? undefined
+      : safeTokenSum(usage.inputTokens, cacheRead, cacheWriteTotal);
+  if (cacheWriteTotal === undefined || promptTokens === undefined) {
     return undefined;
   }
   if (
@@ -521,8 +543,10 @@ export function estimateAnthropicCost(
     return undefined;
   }
 
-  const { input, output } = rate;
-  const cacheReadRate = input * (rate.cacheReadMultiplier ?? DEFAULT_CACHE_READ_MULTIPLIER);
+  const card: AnthropicRateCard =
+    rate.longPrompt && promptTokens > rate.longPrompt.aboveTokens ? rate.longPrompt.card : rate;
+  const { input, output } = card;
+  const cacheReadRate = input * (card.cacheReadMultiplier ?? DEFAULT_CACHE_READ_MULTIPLIER);
   return (
     usage.inputTokens * input +
     cacheRead * cacheReadRate +

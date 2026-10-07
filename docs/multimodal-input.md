@@ -493,8 +493,8 @@ reuses the checked-in Studio Playground screenshot, so no upload is needed:
 pnpm --filter @axlsdk/axl build
 cd examples
 npm install
-IMAGE_MODEL=openai-responses:gpt-6-sol npm run image-lighthouse
-IMAGE_MODEL=anthropic:claude-sonnet-5-5 npm run image-lighthouse
+IMAGE_MODEL=openai-responses:gpt-5.6 npm run image-lighthouse
+IMAGE_MODEL=anthropic:claude-haiku-5-5 npm run image-lighthouse
 IMAGE_MODEL=google:gemini-3.8-flash npm run image-lighthouse
 # Representative OpenRouter transport certification path (not an allowlist):
 IMAGE_MODEL=openrouter:openai/gpt-4o-mini npm run image-lighthouse

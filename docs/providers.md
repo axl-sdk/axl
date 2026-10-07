@@ -1194,24 +1194,26 @@ it stays on the error and is never emitted on the event stream.
 All model parameters are configurable on `AgentConfig` (agent-level defaults) and overridable per-call via `AskOptions`. Precedence: `AskOptions` > `AgentConfig` > internal defaults.
 
 ```typescript
-const creative = agent({
-  model: 'openai-responses:gpt-5.6',
-  system: 'Write creative stories.',
-  temperature: 0.9,   // higher = more creative (0.0–2.0)
-  maxTokens: 8192,
-});
-
 const reasoner = agent({
-  model: 'anthropic:claude-opus-4-6',
+  model: 'anthropic:claude-opus-5-5',
   system: 'Solve complex problems step by step.',
   effort: 'high',   // works across all providers
 });
 
-const precise = agent({
-  model: 'openai-responses:gpt-5.6',
+const extractor = agent({
+  model: 'openai-responses:gpt-6-luna',
   system: 'Extract structured data.',
-  temperature: 0.1,   // lower = more deterministic
+  effort: 'low',
   toolChoice: 'required',
+});
+
+// temperature only affects models that accept sampling (for example
+// claude-sonnet-4-6 without thinking). Current reasoning models drop it.
+const creative = agent({
+  model: 'anthropic:claude-sonnet-4-6',
+  system: 'Write creative stories.',
+  temperature: 0.9,   // higher = more varied (0.0–2.0)
+  maxTokens: 8192,
 });
 
 // Per-call overrides
@@ -1221,7 +1223,7 @@ const solution = await ctx.ask(reasoner, problem, { effort: 'low' });
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `temperature` | provider default | Controls randomness (0.0–2.0). Stripped automatically for reasoning models and when thinking is active on Anthropic. |
+| `temperature` | provider default | Controls randomness (0.0–2.0) on models that accept sampling. Dropped automatically on reasoning models (GPT-5.6, GPT-6 while reasoning, Claude 5.x, Gemini 3.x) and when thinking is active on older Claude models. |
 | `maxTokens` | `4096` | Maximum completion tokens per call. |
 | `effort` | — | Unified effort level controlling reasoning depth across all providers (see below). |
 | `thinkingBudget` | — | Explicit thinking token budget (advanced). Overrides effort-based allocation. `0` disables thinking only where the model permits it; Opus 5.5 and Fable 5.1 use adaptive thinking at `low`, and Sonnet 5.5 / Haiku 5.5 keep adaptive thinking above effort `high`. |

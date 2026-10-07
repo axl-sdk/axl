@@ -207,7 +207,8 @@ thinking always on; the default is `medium`, and `none` uses `low` with an
 `effort_clamped` diagnostic. Opus 5.5 and Fable 5.1 reject `toolChoice:
 'required'` and named choices before dispatch; use `auto` or `none`. Raw
 overrides that disable thinking, set an invalid effort, or add non-default
-sampling are rejected the same way.
+sampling are rejected the same way: `temperature` may only be `1`, `top_p` may
+only be `0.99`, the two cannot be sent together, and `top_k` is not accepted.
 
 **Thinking continuity.** On these two models a thinking block is valid only
 while everything before it is unchanged. When a request replays thinking, Axl

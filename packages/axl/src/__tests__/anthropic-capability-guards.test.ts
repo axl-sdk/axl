@@ -173,3 +173,32 @@ describe.each(['claude-opus-5-5', 'claude-fable-5-1'])('%s keeps every guard', (
     });
   });
 });
+
+// Live evidence 2026-10-07 (verification.md P10, P15, P16): Opus 5.5 and
+// Fable 5.1 return 400 for `top_p: 1` ("`top_p` is deprecated for this
+// model.") and for `temperature` + `top_p` together ("`temperature` and
+// `top_p` cannot both be specified for this model.").
+describe.each(['claude-opus-5-5', 'claude-fable-5-1'])(
+  '%s raw sampling matches the provider rule',
+  (model) => {
+    it.each([
+      [{ top_p: 1 }, 'top_p'],
+      [{ top_p: 0.995 }, 'top_p'],
+      [{ temperature: 1, top_p: 0.99 }, 'temperature and top_p'],
+    ] as const)('rejects %j before dispatch', async (providerOptions, option) => {
+      const fetcher = fetchOk(model);
+      await expect(provider().chat(hi, { model, providerOptions })).rejects.toMatchObject({
+        name: 'UnsupportedModelOptionError',
+        model,
+        option,
+      });
+      expect(fetcher).not.toHaveBeenCalled();
+    });
+
+    it.each([{ top_p: 0.99 }, { temperature: 1 }])('accepts %j', async (providerOptions) => {
+      const fetcher = fetchOk(model);
+      await provider().chat(hi, { model, providerOptions });
+      expect(sentBody(fetcher)).toMatchObject(providerOptions);
+    });
+  },
+);

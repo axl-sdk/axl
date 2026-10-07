@@ -211,9 +211,10 @@ type ClaudeCapability = {
   forcedToolChoice?: 'rejected';
   /**
    * The model rejects non-default raw sampling. Final-body `temperature` may
-   * only be 1, `top_p` must be within 0.99–1, and `top_k` is rejected.
-   * Independent of `stripTemperature`, which governs only
-   * the portable `temperature` option.
+   * only be 1, `top_p` may only be 0.99, the two may not be sent together, and
+   * `top_k` is rejected (live-verified 2026-10-07: `top_p: 1` and
+   * `temperature` + `top_p` are provider 400s). Independent of
+   * `stripTemperature`, which governs only the portable `temperature` option.
    */
   defaultOnlySampling?: true;
   /**
@@ -1244,11 +1245,11 @@ export class AnthropicProvider implements Provider {
       if (body.temperature !== undefined && body.temperature !== 1) {
         reject('temperature', 'Omit temperature or use the default value 1.');
       }
-      if (
-        body.top_p !== undefined &&
-        (typeof body.top_p !== 'number' || body.top_p < 0.99 || body.top_p > 1)
-      ) {
-        reject('top_p', 'Omit top_p or use a value from 0.99 to 1.');
+      if (body.top_p !== undefined && body.top_p !== 0.99) {
+        reject('top_p', 'Omit top_p or use the default value 0.99.');
+      }
+      if (body.temperature !== undefined && body.top_p !== undefined) {
+        reject('temperature and top_p', 'Send at most one of temperature and top_p.');
       }
       if (body.top_k !== undefined) {
         reject('top_k', 'Omit top_k on this model.');

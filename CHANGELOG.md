@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Claude Opus 5.5 and Fable 5.1 now reject raw `providerOptions` `top_p` values other than `0.99`, and `temperature` sent together with `top_p`, before dispatch with `UnsupportedModelOptionError`. Previously Axl accepted `top_p` from 0.99 to 1 and the pair together, and the provider returned a 400.
+
 ## [0.25.1] - 2026-09-26
 
 ### Fixed

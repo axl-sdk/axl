@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Claude Sonnet 5.5 (`claude-sonnet-5-5`) and Haiku 5.5 (`claude-haiku-5-5`) support, matched by exact ID:
+  - Adaptive thinking is on by default, with all five effort levels.
+  - `effort: 'none'` turns thinking off at effort `high` or below, as `disabled` on Haiku 5.5 and `between_tools` on Sonnet 5.5. Sonnet 5.5 can still return short progress-update thinking between tool calls.
+  - Haiku 5.5 accepts forced tool choice. Sonnet 5.5 rejects it before dispatch.
+  - Both drop the portable `temperature` and reject non-default raw sampling.
+  - Replayed thinking uses the binding beta with `drop_block` under adaptive thinking. With thinking off, the beta and `block_binding` are not sent, and a prefix edit Axl did not make is surfaced as the provider's 400.
+- Standard pricing for both models:
+  - Sonnet 5.5 is $2/$10 per million tokens.
+  - Haiku 5.5 has two rate cards: $0.10/$0.50 up to a 100,000-token prompt and $0.50/$2.50 above it, with every component of a long prompt billed on the higher card.
+  - Two unpublished rules are estimated so cost is never understated. See `docs/providers.md`.
+
+### Changed
+
+- Deprecation guidance: Claude Sonnet 4.5 retires on 2026-11-30, so migrate to `claude-sonnet-5-5`. Haiku workloads can move to `claude-haiku-5-5`.
+
 ### Fixed
 
 - Claude Opus 5.5 and Fable 5.1 now reject raw `providerOptions` `top_p` values other than `0.99`, and `temperature` sent together with `top_p`, before dispatch with `UnsupportedModelOptionError`. Previously Axl accepted `top_p` from 0.99 to 1 and the pair together, and the provider returned a 400.

@@ -11,7 +11,8 @@ OpenAI's, Anthropic's, and Gemini's own endpoints an identifiable quota or spend
 
 The base catalog and pricing were reviewed against first-party documentation on
 August 3, 2026; native image transport was refreshed on September 2, and the
-GPT-6, Claude Opus 5.5, and Gemini 3.8 Flash contracts were checked on September 25.
+GPT-6, Claude Opus 5.5, and Gemini 3.8 Flash contracts were checked on September 25,
+and the Claude Haiku 5.5 and Sonnet 5.5 contracts on October 7.
 Exact known
 IDs receive their documented parameter and pricing behavior. Other IDs may pass
 through to the provider but remain unpriced and do not inherit model-specific
@@ -190,6 +191,8 @@ documents text and image inputs only. Neither ever falls back to transcription.
 ```
 anthropic:claude-fable-5-1      # Highest-capability Claude; thinking always on
 anthropic:claude-opus-5-5       # Opus 5.5; adaptive thinking always on
+anthropic:claude-sonnet-5-5     # Sonnet 5.5; adaptive thinking on by default
+anthropic:claude-haiku-5-5      # Haiku 5.5; adaptive thinking on by default
 anthropic:claude-fable-5        # Previous Fable; thinking always on
 anthropic:claude-opus-5         # Claude 5 flagship; thinking on by default
 anthropic:claude-sonnet-5       # Claude 5 balanced; thinking on by default
@@ -206,13 +209,35 @@ Opus 5.5 supports `low`, `medium`, `high`, `xhigh`, and `max` with adaptive
 thinking always on; the default is `medium`, and `none` uses `low` with an
 `effort_clamped` diagnostic. Opus 5.5 and Fable 5.1 reject `toolChoice:
 'required'` and named choices before dispatch; use `auto` or `none`. Raw
-overrides that disable thinking, set an invalid effort, or add non-default
-sampling are rejected the same way: `temperature` may only be `1`, `top_p` may
-only be `0.99`, the two cannot be sent together, and `top_k` is not accepted.
+overrides that disable thinking or set an invalid effort are rejected the same way.
 
-**Thinking continuity.** On these two models a thinking block is valid only
-while everything before it is unchanged. When a request replays thinking, Axl
-sends Anthropic's binding beta with the `drop_block` policy, so an invalidated
+Sonnet 5.5 and Haiku 5.5 think adaptively by default, accept all five effort
+levels, and default to `high` (Sonnet) and `medium` (Haiku) when no effort is
+sent. `effort: 'none'` turns thinking off with each model's own shape: Haiku 5.5
+sends `thinking: { type: 'disabled' }`, and Sonnet 5.5 sends `thinking: { type:
+'between_tools' }`, which keeps short progress-update thinking between tool
+calls. That means `thinking_content` can still appear on Sonnet 5.5 under
+`'none'`. Neither is reported as a clamp. Both models allow thinking off only at
+effort `high` or below. `thinkingBudget: 0` with `xhigh` or `max` therefore
+keeps adaptive thinking at the requested level. Haiku 5.5 accepts `toolChoice:
+'required'` and named choices, and the provider skips thinking on that turn.
+Sonnet 5.5 rejects them before dispatch, like Opus 5.5. Under thinking off, raw
+`providerOptions` are rejected before dispatch when they:
+- use a thinking shape other than the model's own,
+- add any field besides `type` to that shape, including `block_binding`, or
+- set an effort above `high`.
+
+On a model whose thinking stays on by default, a small `maxTokens` cap can be
+used up by thinking. Raise the cap or lower the effort.
+
+All four models (Opus 5.5, Fable 5.1, Sonnet 5.5, Haiku 5.5) accept only
+default sampling. A portable `temperature` is dropped. Raw `providerOptions`
+sampling fails before dispatch unless `temperature` is `1` or `top_p` is
+`0.99`. The two cannot be sent together, and `top_k` is not accepted.
+
+**Thinking continuity.** On these four models a thinking block is valid only
+while everything before it is unchanged. When a request replays thinking under
+adaptive thinking, Axl sends Anthropic's binding beta with the `drop_block` policy, so an invalidated
 block is dropped by the provider while its text and tool calls survive, and
 the call reports safe per-reason counts in `diagnostics` and a
 `provider_diagnostic { kind: 'reasoning_context_reset' }`. When Axl itself
@@ -230,10 +255,40 @@ executions with reasoning kept (see the
 This does not promise reasoning continuity across restarts or prompt and tool
 changes. Live calls used `low` and `max`; other levels have adapter coverage.
 
+Anthropic accepts `block_binding` only with adaptive thinking. When Sonnet 5.5
+or Haiku 5.5 run with thinking off, Axl replays signed blocks unchanged and
+sends neither the beta nor `block_binding`. Two consequences follow:
+- An append-only tool loop continues normally.
+- A prefix change Axl did not make itself fails as a provider `400`
+  (`ProviderError`) on accounts created on or after 2026-08-31, because
+  `drop_block` cannot be requested. Examples are an edited system prompt, a
+  changed tool set, or a different effort per ask in one `between_tools`
+  session. Axl surfaces that error and does not strip or retry. Keep the prefix
+  stable under thinking off, or use adaptive thinking when the prefix changes.
+
+Axl's own summaries and trims still remove stale blocks first. Thinking blocks
+are also bound to the API account. Replaying them through a different account
+drops them silently.
+
 The [Opus 5.5 model page](https://platform.claude.com/docs/en/models/opus-5-5/overview)
 publishes Standard text rates of $4 input, $20 output, $0.20 cache read, $5
 five-minute cache write, and $8 one-hour cache write per million tokens.
 Unmodeled billing modes remain unpriced.
+
+Sonnet 5.5 is priced at $2 input and $10 output per million tokens, with a 10%
+cache read. Haiku 5.5 has two rate cards: $0.10 input / $0.50 output when the
+prompt is at most 100,000 tokens, and $0.50 / $2.50 above that. On the higher
+card every component of the call is billed at the higher rate, output included.
+Both cards use a 10% cache read and the standard 1.25x / 2x cache writes. Two of
+these rules are estimates, chosen so Axl never understates cost:
+- **Haiku 5.5 prompt size.** Anthropic does not say which tokens count toward
+  the 100,000-token split. Axl counts uncached input, cache reads, and both
+  cache-write TTLs, but not output. If invoices show that cache reads or writes
+  do not count, cache-heavy prompts near the split are over-estimated, and the
+  rule should be narrowed.
+- **Sonnet 5.5 cache read.** The pricing table lists $0.20 per million tokens
+  (10%), but the prompt-caching guide says 5%. Axl uses 10%. If invoices show
+  5%, set `cacheReadMultiplier: 0.05` on the rate row.
 
 `claude-mythos-5-1` and `claude-mythos-5` are priced but have no capability entry:
 they are limited-availability models whose per-model thinking semantics are not
@@ -243,11 +298,15 @@ them, requesting an `effort` on them emits a `provider_diagnostic` with
 `effective: 'unset'` — the knob is dropped, and you are told. Arbitrary unpriced
 IDs remain silent pass-through.
 
-`claude-opus-4-1` is deprecated on Anthropic-operated APIs and retires August 5,
-2026; migrate to `claude-opus-4-8`. Claude Opus 4, Sonnet 4, Sonnet 3.7,
-Sonnet/Haiku 3.5, and all Claude 3 models previously shown here are retired on the
-first-party API. Migrate Opus workloads to `claude-opus-4-8`, Sonnet workloads to
-`claude-sonnet-4-6`, and Haiku workloads to `claude-haiku-4-5`. Axl does not enforce
+`claude-sonnet-4-5` is deprecated on Anthropic-operated APIs and retires November 30,
+2026; migrate to `claude-sonnet-5-5`. `claude-haiku-4-5` is still active;
+`claude-haiku-5-5` is its newer replacement. Haiku 5.5 thinks by default, so
+set `effort: 'none'` or `'low'` when migrating latency-sensitive Haiku 4.5
+workloads. `claude-opus-4-1` retired August 5, 2026. Claude Opus 4, Sonnet 4,
+Sonnet 3.7, Sonnet/Haiku 3.5, and all Claude 3 models previously shown here are
+retired on the first-party API. Migrate Opus workloads to `claude-opus-4-8` or
+later, Sonnet workloads to `claude-sonnet-5-5`, and Haiku workloads to
+`claude-haiku-5-5`. Axl does not enforce
 these lifecycle dates with a runtime allowlist: arbitrary IDs remain pass-through.
 [Anthropic-operated and partner-cloud schedules can differ](https://platform.claude.com/docs/en/about-claude/model-deprecations).
 
@@ -1126,7 +1185,7 @@ const solution = await ctx.ask(reasoner, problem, { effort: 'low' });
 | `temperature` | provider default | Controls randomness (0.0–2.0). Stripped automatically for reasoning models and when thinking is active on Anthropic. |
 | `maxTokens` | `4096` | Maximum completion tokens per call. |
 | `effort` | — | Unified effort level controlling reasoning depth across all providers (see below). |
-| `thinkingBudget` | — | Explicit thinking token budget (advanced). Overrides effort-based allocation. `0` disables thinking only where the model permits it; Opus 5.5 and Fable 5.1 use adaptive thinking at `low`. |
+| `thinkingBudget` | — | Explicit thinking token budget (advanced). Overrides effort-based allocation. `0` disables thinking only where the model permits it; Opus 5.5 and Fable 5.1 use adaptive thinking at `low`, and Sonnet 5.5 / Haiku 5.5 keep adaptive thinking above effort `high`. |
 | `includeThoughts` | — | Return reasoning summaries in responses. Supported on OpenAI Responses API and Gemini. No-op on Anthropic. |
 | `toolChoice` | — | Controls whether and how the model uses tools (see below). |
 | `stop` | — | Stop sequences — generation stops when any sequence is encountered (see below). |
@@ -1182,7 +1241,7 @@ agent({ model: 'google:gemini-2.5-pro', effort: 'high', includeThoughts: true })
 | **OpenAI Responses** (GPT-5.6) | `reasoning.effort: 'none'` | `reasoning.effort: 'low'` | `reasoning.effort: 'medium'` | `reasoning.effort: 'high'` | `reasoning.effort: 'xhigh'` | `reasoning.effort: 'max'` | nearest effort level* |
 | **OpenAI Chat / Responses** (GPT-6 Astra) | `low` (clamped) | `low` | `medium` | `high` | `xhigh` | `max` | nearest effort level* |
 | **OpenAI Chat / Responses** (GPT-6 Sol/Luna) | `none` | `low` | `medium` | `high` | `xhigh` | `max` | nearest effort level* |
-| **Anthropic** (Claude 5) | model-specific minimum/default | adaptive + `effort: 'low'` | adaptive + `effort: 'medium'` | adaptive + `effort: 'high'` | adaptive + `effort: 'xhigh'` | adaptive + `effort: 'max'` | unsupported |
+| **Anthropic** (Claude 5) | model-specific: `disabled`, `between_tools` (Sonnet 5.5), or adaptive `'low'` on always-on models | adaptive + `effort: 'low'` | adaptive + `effort: 'medium'` | adaptive + `effort: 'high'` | adaptive + `effort: 'xhigh'` | adaptive + `effort: 'max'` | unsupported |
 | **Anthropic** (Opus 4.8 / 4.7) | disabled | adaptive + `effort: 'low'` | adaptive + `effort: 'medium'` | adaptive + `effort: 'high'` | adaptive + `effort: 'xhigh'` | adaptive + `effort: 'max'` | manual `budget_tokens` |
 | **Anthropic** (4.6) | disabled | adaptive + `effort: 'low'` | adaptive + `effort: 'medium'` | adaptive + `effort: 'high'` | capped to `'high'`◊ | adaptive + `effort: 'max'`† | manual `budget_tokens` |
 | **Anthropic** (4.5) | disabled | `output_config.effort: 'low'` | `output_config.effort: 'medium'` | `output_config.effort: 'high'` | capped to `'high'`◊ | capped to `'high'` | manual `budget_tokens` |
@@ -1239,7 +1298,7 @@ effective levels and a cause, plus a deduped `console.warn`. See
 | OpenAI Chat Completions | `'max'` | `'xhigh'` |
 | OpenAI Chat / Responses | `'none'` (pre-5.1), `'xhigh'` (sub-5.2), any level on `gpt-5-pro` | `'minimal'`, `'high'`, `'high'` |
 | Anthropic | a level the model's `output_config.effort` does not support | nearest supported level |
-| Anthropic | `'none'` on models that cannot disable thinking | adaptive `'low'` |
+| Anthropic | `'none'` on models that cannot disable thinking (Opus 5.5, Fable 5.1, Fable 5) | adaptive `'low'` |
 | Anthropic legacy `budget_tokens` models | `'xhigh'`, `'max'` | the `'high'` tier's budget |
 
 An explicit `thinkingBudget` overrides `effort` by design and is not reported as a clamp.
@@ -1250,7 +1309,7 @@ Third-party providers that omit `Provider.effortResolution()` report nothing.
 - **OpenAI o-series** (o1/o3/o4-mini): Uses `developer` role instead of `system`, strips temperature, sends `reasoning_effort`. `effort: 'none'` sends `reasoning_effort: 'minimal'` (o-series doesn't support `'none'`). `effort: 'max'` sends `'high'` (o-series doesn't support `'xhigh'`).
 - **OpenAI GPT-5.x Chat Completions**: Uses `system`, strips the portable `temperature` when Axl sends a reasoning effort, and supports parallel tool calls. The compatibility baseline maps GPT-5.2+ `'max'` to `'xhigh'`, reported through a `provider_diagnostic` event. Earlier families retain their lower caps.
 - **OpenAI Responses API**: Uses `reasoning: { effort }`; exact GPT-5.6 IDs accept native `'max'` and omit `temperature` because that family rejects it even when reasoning uses the provider default. Older models keep their documented clamps. Exact GPT-6 IDs strip the portable `temperature` on both endpoints unless the effective effort is `none`, and reject raw sampling overrides while reasoning is active (see [GPT-6 endpoint and pricing rules](#gpt-6-endpoint-and-pricing-rules)). `includeThoughts: true` enables reasoning summaries (`reasoning: { summary: 'detailed' }`). Reasoning context is automatically round-tripped via `providerMetadata.openaiReasoningItems`.
-- **Anthropic Claude 5**: Fable 5.1, Fable 5, and Opus 5.5 always reason; Opus 5 and Sonnet 5 reason by default. All accept the full active effort vocabulary through adaptive thinking. Opaque thinking blocks are kept in `providerMetadata` for continuations. A summary or trim removes thinking signed to the old prefix and keeps text, tool calls, and other providers' metadata; the `maxContext` case is reported as `reasoning_context_reset` with reason `client_prefix_rewrite` (see [Opus 5.5](#anthropic) above). A model switch does not delete stored blocks, since a compatible model may read them later. Axl does not request beta fast-mode or model-fallback headers; if Anthropic reports that a fallback model served the call, Axl fails before persisting history or estimating cost.
+- **Anthropic Claude 5**: Fable 5.1, Fable 5, and Opus 5.5 always reason; Opus 5, Sonnet 5, Sonnet 5.5, and Haiku 5.5 reason by default (see [Sonnet 5.5 and Haiku 5.5](#anthropic) for their thinking-off shapes). All accept the full active effort vocabulary through adaptive thinking. Opaque thinking blocks are kept in `providerMetadata` for continuations. A summary or trim removes thinking signed to the old prefix and keeps text, tool calls, and other providers' metadata; the `maxContext` case is reported as `reasoning_context_reset` with reason `client_prefix_rewrite` (see [Opus 5.5](#anthropic) above). A model switch does not delete stored blocks, since a compatible model may read them later. Axl does not request beta fast-mode or model-fallback headers; if Anthropic reports that a fallback model served the call, Axl fails before persisting history or estimating cost.
 - **Anthropic Opus 4.8**: Supports adaptive thinking and native `'xhigh'`/`'max'`.
 - **Anthropic Opus 4.7**: Same adaptive-thinking behavior as 4.6. Additionally supports `effort: 'xhigh'` as a first-class tier between `'high'` and `'max'`, sent as `output_config.effort: 'xhigh'`. Same pricing as Opus 4.6 ($5/$25 per 1M tokens).
 - **Anthropic 4.6** (Opus 4.6, Sonnet 4.6): `effort` enables adaptive thinking (`thinking: { type: "adaptive" }` + `output_config: { effort }`). Temperature stripped when thinking active. `thinkingBudget: 0` + `effort` sends only `output_config.effort` (no thinking block, temperature allowed). `effort: 'xhigh'` clamps to `'high'` (4.6 doesn't expose a distinct xhigh tier).
@@ -1496,7 +1555,7 @@ detect that statically. Turn it on when the agent's prompt and tool set are stab
 across calls; that is the shape of every agentic loop.
 
 **Minimum cacheable prefix** (below it Anthropic silently ignores the breakpoint):
-512 tokens on Fable 5.1 / Mythos 5.1 / Opus 5 / Fable 5 / Mythos 5; 1,024 on Opus 4.8,
+512 tokens on Fable 5.1 / Mythos 5.1 / Sonnet 5.5 / Haiku 5.5 / Opus 5 / Fable 5 / Mythos 5; 1,024 on Opus 4.8,
 Sonnet 5, Sonnet 4.6, Sonnet 4.5; **4,096 on Haiku 4.5**.
 
 **Diagnostic.** With `promptCache` on, Axl watches consecutive calls on one context and
@@ -1518,14 +1577,15 @@ either discard Axl's breakpoint or stack a second one beside the caller's. Verif
 
 | Operation | Multiplier |
 |-----------|-----------|
-| Cache read (hit) | **10%** of input rate — but **2.5%** on Claude Fable 5.1 and Mythos 5.1 |
+| Cache read (hit) | **10%** of input rate — but **5%** on Claude Opus 5.5 and **2.5%** on Claude Fable 5.1 and Mythos 5.1 |
 | Cache write — 5-minute TTL (default) | **125%** of input rate |
 | Cache write — 1-hour TTL | **200%** of input rate |
 
 The cache-read multiplier is per-model (`cacheReadMultiplier` on the rate row in
 `providers/anthropic.ts`), defaulting to 10%. Cache-write multipliers are uniform
 across models. Check the source rather than assuming 10% when sizing a
-cache-heavy workload on the Fable/Mythos 5.1 line.
+cache-heavy workload on Opus 5.5 or the Fable/Mythos 5.1 line. Haiku 5.5 also has a
+prompt-length rate card (see [Anthropic](#anthropic)).
 
 Axl reads the 5-minute and 1-hour creation buckets when Anthropic provides them and prices
 each at the correct multiplier. It also exposes their sum as `usage.cache_write_tokens`.

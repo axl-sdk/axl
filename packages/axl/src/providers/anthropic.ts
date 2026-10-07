@@ -115,6 +115,12 @@ function isFinalThinkingAdaptive(
   return isRecord(thinking) && thinking.type === 'adaptive';
 }
 
+const NATIVE_CLAUDE_EFFORTS: readonly unknown[] = ['low', 'medium', 'high', 'xhigh', 'max'];
+
+function isNativeClaudeEffort(value: unknown): value is Exclude<Effort, 'none'> {
+  return NATIVE_CLAUDE_EFFORTS.includes(value);
+}
+
 function hasReplayedThinking(body: Record<string, unknown>): boolean {
   return (
     Array.isArray(body.messages) &&
@@ -182,8 +188,10 @@ function hasAnthropicProviderFileImage(messages: readonly ChatMessage[]): boolea
 
 // ---------------------------------------------------------------------------
 // Exact Anthropic model capabilities and Standard text pricing. Reviewed
-// 2026-09-03 against https://platform.claude.com/docs/en/about-claude/pricing
-// and .../build-with-claude/effort for the per-model effort levels.
+// 2026-10-07 against https://platform.claude.com/docs/en/about-claude/pricing,
+// .../build-with-claude/effort for the per-model effort levels,
+// .../build-with-claude/preserved-thinking, and the Haiku 5.5 / Sonnet 5.5
+// model overview and migration-guide pages (.../models/<id>/overview).
 //
 // Modern IDs intentionally use exact matching. A future sibling can still pass
 // through to Anthropic, but it must not inherit request semantics or a price.
@@ -204,7 +212,12 @@ type ClaudeCapability = {
   disableAt?: Exclude<Effort, 'none'>;
   /**
    * The `thinking` shape that turns thinking off on an `adaptive-default-on`
-   * model. Absent means `{ type: 'disabled' }`.
+   * model. Absent means `{ type: 'disabled' }` with no off-shape validation
+   * (Opus 5 / Sonnet 5). When set, the final body is also validated against
+   * the model's off-shape contract: `thinking.type` must be `adaptive` or this
+   * shape, the off-shape object carries only `type` (so no `block_binding`),
+   * `output_config.effort` is one of the five levels and, under the
+   * off-shape, at or below `disableAt`.
    */
   offShape?: 'disabled' | 'between_tools';
   /** The model rejects `tool_choice` `any`/`tool`; fail before dispatch. Absent means allowed. */
@@ -231,18 +244,42 @@ type ClaudeCapability = {
    * `thinking` neither is sent: the provider rejects `block_binding` there.
    * Verified per-model against
    * https://platform.claude.com/docs/en/build-with-claude/preserved-thinking
-   * (2026-09-25): that doc names Claude Opus 5.5 and Claude Fable 5.1 only —
-   * "On Claude Fable 5.1 and Claude Opus 5.5, a thinking block stays valid
-   * only while everything you sent before it is unchanged on later
-   * requests." It does not name Claude Fable 5 (legacy, also
+   * (2026-10-07): that doc names Claude Fable 5.1, Claude Opus 5.5, Claude
+   * Sonnet 5.5, and Claude Haiku 5.5, and accepts `block_binding` only with
+   * adaptive thinking. It does not name Claude Fable 5 (legacy, also
    * `adaptive-always-on`), so this is an explicit per-model flag rather than
-   * derived from `thinking === 'adaptive-always-on'`. Re-verify against that
-   * page before adding this flag to any other model.
+   * derived from the thinking mode. Re-verify against that page before adding
+   * this flag to any other model.
    */
   thinkingBinding?: boolean;
 };
 
 const CLAUDE_CAPABILITIES: Record<string, ClaudeCapability> = {
+  // Thinking off is `between_tools` (progress updates between tool calls);
+  // `disabled` is a provider 400. Forced tool choice is a 400.
+  'claude-sonnet-5-5': {
+    thinking: 'adaptive-default-on',
+    effortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
+    manualBudget: false,
+    stripTemperature: true,
+    disableAt: 'high',
+    offShape: 'between_tools',
+    forcedToolChoice: 'rejected',
+    defaultOnlySampling: true,
+    thinkingBinding: true,
+  },
+  // Thinking off is `disabled`, only at effort high or below. Forced tool
+  // choice is accepted (the provider skips thinking for that turn).
+  'claude-haiku-5-5': {
+    thinking: 'adaptive-default-on',
+    effortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
+    manualBudget: false,
+    stripTemperature: true,
+    disableAt: 'high',
+    offShape: 'disabled',
+    defaultOnlySampling: true,
+    thinkingBinding: true,
+  },
   'claude-opus-5-5': {
     thinking: 'adaptive-always-on',
     effortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
@@ -1234,10 +1271,54 @@ export class AnthropicProvider implements Provider {
       if (
         outputConfig !== undefined &&
         (!isRecord(outputConfig) ||
-          (outputConfig.effort !== undefined &&
-            !['low', 'medium', 'high', 'xhigh', 'max'].includes(String(outputConfig.effort))))
+          (outputConfig.effort !== undefined && !isNativeClaudeEffort(outputConfig.effort)))
       ) {
         reject('output_config.effort', 'Use low, medium, high, xhigh, or max effort.');
+      }
+    }
+
+    if (capability.offShape) {
+      const offShape = capability.offShape;
+      const thinking = body.thinking;
+      const outputConfig = body.output_config;
+      const effort = isRecord(outputConfig) ? outputConfig.effort : undefined;
+      if (outputConfig !== undefined && !isRecord(outputConfig)) {
+        reject('output_config', 'Use an output_config object.');
+      }
+      if (effort !== undefined && !isNativeClaudeEffort(effort)) {
+        reject('output_config.effort', 'Use low, medium, high, xhigh, or max effort.');
+      }
+      if (thinking !== undefined) {
+        if (!isRecord(thinking) || (thinking.type !== 'adaptive' && thinking.type !== offShape)) {
+          reject(
+            'thinking.type',
+            `Use thinking: { type: 'adaptive' }, or { type: '${offShape}' } to turn thinking off.`,
+          );
+        }
+        const record = thinking as Record<string, unknown>;
+        if (record.type === 'adaptive' && record.budget_tokens !== undefined) {
+          reject('thinking.budget_tokens', 'Use output_config.effort instead of budget_tokens.');
+        }
+        if (record.type === offShape) {
+          const extra = Object.keys(record).filter((key) => key !== 'type');
+          if (extra.length > 0) {
+            reject(
+              `thinking.${offShape}.${extra[0]}`,
+              `Send thinking: { type: '${offShape}' } with no other fields.`,
+            );
+          }
+          if (
+            effort !== undefined &&
+            capability.disableAt &&
+            !isEffortAtOrBelow(effort as Exclude<Effort, 'none'>, capability.disableAt)
+          ) {
+            reject(
+              'output_config.effort',
+              `Thinking can be turned off only at effort '${capability.disableAt}' or below; ` +
+                `lower the effort or use adaptive thinking.`,
+            );
+          }
+        }
       }
     }
 

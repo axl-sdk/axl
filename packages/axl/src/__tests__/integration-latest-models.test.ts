@@ -1,4 +1,4 @@
-import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { agent } from '../agent.js';
 import { AxlRuntime } from '../runtime.js';
 import { workflow } from '../workflow.js';
@@ -788,6 +788,225 @@ describe.skipIf(!process.env.ANTHROPIC_API_KEY)('latest models: Anthropic live a
     await toolContinuation(provider, 'claude-sonnet-5', 'static');
   }, 180_000);
 });
+
+// Claude Haiku 5.5 and Sonnet 5.5 (plan rows L1-L7 + L4b). Every request goes
+// through `recordedFetch`, which enforces a 14-attempt ceiling for this block
+// (lowered further by AXL_FRONTIER_REMAINING_ATTEMPTS) and records the final
+// wire body and headers for the request-shape assertions.
+describe.skipIf(!process.env.ANTHROPIC_API_KEY)(
+  'latest models: Claude Haiku 5.5 and Sonnet 5.5 live acceptance',
+  () => {
+    const HAIKU = 'claude-haiku-5-5';
+    const SONNET = 'claude-sonnet-5-5';
+    const BINDING_BETA = 'thinking-binding-controls-2026-08-01';
+    type Sent = { body: Record<string, any>; headers: Record<string, string> };
+    let provider: AnthropicProvider;
+    let attempts = 0;
+    const sent: Sent[] = [];
+    beforeAll(() => {
+      provider = new AnthropicProvider();
+      const configuredLimit = process.env.AXL_FRONTIER_REMAINING_ATTEMPTS ?? '14';
+      const parsedLimit = Number(configuredLimit);
+      if (!configuredLimit.trim() || !Number.isSafeInteger(parsedLimit) || parsedLimit < 0) {
+        throw new Error('AXL_FRONTIER_REMAINING_ATTEMPTS must be a nonnegative integer');
+      }
+      const attemptLimit = Math.min(14, parsedLimit);
+      const originalFetch = globalThis.fetch;
+      vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+        if (attempts >= attemptLimit) {
+          throw new Error('Claude 5.5 live block reached its transport-attempt ceiling');
+        }
+        attempts++;
+        sent.push({
+          body: JSON.parse(String(init?.body)) as Record<string, any>,
+          headers: (init?.headers ?? {}) as Record<string, string>,
+        });
+        return originalFetch(input, init);
+      });
+    });
+    afterAll(() => vi.restoreAllMocks());
+    const last = () => sent[sent.length - 1];
+
+    const toolPrompt: ChatMessage[] = [
+      {
+        role: 'user',
+        content:
+          'Find the smallest positive integer n such that n mod 7 = 3, n mod 11 = 5, and n mod 13 = 8. After you have worked it out, call acceptance_probe exactly once, wait for its result, then give a concise final answer.',
+      },
+    ];
+    const continueFrom = (first: ProviderResponse): ChatMessage[] => [
+      ...toolPrompt,
+      {
+        role: 'assistant',
+        content: first.content,
+        tool_calls: first.tool_calls,
+        providerMetadata: first.providerMetadata,
+      },
+      { role: 'tool', content: 'accepted', tool_call_id: first.tool_calls![0].id },
+    ];
+
+    // L1: 4 calls.
+    it.each([HAIKU, SONNET])(
+      'L1 %s text at low and terminal stream at max are metered on the exact model',
+      async (model) => {
+        const text = await provider.chat(prompt, { model, maxTokens: 512, effort: 'low' });
+        expect(last().body).toMatchObject({
+          model,
+          thinking: { type: 'adaptive' },
+          output_config: { effort: 'low' },
+        });
+        expectMetered(text, 'static');
+        const done = await collectDone(
+          provider.stream(prompt, { model, maxTokens: 1024, effort: 'max' }),
+        );
+        expect(last().body.output_config).toEqual({ effort: 'max' });
+        expect(done.usage?.total_tokens).toBeGreaterThan(0);
+        expect(done.cost).toBeGreaterThan(0);
+      },
+      180_000,
+    );
+
+    // L3 + L4 + L2: 3 calls per model. One adaptive tool turn produces signed
+    // thinking; it is replayed once under adaptive thinking (beta + drop_block)
+    // and once under the model's thinking-off shape (no beta, no binding).
+    // Sonnet also runs L6 (adaptive, edited prefix) and L4b (off-shape, edited
+    // prefix) from the same history: 1 call each.
+    it.each([
+      [HAIKU, 'disabled'],
+      [SONNET, 'between_tools'],
+    ] as const)(
+      'L2/L3/L4 %s replays signed thinking under adaptive and under %s',
+      async (model, offShape) => {
+        const first = await provider.chat(toolPrompt, {
+          model,
+          maxTokens: 2048,
+          effort: 'high',
+          tools,
+          toolChoice: 'auto',
+        });
+        expect(first.tool_calls?.[0]?.function.name).toBe('acceptance_probe');
+        expect(first.providerMetadata?.anthropicThinkingBlocks).toBeDefined();
+        const history = continueFrom(first);
+
+        const adaptive = await provider.chat(history, {
+          model,
+          maxTokens: 512,
+          effort: 'high',
+          tools,
+          toolChoice: 'auto',
+        });
+        expect(last().headers['anthropic-beta']).toContain(BINDING_BETA);
+        expect(last().body.thinking).toEqual({
+          type: 'adaptive',
+          block_binding: { prefix_mismatch_behavior: 'drop_block' },
+        });
+        expect(adaptive.usage?.total_tokens).toBeGreaterThan(0);
+        expect(adaptive.diagnostics?.reasoningContextReset).toBeUndefined();
+
+        const off = await provider.chat(history, {
+          model,
+          maxTokens: 512,
+          effort: 'none',
+          tools,
+          toolChoice: 'auto',
+        });
+        expect(last().headers['anthropic-beta']).toBeUndefined();
+        expect(last().body.thinking).toEqual({ type: offShape });
+        expect(last().body.output_config).toBeUndefined();
+        expect(JSON.stringify(last().body.messages)).toContain(
+          JSON.stringify((first.providerMetadata!.anthropicThinkingBlocks as unknown[])[0]),
+        );
+        expect(off.usage?.total_tokens).toBeGreaterThan(0);
+        expect(off.cost).toBeGreaterThan(0);
+        if (model === HAIKU) expect(off.thinking_content).toBeUndefined();
+
+        if (model !== SONNET) return;
+        const editedPrefix: ChatMessage[] = [
+          { role: 'system', content: 'New instruction after signed thinking was produced.' },
+          ...history,
+        ];
+        // L6: adaptive + edited prefix -> provider drop reported, call succeeds.
+        const edited = await provider.chat(editedPrefix, {
+          model,
+          maxTokens: 512,
+          effort: 'high',
+          tools,
+          toolChoice: 'auto',
+        });
+        expect(
+          edited.diagnostics?.reasoningContextReset?.reasons.prefix_binding_mismatch,
+        ).toBeGreaterThan(0);
+
+        // L4b: off-shape + edited prefix. Accounts created on or after
+        // 2026-08-31 get a 400 (drop_block cannot be requested under
+        // between_tools); older accounts may accept. Either way Axl surfaces
+        // the provider result once, without stripping or retrying.
+        const before = attempts;
+        let outcome: string;
+        try {
+          const accepted = await provider.chat(editedPrefix, {
+            model,
+            maxTokens: 512,
+            effort: 'none',
+            tools,
+            toolChoice: 'auto',
+          });
+          expect(accepted.usage?.total_tokens).toBeGreaterThan(0);
+          outcome = 'accepted (200)';
+        } catch (error) {
+          expect((error as { name?: string }).name).toBe('ProviderError');
+          expect((error as { status?: number }).status).toBe(400);
+          outcome = `rejected (400): ${(error as Error).message}`;
+        }
+        expect(attempts - before).toBe(1);
+        expect(last().body.thinking).toEqual({ type: 'between_tools' });
+        console.info(`[L4b] ${SONNET} between_tools + edited system prompt: ${outcome}`);
+      },
+      300_000,
+    );
+
+    // L5: 1 call (Sonnet's rejection is local).
+    it('L5 Haiku sends forced tool choice; Sonnet rejects it before dispatch', async () => {
+      const forced = await provider.chat(
+        [{ role: 'user', content: 'Call acceptance_probe now. Do not answer directly.' }],
+        { model: HAIKU, maxTokens: 256, tools, toolChoice: 'required' },
+      );
+      expect(last().body.tool_choice).toEqual({ type: 'any' });
+      expect(forced.tool_calls?.[0]?.function.name).toBe('acceptance_probe');
+
+      const before = attempts;
+      await expect(
+        provider.chat(prompt, { model: SONNET, maxTokens: 64, tools, toolChoice: 'required' }),
+      ).rejects.toMatchObject({ name: 'UnsupportedModelOptionError', model: SONNET });
+      expect(attempts).toBe(before);
+    }, 120_000);
+
+    // L7: 1 call at the default effort (no thinking or effort sent).
+    it('L7 Haiku answers a schema ask through the JSON-instruction path', async () => {
+      const registry = new ProviderRegistry();
+      registry.registerInstance('anthropic', provider);
+      const context = new WorkflowContext({
+        input: 'task',
+        executionId: 'haiku-55-live-schema',
+        metadata: {},
+        config: { defaultProvider: 'anthropic', diagnostics: { silent: true } },
+        providerRegistry: registry,
+      });
+      const worker = agent({
+        name: 'haiku-55-schema',
+        system: 'Answer briefly.',
+        model: `anthropic:${HAIKU}`,
+        maxTokens: 1024,
+      });
+      const result = await context.ask(worker, 'Return the status ok and the number 3.', {
+        schema: z.object({ status: z.literal('ok'), number: z.number() }),
+      });
+      expect(result).toEqual({ status: 'ok', number: 3 });
+      expect(last().body).not.toHaveProperty('thinking');
+      expect(last().body).not.toHaveProperty('output_config');
+    }, 120_000);
+  },
+);
 
 describe.skipIf(!process.env.GOOGLE_API_KEY)('latest models: Gemini live acceptance', () => {
   let provider: GeminiProvider;

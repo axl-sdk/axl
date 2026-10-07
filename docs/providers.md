@@ -1238,13 +1238,13 @@ The `effort` parameter provides a unified way to control reasoning depth across 
 ```typescript
 // Most users — just effort:
 const reasoner = agent({
-  model: 'anthropic:claude-opus-4-6',
+  model: 'anthropic:claude-opus-5-5',
   system: 'Solve complex math problems.',
   effort: 'high',
 });
 
-// Disable thinking entirely:
-agent({ model: 'anthropic:claude-opus-4-6', effort: 'none' });
+// Turn thinking off (on models that allow it, such as Claude Haiku 5.5):
+agent({ model: 'anthropic:claude-haiku-5-5', effort: 'none' });
 
 // Per-call override:
 const answer = await ctx.ask(reasoner, problem, { effort: 'low' });
@@ -1256,18 +1256,18 @@ const answer = await ctx.ask(reasoner, problem, { effort: 'low' });
 // Explicit token budget:
 const answer = await ctx.ask(reasoner, problem, { thinkingBudget: 8000 });
 
-// Disable thinking but keep effort for output control (Anthropic optimization):
-agent({ model: 'anthropic:claude-opus-4-6', effort: 'low', thinkingBudget: 0 });
+// Turn thinking off but keep an effort level for the answer (Anthropic):
+agent({ model: 'anthropic:claude-haiku-5-5', effort: 'low', thinkingBudget: 0 });
 ```
 
 **`includeThoughts` — reasoning summaries:**
 
 ```typescript
 // OpenAI Responses API: returns reasoning summaries
-agent({ model: 'openai-responses:o3', effort: 'high', includeThoughts: true });
+agent({ model: 'openai-responses:gpt-6-sol', effort: 'high', includeThoughts: true });
 
 // Gemini: returns thought summaries
-agent({ model: 'google:gemini-2.5-pro', effort: 'high', includeThoughts: true });
+agent({ model: 'google:gemini-3.8-flash', effort: 'high', includeThoughts: true });
 ```
 
 #### How `effort` maps to each provider
@@ -1427,7 +1427,7 @@ Provider-specific options merged directly into the raw API request body. Use thi
 
 ```typescript
 const agent = agent({
-  model: 'anthropic:claude-opus-4-6',
+  model: 'anthropic:claude-opus-5-5',
   system: 'You are helpful.',
   providerOptions: {
     // Sent directly to the Anthropic API body
@@ -1450,11 +1450,10 @@ const agent = agent({
 > This matters most for **Google Gemini**, where the request body nests `temperature`, `maxOutputTokens`, and `thinkingConfig` inside a `generationConfig` object. If you pass `providerOptions: { generationConfig: { ... } }`, it will replace the entire `generationConfig` that Axl built — including thinking configuration, temperature, and max tokens.
 >
 > ```typescript
-> // WRONG — replaces the entire generationConfig, losing thinkingConfig and temperature:
+> // WRONG — replaces the entire generationConfig, losing thinkingConfig and maxOutputTokens:
 > agent({
->   model: 'google:gemini-2.5-pro',
+>   model: 'google:gemini-3.8-flash',
 >   effort: 'high',
->   temperature: 0.7,
 >   providerOptions: {
 >     generationConfig: { responseMimeType: 'application/json' },
 >   },
@@ -1462,9 +1461,8 @@ const agent = agent({
 >
 > // CORRECT — set top-level fields that don't collide with nested objects:
 > agent({
->   model: 'google:gemini-2.5-pro',
+>   model: 'google:gemini-3.8-flash',
 >   effort: 'high',
->   temperature: 0.7,
 >   providerOptions: {
 >     safetySettings: [{ category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' }],
 >   },

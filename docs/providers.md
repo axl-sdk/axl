@@ -228,7 +228,9 @@ Sonnet 5.5 rejects them before dispatch, like Opus 5.5. Under thinking off, raw
 - set an effort above `high`.
 
 On a model whose thinking stays on by default, a small `maxTokens` cap can be
-used up by thinking. Raise the cap or lower the effort.
+used up by thinking. Raise the cap or lower the effort. The probes and live rows
+behind these rules, and what remains unverified, are recorded in the
+[Claude 5.5 family verification](./verification/claude-5-5-family-2026-10.md).
 
 All four models (Opus 5.5, Fable 5.1, Sonnet 5.5, Haiku 5.5) accept only
 default sampling. A portable `temperature` is dropped. Raw `providerOptions`

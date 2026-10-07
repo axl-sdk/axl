@@ -1248,13 +1248,20 @@ export class AnthropicProvider implements Provider {
     };
   }
 
+  /**
+   * Whether the final body needs the binding beta header. Runs after
+   * `validateAndBindFinalBody`, which has already injected `block_binding`
+   * wherever it applies, so the header follows the final body rather than
+   * re-deriving the injection rule.
+   */
   private requiresBindingBeta(body: Record<string, unknown>): boolean {
     const capability = resolveClaudeCapability(String(body.model));
     const thinking = body.thinking;
     return (
       capability?.thinkingBinding === true &&
-      isFinalThinkingAdaptive(capability, body) &&
-      (hasReplayedThinking(body) || (isRecord(thinking) && thinking.block_binding !== undefined))
+      isRecord(thinking) &&
+      thinking.type === 'adaptive' &&
+      thinking.block_binding !== undefined
     );
   }
 

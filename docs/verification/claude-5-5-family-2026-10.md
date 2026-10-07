@@ -53,16 +53,16 @@ Conclusions the adapter now enforces before dispatch:
 | --- | --- | --- | --- |
 | L1 | `claude-haiku-5-5`, `claude-sonnet-5-5` | Text at `effort: 'low'` and terminal stream at `'max'` on the exact ID. The wire body is adaptive with the requested effort, and the response is metered with a positive static cost. | Passed on both. |
 | L2/L3/L4 | `claude-haiku-5-5` | Adaptive `high` tool turn with signed thinking. The continuation under adaptive thinking carries the binding beta and `drop_block` and reports no reset. A continuation at `effort: 'none'` sends `{type:'disabled'}`, no beta, and no `output_config`, replays the signed block verbatim, and is metered. | Passed. Switching thinking type with replayed blocks is accepted. |
-| L2/L3/L4/L6/L4b | `claude-sonnet-5-5` | Same loop, with `{type:'between_tools'}` as the thinking-off shape. An edited system prompt under adaptive thinking reports a `prefix_binding_mismatch` reset. Under `between_tools`, an edited system prompt gets one attempt; a 200 or a surfaced `ProviderError` 400 is accepted, and neither is stripped nor retried. | Passed. Which L4b outcome occurred was **not captured**. |
+| L2/L3/L4/L6/L4b | `claude-sonnet-5-5` | Same loop, with `{type:'between_tools'}` as the thinking-off shape. An edited system prompt under adaptive thinking reports a `prefix_binding_mismatch` reset. Under `between_tools`, an edited system prompt gets one attempt; a 200 or a surfaced `ProviderError` 400 is accepted, and neither is stripped nor retried. | Passed. On a targeted re-run, L4b returned **200**: this account predates the 2026-08-31 enforcement default. |
 | L5 | `claude-haiku-5-5`, `claude-sonnet-5-5` | Haiku 5.5 sends `tool_choice: {type:'any'}` and returns the tool call. Sonnet 5.5 forced choice is a local `UnsupportedModelOptionError` with zero transport attempts. | Passed. |
 | L7 | `claude-haiku-5-5` | A schema ask through Axl's JSON-instruction path at the default effort, with no `thinking` or `output_config` sent, returns a Zod-valid result. | Passed. |
 
 ## Limits
 
-- **L4b account class.** It is unknown whether this account's edited-prefix
-  request under `between_tools` returned 200 or 400. `docs/providers.md`
-  documents the 400 for accounts created on or after 2026-08-31, per Anthropic's
-  preserved-thinking guide.
+- **L4b on newer accounts.** The test account predates 2026-08-31, so an edited
+  prefix under `between_tools` was accepted (200). The 400 that accounts created
+  on or after that date receive is documented from Anthropic's preserved-thinking
+  guide and covered by unit tests. It was not observed live.
 - **Streamed `between_tools` progress blocks.** The live Sonnet loop passed, but
   the raw SSE was not captured. The shape of a streamed progress-update block is
   covered only by a documentation-derived unit fixture.
@@ -76,6 +76,4 @@ Conclusions the adapter now enforces before dispatch:
 - **Reverse model switch.** Whether Haiku 5.5 can read thinking blocks produced
   by Sonnet 5.5 or Opus 5.5 is not verified live. Either way, a provider drop is
   reported as `reasoning_context_reset`.
-- **Unrelated failure in the same run.** The existing Opus 5.5 compacted-tool-tail
-  test failed on an empty text reply. That test does not touch the request
-  shapes changed here, and it remains open separately.
+- The Opus 5.5 compacted-tail test that failed in the full run (an empty reply) passed on a targeted re-run. It was model nondeterminism, not a change in request shaping.

@@ -105,7 +105,7 @@ import { lookupOrder } from '../tools/db.js';
 
 export const supportAgent = agent({
   name: 'support',
-  model: 'openai-responses:gpt-5.5',
+  model: 'openai-responses:gpt-6-sol',
   system: 'You are a customer support agent. Use tools to look up order information.',
   tools: [lookupOrder],
 });
@@ -206,13 +206,12 @@ import { agent } from '@axlsdk/axl';
 
 const researcher = agent({
   name: 'researcher',
-  model: 'openai-responses:gpt-5.5',
+  model: 'openai-responses:gpt-6-sol',
   system: 'You are a research assistant.',
   tools: [calculator],
   effort: 'high',
   maxTurns: 10,
   timeout: '30s',
-  temperature: 0.7,
   version: 'v1.2',
 });
 ```
@@ -223,8 +222,8 @@ Dynamic model and system prompt selection:
 const dynamicAgent = agent({
   model: (ctx) =>
     ctx.metadata?.tier === 'premium'
-      ? 'openai-responses:gpt-5.5'
-      : 'openai-responses:gpt-5-nano',
+      ? 'openai-responses:gpt-6-sol'
+      : 'openai-responses:gpt-6-luna',
   system: (ctx) => `You are a ${ctx.metadata?.role ?? 'general'} assistant.`,
 });
 ```
@@ -263,7 +262,7 @@ for precedence, nested asks, and provider timing details.
 
 ```typescript
 const router = agent({
-  model: 'openai-responses:gpt-5-mini',
+  model: 'openai-responses:gpt-6-luna',
   system: 'Route to the right specialist.',
   handoffs: (ctx) => {
     const base = [
@@ -298,7 +297,7 @@ The `effort` parameter provides a unified way to control reasoning depth across 
 ```typescript
 // Simple levels — works on any provider
 const reasoner = agent({
-  model: 'anthropic:claude-opus-4-7',
+  model: 'anthropic:claude-opus-5-5',
   system: 'You are a careful analyst.',
   effort: 'high', // 'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 });
@@ -402,8 +401,8 @@ To observe events between `ctx.ask()` calls — e.g., streaming `partial_object`
 // compiles standalone.
 const outlineSchema = z.object({ outline: z.array(z.string()) });
 const draftSchema = z.object({ draft: z.string() });
-const planner = agent({ model: 'openai:gpt-4o', system: 'Plan an outline.' });
-const writer = agent({ model: 'openai:gpt-4o', system: 'Write a draft.' });
+const planner = agent({ model: 'openai-responses:gpt-6-sol', system: 'Plan an outline.' });
+const writer = agent({ model: 'openai-responses:gpt-6-sol', system: 'Write a draft.' });
 
 const wf = workflow({
   name: 'two-step',
@@ -631,7 +630,7 @@ const containsPII = (text: string) => /\b\d{3}-\d{2}-\d{4}\b/.test(text);
 const isOffTopic = (text: string) => !text.toLowerCase().includes('support');
 
 const safe = agent({
-  model: 'openai-responses:gpt-5.5',
+  model: 'openai-responses:gpt-6-sol',
   system: 'You are a helpful assistant.',
   guardrails: {
     input: async (prompt, ctx) => {
@@ -786,7 +785,7 @@ const session = runtime.session('user-123', {
   history: {
     maxMessages: 100,
     summarize: true,
-    summaryModel: 'openai-responses:gpt-5-mini',
+    summaryModel: 'openai-responses:gpt-6-luna',
   },
   persist: true,
 });
@@ -826,10 +825,10 @@ import {
 Four native adapters using the `provider:model` URI scheme (plus the OpenAI-compatible presets above):
 
 ```
-openai-responses:gpt-5.5               # OpenAI Responses API (preferred over Chat Completions)
-openai:gpt-5.4                         # OpenAI Chat Completions
-anthropic:claude-opus-4-8              # Anthropic (supports effort: 'xhigh' and 'max')
-google:gemini-3.1-pro-preview          # Google Gemini
+openai-responses:gpt-6-sol             # OpenAI Responses API (preferred over Chat Completions)
+openai:gpt-6-sol                       # OpenAI Chat Completions (text; use Responses for tools)
+anthropic:claude-sonnet-5-5            # Anthropic (also claude-haiku-5-5, claude-opus-5-5)
+google:gemini-3.8-flash                # Google Gemini
 ```
 
 See [docs/providers.md](../../docs/providers.md) for the full model list including reasoning models.

@@ -44,7 +44,7 @@ export default defineEval({
     llmScorer({
       name: 'relevance',
       description: 'Is the answer relevant to the question?',
-      model: 'openai:gpt-4o',
+      model: 'anthropic:claude-haiku-5-5',
       system: 'Rate whether the answer is relevant to the question asked.',
     }),
   ],
@@ -166,7 +166,7 @@ import { llmScorer } from '@axlsdk/eval';
 const refusalQuality = llmScorer({
   name: 'refusal-quality',
   description: 'Did the model refuse appropriately and explain why?',
-  model: 'openai:gpt-4o',
+  model: 'anthropic:claude-haiku-5-5',
   system: 'Rate whether the output is a well-justified refusal.',
   applies: (_output, _input, annotations) => annotations?.expectRefusal === true,
 });
@@ -186,7 +186,7 @@ import { llmScorer } from '@axlsdk/eval';
 const qualityJudge = llmScorer({
   name: 'quality',
   description: 'Rates overall output quality',
-  model: 'openai:gpt-4o',           // provider:model URI
+  model: 'anthropic:claude-haiku-5-5', // provider:model URI
   system: 'Rate the quality of the AI output.',
 });
 ```
@@ -199,14 +199,14 @@ import { z } from 'zod';
 const detailedJudge = llmScorer({
   name: 'detailed',
   description: 'Rates quality with confidence',
-  model: 'openai:gpt-4o',
+  model: 'openai-responses:gpt-6-luna',
   system: 'Rate quality and your confidence in the rating.',
   schema: z.object({
     score: z.number().min(0).max(1),
     reasoning: z.string(),
     confidence: z.number().min(0).max(1),
   }),
-  temperature: 0.2,                  // default: 0.2 (low for consistency)
+  temperature: 0.2,                  // default 0.2; ignored on reasoning models (GPT-6, Claude 5.x)
 });
 ```
 
@@ -225,21 +225,21 @@ The `model` field uses a `provider:model` URI. The provider is resolved automati
 Different LLM scorers can use different providers — each resolves independently:
 
 ```typescript
-const qualityJudge = llmScorer({ name: 'quality', model: 'openai:gpt-4o', ... });
-const safetyJudge = llmScorer({ name: 'safety', model: 'anthropic:claude-sonnet-5-5', ... });
+const qualityJudge = llmScorer({ name: 'quality', model: 'openai-responses:gpt-6-luna', ... });
+const safetyJudge = llmScorer({ name: 'safety', model: 'anthropic:claude-haiku-5-5', ... });
 ```
 
 LLM scorers also accept the conditional `applies` predicate described in [Conditional scorers](#conditional-scorers-applies) — the most valuable place to use it, since a skipped judge makes no provider call at all.
 
 #### Tuning the judge
 
-For reasoning-capable judge models (gpt-5.x, Anthropic Opus/Sonnet 4.5+, Gemini 3.x), `effort` is the highest-leverage knob — judges with reasoning enabled are materially more consistent. The full `ChatOptions` surface is forwarded:
+For reasoning-capable judge models (GPT-6, Claude 5.x, Gemini 3.x), `effort` is the highest-leverage knob — judges with reasoning enabled are materially more consistent. The full `ChatOptions` surface is forwarded:
 
 ```typescript
 const carefulJudge = llmScorer({
   name: 'careful',
   description: 'Reasoning-grade quality judge',
-  model: 'openai-responses:gpt-5',
+  model: 'openai-responses:gpt-6-sol',
   system: 'Rate output quality and explain your reasoning.',
   effort: 'high',              // huge calibration improvement on reasoning models
   maxTokens: 1024,             // cap chatty judges to control spend
@@ -346,7 +346,7 @@ import { AxlRuntime, workflow, agent } from '@axlsdk/axl';
 import { dataset, scorer } from '@axlsdk/eval';
 import { z } from 'zod';
 
-const qaAgent = agent({ name: 'qa', model: 'openai:gpt-4o', system: 'Answer questions.' });
+const qaAgent = agent({ name: 'qa', model: 'openai-responses:gpt-6-sol', system: 'Answer questions.' });
 const qaWorkflow = workflow({
   name: 'qa-workflow',
   input: z.object({ question: z.string() }),
@@ -473,8 +473,8 @@ console.log(results.unpriced);                            // true when that tota
 console.log(results.accounting.completeness);             // 'complete' | 'incomplete' | 'unverified'
 console.log(results.accounting.breakdown);                // { generation, judging, external }
 console.log(results.summary.coverage.items);              // { completed, failed, cancelled, budget_skipped, budget_interrupted }
-console.log(results.metadata.models);                    // ["openai:gpt-4o"] (sorted by usage)
-console.log(results.metadata.modelCounts);               // { "openai:gpt-4o": 48, "openai:gpt-4o-mini": 2 } (total LLM calls per model)
+console.log(results.metadata.models);                    // ["openai-responses:gpt-6-sol"] (sorted by usage)
+console.log(results.metadata.modelCounts);               // { "openai-responses:gpt-6-sol": 48, "openai-responses:gpt-6-luna": 2 } (total LLM calls per model)
 
 // ── Per-item inspection ──────────────────────────────
 for (const item of results.items) {
@@ -487,7 +487,7 @@ for (const item of results.items) {
   console.log(item.scorerCost);                          // total scorer cost for this item
 
   // Execution metadata (models, tokens, agent calls — captured by AxlRuntime)
-  console.log(item.metadata?.models);                    // ["openai:gpt-4o"]
+  console.log(item.metadata?.models);                    // ["openai-responses:gpt-6-sol"]
   console.log(item.metadata?.tokens);                    // { input: 150, output: 320, reasoning: 0 }
   console.log(item.metadata?.agentCalls);                // 1
 

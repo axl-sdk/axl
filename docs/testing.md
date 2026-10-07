@@ -194,7 +194,7 @@ import { AxlTestRuntime, MockProvider } from '@axlsdk/testing';
 import { agent, workflow } from '@axlsdk/axl';
 import { z } from 'zod';
 
-const myAgent = agent({ model: 'openai:gpt-4o', system: 'extract' });
+const myAgent = agent({ model: 'openai-responses:gpt-6-sol', system: 'extract' });
 
 const provider = MockProvider.sequence([
   { content: '{"v":3}', chunks: ['{"v":', '3', '}'] },
@@ -599,7 +599,7 @@ The CLI prints a `mean/p95` pair for the two model-comparison figures and a mean
 
 ```
   Timing        1.20s     1.10s     1.90s
-    openai:gpt-4o  wire 412ms/980ms · first token 180ms/410ms · queued 38ms · retries 0ms  (48 calls, mean/p95 per call)
+    openai-responses:gpt-6-sol  wire 412ms/980ms · first token 180ms/410ms · queued 38ms · retries 0ms  (48 calls, mean/p95 per call)
 ```
 
 `item.timing` stays the compact per-item **sums** so a persisted eval artifact does not grow with call count. `summary.modelTiming` is not derived from it — the raw per-call blocks are pooled while the run is in memory, which is what makes its percentiles real per-call percentiles. A consumer holding only a saved artifact can recover totals from `item.timing`, but not the distribution.
@@ -635,7 +635,7 @@ AXL_MULTIMODAL_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.
 
 # L1, L11, and L4 accept model overrides for catalog-capability smoke tests.
 # This makes exactly one model invocation for each provider whose key is set.
-AXL_MULTIMODAL_LIVE=1 OPENAI_IMAGE_MODEL=gpt-5.6 ANTHROPIC_IMAGE_MODEL=claude-opus-5 GEMINI_IMAGE_MODEL=gemini-3.8-flash pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L1\]|\[L11\]|\[L4\]'
+AXL_MULTIMODAL_LIVE=1 OPENAI_IMAGE_MODEL=gpt-6-sol ANTHROPIC_IMAGE_MODEL=claude-sonnet-5-5 GEMINI_IMAGE_MODEL=gemini-3.8-flash pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L1\]|\[L11\]|\[L4\]'
 
 # Native blocking rows: six logical invocations on a normal successful path
 # (L1/L2/L4/L11/L13/L14). L6 and L12 are local and make zero HTTP attempts.

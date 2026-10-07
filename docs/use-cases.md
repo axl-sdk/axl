@@ -25,7 +25,7 @@ const refundOrder = tool({
 });
 
 const SupportBot = agent({
-  model: 'openai-responses:gpt-5.5',
+  model: 'openai-responses:gpt-6-sol',
   system: 'You are a helpful customer support agent. Be concise.',
   tools: [getOrder, refundOrder],
   timeout: '30s',
@@ -109,9 +109,8 @@ const UserProfile = z.object({
 });
 
 const Extractor = agent({
-  model: 'openai-responses:gpt-5.5',
+  model: 'openai-responses:gpt-6-sol',
   system: 'Extract structured user profile data from the given text.',
-  temperature: 0.1,
 });
 
 const GenerateProfile = workflow({
@@ -318,9 +317,8 @@ const ReviewScore = z.object({
 });
 
 const Reviewer = agent({
-  model: 'openai-responses:gpt-5.5',
+  model: 'openai-responses:gpt-6-sol',
   system: 'Review the document and provide a score from 1-10 with reasoning.',
-  temperature: 0.7,  // some randomness so each call produces a different review
 });
 
 const PeerReview = workflow({
@@ -366,9 +364,9 @@ const PeerReview = workflow({
 Use different models as reviewers to reduce correlated errors:
 
 ```typescript
-const ReviewerGPT = agent({ model: 'openai-responses:gpt-5.5', system: 'Review the document...', temperature: 0.7 });
-const ReviewerClaude = agent({ model: 'anthropic:claude-sonnet-4-6', system: 'Review the document...', temperature: 0.7 });
-const ReviewerGemini = agent({ model: 'google:gemini-3.1-pro-preview', system: 'Review the document...', temperature: 0.7 });
+const ReviewerGPT = agent({ model: 'openai-responses:gpt-6-sol', system: 'Review the document...' });
+const ReviewerClaude = agent({ model: 'anthropic:claude-sonnet-5-5', system: 'Review the document...' });
+const ReviewerGemini = agent({ model: 'google:gemini-3.8-flash', system: 'Review the document...' });
 
 const reviewers = [ReviewerGPT, ReviewerClaude, ReviewerGemini];
 
@@ -394,9 +392,8 @@ Use `scorer` to have an LLM evaluate each candidate. The scorer runs on every re
 
 ```typescript
 const Judge = agent({
-  model: 'anthropic:claude-sonnet-4-6',
+  model: 'anthropic:claude-haiku-5-5',
   system: 'You are an expert writing evaluator. Score the given text on clarity, depth, and accuracy.',
-  temperature: 0.1,
 });
 
 const JudgeScore = z.object({
@@ -467,16 +464,15 @@ Deep research task that could consume unlimited tokens, capped at a fixed cost. 
 
 ```typescript
 const Researcher = agent({
-  model: 'openai-responses:gpt-5.5',
+  model: 'openai-responses:gpt-6-astra',
   system: 'Research the given topic thoroughly.',
   tools: [webSearch, readUrl],
   maxTurns: 20,
 });
 
 const Summarizer = agent({
-  model: 'anthropic:claude-sonnet-4-6',
+  model: 'anthropic:claude-haiku-5-5',
   system: 'Summarize the research into a concise brief.',
-  temperature: 0.3,
 });
 
 const ResearchTopic = workflow({
@@ -499,7 +495,7 @@ A customer chats back and forth with a support agent. Axl maintains conversation
 
 ```typescript
 const SupportBot = agent({
-  model: 'openai-responses:gpt-5.5',
+  model: 'openai-responses:gpt-6-sol',
   system: 'You are a helpful support agent. Be concise and friendly.',
   tools: [getOrder, getCustomer, refundOrder],
   maxTurns: 10,
@@ -598,8 +594,8 @@ See [docs/security.md](./security.md#right-to-be-forgotten--execution-deletion) 
 Try multiple models in parallel, take the first valid response:
 
 ```typescript
-const FastModel = agent({ model: 'openai-responses:gpt-5-mini', system: 'Answer the question concisely.' });
-const SmartModel = agent({ model: 'anthropic:claude-sonnet-4-6', system: 'Answer the question concisely.' });
+const FastModel = agent({ model: 'openai-responses:gpt-6-luna', system: 'Answer the question concisely.' });
+const SmartModel = agent({ model: 'anthropic:claude-sonnet-5-5', system: 'Answer the question concisely.' });
 
 const QuickAnswer = workflow({
   name: 'QuickAnswer',
@@ -619,19 +615,19 @@ A triage agent routes to specialist agents. Each specialist has its own scoped t
 
 ```typescript
 const BillingBot = agent({
-  model: 'openai-responses:gpt-5.5',
+  model: 'openai-responses:gpt-6-sol',
   system: 'You handle billing and payment questions.',
   tools: [getInvoice, processPayment, applyCredit],
 });
 
 const ShippingBot = agent({
-  model: 'openai-responses:gpt-5.5',
+  model: 'openai-responses:gpt-6-sol',
   system: 'You handle shipping and delivery questions.',
   tools: [trackPackage, updateAddress, scheduleRedelivery],
 });
 
 const TriageBot = agent({
-  model: 'openai-responses:gpt-5-mini',  // Cheap model for routing
+  model: 'openai-responses:gpt-6-luna',  // Cheap model for routing
   system: `Route the customer to the right specialist:
 - BillingBot: billing, payments, invoices, credits
 - ShippingBot: shipping, delivery, tracking, addresses`,
@@ -677,7 +673,7 @@ A coding assistant that uses tools from external MCP servers alongside local too
 
 ```typescript
 const DevAssistant = agent({
-  model: 'anthropic:claude-sonnet-4-6',
+  model: 'anthropic:claude-sonnet-5-5',
   system: 'You are a senior developer assistant.',
   mcp: ['github', 'linear'],
   tools: [readFile, writeFile, runTests],
@@ -706,9 +702,8 @@ const SentimentScore = z.object({
 });
 
 const Analyst = agent({
-  model: 'openai-responses:gpt-5-mini',
+  model: 'openai-responses:gpt-6-luna',
   system: 'Analyze the sentiment of the given customer review.',
-  temperature: 0.1,
 });
 
 const BatchAnalysis = workflow({
@@ -749,7 +744,7 @@ import { dataset, scorer, llmScorer, defineEval } from '@axlsdk/eval';
 
 // The workflow under evaluation — this is what we're iterating on
 const FitnessCoach = agent({
-  model: 'openai-responses:gpt-5.5',
+  model: 'openai-responses:gpt-6-sol',
   system: 'You are a certified personal trainer. Generate a workout plan for the given profile.',
 });
 
@@ -798,7 +793,7 @@ const structuralValidity = scorer({
 // LLM-as-judge scorer
 const planQuality = llmScorer({
   name: 'plan-quality',
-  model: 'openai-responses:gpt-5.5',
+  model: 'openai-responses:gpt-6-sol',
   system: 'You are an expert fitness coach evaluating workout plans. Rate on a 0-1 scale.',
   schema: z.object({ score: z.number().min(0).max(1), reasoning: z.string() }),
   effort: 'high',  // reasoning-capable judges score more consistently with effort enabled
@@ -818,7 +813,7 @@ export default defineEval({
 > ```typescript
 > const respectsInjuries = llmScorer({
 >   name: 'respects-injuries',
->   model: 'openai-responses:gpt-5.5',
+>   model: 'openai-responses:gpt-6-sol',
 >   system: 'Does the plan avoid exercises contraindicated by the stated injury?',
 >   applies: (_output, _input, annotations) => Boolean(annotations?.injury),
 > });
@@ -853,7 +848,7 @@ const transcript = await ctx.transcribe({
 });
 
 const review = await ctx.ask(
-  agent({ model: 'google:gemini-3.7-flash' }),
+  agent({ model: 'google:gemini-3.8-flash' }),
   `Summarize this call and list concrete action items:\n${transcript.text}`,
   { maxTokens: 256 },
 );

@@ -1,6 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
 import { z } from 'zod';
-import type { AxlRuntime } from '@axlsdk/axl';
 import { dataset } from '../dataset.js';
 import { scorer } from '../scorer.js';
 import type { Scorer } from '../scorer.js';
@@ -8,7 +7,8 @@ import { llmScorer } from '../llm-scorer.js';
 import { runEval } from '../runner.js';
 import type { EvalProgressEvent } from '../types.js';
 import { askExecute, fixtureAgent, scriptedRuntime } from './accounting-helpers.js';
-import { agent as makeAgent, workflow as makeWorkflow } from '@axlsdk/axl';
+import { AxlRuntime, agent as makeAgent, workflow as makeWorkflow } from '@axlsdk/axl';
+import { rescore } from '../rescore.js';
 
 /**
  * A runtime with no `trackOutcome`. Tests using it exercise the UNINSTRUMENTED
@@ -1620,7 +1620,6 @@ describe('rescore() backward compatibility', () => {
     // Pre-0.14 EvalResult artifact: top-level `workflow` field, no metadata.workflows.
     // Importing such an artifact and rescoring it should preserve workflow attribution
     // by migrating the legacy field into the modern shape on the rescored result.
-    const { rescore } = await import('../rescore.js');
     const legacyResult = {
       id: 'legacy-id',
       workflow: 'legacy-wf', // pre-0.14 field
@@ -1654,7 +1653,6 @@ describe('rescore() backward compatibility', () => {
   it('preserves modern metadata.workflows through rescore', async () => {
     // Modern artifact: workflow lives in metadata.workflows. Rescore should
     // pass it through via the existing ...rest spread without touching it.
-    const { rescore } = await import('../rescore.js');
     const modernResult = {
       id: 'modern-id',
       dataset: 'ds',
@@ -1735,7 +1733,6 @@ describe('runEval: captureTraces', () => {
   // A tiny in-process workflow that triggers a real agent_call trace event
   // so we can assert the per-item trace capture end-to-end.
   async function buildTracingRuntime(options: { omitCost?: boolean } = {}) {
-    const { AxlRuntime, agent, workflow } = await import('@axlsdk/axl');
     const runtime = new AxlRuntime({ defaultProvider: 'mock' });
     const provider = {
       name: 'mock',
@@ -1754,12 +1751,12 @@ describe('runEval: captureTraces', () => {
       },
     };
     runtime.registerProvider('mock', provider as any);
-    const answerer = agent({
+    const answerer = makeAgent({
       name: 'answerer',
       model: 'mock:test',
       system: 'Answer the question.',
     });
-    const wf = workflow({
+    const wf = makeWorkflow({
       name: 'ask',
       input: z.object({ question: z.string() }),
       handler: async (ctx) => ctx.ask(answerer, ctx.input.question),
@@ -1968,7 +1965,6 @@ describe('runEval: captureTraces', () => {
   });
 
   it('strips verbose messages snapshot from captured traces', async () => {
-    const { AxlRuntime, agent, workflow } = await import('@axlsdk/axl');
     const runtime = new AxlRuntime({
       defaultProvider: 'mock',
       trace: { level: 'full' }, // Verbose mode ON — snapshots would be emitted
@@ -1990,9 +1986,9 @@ describe('runEval: captureTraces', () => {
       },
     };
     runtime.registerProvider('mock', provider as any);
-    const a = agent({ name: 'a', model: 'mock:test', system: 'sys' });
+    const a = makeAgent({ name: 'a', model: 'mock:test', system: 'sys' });
     runtime.register(
-      workflow({
+      makeWorkflow({
         name: 'ask',
         input: z.object({ question: z.string() }),
         handler: async (ctx) => ctx.ask(a, ctx.input.question),
@@ -2025,10 +2021,9 @@ describe('runEval: captureTraces', () => {
 
   it('captures traces on failed items — the exact case where they matter most', async () => {
     // Build a runtime that records a workflow_start, then throws.
-    const { AxlRuntime, workflow: wf } = await import('@axlsdk/axl');
     const runtime = new AxlRuntime();
     runtime.register(
-      wf({
+      makeWorkflow({
         name: 'boom',
         input: z.object({ question: z.string() }),
         handler: async () => {

@@ -171,10 +171,9 @@ Define an agent with a model, system prompt, tools, and optional handoffs.
 import { agent } from '@axlsdk/axl';
 
 const myAgent = agent({
-  model: 'openai-responses:gpt-5.6',
+  model: 'openai-responses:gpt-6-sol',
   system: 'You are a helpful assistant.',
   tools: [search, calculator],
-  temperature: 0.7,
   maxTokens: 8192,
   effort: 'high',
   maxTurns: 10,
@@ -185,7 +184,7 @@ const myAgent = agent({
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `name` | `string` | model string or `Agent_N` | Display name used in traces |
-| `model` | `string \| (ctx) => string` | **required** | Provider URI (e.g., `'openai:gpt-4o'`, `'anthropic:claude-sonnet-4-6'`). Function form enables dynamic model routing |
+| `model` | `string \| (ctx) => string` | **required** | Provider URI (e.g., `'openai-responses:gpt-6-sol'`, `'anthropic:claude-sonnet-5-5'`). Function form enables dynamic model routing |
 | `system` | `string \| (ctx) => string` | **required** | System prompt. Function form enables per-request customization |
 | `tools` | `Tool[]` | `[]` | Tools this agent can call. Acts as an ACL — the agent cannot call tools not in this list |
 | `handoffs` | `HandoffDescriptor[] \| (ctx) => HandoffDescriptor[]` | `[]` | Agents this agent can hand off to. Function form receives `{ metadata?: Record<string, unknown> }` for dynamic routing (see below) |
@@ -194,10 +193,10 @@ const myAgent = agent({
 | `temperature` | `number` | provider default | LLM sampling temperature |
 | `maxTokens` | `number` | `4096` | Maximum tokens in the LLM response |
 | `effort` | `Effort` | — | Unified effort level: `'none'` \| `'low'` \| `'medium'` \| `'high'` \| `'xhigh'` \| `'max'`. Exact model and endpoint capabilities determine whether a tier is sent, clamped, or omitted. GPT-5.6 supports native `'max'` on Responses; Chat sends `'xhigh'` and reports the clamp via a `provider_diagnostic` event. Claude 5 supports native `'max'`; earlier families keep their documented caps |
-| `thinkingBudget` | `number` | — | Explicit thinking token budget (advanced). Overrides effort-based allocation. On models that allow it, `0` disables thinking while keeping effort; Claude Opus 5.5 and Fable 5.1 instead use adaptive thinking at the low floor. |
+| `thinkingBudget` | `number` | — | Explicit thinking token budget (advanced). Overrides effort-based allocation. On models that allow it, `0` disables thinking while keeping effort; Claude Opus 5.5 and Fable 5.1 instead use adaptive thinking at the low floor, and Claude Sonnet 5.5 and Haiku 5.5 disable thinking only at effort `high` or below. |
 | `promptCache` | `boolean` | `false` | Opt in to caching the agent's stable prefix (system prompt + tool definitions). Anthropic: one `cache_control` breakpoint on the first system block, so runtime-injected summaries and the user turn are never cached. OpenAI and Gemini cache automatically — no-op there. Off by default because a prefix that changes every call (a `system` built from `ctx.metadata`) pays the write premium with no reads. See [providers.md#prompt-caching](providers.md#prompt-caching) |
 | `includeThoughts` | `boolean` | — | Return reasoning summaries in responses. Supported on OpenAI Responses API and Gemini |
-| `toolChoice` | `'auto' \| 'none' \| 'required' \| { type: 'function', function: { name } }` | — | Tool choice strategy: `'auto'` lets the model decide, `'none'` forbids tool use, `'required'` forces at least one tool call, or specify a function name to force a specific tool. Claude Opus 5.5 and Fable 5.1 reject forced choices before dispatch. |
+| `toolChoice` | `'auto' \| 'none' \| 'required' \| { type: 'function', function: { name } }` | — | Tool choice strategy: `'auto'` lets the model decide, `'none'` forbids tool use, `'required'` forces at least one tool call, or specify a function name to force a specific tool. Claude Opus 5.5, Fable 5.1, and Sonnet 5.5 reject forced choices before dispatch; Claude Haiku 5.5 accepts them. |
 | `stop` | `string[]` | — | Stop sequences — generation stops when any sequence is encountered. Not supported by the `openai-responses` provider (silently ignored) |
 | `providerOptions` | `Record<string, unknown>` | — | Provider-specific options shallow-merged into the raw API request body via `Object.assign`. Not portable across providers. See [shallow merge caveat](providers.md#provideroptions) |
 | `maxTurns` | `number` | `25` | Maximum tool-call loop iterations before throwing `MaxTurnsError`. **A "turn" in axl is one provider call inside a single `ctx.ask()`** — not a user↔assistant exchange. Schema/validate/guardrail retries also consume turns. See [Sessions → Turns vs. Exchanges](#turns-vs-exchanges) |
@@ -222,7 +221,7 @@ The `handoffs` option accepts a function for runtime-conditional routing. The fu
 ```typescript
 const router = agent({
   name: 'support-router',
-  model: 'openai-responses:gpt-5-mini',
+  model: 'openai-responses:gpt-6-luna',
   system: 'Route to the right specialist.',
   handoffs: (ctx) => {
     const base = [
@@ -701,7 +700,7 @@ const result = await ctx.delegate(
   customerMessage,
   {
     schema: z.object({ answer: z.string(), category: z.string() }),
-    routerModel: 'openai-responses:gpt-5-mini',
+    routerModel: 'openai-responses:gpt-6-luna',
   },
 );
 ```
@@ -901,8 +900,8 @@ Lazy `AxlEventBus` exposing every `AxlEvent` emitted by this context (and its ch
 // self-contained.
 const outlineSchema = z.object({ outline: z.array(z.string()) });
 const draftSchema = z.object({ draft: z.string() });
-const planner = agent({ model: 'openai:gpt-4o', system: 'Plan an outline.' });
-const writer = agent({ model: 'openai:gpt-4o', system: 'Write the draft.' });
+const planner = agent({ model: 'openai-responses:gpt-6-sol', system: 'Plan an outline.' });
+const writer = agent({ model: 'openai-responses:gpt-6-sol', system: 'Write the draft.' });
 
 const wf = workflow({
   name: 'two-step',
@@ -1412,7 +1411,7 @@ User-defined validation functions that run at the agent boundary, before and aft
 
 ```typescript
 const safe = agent({
-  model: 'openai-responses:gpt-5.6',
+  model: 'openai-responses:gpt-6-sol',
   system: 'You are a helpful assistant.',
   guardrails: {
     input: async (prompt, ctx) => {
@@ -1665,7 +1664,7 @@ const session = runtime.session('user-123', {
   history: {
     maxMessages: 100,
     summarize: true,
-    summaryModel: 'openai-responses:gpt-5-mini',
+    summaryModel: 'openai-responses:gpt-6-luna',
   },
   deduplicateInput: true,
   persist: true,
@@ -1680,7 +1679,7 @@ const result = await session.send('HandleSupport', { msg: 'Help me' });
 |--------|------|---------|-------------|
 | `history.maxMessages` | `number` | — | Keep the last N messages. Older messages are trimmed (or summarized if `summarize` is `true`) |
 | `history.summarize` | `boolean` | `false` | When `true` and `maxMessages` is exceeded, summarize old messages instead of dropping them |
-| `history.summaryModel` | `string` | — | Model URI for summarization (e.g., `'openai:gpt-4o-mini'`). **Required** when `summarize` is `true` |
+| `history.summaryModel` | `string` | — | Model URI for summarization (e.g., `'anthropic:claude-haiku-5-5'`). **Required** when `summarize` is `true` |
 | `deduplicateInput` | `boolean` | `true` | Send the current session input once when the workflow passes that same normalized input to `ctx.ask()`. Set to `false` to preserve the legacy duplicate request |
 | `persist` | `boolean` | `true` | Save session history to the state store. When `false`, history exists only in memory for the session lifetime |
 
@@ -2854,12 +2853,12 @@ Configuration for `llmScorer()`.
 |-------|------|---------|-------------|
 | `name` | `string` | required | Unique scorer name |
 | `description` | `string` | required | What this scorer evaluates |
-| `model` | `string` | required | Provider:model URI (e.g., `openai:gpt-4o`) |
+| `model` | `string` | required | Provider:model URI (e.g., `anthropic:claude-haiku-5-5`) |
 | `system` | `string` | required | System prompt for the judge LLM |
 | `schema` | `z.ZodType<{ score: number; ... }>` | `z.object({ score: z.number(), reasoning: z.string() })` | Response schema — converted to JSON Schema and included in the prompt so the LLM knows the exact structure to produce |
-| `temperature` | `number` | `0.2` | Low for scoring consistency |
+| `temperature` | `number` | `0.2` | Low for scoring consistency. Dropped on models that reject sampling (Claude 5.x, GPT-6 while reasoning); tune `effort` instead. |
 | `maxTokens` | `number` | provider default | Cap on response tokens |
-| `effort` | `Effort` | provider default | Unified reasoning/thinking level (`'none' \| 'low' \| 'medium' \| 'high' \| 'xhigh' \| 'max'`). On reasoning-capable judges (gpt-5.x, Anthropic Opus 4.5+, Sonnet 4.6+, Gemini 3.x), `'high'` or `'max'` materially improves calibration. Provider-specific mapping (`xhigh` clamps, `none` semantics, etc.) lives on the [`Effort`](#effort) type — judges follow the same rules as agents |
+| `effort` | `Effort` | provider default | Unified reasoning/thinking level (`'none' \| 'low' \| 'medium' \| 'high' \| 'xhigh' \| 'max'`). On reasoning-capable judges (GPT-5.x and GPT-6, Claude Opus 4.5+, Sonnet 4.6+, and the Claude 5.x family, Gemini 3.x), `'high'` or `'max'` materially improves calibration. Provider-specific mapping (`xhigh` clamps, `none` semantics, etc.) lives on the [`Effort`](#effort) type — judges follow the same rules as agents |
 | `thinkingBudget` | `number` | — | Precise thinking-token budget override; `0` disables thinking while keeping `effort` for output control (Anthropic). On other providers, simply disables reasoning |
 | `includeThoughts` | `boolean` | provider default | Surface reasoning summaries in the judge's response. Effective on Gemini and the `openai-responses:` provider; no-op on Anthropic and OpenAI Chat Completions (`openai:`). Resolved to `false` if unset |
 | `stop` | `string[]` | — | Stop sequences forwarded to the provider |

@@ -97,6 +97,30 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+/**
+ * Whether the final request runs adaptive thinking: an explicit
+ * `{ type: 'adaptive' }`, or no `thinking` on a model that thinks adaptively by
+ * default. Anthropic accepts `block_binding` only under adaptive thinking.
+ */
+function isFinalThinkingAdaptive(
+  capability: ClaudeCapability,
+  body: Record<string, unknown>,
+): boolean {
+  const thinking = body.thinking;
+  if (thinking === undefined) {
+    return (
+      capability.thinking === 'adaptive-default-on' || capability.thinking === 'adaptive-always-on'
+    );
+  }
+  return isRecord(thinking) && thinking.type === 'adaptive';
+}
+
+const NATIVE_CLAUDE_EFFORTS: readonly unknown[] = ['low', 'medium', 'high', 'xhigh', 'max'];
+
+function isNativeClaudeEffort(value: unknown): value is Exclude<Effort, 'none'> {
+  return NATIVE_CLAUDE_EFFORTS.includes(value);
+}
+
 function hasReplayedThinking(body: Record<string, unknown>): boolean {
   return (
     Array.isArray(body.messages) &&
@@ -164,8 +188,10 @@ function hasAnthropicProviderFileImage(messages: readonly ChatMessage[]): boolea
 
 // ---------------------------------------------------------------------------
 // Exact Anthropic model capabilities and Standard text pricing. Reviewed
-// 2026-09-03 against https://platform.claude.com/docs/en/about-claude/pricing
-// and .../build-with-claude/effort for the per-model effort levels.
+// 2026-10-07 against https://platform.claude.com/docs/en/about-claude/pricing,
+// .../build-with-claude/effort for the per-model effort levels,
+// .../build-with-claude/preserved-thinking, and the Haiku 5.5 / Sonnet 5.5
+// model overview and migration-guide pages (.../models/<id>/overview).
 //
 // Modern IDs intentionally use exact matching. A future sibling can still pass
 // through to Anthropic, but it must not inherit request semantics or a price.
@@ -185,27 +211,83 @@ type ClaudeCapability = {
   stripTemperature?: boolean;
   disableAt?: Exclude<Effort, 'none'>;
   /**
-   * Requires the `thinking-binding-controls-2026-08-01` beta and final-body
-   * validation/`block_binding` injection when replaying thinking blocks.
+   * The `thinking` shape that turns thinking off on an `adaptive-default-on`
+   * model. Absent means `{ type: 'disabled' }`.
+   */
+  offShape?: 'between_tools';
+  /** The model rejects `tool_choice` `any`/`tool`; fail before dispatch. Absent means allowed. */
+  forcedToolChoice?: 'rejected';
+  /**
+   * The model rejects non-default raw sampling. Final-body `temperature` may
+   * only be 1, `top_p` may only be 0.99, the two may not be sent together, and
+   * `top_k` is rejected (live-verified 2026-10-07: `top_p: 1` and
+   * `temperature` + `top_p` are provider 400s). Independent of
+   * `stripTemperature`, which governs only the portable `temperature` option.
+   */
+  defaultOnlySampling?: true;
+  /**
+   * Validate the final body's `thinking` and `output_config` against the
+   * model's thinking contract before dispatch. `output_config.effort` must be
+   * one of the five native levels. `thinking` must be `adaptive` without
+   * `budget_tokens` or, on an `adaptive-default-on` model, exactly the
+   * off-shape (`offShape ?? 'disabled'`, no other fields, so no
+   * `block_binding`) at an effort at or below `disableAt`. An
+   * `adaptive-always-on` model has no off-shape.
+   */
+  strictThinking?: true;
+  /**
+   * The model runs Anthropic's preserved-thinking prefix check, so a request
+   * that replays thinking under adaptive thinking carries the
+   * `thinking-binding-controls-2026-08-01` beta and a `block_binding`
+   * (`drop_block` unless the caller set one). Under a non-adaptive final
+   * `thinking` neither is sent: the provider rejects `block_binding` there.
    * Verified per-model against
    * https://platform.claude.com/docs/en/build-with-claude/preserved-thinking
-   * (2026-09-25): that doc names Claude Opus 5.5 and Claude Fable 5.1 only —
-   * "On Claude Fable 5.1 and Claude Opus 5.5, a thinking block stays valid
-   * only while everything you sent before it is unchanged on later
-   * requests." It does not name Claude Fable 5 (legacy, also
+   * (2026-10-07): that doc names Claude Fable 5.1, Claude Opus 5.5, Claude
+   * Sonnet 5.5, and Claude Haiku 5.5, and accepts `block_binding` only with
+   * adaptive thinking. It does not name Claude Fable 5 (legacy, also
    * `adaptive-always-on`), so this is an explicit per-model flag rather than
-   * derived from `thinking === 'adaptive-always-on'`. Re-verify against that
-   * page before adding this flag to any other model.
+   * derived from the thinking mode. Re-verify against that page before adding
+   * this flag to any other model.
    */
   thinkingBinding?: boolean;
 };
 
 const CLAUDE_CAPABILITIES: Record<string, ClaudeCapability> = {
+  // Thinking off is `between_tools` (progress updates between tool calls);
+  // `disabled` is a provider 400. Forced tool choice is a 400.
+  'claude-sonnet-5-5': {
+    thinking: 'adaptive-default-on',
+    effortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
+    manualBudget: false,
+    stripTemperature: true,
+    disableAt: 'high',
+    offShape: 'between_tools',
+    forcedToolChoice: 'rejected',
+    defaultOnlySampling: true,
+    strictThinking: true,
+    thinkingBinding: true,
+  },
+  // Thinking off is `disabled`, only at effort high or below. Forced tool
+  // choice is accepted (the provider skips thinking for that turn).
+  'claude-haiku-5-5': {
+    thinking: 'adaptive-default-on',
+    effortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
+    manualBudget: false,
+    stripTemperature: true,
+    disableAt: 'high',
+    defaultOnlySampling: true,
+    strictThinking: true,
+    thinkingBinding: true,
+  },
   'claude-opus-5-5': {
     thinking: 'adaptive-always-on',
     effortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
     manualBudget: false,
     stripTemperature: true,
+    forcedToolChoice: 'rejected',
+    defaultOnlySampling: true,
+    strictThinking: true,
     thinkingBinding: true,
   },
   'claude-fable-5-1': {
@@ -213,6 +295,9 @@ const CLAUDE_CAPABILITIES: Record<string, ClaudeCapability> = {
     effortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
     manualBudget: false,
     stripTemperature: true,
+    forcedToolChoice: 'rejected',
+    defaultOnlySampling: true,
+    strictThinking: true,
     thinkingBinding: true,
   },
   'claude-fable-5': {
@@ -315,7 +400,7 @@ function resolveClaudeCapability(model: string): ClaudeCapability | undefined {
   );
 }
 
-type AnthropicRate = {
+type AnthropicRateCard = {
   input: number;
   output: number;
   /**
@@ -325,10 +410,31 @@ type AnthropicRate = {
   cacheReadMultiplier?: number;
 };
 
+type AnthropicRate = AnthropicRateCard & {
+  /**
+   * A second rate card for long prompts. The prompt is uncached input plus
+   * cache reads plus both cache-write TTLs (output never counts); a prompt
+   * strictly above `aboveTokens` prices every component, output included, on
+   * `card`. Anthropic does not define which tokens make up the "prompt" for
+   * this split, so the widest reading is used: it can only select the higher
+   * card, never understate cost.
+   */
+  longPrompt?: { aboveTokens: number; card: AnthropicRateCard };
+};
+
 /** Cache-read multiplier when a rate does not override it. */
 const DEFAULT_CACHE_READ_MULTIPLIER = 0.1;
 
 const ANTHROPIC_RATES: Record<string, AnthropicRate> = {
+  // Sonnet 5.5 cache reads are 0.05x ($0.10/MTok): the pricing table, its
+  // footnote, the models overview, and the prompt-caching guide agree
+  // (re-checked 2026-10-07).
+  'claude-sonnet-5-5': { input: 2e-6, output: 10e-6, cacheReadMultiplier: 0.05 },
+  'claude-haiku-5-5': {
+    input: 0.1e-6,
+    output: 0.5e-6,
+    longPrompt: { aboveTokens: 100_000, card: { input: 0.5e-6, output: 2.5e-6 } },
+  },
   'claude-opus-5-5': { input: 4e-6, output: 20e-6, cacheReadMultiplier: 0.05 },
   'claude-fable-5-1': { input: 10e-6, output: 50e-6, cacheReadMultiplier: 0.025 },
   'claude-fable-5': { input: 10e-6, output: 50e-6 },
@@ -422,10 +528,11 @@ export function estimateAnthropicCost(
   }
 
   const cacheWriteTotal = safeTokenSum(cacheWrite5m, cacheWrite1h);
-  if (
-    cacheWriteTotal === undefined ||
-    safeTokenSum(usage.inputTokens, cacheRead, cacheWriteTotal) === undefined
-  ) {
+  const promptTokens =
+    cacheWriteTotal === undefined
+      ? undefined
+      : safeTokenSum(usage.inputTokens, cacheRead, cacheWriteTotal);
+  if (cacheWriteTotal === undefined || promptTokens === undefined) {
     return undefined;
   }
   if (
@@ -436,8 +543,10 @@ export function estimateAnthropicCost(
     return undefined;
   }
 
-  const { input, output } = rate;
-  const cacheReadRate = input * (rate.cacheReadMultiplier ?? DEFAULT_CACHE_READ_MULTIPLIER);
+  const card: AnthropicRateCard =
+    rate.longPrompt && promptTokens > rate.longPrompt.aboveTokens ? rate.longPrompt.card : rate;
+  const { input, output } = card;
+  const cacheReadRate = input * (card.cacheReadMultiplier ?? DEFAULT_CACHE_READ_MULTIPLIER);
   return (
     usage.inputTokens * input +
     cacheRead * cacheReadRate +
@@ -538,7 +647,7 @@ function resolveClaudeThinking(
         };
       }
       return {
-        thinking: { type: 'disabled' },
+        thinking: { type: capability.offShape ?? 'disabled' },
         outputConfig: activeEffort ? { effort: activeEffort } : undefined,
         stripTemperature: true,
       };
@@ -1139,72 +1248,143 @@ export class AnthropicProvider implements Provider {
     };
   }
 
+  /**
+   * Whether the final body needs the binding beta header. Runs after
+   * `validateAndBindFinalBody`, which has already injected `block_binding`
+   * wherever it applies, so the header follows the final body rather than
+   * re-deriving the injection rule.
+   */
   private requiresBindingBeta(body: Record<string, unknown>): boolean {
+    const capability = resolveClaudeCapability(String(body.model));
     const thinking = body.thinking;
     return (
-      resolveClaudeCapability(String(body.model))?.thinkingBinding === true &&
-      (hasReplayedThinking(body) || (isRecord(thinking) && thinking.block_binding !== undefined))
+      capability?.thinkingBinding === true &&
+      isRecord(thinking) &&
+      thinking.type === 'adaptive' &&
+      thinking.block_binding !== undefined
     );
   }
 
+  /**
+   * Validate the final body (after `providerOptions`) against the effective
+   * model's capability, then inject `block_binding` where it applies. Every
+   * rule is gated on its own capability field and is a no-op when unset, so a
+   * model only gets the guards its provider contract calls for.
+   */
   private validateAndBindFinalBody(body: Record<string, unknown>): void {
     const model = typeof body.model === 'string' ? body.model : '';
-    if (resolveClaudeCapability(model)?.thinkingBinding !== true) return;
+    const capability = resolveClaudeCapability(model);
+    if (!capability) return;
     const reject = (option: string, remediation: string): never => {
       throw new UnsupportedModelOptionError({ provider: this.name, model, option, remediation });
     };
-    const toolChoice = body.tool_choice;
-    if (isRecord(toolChoice) && (toolChoice.type === 'any' || toolChoice.type === 'tool')) {
-      reject('forced tool choice', "Use toolChoice: 'auto' or 'none' on this model.");
+
+    if (capability.forcedToolChoice === 'rejected') {
+      const toolChoice = body.tool_choice;
+      if (isRecord(toolChoice) && (toolChoice.type === 'any' || toolChoice.type === 'tool')) {
+        reject('forced tool choice', "Use toolChoice: 'auto' or 'none' on this model.");
+      }
     }
-    if (
-      body.thinking !== undefined &&
-      (!isRecord(body.thinking) ||
-        body.thinking.type !== 'adaptive' ||
-        body.thinking.budget_tokens !== undefined)
-    ) {
-      reject(
-        'manual or disabled thinking',
-        "Use thinking: { type: 'adaptive' } and output_config.effort.",
-      );
+
+    if (capability.strictThinking) {
+      const offShape =
+        capability.thinking === 'adaptive-always-on'
+          ? undefined
+          : (capability.offShape ?? 'disabled');
+      const thinking = body.thinking;
+      const outputConfig = body.output_config;
+      const effort = isRecord(outputConfig) ? outputConfig.effort : undefined;
+      // Thinking shape first, then effort validity, then the off-shape effort
+      // ceiling, which needs a valid effort to compare.
+      if (thinking !== undefined && offShape === undefined) {
+        if (
+          !isRecord(thinking) ||
+          thinking.type !== 'adaptive' ||
+          thinking.budget_tokens !== undefined
+        ) {
+          reject(
+            'manual or disabled thinking',
+            "Use thinking: { type: 'adaptive' } and output_config.effort.",
+          );
+        }
+      } else if (thinking !== undefined) {
+        if (!isRecord(thinking) || (thinking.type !== 'adaptive' && thinking.type !== offShape)) {
+          reject(
+            'thinking.type',
+            `Use thinking: { type: 'adaptive' }, or { type: '${offShape}' } to turn thinking off.`,
+          );
+        }
+        const record = thinking as Record<string, unknown>;
+        if (record.type === 'adaptive' && record.budget_tokens !== undefined) {
+          reject('thinking.budget_tokens', 'Use output_config.effort instead of budget_tokens.');
+        }
+        if (record.type === offShape) {
+          const extra = Object.keys(record).filter((key) => key !== 'type');
+          if (extra.length > 0) {
+            reject(
+              `thinking.${offShape}.${extra[0]}`,
+              `Send thinking: { type: '${offShape}' } with no other fields.`,
+            );
+          }
+        }
+      }
+      if (
+        outputConfig !== undefined &&
+        (!isRecord(outputConfig) || (effort !== undefined && !isNativeClaudeEffort(effort)))
+      ) {
+        reject('output_config.effort', 'Use low, medium, high, xhigh, or max effort.');
+      }
+      if (
+        offShape !== undefined &&
+        isRecord(thinking) &&
+        thinking.type === offShape &&
+        effort !== undefined &&
+        capability.disableAt &&
+        !isEffortAtOrBelow(effort as Exclude<Effort, 'none'>, capability.disableAt)
+      ) {
+        reject(
+          'output_config.effort',
+          `Thinking can be turned off only at effort '${capability.disableAt}' or below; ` +
+            `lower the effort or use adaptive thinking.`,
+        );
+      }
     }
-    const outputConfig = body.output_config;
-    if (
-      outputConfig !== undefined &&
-      (!isRecord(outputConfig) ||
-        (outputConfig.effort !== undefined &&
-          !['low', 'medium', 'high', 'xhigh', 'max'].includes(String(outputConfig.effort))))
-    ) {
-      reject('output_config.effort', 'Use low, medium, high, xhigh, or max effort.');
+
+    if (capability.defaultOnlySampling) {
+      if (body.temperature !== undefined && body.temperature !== 1) {
+        reject('temperature', 'Omit temperature or use the default value 1.');
+      }
+      if (body.top_p !== undefined && body.top_p !== 0.99) {
+        reject('top_p', 'Omit top_p or use the default value 0.99.');
+      }
+      if (body.temperature !== undefined && body.top_p !== undefined) {
+        reject('temperature and top_p', 'Send at most one of temperature and top_p.');
+      }
+      if (body.top_k !== undefined) {
+        reject('top_k', 'Omit top_k on this model.');
+      }
     }
-    if (body.temperature !== undefined && body.temperature !== 1) {
-      reject('temperature', 'Omit temperature or use the default value 1.');
+
+    if (capability.thinkingBinding === true && isFinalThinkingAdaptive(capability, body)) {
+      const thinking = isRecord(body.thinking) ? body.thinking : { type: 'adaptive' };
+      const binding = thinking.block_binding;
+      // A caller binding is validated whether or not anything is replayed; it
+      // still sends the beta header (see requiresBindingBeta).
+      if (
+        binding !== undefined &&
+        (!isRecord(binding) ||
+          (binding.prefix_mismatch_behavior !== 'error' &&
+            binding.prefix_mismatch_behavior !== 'drop_block'))
+      ) {
+        reject('thinking.block_binding', "Use prefix_mismatch_behavior: 'error' or 'drop_block'.");
+      }
+      if (hasReplayedThinking(body)) {
+        body.thinking = {
+          ...thinking,
+          block_binding: binding ?? { prefix_mismatch_behavior: 'drop_block' },
+        };
+      }
     }
-    if (
-      body.top_p !== undefined &&
-      (typeof body.top_p !== 'number' || body.top_p < 0.99 || body.top_p > 1)
-    ) {
-      reject('top_p', 'Omit top_p or use a value from 0.99 to 1.');
-    }
-    if (body.top_k !== undefined) {
-      reject('top_k', 'Omit top_k on this model.');
-    }
-    const replayed = hasReplayedThinking(body);
-    if (!replayed) return;
-    const thinking = isRecord(body.thinking) ? body.thinking : { type: 'adaptive' };
-    const binding = thinking.block_binding;
-    if (
-      binding !== undefined &&
-      (!isRecord(binding) ||
-        (binding.prefix_mismatch_behavior !== 'error' &&
-          binding.prefix_mismatch_behavior !== 'drop_block'))
-    ) {
-      reject('thinking.block_binding', "Use prefix_mismatch_behavior: 'error' or 'drop_block'.");
-    }
-    body.thinking = {
-      ...thinking,
-      block_binding: binding ?? { prefix_mismatch_behavior: 'drop_block' },
-    };
   }
 
   /** Extract a human-readable message from an API error response body. */

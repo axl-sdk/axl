@@ -1,6 +1,12 @@
 import { describe, it, expect, vi } from 'vitest';
+import { z } from 'zod';
 import { AxlStream } from '../stream.js';
 import { AXL_EVENT_TYPES, type AxlEvent, type AxlEventType } from '../types.js';
+import { AxlRuntime } from '../runtime.js';
+import { workflow } from '../workflow.js';
+import { agent } from '../agent.js';
+import { tool } from '../tool.js';
+import { MockProvider } from '../../../axl-testing/src/mock-provider.js';
 
 /** Build a synthetic AxlEvent with the required base fields (executionId,
  *  step, timestamp). Test fixtures pass variant-specific fields via the
@@ -562,12 +568,6 @@ describe('AxlStream', () => {
       // outer's tokens carry one askId and the nested's tokens carry a
       // DIFFERENT askId. Both agents are reflected in the per-chunk
       // `agent` field.
-      const { AxlRuntime } = await import('../runtime.js');
-      const { workflow } = await import('../workflow.js');
-      const { agent } = await import('../agent.js');
-      const { tool } = await import('../tool.js');
-      const { z } = await import('zod');
-      const { MockProvider } = await import('../../../axl-testing/src/mock-provider.js');
 
       const subAgent = agent({
         name: 'sub_specialist',
@@ -695,11 +695,6 @@ describe('AxlStream', () => {
       // appear, (b) chunks group cleanly by askId, (c) each lane's
       // joined text equals the corresponding agent's full content with
       // no cross-contamination.
-      const { AxlRuntime } = await import('../runtime.js');
-      const { workflow } = await import('../workflow.js');
-      const { agent } = await import('../agent.js');
-      const { z } = await import('zod');
-      const { MockProvider } = await import('../../../axl-testing/src/mock-provider.js');
 
       const branchA = agent({
         name: 'branch_a',

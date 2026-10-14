@@ -99,9 +99,9 @@ AXL_TRACE_ENABLED=true AXL_TRACE_LEVEL=full node server.js
 
 ```
 [axl] execution:abc-123 | workflow:HandleSupport | started
-[axl] execution:abc-123 | step:1 agent_call_end | agent:SupportBot | model:openai-responses:gpt-5.6 | 1.2s | $0.003
+[axl] execution:abc-123 | step:1 agent_call_end | agent:SupportBot | model:openai-responses:gpt-6-sol | 1.2s | $0.003
 [axl] execution:abc-123 | step:2 tool_call_end  | tool:get_order | args:["ORD-456"] | 45ms
-[axl] execution:abc-123 | step:3 agent_call_end | agent:SupportBot | model:openai-responses:gpt-5.6 | 0.8s | $0.002
+[axl] execution:abc-123 | step:3 agent_call_end | agent:SupportBot | model:openai-responses:gpt-6-sol | 0.8s | $0.002
 [axl] execution:abc-123 | step:4 tool_call_end  | tool:refund_order | args:["ORD-456"] | 120ms
 [axl] execution:abc-123 | workflow:HandleSupport | completed | 2.4s | $0.005
 ```
@@ -404,8 +404,8 @@ The customer use case: a workflow handler that runs several `ctx.ask()` calls an
 // self-contained.
 const outlineSchema = z.object({ outline: z.array(z.string()) });
 const draftSchema = z.object({ draft: z.string() });
-const planner = agent({ model: 'openai:gpt-4o', system: 'Plan an outline.' });
-const writer = agent({ model: 'openai:gpt-4o', system: 'Write the draft.' });
+const planner = agent({ model: 'openai-responses:gpt-6-sol', system: 'Plan an outline.' });
+const writer = agent({ model: 'openai-responses:gpt-6-sol', system: 'Write the draft.' });
 
 const wf = workflow({
   name: 'multi-step',
@@ -448,7 +448,7 @@ import { z } from 'zod';
 
 const summarizer = agent({
   name: 'summarizer',
-  model: 'openai:gpt-4o',
+  model: 'openai-responses:gpt-6-sol',
   system: 'Summarize the input thoroughly.',
 });
 
@@ -1084,14 +1084,14 @@ When an agent has a `version` field, it appears in trace events and OTel span at
 
 ```typescript
 const PlanGenerator = agent({
-  model: 'anthropic:claude-sonnet-4-6',
+  model: 'anthropic:claude-sonnet-5-5',
   system: 'You are an expert fitness coach.',
   version: 'plan-v2.1',
 });
 ```
 
 ```
-[axl] step:1 agent_call_end | agent:PlanGenerator | version:plan-v2.1 | model:anthropic:claude-sonnet-4-6 | 2.1s | $0.008
+[axl] step:1 agent_call_end | agent:PlanGenerator | version:plan-v2.1 | model:anthropic:claude-sonnet-5-5 | 2.1s | $0.008
 ```
 
 This lets you correlate trace output to specific prompt versions, which is especially useful when comparing eval results.

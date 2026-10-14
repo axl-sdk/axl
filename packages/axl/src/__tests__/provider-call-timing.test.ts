@@ -6,7 +6,6 @@ import { GeminiProvider } from '../providers/gemini.js';
 import { ProviderError } from '../providers/errors.js';
 import { CallTimingRecorder, withCallTiming } from '../providers/call-timing.js';
 import type { CallTiming, Provider, StreamChunk } from '../providers/types.js';
-import { expectWindow } from './helpers.js';
 
 // ---------------------------------------------------------------------------
 // AC-3 — every built-in chat adapter reports a CallTiming block on chat() and
@@ -17,9 +16,15 @@ import { expectWindow } from './helpers.js';
 // that a swapped or shared anchor lands outside the asserted window — ordering
 // assertions alone (`ttfbMs <= wireMs`) would pass on a broken implementation.
 //
-// Real timers on purpose: the figures under test ARE `Date.now()` deltas, and
-// vitest's `shouldAdvanceTime` fake clock ticks in ~20ms steps, which would
-// quantize away the very differences these windows discriminate.
+// Fake timers on purpose, WITHOUT `shouldAdvanceTime`: the figures under test
+// ARE `Date.now()` deltas, and a real clock lets event-loop stalls under
+// parallel load push a delta outside any fixed window. `onFakeClock` freezes
+// virtual time and advances it only to the next scheduled timer
+// (`runAllTimersAsync`), so each delta is exactly the sum of the mocked delays.
+// The `shouldAdvanceTime` variant ticks in ~20ms steps and would quantize the
+// differences under test, which is why it is not used. No production path
+// exercised here arms a request or acquire timeout (`acquireTimeoutMs` is
+// unset), so running every timer cannot fire a timeout early.
 // ---------------------------------------------------------------------------
 
 const H = 60; // headers
@@ -27,17 +32,14 @@ const F = 90; // headers → first content chunk
 const B = 120; // first content chunk → final chunk
 
 /**
- * Two-sided windows, deliberately DISJOINT so the three figures cannot collapse
- * into one another. `ttfbMs`'s upper bound sits below `firstTokenMs`'s lower
- * bound, so aliasing `firstTokenMs` to `ttfbMs` — the single most likely fault —
- * fails a bound rather than sliding through an ordering check.
- *
- * Tolerance is ±40ms on a single delta and −60/+90ms on `wireMs`, which is a sum
- * of three transport gaps plus body parsing.
+ * Exact expected figures on the virtual clock. They are deliberately DISTINCT
+ * (60 / 150 / 270) so the three cannot collapse into one another: aliasing
+ * `firstTokenMs` to `ttfbMs` — the single most likely fault — fails an equality
+ * rather than sliding through an ordering check.
  */
-const TTFB_WINDOW: [number, number] = [H - 40, H + 40]; // 20..100
-const FIRST_TOKEN_WINDOW: [number, number] = [H + F - 40, H + F + 40]; // 110..190
-const WIRE_WINDOW: [number, number] = [H + F + B - 60, H + F + B + 90]; // 210..360
+const TTFB = H; // 60
+const FIRST_TOKEN = H + F; // 150
+const WIRE_TOTAL = H + F + B; // 270
 
 const originalFetch = globalThis.fetch;
 afterEach(() => {
@@ -48,9 +50,10 @@ afterEach(() => {
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /**
- * Run `call` on a fake clock with jitter pinned to 1.0, so a retry's backoff
- * (at least 1 s: a hint only ever lengthens it) costs no real time and every
- * figure is exact.
+ * Run `call` on a fake clock with jitter pinned to 0.5, so every mocked delay
+ * and any retry backoff (at least 1 s: a hint only ever lengthens it) costs no
+ * real time and every figure is exact. Timers fire in order, each advancing the
+ * virtual clock only to its own deadline.
  */
 async function onFakeClock<T>(call: () => Promise<T>): Promise<T> {
   vi.useFakeTimers();
@@ -207,17 +210,17 @@ for (const c of CASES) {
   describe(`CallTiming — ${c.name}`, () => {
     it('chat() anchors ttfbMs at headers and wireMs at the parsed body', async () => {
       mockChatFetch(c.chatJson);
-      const res = await c.make().chat(messages, { model: c.model });
+      const res = await onFakeClock(() => c.make().chat(messages, { model: c.model }));
 
       const t = res.timing;
       expect(t, 'chat() returned no timing block').toBeDefined();
       expect(t!.queuedMs).toBe(0);
       expect(t!.attempts).toBe(1);
       expect(t!.retryMs).toBe(0);
-      expectWindow(t!.ttfbMs, TTFB_WINDOW, 'ttfbMs');
-      expectWindow(t!.wireMs, WIRE_WINDOW, 'wireMs');
+      expect(t!.ttfbMs, 'ttfbMs').toBe(TTFB);
+      expect(t!.wireMs, 'wireMs').toBe(WIRE_TOTAL);
       // An implementation that stops the clock at headers sets wireMs = ttfbMs.
-      expect(t!.wireMs - t!.ttfbMs).toBeGreaterThan(100);
+      expect(t!.wireMs - t!.ttfbMs).toBe(F + B);
       // chat() has no content deltas to time — absent, not zero.
       expect('firstTokenMs' in t!).toBe(false);
       expectValueDomain(t!);
@@ -228,14 +231,14 @@ for (const c of CASES) {
         { delayMs: F, text: c.sseFirst },
         { delayMs: B, text: c.sseLast },
       ]);
-      const chunks = await drain(c.make().stream(messages, { model: c.model }));
+      const chunks = await onFakeClock(() => drain(c.make().stream(messages, { model: c.model })));
 
       expect(chunks.some((ch) => ch.type === 'text_delta')).toBe(true);
       const t = doneChunk(chunks).timing;
       expect(t, 'done chunk carried no timing block').toBeDefined();
-      expectWindow(t!.ttfbMs, TTFB_WINDOW, 'ttfbMs');
-      expectWindow(t!.firstTokenMs, FIRST_TOKEN_WINDOW, 'firstTokenMs');
-      expectWindow(t!.wireMs, WIRE_WINDOW, 'wireMs');
+      expect(t!.ttfbMs, 'ttfbMs').toBe(TTFB);
+      expect(t!.firstTokenMs, 'firstTokenMs').toBe(FIRST_TOKEN);
+      expect(t!.wireMs, 'wireMs').toBe(WIRE_TOTAL);
       // The windows are disjoint, so this ordering is implied — asserted anyway
       // because it is the property a reader of a trace relies on.
       expect(t!.ttfbMs).toBeLessThan(t!.firstTokenMs!);
@@ -251,7 +254,7 @@ for (const c of CASES) {
       // `firstTokenMs` must then be ABSENT, not 0 and not aliased to ttfbMs —
       // either fallback would silently corrupt a cross-model comparison.
       mockStreamFetch([{ delayMs: F + B, text: c.sseLast }]);
-      const chunks = await drain(c.make().stream(messages, { model: c.model }));
+      const chunks = await onFakeClock(() => drain(c.make().stream(messages, { model: c.model })));
 
       expect(chunks.some((ch) => ch.type === 'text_delta' || ch.type === 'thinking_delta')).toBe(
         false,
@@ -259,8 +262,8 @@ for (const c of CASES) {
       const t = doneChunk(chunks).timing;
       expect(t, 'a content-less stream still reports timing').toBeDefined();
       expect('firstTokenMs' in t!).toBe(false);
-      expectWindow(t!.ttfbMs, TTFB_WINDOW, 'ttfbMs');
-      expectWindow(t!.wireMs, WIRE_WINDOW, 'wireMs');
+      expect(t!.ttfbMs, 'ttfbMs').toBe(TTFB);
+      expect(t!.wireMs, 'wireMs').toBe(WIRE_TOTAL);
       expectValueDomain(t!);
     });
 
@@ -298,22 +301,26 @@ for (const c of CASES) {
       }) as unknown as typeof fetch;
 
       const provider = c.make({ maxConcurrent: 1 });
-      const firstDrain = drain(provider.stream(messages, { model: c.model }));
-      await sleep(20); // let the first call take the permit
-      const secondDrain = drain(provider.stream(messages, { model: c.model }));
-      const [firstChunks, secondChunks] = await Promise.all([firstDrain, secondDrain]);
+      const [firstChunks, secondChunks] = await onFakeClock(async () => {
+        const firstDrain = drain(provider.stream(messages, { model: c.model }));
+        await sleep(20); // let the first call take the permit
+        const secondDrain = drain(provider.stream(messages, { model: c.model }));
+        return Promise.all([firstDrain, secondDrain]);
+      });
 
       const first = doneChunk(firstChunks).timing!;
       const second = doneChunk(secondChunks).timing!;
-      expectWindow(first.queuedMs, [0, 60], 'first queuedMs');
-      expectWindow(second.queuedMs, [0, BODY * 0.4], 'queuedMs behind a slow stream body');
+      expect(first.queuedMs, 'first queuedMs').toBe(0);
+      // Exactly 0: release at headers means the permit was already free when
+      // the second call arrived. Holding it to body end would give BODY + 5 - 20.
+      expect(second.queuedMs, 'queuedMs behind a slow stream body').toBe(0);
       // The slow body is not lost — it lands in the first call's wireMs, which
       // is what makes the assertion above a separation rather than an absence.
       // Positive control for the near-zero window: the governed fan-out case
       // below, and `retry.test.ts`'s AC-1 case, both show queuedMs rising to
       // hundreds of ms when the permit genuinely IS held that long. So a ~0
       // here means "excluded", not "never measured".
-      expect(first.wireMs).toBeGreaterThan(BODY * 0.7);
+      expect(first.wireMs).toBe(BODY + 5);
     });
 
     it('stream() does not charge consumer time to wireMs', async () => {
@@ -328,21 +335,24 @@ for (const c of CASES) {
       ]);
 
       const collected: StreamChunk[] = [];
-      const started = Date.now();
-      for await (const chunk of c.make().stream(messages, { model: c.model })) {
-        collected.push(chunk);
-        await sleep(SLOW);
-      }
-      const wallClock = Date.now() - started;
+      const wallClock = await onFakeClock(async () => {
+        const started = Date.now();
+        for await (const chunk of c.make().stream(messages, { model: c.model })) {
+          collected.push(chunk);
+          await sleep(SLOW);
+        }
+        return Date.now() - started;
+      });
 
       const t = doneChunk(collected).timing;
-      // Upper bound is the transport's own delays; the later chunk may well
-      // have arrived DURING the consumer's sleep, which legitimately shortens
-      // the measured read wait. What must never happen is absorbing the sleep.
-      expectWindow(t!.wireMs, [TTFB_WINDOW[0], WIRE_WINDOW[1]], 'wireMs under a slow consumer');
+      // The final chunk's B gap elapses DURING the consumer's first sleep (the
+      // stream pulls ahead), so the later read returns at once and adds no read
+      // wait: wireMs = headers + first-content wait = FIRST_TOKEN exactly. What
+      // must never happen is absorbing the consumer's sleep.
+      expect(t!.wireMs, 'wireMs under a slow consumer').toBe(FIRST_TOKEN);
       // firstTokenMs is unshifted too — it is stamped at the delta, not at the
       // consumer's next pull.
-      expectWindow(t!.firstTokenMs, FIRST_TOKEN_WINDOW, 'firstTokenMs under a slow consumer');
+      expect(t!.firstTokenMs, 'firstTokenMs under a slow consumer').toBe(FIRST_TOKEN);
       // The discriminating comparison, stated against the measured run rather
       // than a fixture formula (how many consumer sleeps elapse before the
       // done chunk is built depends on how the adapter frames its last SSE
@@ -380,18 +390,21 @@ describe('CallTiming — governed fan-out', () => {
     }) as unknown as typeof fetch;
 
     const provider = new OpenAIProvider({ apiKey: 'k', rateLimit: { maxConcurrent: 1 } });
-    const [a, b] = await Promise.all([
-      provider.chat(messages, { model: 'gpt-4o' }),
-      provider.chat(messages, { model: 'gpt-4o' }),
-    ]);
+    const [a, b] = await onFakeClock(() =>
+      Promise.all([
+        provider.chat(messages, { model: 'gpt-4o' }),
+        provider.chat(messages, { model: 'gpt-4o' }),
+      ]),
+    );
 
     const queued = [a.timing!.queuedMs, b.timing!.queuedMs].sort((x, y) => x - y);
-    expectWindow(queued[0], [0, 50], 'winner queuedMs');
-    expectWindow(queued[1], [150, 320], 'waiter queuedMs');
+    expect(queued[0], 'winner queuedMs').toBe(0);
+    // The waiter sat behind the winner's 200ms headers wait, exactly.
+    expect(queued[1], 'waiter queuedMs').toBe(200);
     // The waiter's own wire time is the fast fetch and nothing else. An
     // implementation measuring from acquire-start would land near 220 here.
     const waiter = a.timing!.queuedMs > b.timing!.queuedMs ? a.timing! : b.timing!;
-    expectWindow(waiter.wireMs, [0, 120], 'waiter wireMs');
+    expect(waiter.wireMs, 'waiter wireMs').toBe(20);
   });
 });
 
@@ -425,16 +438,18 @@ describe('CallTiming — permit lifetime', () => {
     })) as unknown as typeof fetch;
 
     const provider = new OpenAIProvider({ apiKey: 'k', rateLimit: { maxConcurrent: 1 } });
-    const [a, b] = await Promise.all([
-      provider.chat(messages, { model: 'gpt-4o' }),
-      provider.chat(messages, { model: 'gpt-4o' }),
-    ]);
+    const [a, b] = await onFakeClock(() =>
+      Promise.all([
+        provider.chat(messages, { model: 'gpt-4o' }),
+        provider.chat(messages, { model: 'gpt-4o' }),
+      ]),
+    );
 
     for (const t of [a.timing!, b.timing!]) {
-      expectWindow(t.queuedMs, [0, 100], 'queuedMs with a slow body');
+      expect(t.queuedMs, 'queuedMs with a slow body').toBe(0);
     }
     // Body time is real and is attributed to wireMs, just not to the queue.
-    expectWindow(a.timing!.wireMs, [BODY - 60, BODY + 150], 'wireMs covers the body');
+    expect(a.timing!.wireMs, 'wireMs covers the body').toBe(BODY);
   });
 
   it('does not charge a slow stream CONSUMER to the next call (A7)', async () => {
@@ -477,25 +492,27 @@ describe('CallTiming — permit lifetime', () => {
 
     const provider = new OpenAIProvider({ apiKey: 'k', rateLimit: { maxConcurrent: 1 } });
 
-    const streamed = (async () => {
-      const out: StreamChunk[] = [];
-      let first = true;
-      for await (const chunk of provider.stream(messages, { model: 'gpt-4o' })) {
-        if (first) {
-          first = false;
-          await sleep(SLOW); // dawdle right after headers
+    const [chunks, chat] = await onFakeClock(async () => {
+      const streamed = (async () => {
+        const out: StreamChunk[] = [];
+        let first = true;
+        for await (const chunk of provider.stream(messages, { model: 'gpt-4o' })) {
+          if (first) {
+            first = false;
+            await sleep(SLOW); // dawdle right after headers
+          }
+          out.push(chunk);
         }
-        out.push(chunk);
-      }
-      return out;
-    })();
-    // Started after the stream so it queues behind it.
-    await sleep(10);
-    const chatted = provider.chat(messages, { model: 'gpt-4o' });
+        return out;
+      })();
+      // Started after the stream so it queues behind it.
+      await sleep(10);
+      const chatted = provider.chat(messages, { model: 'gpt-4o' });
 
-    const [chunks, chat] = await Promise.all([streamed, chatted]);
+      return Promise.all([streamed, chatted]);
+    });
 
-    expectWindow(chat.timing!.queuedMs, [0, 150], 'queuedMs behind a slow stream consumer');
+    expect(chat.timing!.queuedMs, 'queuedMs behind a slow stream consumer').toBe(0);
     // The stream's own wireMs is likewise unmoved by its consumer.
     expect(doneChunk(chunks).timing!.wireMs).toBeLessThan(SLOW);
   });
@@ -735,7 +752,9 @@ for (const c of CASES) {
   describe(`CallTiming — error path (${c.name})`, () => {
     it('chat() attaches timing to the thrown ProviderError', async () => {
       mockErrorFetch(500);
-      const err = await caught(() => c.make().chat(messages, { model: c.model }));
+      const err = await onFakeClock(() =>
+        caught(() => c.make().chat(messages, { model: c.model })),
+      );
 
       expect(err.status).toBe(500);
       const t = err.timing;
@@ -743,10 +762,10 @@ for (const c of CASES) {
       expect(t!.attempts).toBe(1);
       expect(t!.queuedMs).toBe(0);
       expect(t!.retryMs).toBe(0);
-      expectWindow(t!.ttfbMs, TTFB_WINDOW, 'error ttfbMs');
-      expectWindow(t!.wireMs, WIRE_WINDOW, 'error wireMs');
+      expect(t!.ttfbMs, 'error ttfbMs').toBe(TTFB);
+      expect(t!.wireMs, 'error wireMs').toBe(WIRE_TOTAL);
       // A zero-filled or dispatch-anchored block would collapse these two.
-      expect(t!.wireMs - t!.ttfbMs).toBeGreaterThan(100);
+      expect(t!.wireMs - t!.ttfbMs).toBe(F + B);
       expectValueDomain(t!);
       // The rest of the typed error is untouched by the addition.
       expect(err.retryable).toBe(true);
@@ -757,12 +776,14 @@ for (const c of CASES) {
       // Headers have arrived and no body will be streamed, so the streaming
       // throw site reports chat semantics: dispatch → now.
       mockErrorFetch(500);
-      const err = await caught(() => drain(c.make().stream(messages, { model: c.model })));
+      const err = await onFakeClock(() =>
+        caught(() => drain(c.make().stream(messages, { model: c.model }))),
+      );
 
       const t = err.timing;
       expect(t, 'a failed stream carries timing too').toBeDefined();
-      expectWindow(t!.ttfbMs, TTFB_WINDOW, 'error ttfbMs (stream)');
-      expectWindow(t!.wireMs, WIRE_WINDOW, 'error wireMs (stream)');
+      expect(t!.ttfbMs, 'error ttfbMs (stream)').toBe(TTFB);
+      expect(t!.wireMs, 'error wireMs (stream)').toBe(WIRE_TOTAL);
       // Nothing streamed, so there is no first token to report.
       expect('firstTokenMs' in t!).toBe(false);
       expectValueDomain(t!);
@@ -820,8 +841,8 @@ describe('CallTiming — error path, exhausted retries', () => {
       throw new TypeError('fetch failed');
     }) as unknown as typeof fetch;
 
-    const err = await caught(() =>
-      new OpenAIProvider({ apiKey: 'k' }).chat(messages, { model: 'gpt-4o' }),
+    const err = await onFakeClock(() =>
+      caught(() => new OpenAIProvider({ apiKey: 'k' }).chat(messages, { model: 'gpt-4o' })),
     );
 
     expect(err.status).toBe(0);
@@ -852,8 +873,12 @@ describe('CallTiming — mid-stream error frame (anthropic)', () => {
       },
     ]);
 
-    const err = await caught(() =>
-      drain(new AnthropicProvider({ apiKey: 'k' }).stream(messages, { model: 'claude-sonnet-4' })),
+    const err = await onFakeClock(() =>
+      caught(() =>
+        drain(
+          new AnthropicProvider({ apiKey: 'k' }).stream(messages, { model: 'claude-sonnet-4' }),
+        ),
+      ),
     );
 
     expect(err.status).toBe(529);
@@ -861,13 +886,13 @@ describe('CallTiming — mid-stream error frame (anthropic)', () => {
     const t = err.timing;
     expect(t, 'a mid-stream error frame carries timing').toBeDefined();
     expect(t!.attempts).toBe(1);
-    expectWindow(t!.ttfbMs, TTFB_WINDOW, 'mid-stream ttfbMs');
+    expect(t!.ttfbMs, 'mid-stream ttfbMs').toBe(TTFB);
     // The discriminating figure: a delta really did arrive before the error, so
     // firstTokenMs must be present and land in its own disjoint window. A site
     // reusing `chatTiming()` here would omit it entirely, and a zero-filled
     // block would land below the window.
-    expectWindow(t!.firstTokenMs, FIRST_TOKEN_WINDOW, 'mid-stream firstTokenMs');
-    expectWindow(t!.wireMs, WIRE_WINDOW, 'mid-stream wireMs');
+    expect(t!.firstTokenMs, 'mid-stream firstTokenMs').toBe(FIRST_TOKEN);
+    expect(t!.wireMs, 'mid-stream wireMs').toBe(WIRE_TOTAL);
     expect(t!.firstTokenMs!).toBeLessThan(t!.wireMs);
     expectValueDomain(t!);
   });
@@ -885,17 +910,19 @@ describe('CallTiming — mid-stream error frame (openai-compatible)', () => {
       { delayMs: B, text: sse({ error: { message: 'upstream exploded', type: 'server_error' } }) },
     ]);
 
-    const err = await caught(() =>
-      drain(new OpenAIProvider({ apiKey: 'k' }).stream(messages, { model: 'gpt-4o' })),
+    const err = await onFakeClock(() =>
+      caught(() =>
+        drain(new OpenAIProvider({ apiKey: 'k' }).stream(messages, { model: 'gpt-4o' })),
+      ),
     );
 
     expect(err.message).toBe('upstream exploded');
     expect(err.status).toBe(0);
     const t = err.timing;
     expect(t, 'a status-0 mid-stream frame still carries timing').toBeDefined();
-    expectWindow(t!.ttfbMs, TTFB_WINDOW, 'mid-stream ttfbMs');
-    expectWindow(t!.firstTokenMs, FIRST_TOKEN_WINDOW, 'mid-stream firstTokenMs');
-    expectWindow(t!.wireMs, WIRE_WINDOW, 'mid-stream wireMs');
+    expect(t!.ttfbMs, 'mid-stream ttfbMs').toBe(TTFB);
+    expect(t!.firstTokenMs, 'mid-stream firstTokenMs').toBe(FIRST_TOKEN);
+    expect(t!.wireMs, 'mid-stream wireMs').toBe(WIRE_TOTAL);
     expectValueDomain(t!);
   });
 
@@ -906,15 +933,17 @@ describe('CallTiming — mid-stream error frame (openai-compatible)', () => {
     // carries timing.
     mockStreamFetch([{ delayMs: F, text: sse({ choices: [{ delta: { content: 'hel' } }] }) }]);
 
-    const err = await caught(() =>
-      drain(new OpenAIProvider({ apiKey: 'k' }).stream(messages, { model: 'gpt-4o' })),
+    const err = await onFakeClock(() =>
+      caught(() =>
+        drain(new OpenAIProvider({ apiKey: 'k' }).stream(messages, { model: 'gpt-4o' })),
+      ),
     );
 
     expect(err.message).toContain('stream ended before [DONE]');
     const t = err.timing;
     expect(t, 'a truncated stream still carries timing').toBeDefined();
-    expectWindow(t!.ttfbMs, TTFB_WINDOW, 'truncated ttfbMs');
-    expectWindow(t!.firstTokenMs, FIRST_TOKEN_WINDOW, 'truncated firstTokenMs');
+    expect(t!.ttfbMs, 'truncated ttfbMs').toBe(TTFB);
+    expect(t!.firstTokenMs, 'truncated firstTokenMs').toBe(FIRST_TOKEN);
     // Delivering first content is necessarily part of provider-attributable
     // stream time, including the small parse/scheduling gap after a body read.
     expect(t!.wireMs).toBeGreaterThanOrEqual(t!.firstTokenMs!);

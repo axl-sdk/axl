@@ -397,7 +397,7 @@ const transcript = await ctx.transcribe({
   language: 'en',
 });
 const review = await ctx.ask(
-  agent({ model: 'openai-responses:gpt-4o-mini' }),
+  agent({ model: 'openai-responses:gpt-6-luna' }),
   `Summarize and extract action items:\n${transcript.text}`,
 );
 ```
@@ -493,9 +493,9 @@ reuses the checked-in Studio Playground screenshot, so no upload is needed:
 pnpm --filter @axlsdk/axl build
 cd examples
 npm install
-IMAGE_MODEL=openai-responses:gpt-4o-mini npm run image-lighthouse
-IMAGE_MODEL=anthropic:claude-sonnet-4-5 npm run image-lighthouse
-IMAGE_MODEL=google:gemini-3.7-flash npm run image-lighthouse
+IMAGE_MODEL=openai-responses:gpt-5.6 npm run image-lighthouse
+IMAGE_MODEL=anthropic:claude-haiku-5-5 npm run image-lighthouse
+IMAGE_MODEL=google:gemini-3.8-flash npm run image-lighthouse
 # Representative OpenRouter transport certification path (not an allowlist):
 IMAGE_MODEL=openrouter:openai/gpt-4o-mini npm run image-lighthouse
 ```

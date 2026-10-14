@@ -97,10 +97,10 @@ const calculator = tool({
 });
 
 // 2. Define an agent — an LLM with tools and a system prompt
-//    Model format is provider:model. Reads API key from env automatically.
-//    Swap in any supported model (anthropic:claude-sonnet-4-6, google:gemini-3.1-pro-preview, …).
+//    Model format is provider:model. The API key is read from the environment.
+//    To switch providers, change the string, e.g. anthropic:claude-sonnet-5-5.
 const mathAgent = agent({
-  model: 'openai-responses:gpt-5.5',
+  model: 'openai-responses:gpt-6-sol',
   system: 'You are a math assistant. Use the calculator for all arithmetic.',
   tools: [calculator],
 });
@@ -237,8 +237,8 @@ const result = await stream.promise; // final output after stream completes
 ```typescript
 const planSchema = z.object({ outline: z.array(z.string()) });
 const draftSchema = z.object({ draft: z.string() });
-const planner = agent({ model: 'openai-responses:gpt-5.5', system: 'Plan an outline.' });
-const writer = agent({ model: 'openai-responses:gpt-5.5', system: 'Write the draft.' });
+const planner = agent({ model: 'openai-responses:gpt-6-sol', system: 'Plan an outline.' });
+const writer = agent({ model: 'openai-responses:gpt-6-sol', system: 'Write the draft.' });
 
 const wf = workflow({
   name: 'two-step',
@@ -342,10 +342,12 @@ Four native adapters, zero SDK dependencies (raw `fetch`). Set the corresponding
 | Google Gemini             | `google:`           | `GOOGLE_API_KEY` or `GEMINI_API_KEY` |
 
 ```typescript
-agent({ model: 'openai-responses:gpt-5.5', ... })
-agent({ model: 'anthropic:claude-sonnet-4-6', ... })
-agent({ model: 'google:gemini-3.1-pro-preview', ... })
+agent({ model: 'anthropic:claude-sonnet-5-5', ... })
+agent({ model: 'openai-responses:gpt-6-sol', ... })
+agent({ model: 'google:gemini-3.8-flash', ... })
 ```
+
+**Which model?** Start with a general model (`anthropic:claude-sonnet-5-5` or `openai-responses:gpt-6-sol`). Use a fast, cheap one for judges, routers, and sub-agents (`anthropic:claude-haiku-5-5`, `openai-responses:gpt-6-luna`, `google:gemini-3.8-flash`). Save the top tier for the hardest work (`anthropic:claude-opus-5-5`, `openai-responses:gpt-6-astra`). Prefer `openai-responses:` over `openai:` for GPT-6 with tools, reasoning, or structured output.
 
 Beyond the four, a generic OpenAI-compatible engine ships presets for any endpoint that speaks the OpenAI Chat Completions format — pick a model with `preset:model` and set the matching env var:
 
@@ -360,9 +362,9 @@ Presets: `openrouter`, `azure`, `xai`, `deepseek`, `mistral`, `groq`, `bedrock`,
 The `effort` parameter controls reasoning depth identically across all providers:
 
 ```typescript
-agent({ model: 'openai-responses:gpt-5.5', effort: 'high', ... })  // OpenAI reasoning effort
-agent({ model: 'anthropic:claude-opus-4-6', effort: 'high', ... }) // Anthropic adaptive thinking
-agent({ model: 'google:gemini-3.1-pro-preview', effort: 'high', ... }) // Gemini thinking level
+agent({ model: 'openai-responses:gpt-6-sol', effort: 'high', ... })    // OpenAI reasoning effort
+agent({ model: 'anthropic:claude-opus-5-5', effort: 'high', ... })     // Anthropic adaptive thinking
+agent({ model: 'google:gemini-3.8-flash', effort: 'high', ... })       // Gemini thinking level
 ```
 
 See [docs/providers.md](./docs/providers.md) for the full model list and effort mapping.

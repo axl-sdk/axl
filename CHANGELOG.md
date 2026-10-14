@@ -9,25 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Claude Sonnet 5.5 (`claude-sonnet-5-5`) and Haiku 5.5 (`claude-haiku-5-5`) support, matched by exact ID:
-  - Adaptive thinking is on by default, with all five effort levels.
-  - `effort: 'none'` turns thinking off at effort `high` or below, as `disabled` on Haiku 5.5 and `between_tools` on Sonnet 5.5. Sonnet 5.5 can still return short progress-update thinking between tool calls.
-  - Haiku 5.5 accepts forced tool choice. Sonnet 5.5 rejects it before dispatch.
-  - Both drop the portable `temperature` and reject non-default raw sampling.
-  - Replayed thinking uses the binding beta with `drop_block` under adaptive thinking. With thinking off, the beta and `block_binding` are not sent, and a prefix edit Axl did not make is surfaced as the provider's 400.
-- Standard pricing for both models:
-  - Sonnet 5.5 is $2/$10 per million tokens, with cache reads at 5% of input ($0.10).
-  - Haiku 5.5 has two rate cards: $0.10/$0.50 up to a 100,000-token prompt and $0.50/$2.50 above it, with every component of a long prompt billed on the higher card.
-  - Which tokens count toward the Haiku 5.5 split is not published, so Axl counts every prompt token and cost is never understated. See `docs/providers.md`.
+- **Claude Sonnet 5.5 and Haiku 5.5** (`claude-sonnet-5-5`, `claude-haiku-5-5`). Thinking is on by default, all five effort levels work, and cost is estimated at Standard rates. To choose between the Claude models, see the comparison table in `docs/providers.md`.
+  - `effort: 'none'` turns thinking off when the effort is `high` or below. Sonnet 5.5 can still produce short thinking between tool calls.
+  - Haiku 5.5 accepts forced tool choice (`toolChoice: 'required'` or a named tool). Sonnet 5.5, like Opus 5.5 and Fable 5.1, does not; Axl rejects it before sending the request.
+  - The portable `temperature` is dropped. Tune `effort` instead.
+  - With thinking on, a changed conversation prefix is recovered the same way as on Opus 5.5. With thinking off, Anthropic offers no recovery, so editing the system prompt or tool set mid-conversation can fail with a provider 400 on newer accounts. Keep the prefix stable while thinking is off.
+- Pricing for the new models:
+  - Sonnet 5.5: $2 input and $10 output per million tokens, with cache reads at $0.10.
+  - Haiku 5.5: $0.10 / $0.50 for prompts up to 100,000 tokens, and $0.50 / $2.50 for the whole call above that.
+  - Anthropic does not say which tokens count toward Haiku 5.5's 100,000-token limit, so Axl counts every prompt token, cached ones included. Estimates near the limit may run high, never low.
+- `docs/providers.md` has a new "Choosing a model" guide, and the docs and examples now use current models.
 
 ### Changed
 
-- Deprecation guidance: Claude Sonnet 4.5 retires on 2026-11-30, so migrate to `claude-sonnet-5-5`. Haiku workloads can move to `claude-haiku-5-5`.
+- Claude Sonnet 4.5 retires on 2026-11-30. Migrate to `claude-sonnet-5-5`. Haiku 4.5 is still available, and `claude-haiku-5-5` is its newer replacement.
 
 ### Fixed
 
-- Claude Opus 5.5 and Fable 5.1 now reject raw `providerOptions` `top_p` values other than `0.99`, and `temperature` sent together with `top_p`, before dispatch with `UnsupportedModelOptionError`. Previously Axl accepted `top_p` from 0.99 to 1 and the pair together, and the provider returned a 400.
-- On Claude Opus 5.5, Fable 5.1, Sonnet 5.5, and Haiku 5.5, a `providerOptions.thinking.block_binding` with a `prefix_mismatch_behavior` other than `'error'` or `'drop_block'` is now rejected before dispatch with `UnsupportedModelOptionError`, even when the request replays no thinking. Previously it was checked only on requests that replay thinking.
+- On Claude Opus 5.5 and Fable 5.1, Axl now rejects raw `providerOptions` sampling that the API would refuse: a `top_p` other than `0.99`, or `temperature` and `top_p` together. The error is `UnsupportedModelOptionError`, raised before the request is sent. Previously the provider returned a 400.
+- On Claude Opus 5.5, Fable 5.1, Sonnet 5.5, and Haiku 5.5, an invalid `providerOptions.thinking.block_binding.prefix_mismatch_behavior` (anything other than `'error'` or `'drop_block'`) is now rejected before sending on every request. Previously it was checked only when the request replayed thinking.
 
 ## [0.25.1] - 2026-09-26
 

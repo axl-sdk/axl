@@ -68,9 +68,7 @@ Conclusions the adapter now enforces before dispatch:
   covered only by a documentation-derived unit fixture.
 - **Pricing assumption.** The Haiku 5.5 100,000-token split counts uncached
   input, cache reads, and both cache-write TTLs. This is not invoice-verified.
-  (Sonnet 5.5 cache reads were first priced at 10% while Anthropic's pages
-  disagreed. All of them now say 5%, and the rate uses 5%.) Live calls never
-  cross 100,000 tokens. Costs here are Axl's usage-based
+  Live calls never cross 100,000 tokens. Costs here are Axl's usage-based
   estimates, not invoice audits.
 - **Reverse model switch.** Whether Haiku 5.5 can read thinking blocks produced
   by Sonnet 5.5 or Opus 5.5 is not verified live. Either way, a provider drop is

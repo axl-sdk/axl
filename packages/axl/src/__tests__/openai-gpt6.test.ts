@@ -61,7 +61,10 @@ describe('exact GPT-6 adapter boundary', () => {
         model,
         effort: 'max',
       });
-      expect(requests[0]).toMatchObject({ model, reasoning_effort: 'max' });
+      expect(requests[0]).toMatchObject({
+        model,
+        reasoning_effort: model === 'gpt-6.1-sol' ? 'xhigh' : 'max',
+      });
       expect(requests[1]).toMatchObject({ model, reasoning: { effort: 'max' } });
       expect(chat.cost).toBeGreaterThan(0);
       expect(responses.cost).toBe(chat.cost);
@@ -142,6 +145,41 @@ describe('exact GPT-6 adapter boundary', () => {
       ).rejects.toMatchObject({ option: 'reasoning effort', model: 'gpt-6.1-sol' });
     }
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('clamps 6.1 Sol portable max on Chat only and rejects raw Chat max before fetch', async () => {
+    const { requests, fetchMock } = captureFetch();
+    const chat = new OpenAIProvider({ apiKey: 'test' });
+    const responses = new OpenAIResponsesProvider({ apiKey: 'test' });
+    await chat.chat(message, { model: 'gpt-6.1-sol', effort: 'max' });
+    await responses.chat(message, { model: 'gpt-6.1-sol', effort: 'max' });
+    expect(requests[0].reasoning_effort).toBe('xhigh');
+    expect(requests[1].reasoning).toMatchObject({ effort: 'max' });
+    expect(chat.effortResolution({ model: 'gpt-6.1-sol', effort: 'max' })).toMatchObject({
+      requested: 'max',
+      effective: 'xhigh',
+      clamped: true,
+    });
+    expect(responses.effortResolution({ model: 'gpt-6.1-sol', effort: 'max' })).toBeUndefined();
+    await chat.chat(message, {
+      model: 'gpt-6-sol',
+      effort: 'max',
+      providerOptions: { model: 'gpt-6.1-sol' },
+    });
+    await chat.chat(message, {
+      model: 'gpt-6.1-sol',
+      effort: 'max',
+      providerOptions: { model: 'gpt-6-sol' },
+    });
+    expect(requests[2].reasoning_effort).toBe('xhigh');
+    expect(requests[3].reasoning_effort).toBe('max');
+    await expect(
+      chat.chat(message, {
+        model: 'gpt-6.1-sol',
+        providerOptions: { reasoning_effort: 'max' },
+      }),
+    ).rejects.toMatchObject({ option: 'reasoning effort', model: 'gpt-6.1-sol' });
+    expect(fetchMock).toHaveBeenCalledTimes(4);
   });
 
   it('6.1 Sol Chat rejects tools even with portable or raw none, while Responses sends tools', async () => {

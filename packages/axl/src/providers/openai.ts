@@ -713,17 +713,18 @@ function bothEndpoints<T>(value: T): Readonly<Record<OpenAIEndpoint, T>> {
   return { chat: value, responses: value };
 }
 
-/** GPT-6: native `max` on both endpoints; Axl owns the exact wire contract. */
+/** GPT-6 exact-model effort and tool policy for both endpoints. */
 function gpt6(
   id: string,
-  efforts: readonly ReasoningEffort[],
+  responsesEfforts: readonly ReasoningEffort[],
   chatTools: OpenAIChatToolPolicy,
+  chatEfforts: readonly ReasoningEffort[] = responsesEfforts,
 ): OpenAIModelDescriptor {
   return {
     id,
     family: 'gpt-6',
     reasoning: true,
-    efforts: bothEndpoints(efforts),
+    efforts: { chat: chatEfforts, responses: responsesEfforts },
     defaultEffort: 'medium',
     // Same policy as GPT-5.x: a portable `temperature` is dropped while
     // reasoning is active (including the active default). A raw
@@ -754,7 +755,13 @@ function gpt56(id: string): OpenAIModelDescriptor {
 const OPENAI_EXACT_MODELS: ReadonlyMap<string, OpenAIModelDescriptor> = new Map(
   [
     gpt6('gpt-6-astra', ['low', 'medium', 'high', 'xhigh', 'max'], 'never'),
-    gpt6('gpt-6.1-sol', ['low', 'medium', 'high', 'xhigh', 'max'], 'never'),
+    // Live Chat Completions rejects max; Responses accepts it (2026-10-15).
+    gpt6('gpt-6.1-sol', ['low', 'medium', 'high', 'xhigh', 'max'], 'never', [
+      'low',
+      'medium',
+      'high',
+      'xhigh',
+    ]),
     gpt6('gpt-6-sol', ['none', 'low', 'medium', 'high', 'xhigh', 'max'], 'effort-none-only'),
     gpt6('gpt-6-luna', ['none', 'low', 'medium', 'high', 'xhigh', 'max'], 'effort-none-only'),
     gpt56('gpt-5.6'),
@@ -1124,8 +1131,8 @@ export class OpenAIProvider extends OpenAICompatibleProvider {
     super({ profile: OPENAI_PROFILE, ...options });
   }
 
-  /** Report a clamped `effort` — Chat Completions caps `'max'` at `'xhigh'` and
-   *  rejects `'none'` before gpt-5.1 (clamped to `'minimal'`). */
+  /** Report a clamped `effort` — Chat caps `'max'` at `'xhigh'` on GPT-5.6 and
+   *  GPT-6.1 Sol, and maps `'none'` to the model's supported floor. */
   effortResolution(
     options: Pick<
       ChatOptions,

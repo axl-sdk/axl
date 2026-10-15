@@ -191,6 +191,37 @@ describe.skipIf(!process.env.OPENAI_API_KEY)('latest models: OpenAI live accepta
 
   afterEach(() => vi.restoreAllMocks());
 
+  it.each([
+    ['openai', 'none'],
+    ['openai', 'max'],
+    ['openai-responses', 'none'],
+    ['openai-responses', 'max'],
+  ] as const)(
+    'GPT-6.1 Sol %s accepts portable effort %s',
+    async (endpoint, effort) => {
+      const bodies: Array<Record<string, unknown>> = [];
+      const originalFetch = globalThis.fetch;
+      vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+        bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return originalFetch(input, init);
+      });
+      const provider = endpoint === 'openai' ? chat : responses;
+      const response = await provider.chat(prompt, {
+        model: 'gpt-6.1-sol',
+        maxTokens: 128,
+        effort,
+      });
+      expectMetered(response, 'static');
+      expect(bodies).toHaveLength(1);
+      const wireEffort =
+        endpoint === 'openai'
+          ? bodies[0].reasoning_effort
+          : (bodies[0].reasoning as { effort?: unknown } | undefined)?.effort;
+      expect(wireEffort).toBe(effort === 'none' ? 'low' : endpoint === 'openai' ? 'xhigh' : 'max');
+    },
+    120_000,
+  );
+
   // Owner remediation row: a portable temperature under the default (active)
   // effort must be stripped from the wire, not rejected, and the provider must
   // accept the resulting body on both endpoints.

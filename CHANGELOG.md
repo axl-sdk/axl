@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Exact `gpt-6.1-sol` support on OpenAI Responses and Chat Completions: native reasoning through `max`, a `none`→`low` clamp, pre-dispatch Chat tool and invalid-option errors, and direct Standard text cost estimates with cache and the 272K input-token boundary. Unsupported billing remains unpriced; paid live certification is pending.
+- Exact `gpt-6.1-sol` support on OpenAI Responses and Chat Completions: `none`→`low` on both endpoints, native `max` on Responses, and `max`→`xhigh` on Chat with a diagnostic. Chat tool and invalid-option combinations fail before dispatch. Direct Standard text cost estimates include cache and the 272K input-token boundary. Unsupported billing remains unpriced.
 
 ### Fixed
 

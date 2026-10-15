@@ -99,7 +99,7 @@ describe.skipIf(!process.env.OPENAI_API_KEY)('latest models: OpenAI live accepta
 
   // Paid exact-model certification. Keep this file outside the routine live
   // suite; the frontier gate runs only after an explicit spend decision.
-  it.each(['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna'])(
+  it.each(['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna'])(
     'GPT-6 Responses text and schema accept %s',
     async (model) => {
       expectMetered(await responses.chat(prompt, { model, maxTokens: 64 }), 'static');
@@ -127,7 +127,7 @@ describe.skipIf(!process.env.OPENAI_API_KEY)('latest models: OpenAI live accepta
     120_000,
   );
 
-  it.each(['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna'])(
+  it.each(['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna'])(
     'GPT-6 Responses tool continuation accepts %s',
     async (model) => {
       await toolContinuation(responses, model, 'static');
@@ -143,7 +143,21 @@ describe.skipIf(!process.env.OPENAI_API_KEY)('latest models: OpenAI live accepta
     expect(done.cost).toBeGreaterThan(0);
   }, 120_000);
 
-  it.each(['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna'])(
+  it('GPT-6.1 Sol Responses stream returns terminal usage and Standard cost', async () => {
+    const done = await collectDone(
+      responses.stream(prompt, { model: 'gpt-6.1-sol', maxTokens: 64 }),
+    );
+    expect(done.usage?.total_tokens).toBeGreaterThan(0);
+    expect(done.cost).toBeGreaterThan(0);
+  }, 120_000);
+
+  it('GPT-6.1 Sol Chat stream returns terminal usage and Standard cost', async () => {
+    const done = await collectDone(chat.stream(prompt, { model: 'gpt-6.1-sol', maxTokens: 64 }));
+    expect(done.usage?.total_tokens).toBeGreaterThan(0);
+    expect(done.cost).toBeGreaterThan(0);
+  }, 120_000);
+
+  it.each(['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna'])(
     'GPT-6 Chat text accepts %s',
     async (model) => {
       expectMetered(await chat.chat(prompt, { model, maxTokens: 64 }), 'static');
@@ -182,9 +196,11 @@ describe.skipIf(!process.env.OPENAI_API_KEY)('latest models: OpenAI live accepta
   // accept the resulting body on both endpoints.
   it.each([
     ['openai', 'gpt-6-astra'],
+    ['openai', 'gpt-6.1-sol'],
     ['openai', 'gpt-6-sol'],
     ['openai', 'gpt-6-luna'],
     ['openai-responses', 'gpt-6-astra'],
+    ['openai-responses', 'gpt-6.1-sol'],
     ['openai-responses', 'gpt-6-sol'],
     ['openai-responses', 'gpt-6-luna'],
   ] as const)(

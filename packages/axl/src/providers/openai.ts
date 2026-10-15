@@ -34,7 +34,7 @@ export const OPENAI_PRICING: PricingTable = {
   'gpt-4.1-mini': [0.4e-6, 1.6e-6, 0.25],
   'gpt-4.1-nano': [0.1e-6, 0.4e-6, 0.25],
   o3: [2e-6, 8e-6, 0.25],
-  'o3-mini': [1.1e-6, 4.4e-6, 0.25],
+  'o3-mini': [1.1e-6, 4.4e-6, 0.5],
   'o4-mini': [1.1e-6, 4.4e-6, 0.25],
   'gpt-5': [1.25e-6, 10e-6, 0.1],
   'gpt-5-mini': [0.25e-6, 2e-6, 0.1],
@@ -100,6 +100,13 @@ const DIRECT_OPENAI_CATALOG: readonly DirectOpenAIModel[] = [
     aliases: ['gpt-6-astra'],
     short: { input: 10 / M, cachedInput: 1 / M, cacheWrite: 12.5 / M, output: 50 / M },
     long: { input: 20 / M, cachedInput: 2 / M, cacheWrite: 25 / M, output: 75 / M },
+    contextBoundary: LONG_CONTEXT_BOUNDARY,
+  },
+  {
+    aliases: ['gpt-6.1-sol'],
+    // Rechecked 2026-10-15 against https://developers.openai.com/api/docs/pricing.
+    short: { input: 2 / M, cachedInput: 0.1 / M, cacheWrite: 2.5 / M, output: 10 / M },
+    long: { input: 4 / M, cachedInput: 0.2 / M, cacheWrite: 5 / M, output: 15 / M },
     contextBoundary: LONG_CONTEXT_BOUNDARY,
   },
   {
@@ -606,8 +613,8 @@ export function estimateDirectOpenAICost(
 }
 
 /**
- * Estimate OpenAI call cost from token usage. Exact match first, then
- * longest-prefix match for versioned models (e.g. `gpt-4o-2024-05-13`).
+ * Estimate OpenAI call cost from token usage using exact catalog IDs only.
+ * Explicitly listed snapshots (e.g. `gpt-4o-2024-05-13`) have their own rows.
  *
  * Returns `undefined` when the model is not in the table — callers must treat
  * that as "unknown cost", never as free (a silent `0` would break
@@ -747,6 +754,7 @@ function gpt56(id: string): OpenAIModelDescriptor {
 const OPENAI_EXACT_MODELS: ReadonlyMap<string, OpenAIModelDescriptor> = new Map(
   [
     gpt6('gpt-6-astra', ['low', 'medium', 'high', 'xhigh', 'max'], 'never'),
+    gpt6('gpt-6.1-sol', ['low', 'medium', 'high', 'xhigh', 'max'], 'never'),
     gpt6('gpt-6-sol', ['none', 'low', 'medium', 'high', 'xhigh', 'max'], 'effort-none-only'),
     gpt6('gpt-6-luna', ['none', 'low', 'medium', 'high', 'xhigh', 'max'], 'effort-none-only'),
     gpt56('gpt-5.6'),
@@ -997,13 +1005,16 @@ export function validateOpenAIFinalRequestBody(
     }
   }
   if (activeReasoning) {
+    const remediation = (key: string): string =>
+      descriptor.efforts[endpoint].includes('none')
+        ? `Remove ${key} or set reasoning effort to 'none'.`
+        : `Remove ${key}; ${model} does not support reasoning effort 'none'.`;
     const forbidden =
       endpoint === 'chat'
         ? ['temperature', 'top_p', 'top_logprobs', 'logprobs']
         : ['temperature', 'top_p', 'top_logprobs'];
     for (const key of forbidden) {
-      if (body[key] !== undefined)
-        fail(key, `Remove ${key} or set reasoning effort to 'none' on Sol or Luna.`);
+      if (body[key] !== undefined) fail(key, remediation(key));
     }
     if (
       endpoint === 'responses' &&
@@ -1012,7 +1023,7 @@ export function validateOpenAIFinalRequestBody(
     ) {
       fail(
         'message.output_text.logprobs',
-        'Remove it from include or set reasoning effort to none on Sol or Luna.',
+        remediation('message.output_text.logprobs from include'),
       );
     }
   }

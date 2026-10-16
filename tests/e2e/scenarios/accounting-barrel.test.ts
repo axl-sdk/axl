@@ -90,6 +90,8 @@ describe('H2 — cross-realm identity', () => {
     );
 
     expect(outcome.status).toBe('rejected');
+    if (outcome.status !== 'rejected')
+      throw new Error('Expected the foreign controller to be refused');
     expect(String(outcome.error)).toMatch(/INCOMPATIBLE_ADMISSION_CONTROLLER|settlement channel/i);
   });
 

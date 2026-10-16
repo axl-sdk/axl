@@ -32,7 +32,16 @@ export function createTestServer(
      */
     stateStore?: StateStore;
   },
-) {
+): Pick<
+  ReturnType<typeof createServer>,
+  | 'app'
+  | 'connMgr'
+  | 'costAggregator'
+  | 'workflowStatsAggregator'
+  | 'traceStatsAggregator'
+  | 'evalTrendsAggregator'
+  | 'aggregatorStartPromise'
+> & { runtime: AxlRuntime; provider: MockProvider } {
   // Only set `redact: true` — leave `trace.enabled` at the config default
   // so redact-on tests don't unexpectedly activate console trace output
   // and spam test logs. `runtime.isRedactEnabled()` reads the flag

@@ -378,7 +378,9 @@ describe('Smoke: Packaged Runtime Contract', () => {
     });
 
     const stdout = execSync('node run.mjs', { cwd: sandbox, encoding: 'utf-8' });
-    const report = JSON.parse(stdout.trim().split('\n').pop());
+    const reportLine = stdout.trim().split('\n').pop();
+    if (!reportLine) throw new Error('Budgeted eval produced no JSON report');
+    const report = JSON.parse(reportLine);
 
     // Measured, not declared: the provider reported $0.30 per call.
     expect(report.knownCost).toBeGreaterThan(0);

@@ -12,7 +12,7 @@ import { dataset, runEval } from '@axlsdk/eval';
 
 const cjs = createRequire(import.meta.url)('@axlsdk/axl') as typeof esm;
 const usage = { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 };
-const timing = { queuedMs: 2, retryMs: 3, wireMs: 5, attempts: 1, rateLimitRetries: 0 };
+const timing = { queuedMs: 2, retryMs: 3, ttfbMs: 1, wireMs: 5, attempts: 1, rateLimitRetries: 0 };
 const roots: string[] = [];
 
 afterEach(async () => {

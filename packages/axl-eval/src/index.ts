@@ -1,5 +1,16 @@
 export { dataset } from './dataset.js';
 export type { Dataset, DatasetConfig, DatasetItem, ExtraKeyPolicy } from './dataset.js';
+export {
+  loadModelCalls,
+  modelCallDataset,
+  recordedModelCall,
+  replayModelCall,
+} from './model-calls.js';
+export type {
+  ModelCallInput,
+  ModelCallDatasetOptions,
+  ReplayModelCallOptions,
+} from './model-calls.js';
 
 export { scorer, normalizeScorerResult } from './scorer.js';
 export type {

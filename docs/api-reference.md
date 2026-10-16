@@ -1934,7 +1934,9 @@ Storage for [captured requests](observability.md#captured-requests-opt-in), conf
 `CapturedRequestRecord` remains JSONL codec `v: 1`. Its additive fields include
 `workflow`, `agent`, `depth`, `sessionId`, `purpose`, `rejectedCallId`, optional
 dispatch/settlement timestamps and duration, response finish/identity metadata,
-and `partial` stream output on interrupted calls. New start lines mark
+and `partial` stream output on interrupted calls. Captured request messages
+retain runtime `origin`, and tool definitions retain explicit `strict` values.
+New start lines mark
 `captured.continuityCaptured: true` after a continuity-aware request snapshot;
 older v1 lines without it have unknown replay fidelity. Oversized end stubs
 retain `outcomeStatus`, usage, cost and structural finish/error/timing data while
@@ -2714,6 +2716,50 @@ timeout check.
 ---
 
 ## Evaluation Types
+
+### Captured model-call eval helpers
+
+`@axlsdk/eval` exports `loadModelCalls(source)`, `modelCallDataset(records,
+{ filter?, annotate? })`, `recordedModelCall()`, and
+`replayModelCall({ model? })`. `source` is a file path to v1 journal JSONL, v2
+record JSONL, or a JSON array, or an in-memory record array. The asynchronous
+loader returns `FoldedOperationRecord[]`, preserving both model and external
+operations. A source cannot mix v1 phase lines with v2 records. Blank JSONL
+separator lines are allowed; malformed lines report their physical line number.
+Every entry is validated, including entries passed in memory.
+
+`modelCallDataset` returns an ordinary `Dataset<ModelCallInput, TAnnotations>`
+named `model-calls`. Each input has `{ request?, ids, attributes, recorded }`;
+`recorded` is the validated `ModelCallRecord`. `filter` runs on each validated
+folded operation. An external operation that remains after filtering throws
+`AxlError('MODEL_CALL_EXPECTED')`; it is never silently dropped. `annotate`
+attaches typed ground truth for scorers.
+
+Both executor factories return an ordinary `executeWorkflow` callback accepted
+by `runEval` and core's `EvalExecuteWorkflow` type. They return `{ output }`
+with no historical cost claim. `recordedModelCall` reads a complete,
+unredacted successful response without a model call. It returns text, or parses
+JSON for a captured `json_object`/`json_schema` request. JSON parsing does not
+reconstruct the original Zod refinements or transforms. A request stub can
+still supply scorable text when its outcome has a complete response; without
+the request, its response format is unknown. Missing, redacted, omitted, or
+non-successful output throws a typed error.
+
+`replayModelCall` sends one captured request through
+`runtime.resolveProvider(...).provider`, preserving chat versus stream mode,
+message history (including reasoning continuity, agent provenance, runtime origin and ordered
+text parts), tool definitions, response format and allowlisted options. It
+refuses a missing, redacted, truncated, omitted or otherwise non-replayable
+request before dispatch. A full `provider:model` override selects a different
+model; a bare captured model is resolved with its captured provider. Custom
+registry aliases that cannot be resolved safely require an explicit override.
+Replay executes no tool calls from the response. Its output is model text or
+parsed JSON, and only the **new** call is measured as spend by `runEval`.
+A replayed stream stops at its terminal `done`; EOF before `done` raises a
+typed incomplete-stream error instead of returning partial text.
+`RunEvalOptions.signal` is checked between cases and scorers; the existing
+`executeWorkflow(input, runtime)` callback does not receive that signal, so
+it does not cancel an already dispatched replay call.
 
 Types from `@axlsdk/eval` used by `runEval()`, `runtime.eval()`, and the CLI.
 

@@ -625,6 +625,8 @@ startup pass plus a periodic sweep. See
 `foldJournal()` assembles the v1 phase lines into validated v2 model or external
 operation records; `redactModelCallRecord()` returns a redacted copy for a
 consumer boundary. See the [record contract](../../docs/api-reference.md#diagnostic-artifacts).
+Captured model requests retain tool `strict` and runtime message `origin` for
+faithful single-call replay through `@axlsdk/eval`.
 
 Compatible loaded ESM/CJS copies share accounting, admission, and capture in
 one JavaScript realm. Cross-copy work emits one warning identifying both copies;

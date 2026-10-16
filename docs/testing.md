@@ -566,6 +566,32 @@ for await (const line of opened!.lines) {
 From the CLI, `axl-eval --capture-requests --output result.json` writes the same
 records to `result.requests.jsonl`.
 
+To rescore captured model outputs, load the journal, turn its model calls into
+a dataset, then use the normal eval runner:
+
+```ts
+import { defineEval, loadModelCalls, modelCallDataset, recordedModelCall, replayModelCall, runEval, scorer } from '@axlsdk/eval';
+
+const records = await loadModelCalls('result.requests.jsonl');
+const captured = modelCallDataset(records, {
+  filter: (record) => record.kind !== 'external',
+});
+const scorers = [scorer({ name: 'nonempty', description: 'model returned content', score: (output) => String(output).length > 0 ? 1 : 0 })];
+const config = defineEval({ workflow: 'captured', dataset: captured, scorers });
+const rescored = await runEval(config, recordedModelCall(), runtime);
+const replayed = await runEval(config, replayModelCall({ model: 'openai:gpt-4o' }), runtime);
+```
+
+Recorded output is model text, or parsed JSON when the captured request asked
+for JSON; it is not an agent result or executed tool output. The recorded run
+does no generation calls, so only explicitly configured LLM judges can spend.
+Replay makes one new provider call per item and never executes returned tool
+calls. The runtime measures that new spend without carrying forward the
+historical charge. A captured request with missing or omitted data is refused
+before replay dispatch. The runner's `signal` stops cases and scorers between
+operations; its ordinary `executeWorkflow` callback does not receive the
+signal, so an in-flight replay is not cancelled by that option.
+
 Three things to know before asserting on capture in a test:
 
 - **It is off by default and requires storage.** Without `diagnostics.artifacts`

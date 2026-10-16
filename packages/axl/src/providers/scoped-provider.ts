@@ -254,7 +254,7 @@ function stubRecord(
 }
 
 /**
- * A capture-side failure reason: the error's CLASS, never its message.
+ * A capture-side failure reason from a fixed set of labels, never error data.
  *
  * The reason lands in `captured.reason` on a stub, and a stub is written
  * straight to the channel rather than through `redactCapturedRequest` — it has
@@ -262,15 +262,20 @@ function stubRecord(
  * carry content: a `DataCloneError` stringifies the value it choked on, and an
  * adapter that throws from a response getter can put model output in the
  * message, which under `trace.redact` would land in the artifact labelled
- * scrubbed. A name and an error code identify the defect and carry nothing of
- * the call.
+ * scrubbed. Custom names, codes and toStringTag values can also contain
+ * request data, and even inspecting a thrown value can throw again.
  */
 function describeCaptureFailure(error: unknown): string {
-  if (error instanceof Error) {
-    const code = (error as { code?: unknown }).code;
-    return typeof code === 'string' ? `${error.name} (${code})` : error.name;
+  try {
+    if (typeof DOMException !== 'undefined' && error instanceof DOMException) {
+      if (error.name === 'DataCloneError') return 'DataCloneError';
+      return 'DOMException';
+    }
+    if (error instanceof Error) return 'Error';
+  } catch {
+    return 'capture failure';
   }
-  return typeof error === 'string' ? 'thrown string' : Object.prototype.toString.call(error);
+  return 'capture failure';
 }
 
 class CaptureRecorder {

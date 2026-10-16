@@ -95,6 +95,8 @@ const messageSchema = z.strictObject({
   content: z.string().nullable(),
   input: z.strictObject({ parts: z.array(inputPartSchema) }).optional(),
   name: z.string().optional(),
+  agent: z.string().optional(),
+  origin: z.literal('runtime').optional(),
   tool_calls: z.array(toolCallSchema).optional(),
   tool_call_id: z.string().optional(),
   providerMetadata: jsonObjectSchema.optional(),
@@ -119,6 +121,7 @@ const requestSchema = z.strictObject({
         name: z.string(),
         description: z.string().optional(),
         parameters: jsonValueSchema,
+        strict: z.boolean().optional(),
       }),
     )
     .optional(),
@@ -313,6 +316,15 @@ const externalShape = commonSchema.extend({
   outcome: externalOutcomeSchema,
   usage: externalUsageSchema.optional(),
 });
+function messageCanReplay(message: z.infer<typeof messageSchema>): boolean {
+  if (!message.input) return message.content !== null;
+  if (message.input.parts.some((part) => part.type !== 'text')) return false;
+  const characters = message.input.parts.reduce(
+    (sum, part) => sum + (part.type === 'text' ? part.characters : 0),
+    0,
+  );
+  return characters === (message.content?.length ?? 0);
+}
 const modelBodySchema = modelShape.superRefine((record, ctx) => {
   const exact =
     !!record.request &&
@@ -321,9 +333,7 @@ const modelBodySchema = modelShape.superRefine((record, ctx) => {
     !record.captured.truncated &&
     record.captured.omitted.length === 0 &&
     !record.request.providerOptionKeys?.length &&
-    !record.request.messages.some((message) =>
-      message.input?.parts.some((part) => part.type !== 'text'),
-    );
+    record.request.messages.every(messageCanReplay);
   if (record.captured.replayable && !exact)
     ctx.addIssue({
       code: 'custom',
@@ -740,9 +750,7 @@ export function foldJournal(
       !captured.truncated &&
       captured.omitted.length === 0 &&
       !request.providerOptionKeys?.length &&
-      !request.messages.some((message) =>
-        message.input?.parts.some((part) => part.type !== 'text'),
-      );
+      request.messages.every(messageCanReplay);
     const outcome = !end
       ? { status: 'unfinished' as const }
       : status === 'ok'

@@ -322,6 +322,8 @@ export type CapturedMessage = {
   content: string | null;
   input?: { kind?: string; [key: string]: unknown };
   name?: string;
+  agent?: string;
+  origin?: 'runtime';
   /**
    * Mirror of core's `ToolCallMessage` (`packages/axl/src/types.ts`), which is
    * the shape `redactCapturedRequest` reaches into. Flattening it here would
@@ -375,7 +377,7 @@ export type RequestRecord = {
   external?: { request?: unknown; response?: unknown };
   request?: {
     messages: CapturedMessage[];
-    tools?: Array<{ name: string; description?: string; parameters: unknown }>;
+    tools?: Array<{ name: string; description?: string; parameters: unknown; strict?: boolean }>;
     responseFormat?: unknown;
     options: {
       model: string;

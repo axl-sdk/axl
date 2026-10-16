@@ -903,11 +903,15 @@ New records carry `startedAt` on dispatch and `endedAt` / `durationMs` on
 settlement. Older v1 records lack these fields; their timing is unknown. A
 completed response keeps text, thinking, tool calls, usage, cost, provider
 timing, finish reason and provider-reported response identity when available.
+The request keeps `strict` on offered tool definitions and `origin: 'runtime'`
+on messages where Axl set it; both can change the provider request on replay.
 An interrupted stream keeps observed text, thinking and tool-call deltas in
 `partial`, with `termination` distinguishing `aborted`, `stalled` and
 `consumer_closed`. A failed provider call keeps structural retry hints and
 request ID without serializing the provider error body. Capture does not change
-the original provider result or accounting.
+the original provider result or accounting. If projection fails, the stub's
+reason uses a fixed failure class label; custom error names, codes and tags
+never enter the artifact.
 
 `EvalItem.diagnostics.operations` and `ScorerDetail.diagnostics.operations`
 point at the operations each owns, so you can go from a suspicious score
@@ -947,6 +951,18 @@ metadata to retain.
 Older v1 starts without this marker cannot claim exact replayability, even if
 their omission list is empty. The marker says the projection supported this
 data; it does not claim that the provider sent any on a particular call.
+
+### From captured traffic to an eval
+
+`loadModelCalls()` turns a v1 journal artifact or v2 record file into validated
+folded operations. `modelCallDataset()` maps model records into ordinary eval
+items; mixed artifacts require an explicit filter for `kind: 'external'`.
+Use `recordedModelCall()` with `runEval()` to rescore stored model text or
+parsed JSON without new generation calls. Use `replayModelCall({ model? })` to
+send the captured request to a model again; the new call's usage and cost are
+measured separately. Replay covers one provider call and its recorded history,
+not the surrounding agent or tools. See the [eval helper contract](api-reference.md#captured-model-call-eval-helpers)
+and [testing recipe](testing.md#seeing-the-request-behind-a-score).
 
 Signals, functions, callbacks and configured provider credentials are never
 captured. Opaque `providerMetadata` comes from provider responses (or a custom

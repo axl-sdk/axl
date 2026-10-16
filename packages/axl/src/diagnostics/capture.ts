@@ -47,6 +47,10 @@ export type CapturedMessage = {
   /** Bounded descriptor for the non-text parts, when there were any. */
   input?: ModelInputDescriptor;
   name?: string;
+  /** Agent provenance carried by the provider-neutral conversation. */
+  agent?: ChatMessage['agent'];
+  /** Runtime provenance that can affect provider prompt-cache placement. */
+  origin?: ChatMessage['origin'];
   tool_calls?: ToolCallMessage[];
   tool_call_id?: string;
   /** Opaque response-derived continuity data required for later model turns. */
@@ -57,7 +61,7 @@ export type CapturedMessage = {
 export type CapturedRequest = {
   messages: CapturedMessage[];
   /** Tool definitions as the model sees them: names + JSON-Schema parameters. */
-  tools?: Array<{ name: string; description?: string; parameters: unknown }>;
+  tools?: Array<{ name: string; description?: string; parameters: unknown; strict?: boolean }>;
   responseFormat?: ResponseFormat;
   /** Allowlisted call options only. Never signals, functions or credentials. */
   options: {
@@ -319,6 +323,8 @@ function captureMessage(message: ChatMessage): CapturedMessage {
     if (descriptor) out.input = descriptor;
   }
   if (message.name !== undefined) out.name = message.name;
+  if (message.agent !== undefined) out.agent = message.agent;
+  if (message.origin !== undefined) out.origin = message.origin;
   if (message.tool_calls)
     out.tool_calls = message.tool_calls.map((call) => ({
       ...call,
@@ -342,6 +348,7 @@ function captureTools(tools: ToolDefinition[] | undefined): CapturedRequest['too
     name: tool.function.name,
     ...(tool.function.description ? { description: tool.function.description } : {}),
     parameters: structuredClone(tool.function.parameters),
+    ...(tool.function.strict !== undefined ? { strict: tool.function.strict } : {}),
   }));
 }
 

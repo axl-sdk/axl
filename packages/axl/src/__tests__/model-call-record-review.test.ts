@@ -50,9 +50,48 @@ function json<T>(value: T): T {
 }
 
 describe('review boundaries for folded model calls', () => {
+  it('treats text-part lengths as exact UTF-16 boundaries for replayability', () => {
+    const complete = start({
+      request: {
+        messages: [
+          {
+            role: 'user',
+            content: 'A😀B',
+            input: {
+              parts: [
+                { type: 'text', characters: 1 },
+                { type: 'text', characters: 2 },
+                { type: 'text', characters: 1 },
+              ],
+            },
+          },
+        ],
+        options: { model: 'm' },
+      },
+    });
+    const record = foldJournal([complete, end()])[0];
+    expect(record.captured.replayable).toBe(true);
+    const malformed = start({
+      request: {
+        messages: [
+          { role: 'user', content: 'A😀B', input: { parts: [{ type: 'text', characters: 3 }] } },
+        ],
+        options: { model: 'm' },
+      },
+    });
+    const invalid = foldJournal([malformed, end()])[0];
+    expect(invalid.captured.replayable).toBe(false);
+    expect(
+      modelCallRecordSchema.safeParse({
+        ...invalid,
+        captured: { ...invalid.captured, replayable: true },
+      }).success,
+    ).toBe(false);
+  });
+
   it('redacts the same request content in v1 and v2, including tool prose and options', () => {
     const request = {
-      messages: [{ role: 'user', content: 'PRIVATE', providerMetadata: { token: 'PRIVATE' } }],
+      messages: [{ role: 'user', content: 'PRIVATE', agent: 'writer', providerMetadata: { token: 'PRIVATE' } }],
       tools: [
         { name: 'safe_tool', description: 'PRIVATE', parameters: { description: 'PRIVATE' } },
       ],
@@ -76,6 +115,7 @@ describe('review boundaries for folded model calls', () => {
     expect(v2.kind).toBe('chat');
     if (v2.kind !== 'chat' && v2.kind !== 'stream') throw new Error('expected model call');
     expect(v2.request).toEqual(v1.request);
+    expect(v2.request?.messages[0].agent).toBe('writer');
     expect(JSON.stringify(v1.request)).not.toContain('PRIVATE');
     expect(JSON.stringify(v2.request)).not.toContain('PRIVATE');
     expect(v2.request?.tools?.[0]).toMatchObject({

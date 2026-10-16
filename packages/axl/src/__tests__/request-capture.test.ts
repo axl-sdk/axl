@@ -355,7 +355,6 @@ describe('P2 — journal fidelity at the provider boundary', () => {
     ]);
     const { tool } = await import('../tool.js');
     const inner = agent({ name: 'inner', model: 'scripted:m', maxContext: 500 });
-    let ctx!: ReturnType<typeof runtime.createContext>;
     const nested = tool({
       name: 'nested',
       description: 'nested ask',
@@ -363,7 +362,7 @@ describe('P2 — journal fidelity at the provider boundary', () => {
       handler: async () => ctx.ask(inner, 'inner'),
     } as never);
     const outer = agent({ name: 'outer', model: 'scripted:m', tools: [nested] });
-    ctx = runtime.createContext({
+    const ctx = runtime.createContext({
       sessionHistory: Array.from({ length: 20 }, (_, i) => ({
         role: (i % 2 ? 'assistant' : 'user') as 'assistant' | 'user',
         content: `history ${i} ${'x'.repeat(200)}`,
@@ -514,9 +513,17 @@ describe('P2 — journal fidelity at the provider boundary', () => {
     const sink = new CollectingSink();
     const channel = channelWith(sink);
     const messages: ChatMessage[] = [
-      { role: 'assistant', content: 'prior', providerMetadata: continuity },
+      {
+        role: 'assistant',
+        content: 'prior',
+        agent: 'writer',
+        origin: 'runtime',
+        providerMetadata: continuity,
+      },
     ];
-    const tools = [{ type: 'function' as const, function: { name: 'lookup', parameters } }];
+    const tools = [
+      { type: 'function' as const, function: { name: 'lookup', parameters, strict: false } },
+    ];
 
     await runtime.trackOutcome(() => facade.chat(messages, { model: 'm', tools }), {
       capture: channel,
@@ -534,6 +541,9 @@ describe('P2 — journal fidelity at the provider boundary', () => {
         { type: 'thinking', thinking: 'reason', signature: 'sig-original' },
       ],
     });
+    expect(start.request?.messages[0].origin).toBe('runtime');
+    expect(start.request?.messages[0].agent).toBe('writer');
+    expect(start.request?.tools?.[0].strict).toBe(false);
     expect(start.request?.tools?.[0].parameters).toMatchObject({
       properties: { city: { description: 'original' } },
     });
@@ -1412,6 +1422,100 @@ describe('capture failures never reach the run', () => {
     // so a message would land in the artifact stamped `redacted: true`.
     expect(stub.captured.reason).not.toMatch(/validate/);
     expect(stub.captured.reason).toMatch(/DataCloneError/);
+  });
+
+  it('a revoked-proxy projection error cannot escape capture or replace the model error', async () => {
+    const { proxy, revoke } = Proxy.revocable({}, {});
+    revoke();
+    const options = { model: 'm' } as ChatOptions;
+    Object.defineProperty(options, 'responseFormat', {
+      get() {
+        throw proxy;
+      },
+    });
+    const off = providerRuntime();
+    const baseline = await off.runtime.trackOutcome(() =>
+      off.runtime
+        .resolveProvider('scripted:m')
+        .provider.chat([{ role: 'user', content: 'go' }], options),
+    );
+    const on = providerRuntime();
+    const sink = new CollectingSink();
+    const channel = channelWith(sink, { redact: true });
+    const outcome = await on.runtime.trackOutcome(
+      () =>
+        on.runtime
+          .resolveProvider('scripted:m')
+          .provider.chat([{ role: 'user', content: 'go' }], options),
+      { capture: channel },
+    );
+    await channel.close();
+    expect(outcome.status).toBe('fulfilled');
+    expect(on.provider.calls).toHaveLength(1);
+    expect(outcome.accounting).toEqual(baseline.accounting);
+    expect(sink.records()[0].captured.reason).toBe(
+      'the request could not be captured: capture failure',
+    );
+
+    const original = new Error('original provider error');
+    const failing: Provider = {
+      name: 'scripted',
+      async chat() {
+        throw original;
+      },
+      async *stream() {
+        yield { type: 'done' };
+      },
+    };
+    const runtime = new AxlRuntime({ defaultProvider: 'scripted', trace: { enabled: false } });
+    runtime.registerProvider('scripted', failing);
+    const failingSink = new CollectingSink();
+    const failingChannel = channelWith(failingSink);
+    const failure = await runtime.trackOutcome(
+      () =>
+        runtime
+          .resolveProvider('scripted:m')
+          .provider.chat([{ role: 'user', content: 'go' }], options),
+      { capture: failingChannel },
+    );
+    await failingChannel.close();
+    expect(failure.status).toBe('rejected');
+    if (failure.status === 'rejected') expect(failure.error).toBe(original);
+    expect(failure.accounting.operations.total).toBe(1);
+  });
+
+  it('redacted capture stubs never serialize attacker-controlled error names, codes or tags', async () => {
+    const secret = 'SECRET_CAPTURE_PAYLOAD_42';
+    const named = new Error('ordinary message');
+    Object.defineProperties(named, {
+      name: { get: () => secret },
+      code: { get: () => secret },
+      [Symbol.toStringTag]: { get: () => secret },
+    });
+    const tagged = { [Symbol.toStringTag]: secret };
+    for (const thrown of [named, tagged]) {
+      const options = { model: 'm' } as ChatOptions;
+      Object.defineProperty(options, 'responseFormat', {
+        get() {
+          throw thrown;
+        },
+      });
+      const { runtime, provider } = providerRuntime();
+      const sink = new CollectingSink();
+      const channel = channelWith(sink, { redact: true });
+      const outcome = await runtime.trackOutcome(
+        () =>
+          runtime
+            .resolveProvider('scripted:m')
+            .provider.chat([{ role: 'user', content: 'go' }], options),
+        { capture: channel },
+      );
+      await channel.close();
+      expect(outcome.status).toBe('fulfilled');
+      expect(provider.calls).toHaveLength(1);
+      expect(sink.lines.join('\n')).not.toContain(secret);
+      expect(sink.records()[0].captured.reason).toMatch(/could not be captured/);
+    }
   });
 
   it('a mutable options getter cannot rewrite or break a later retry record', async () => {

@@ -584,6 +584,7 @@ export function redactCapturedRequestPayload<T extends CapturedRequest>(request:
     ...request,
     messages: request.messages.map((message) => {
       const { providerMetadata: _metadata, ...safeMessage } = message;
+      void _metadata;
       return {
         ...safeMessage,
         content: message.content === null ? null : REDACTED,
@@ -648,6 +649,7 @@ export function redactCapturedRequest(record: CapturedRequestRecord): CapturedRe
   }
   if (record.response) {
     const { providerMetadata: _metadata, ...safeResponse } = record.response;
+    void _metadata;
     out.response = {
       ...safeResponse,
       content: REDACTED,

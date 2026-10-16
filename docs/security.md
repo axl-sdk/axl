@@ -385,7 +385,7 @@ programmatically. See [providers.md](./providers.md#typed-provider-errors).
 and responses of a run to disk. That is exactly the material redaction exists to
 contain, so the same policy applies, twice:
 
-- **Before the write.** When `trace.redact` is on, every record passes through
+- **Before the write.** When `trace.redact` is on, every full record passes through
   `redactCapturedRequest()` before it reaches the sink. Message content, tool-call
   arguments, tool descriptions and schemas, output schemas, stop strings,
   tool choice, response content and thinking, partial stream output, error
@@ -396,6 +396,11 @@ contain, so the same policy applies, twice:
   `captured.redacted: true`.
 - **Again at delivery.** Studio re-applies redaction when streaming records out,
   because an artifact may have been written before the flag was switched on.
+
+If request or response projection fails, capture writes a bounded stub. Its
+reason uses only fixed failure labels, even when the thrown value has a custom
+name, code or `Symbol.toStringTag`; provider output and accounting continue
+independently of that diagnostic failure.
 
 For folded `v: 2` records, `redactModelCallRecord()` returns a copy. It also
 scrubs tool definitions, output schemas, optional tool choice, partial output,

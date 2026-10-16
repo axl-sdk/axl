@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   GEN_AI_CONTENT_ATTRIBUTE_MAX_BYTES,
+  GenAiStreamContent,
   genAiInferenceEnd,
   genAiInferenceStart,
 } from '../telemetry/gen-ai.js';
@@ -52,6 +53,11 @@ describe('pinned GenAI inference mapping', () => {
     });
     expect(withoutNativeLevel.attributes['gen_ai.provider.name']).toBe('gcp.gen_ai');
     expect(withoutNativeLevel.attributes).not.toHaveProperty('gen_ai.request.reasoning.level');
+    expect(
+      genAiInferenceStart({ providerId: 'xai', options, stream: false }).attributes[
+        'gen_ai.provider.name'
+      ],
+    ).toBe('x_ai');
     expect(genAiInferenceEnd({ response: { content: 'answer' } })).not.toHaveProperty(
       'gen_ai.response.time_to_first_chunk',
     );
@@ -121,6 +127,8 @@ describe('pinned GenAI inference mapping', () => {
     expect(end['gen_ai.usage.cache_read.input_tokens']).toBe(3);
     expect(end['gen_ai.usage.cache_write.input_tokens']).toBe(2);
     expect(end['gen_ai.usage.reasoning.output_tokens']).toBe(1);
+    expect(genAiInferenceEnd({ errorType: 'ProviderError' })['error.type']).toBe('ProviderError');
+    expect(genAiInferenceEnd({ errorType: 'secret prompt text' })['error.type']).toBe('error');
     expect(JSON.parse(end['gen_ai.output.messages'] as string)).toEqual([
       {
         role: 'assistant',
@@ -175,5 +183,19 @@ describe('pinned GenAI inference mapping', () => {
       response: { content: 'x'.repeat(GEN_AI_CONTENT_ATTRIBUTE_MAX_BYTES) },
     });
     expect(end).not.toHaveProperty('gen_ai.output.messages');
+    const streamed = new GenAiStreamContent();
+    streamed.observe({
+      type: 'text_delta',
+      content: '😀'.repeat(GEN_AI_CONTENT_ATTRIBUTE_MAX_BYTES / 2),
+    });
+    const partial = streamed.snapshot();
+    expect(partial.omitContent).toBe(true);
+    const streamEnd = genAiInferenceEnd({
+      response: { ...partial.response, finishReason: 'stop' },
+      omitContent: partial.omitContent,
+      captureContent: true,
+    });
+    expect(streamEnd).not.toHaveProperty('gen_ai.output.messages');
+    expect(streamEnd['gen_ai.response.finish_reasons']).toEqual(['stop']);
   });
 });

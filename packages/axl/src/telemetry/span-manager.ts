@@ -16,7 +16,10 @@ interface OTelSpan {
 
 /** Minimal interface for an OTel tracer. */
 interface OTelTracer {
-  startSpan(name: string, options: { attributes: SpanAttributes; kind?: number }): OTelSpan;
+  startSpan(
+    name: string,
+    options: { attributes: SpanAttributes; kind?: number; startTime?: number },
+  ): OTelSpan;
   startActiveSpan<T>(
     name: string,
     options: { attributes: SpanAttributes },
@@ -99,10 +102,15 @@ export class OTelSpanManager implements SpanManager {
   }
 
   /** Start a CLIENT inference span under the current OTel context. The caller ends it. */
-  startSpan(name: string, attributes: SpanAttributes, options?: { kind?: 'client' }): SpanHandle {
+  startSpan(
+    name: string,
+    attributes: SpanAttributes,
+    options?: { kind?: 'client'; startTime?: number },
+  ): SpanHandle {
     const span = this.tracer.startSpan(name, {
       attributes,
       ...(options?.kind === 'client' ? { kind: this.otelApi.SpanKind.CLIENT } : {}),
+      ...(options?.startTime !== undefined ? { startTime: options.startTime } : {}),
     });
     return this.handle(span);
   }

@@ -1069,7 +1069,11 @@ export class WorkflowContext<TInput = unknown> {
         const { provider, model } = this.providerRegistry.resolve(uri, this.config);
         let facade = this.ownScopedProviders.get(provider);
         if (!facade) {
-          facade = createScopedProvider(provider);
+          facade = createScopedProvider(provider, {
+            getSpanManager: () => this.spanManager,
+            captureContent: this.config.telemetry?.captureContent === true,
+            redact: this.config.trace?.redact === true,
+          });
           this.ownScopedProviders.set(provider, facade);
         }
         return { provider: facade, model };
@@ -1481,7 +1485,13 @@ export class WorkflowContext<TInput = unknown> {
     const settlement = this.spanManager
       ? await this.spanManager.withSpanAsync(
           'axl.tool.call',
-          { 'axl.tool.name': parsed.toolName, 'axl.agent.name': agent._name },
+          {
+            'axl.tool.name': parsed.toolName,
+            'axl.agent.name': agent._name,
+            'gen_ai.operation.name': 'execute_tool',
+            'gen_ai.tool.name': parsed.toolName,
+            'gen_ai.tool.call.id': parsed.callId,
+          },
           executeAndObserve,
         )
       : await executeAndObserve();
@@ -1622,6 +1632,8 @@ export class WorkflowContext<TInput = unknown> {
                       {
                         'axl.agent.name': agent._name,
                         'axl.agent.model': agent.resolveModel(resolveCtx),
+                        'gen_ai.operation.name': 'invoke_agent',
+                        'gen_ai.agent.name': agent._name,
                       },
                       async (span) => {
                         const r = await doCall();

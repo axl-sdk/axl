@@ -1972,8 +1972,8 @@ export class AxlRuntime extends EventEmitter {
    * It forwards everything to the adapter — custom properties and accessors,
    * class private-field methods, property writes, capability methods, ordinary
    * `instanceof` — while routing `chat`/`stream` through accounting and budget
-   * admission whenever a `trackOutcome` scope is active. Outside a scope it
-   * delegates verbatim.
+   * admission whenever a `trackOutcome` scope is active. Optional runtime
+   * telemetry also observes calls outside an accounting scope.
    *
    * Identity is stable per runtime per adapter (repeated calls return the same
    * facade), but `resolveProvider(uri).provider === registeredInstance` is now
@@ -1988,7 +1988,11 @@ export class AxlRuntime extends EventEmitter {
   private scopedProvider(raw: Provider): Provider {
     const existing = this.scopedProviders.get(raw);
     if (existing) return existing;
-    const facade = createScopedProvider(raw);
+    const facade = createScopedProvider(raw, {
+      getSpanManager: () => this.spanManager,
+      captureContent: this.config.telemetry?.captureContent === true,
+      redact: this.config.trace?.redact === true,
+    });
     this.scopedProviders.set(raw, facade);
     return facade;
   }

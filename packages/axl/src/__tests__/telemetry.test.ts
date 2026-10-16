@@ -242,6 +242,11 @@ describe('OTelSpanManager', () => {
     );
     expect(toolSpan?.parentSpanContext?.spanId).toBe(outerAsk?.spanContext().spanId);
     expect(innerAsk?.parentSpanContext?.spanId).toBe(toolSpan?.spanContext().spanId);
+    expect(outerAsk?.attributes['gen_ai.operation.name']).toBe('invoke_agent');
+    expect(outerAsk?.attributes['gen_ai.agent.name']).toBe('otel-outer');
+    expect(toolSpan?.attributes['gen_ai.operation.name']).toBe('execute_tool');
+    expect(toolSpan?.attributes['gen_ai.tool.name']).toBe('ask_otel_inner');
+    expect(toolSpan?.attributes['gen_ai.tool.call.id']).toBe('otel-tool-call');
   });
 
   it('setAttribute adds attributes after creation', async () => {

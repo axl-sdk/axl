@@ -1,5 +1,5 @@
 import type { ChatMessage, ProviderResponse, ToolCallMessage } from '../types.js';
-import type { ChatOptions } from '../providers/types.js';
+import type { ChatOptions, StreamChunk } from '../providers/types.js';
 import type { SpanAttributes } from './types.js';
 
 /**
@@ -15,6 +15,7 @@ const PROVIDER_NAMES: Readonly<Record<string, string>> = {
   'openai-responses': 'openai',
   anthropic: 'anthropic',
   google: 'gcp.gen_ai',
+  xai: 'x_ai',
   azure: 'azure.ai.openai',
   bedrock: 'aws.bedrock',
 };
@@ -103,6 +104,8 @@ export type InferenceEnd = {
   errorType?: string;
   captureContent?: boolean;
   redact?: boolean;
+  /** Content exceeded the per-attribute bound while streaming. */
+  omitContent?: boolean;
 };
 
 export function genAiInferenceEnd(input: InferenceEnd): SpanAttributes {
@@ -135,7 +138,7 @@ export function genAiInferenceEnd(input: InferenceEnd): SpanAttributes {
       ? input.errorType
       : 'error';
   }
-  if (input.captureContent && !input.redact && response) {
+  if (input.captureContent && !input.redact && !input.omitContent && response) {
     const parts: Array<Record<string, unknown>> = [];
     if (response.content) parts.push({ type: 'text', content: response.content });
     if (response.thinking_content)
@@ -145,6 +148,68 @@ export function genAiInferenceEnd(input: InferenceEnd): SpanAttributes {
       setJsonContent(attributes, 'gen_ai.output.messages', [{ role: 'assistant', parts }]);
   }
   return attributes;
+}
+
+/** Bounded projection of streamed output for the optional content attribute. */
+export class GenAiStreamContent {
+  private text = '';
+  private reasoning = '';
+  private readonly calls = new Map<string, { id: string; name: string; arguments: string }>();
+  private size = 0;
+  private overflow = false;
+
+  observe(chunk: StreamChunk): void {
+    if (this.overflow || chunk.type === 'done') return;
+    if (chunk.type === 'text_delta') {
+      if (this.reserve(chunk.content)) this.text += chunk.content;
+    } else if (chunk.type === 'thinking_delta') {
+      if (this.reserve(chunk.content)) this.reasoning += chunk.content;
+    } else if (chunk.type === 'tool_call_delta') {
+      if (!this.reserve(chunk.id + (chunk.name ?? '') + (chunk.arguments ?? ''))) return;
+      const call = this.calls.get(chunk.id) ?? { id: chunk.id, name: '', arguments: '' };
+      if (chunk.name) call.name = chunk.name;
+      if (chunk.arguments) call.arguments += chunk.arguments;
+      this.calls.set(chunk.id, call);
+    }
+  }
+
+  snapshot(): {
+    response: InferenceEnd['response'];
+    omitContent: boolean;
+  } {
+    return {
+      response: {
+        ...(this.text ? { content: this.text } : {}),
+        ...(this.reasoning ? { thinking_content: this.reasoning } : {}),
+        ...(this.calls.size
+          ? {
+              tool_calls: [...this.calls.values()].map((call) => ({
+                id: call.id,
+                type: 'function' as const,
+                function: { name: call.name, arguments: call.arguments },
+              })),
+            }
+          : {}),
+      },
+      omitContent: this.overflow,
+    };
+  }
+
+  private reserve(value: string): boolean {
+    const bytes =
+      value.length > GEN_AI_CONTENT_ATTRIBUTE_MAX_BYTES
+        ? GEN_AI_CONTENT_ATTRIBUTE_MAX_BYTES + 1
+        : new TextEncoder().encode(value).byteLength;
+    if (this.size + bytes > GEN_AI_CONTENT_ATTRIBUTE_MAX_BYTES) {
+      this.overflow = true;
+      this.text = '';
+      this.reasoning = '';
+      this.calls.clear();
+      return false;
+    }
+    this.size += bytes;
+    return true;
+  }
 }
 
 function toToolCallPart(call: ToolCallMessage): Record<string, unknown> {

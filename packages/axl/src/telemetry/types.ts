@@ -31,7 +31,15 @@ export interface SpanManager {
     fn: (span: SpanHandle) => Promise<T>,
   ): Promise<T>;
   /** Start a span whose lifetime is controlled by the caller (for streamed calls). Optional for legacy managers. */
-  startSpan?(name: string, attributes: SpanAttributes, options?: { kind?: 'client' }): SpanHandle;
+  startSpan?(
+    name: string,
+    attributes: SpanAttributes,
+    options?: {
+      kind?: 'client';
+      /** Epoch milliseconds at logical call initiation. */
+      startTime?: number;
+    },
+  ): SpanHandle;
   /** Add an event to the currently active span (if any). */
   addEventToActiveSpan(name: string, attributes?: SpanAttributes): void;
   /** Release manager-owned resources. External tracer providers remain application-owned. */

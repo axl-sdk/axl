@@ -18,8 +18,8 @@
  * it, and ordinary `instanceof` still holds. Exotic reflection — a custom
  * `Symbol.hasInstance`, identity-keyed maps — is not guaranteed.
  *
- * Outside an accounting scope the facade delegates verbatim: no admission
- * check, no operation, no observable difference.
+ * Outside an accounting scope the facade still delegates provider work; when
+ * runtime telemetry is enabled it also observes dispatched calls as spans.
  */
 
 import { openOperation, type AccountingUsage, type OperationHandle } from '../accounting.js';
@@ -38,6 +38,8 @@ import {
 import { redactCapturedRequest } from '../redaction.js';
 import type { CallTiming, ProviderResponse } from '../types.js';
 import { StallTimeoutError } from '../errors.js';
+import { GenAiStreamContent, genAiInferenceEnd, genAiInferenceStart } from '../telemetry/gen-ai.js';
+import type { SpanHandle, SpanManager } from '../telemetry/types.js';
 import type { ChatMessage, ChatOptions, Provider, StreamChunk } from './types.js';
 
 /** Map a provider usage block onto the accounting usage buckets. */
@@ -109,16 +111,19 @@ function composeLifecycle(
 
 function instrumentedOptions(
   options: ChatOptions,
-  handle: OperationHandle,
+  handle?: OperationHandle,
   recorder?: CaptureRecorder,
+  onDispatch?: () => void,
 ): ChatOptions {
+  if (!handle && !onDispatch) return options;
   return {
     ...options,
     requestLifecycle: composeLifecycle(options.requestLifecycle, () => {
-      handle.markDispatched();
+      handle?.markDispatched();
       recorder?.markDispatch();
+      onDispatch?.();
     }),
-    dispatchAdmission: handle.dispatchAdmission,
+    dispatchAdmission: handle?.dispatchAdmission ?? options.dispatchAdmission,
   };
 }
 
@@ -636,50 +641,212 @@ function openProviderOperation(
   return handle;
 }
 
+/** Runtime-owned telemetry settings; the manager getter sees late initialization. */
+export type ScopedProviderTelemetry = {
+  getSpanManager(): SpanManager | undefined;
+  captureContent: boolean;
+  redact: boolean;
+};
+
+type InferenceObserver = {
+  onDispatch(): void;
+  observe(chunk: StreamChunk): void;
+  end(
+    response?: Parameters<typeof genAiInferenceEnd>[0]['response'],
+    error?: unknown,
+    cause?: string,
+  ): void;
+};
+
+function inferenceErrorType(error: unknown): string {
+  if (error instanceof StallTimeoutError) return 'stalled';
+  if (error instanceof Error) {
+    const code = (error as { code?: unknown }).code;
+    if (typeof code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(code)) return code;
+    if (error.name === 'AbortError' || error.name === 'TimeoutError') return error.name;
+  }
+  return 'error';
+}
+
+function createInferenceObserver(
+  telemetry: ScopedProviderTelemetry | undefined,
+  raw: Provider,
+  messages: readonly ChatMessage[],
+  options: ChatOptions,
+  stream: boolean,
+): InferenceObserver | undefined {
+  let manager: SpanManager | undefined;
+  try {
+    manager = telemetry?.getSpanManager();
+    if (!manager?.startSpan || !telemetry) return undefined;
+  } catch {
+    return undefined;
+  }
+  const issuedAtEpochMs = Date.now();
+  const issuedAtMonotonicMs = performance.now();
+  const content =
+    telemetry.captureContent && !telemetry.redact && stream ? new GenAiStreamContent() : undefined;
+  let attempted = false;
+  let closed = false;
+  let span: SpanHandle | undefined;
+  let firstChunkMs: number | undefined;
+
+  return {
+    onDispatch(): void {
+      if (attempted || closed) return;
+      attempted = true;
+      try {
+        let reported: string | undefined;
+        // providerOptions merges after the portable effort mapping. Even an
+        // unrelated-looking key may change a provider-native reasoning field,
+        // so the reporting hook is not a truthful wire source in that case.
+        let canTrustEffort = false;
+        try {
+          canTrustEffort =
+            options.providerOptions === undefined ||
+            Object.keys(options.providerOptions).length === 0;
+        } catch {
+          // A hostile options getter cannot turn a guess into a wire claim.
+        }
+        if (canTrustEffort) {
+          try {
+            reported = raw.effortResolution?.(options)?.effective;
+          } catch {
+            /* An optional diagnostic hook cannot suppress the span. */
+          }
+        }
+        const effectiveReasoningLevel =
+          reported &&
+          ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(reported)
+            ? reported
+            : undefined;
+        const mapped = genAiInferenceStart({
+          providerId: raw.name ?? 'unknown',
+          options,
+          stream,
+          sessionId: currentCaptureTurn()?.sessionId,
+          effectiveReasoningLevel,
+          messages,
+          captureContent: telemetry.captureContent,
+          redact: telemetry.redact,
+        });
+        span = manager.startSpan!(mapped.name, mapped.attributes, {
+          kind: 'client',
+          startTime: issuedAtEpochMs,
+        });
+      } catch {
+        // Telemetry is diagnostic. Projection or a custom span manager must
+        // never alter provider dispatch, accounting, or capture.
+      }
+    },
+    observe(chunk): void {
+      if (!span || closed) return;
+      if (firstChunkMs === undefined)
+        firstChunkMs = Math.max(0, performance.now() - issuedAtMonotonicMs);
+      try {
+        content?.observe(chunk);
+      } catch {
+        // A custom chunk getter may throw. The provider's own result wins.
+      }
+    },
+    end(response, error, cause): void {
+      if (closed) return;
+      closed = true;
+      if (!span) return;
+      try {
+        const captured = content?.snapshot();
+        const failed = error !== undefined || (cause !== undefined && cause !== 'consumer_closed');
+        const attributes = genAiInferenceEnd({
+          response: { ...captured?.response, ...response },
+          firstChunkMs,
+          errorType:
+            cause === 'aborted' || cause === 'stalled'
+              ? cause
+              : error !== undefined
+                ? inferenceErrorType(error)
+                : failed
+                  ? cause
+                  : undefined,
+          captureContent: telemetry.captureContent,
+          redact: telemetry.redact,
+          omitContent: captured?.omitContent,
+        });
+        for (const [key, value] of Object.entries(attributes)) {
+          try {
+            span.setAttribute(key, value);
+          } catch {
+            /* Keep closing the span. */
+          }
+        }
+        try {
+          span.setStatus(failed ? 'error' : cause === 'consumer_closed' ? 'unset' : 'ok');
+        } catch {
+          /* Keep closing the span. */
+        }
+      } catch {
+        // Even a failed result projection must not keep a live span open.
+      } finally {
+        try {
+          span.end();
+        } catch {
+          /* Telemetry must not change the result. */
+        }
+      }
+    },
+  };
+}
+
 /**
- * Wrap `raw` in an accounting/admission facade.
+ * Wrap `raw` in an accounting/admission and optional telemetry facade.
  *
  * Prefer `runtime.resolveProvider()`, which caches one facade per raw adapter
  * per runtime so repeated resolutions keep facade identity.
  */
-export function createScopedProvider(raw: Provider): Provider {
+export function createScopedProvider(raw: Provider, telemetry?: ScopedProviderTelemetry): Provider {
   // `get` returns the SAME function object for a given property across calls so
   // that `p.chat === p.chat` and consumers can compare or unsubscribe.
   const boundCache = new Map<PropertyKey, unknown>();
 
   const chat = async (messages: ChatMessage[], options: ChatOptions): Promise<ProviderResponse> => {
     const handle = openProviderOperation(raw, 'chat', options);
-    if (!handle) return raw.chat(messages, options);
+    const inference = createInferenceObserver(telemetry, raw, messages, options, false);
     // Snapshot BEFORE dispatch. `beginCapture` reads the request by value, so a
     // caller (or the adapter) mutating `messages`/`options` afterwards cannot
     // rewrite history.
-    const recorder = beginCapture(raw, 'chat', handle.id, messages, options);
+    const recorder = handle ? beginCapture(raw, 'chat', handle.id, messages, options) : undefined;
     try {
-      const response = await handle.run(() => {
-        if (raw.reportsRequestLifecycle !== true) recorder?.markDispatch();
+      const invoke = () => {
+        if (raw.reportsRequestLifecycle !== true) {
+          recorder?.markDispatch();
+          inference?.onDispatch();
+        }
         return raw.chat(
           messages,
           instrumentedOptions(
             options,
             handle,
             raw.reportsRequestLifecycle === true ? recorder : undefined,
+            inference?.onDispatch,
           ),
         );
-      });
-      handle.settle({
+      };
+      const response = await (handle ? handle.run(invoke) : invoke());
+      handle?.settle({
         cost: response.cost,
         provenance: response.costProvenance,
         usage: toAccountingUsage(response.usage),
         timing: safeTiming(response),
       });
       recorder?.end({ response });
+      inference?.end(response);
       return response;
     } catch (error) {
       // Settlement first, then rethrow the ORIGINAL value untouched — an
       // AdmissionDeniedError raised by our own dispatch hook has already
       // retracted the operation, and `settleFailure` is a no-op after that.
-      handle.settleFailure();
+      handle?.settleFailure();
       recorder?.end({ error, termination: recorder.termination(undefined, error) });
+      inference?.end(undefined, error);
       throw error;
     }
   };
@@ -698,6 +865,7 @@ export function createScopedProvider(raw: Provider): Provider {
     let inner: AsyncGenerator<StreamChunk> | undefined;
     let handle: OperationHandle | undefined;
     let recorder: CaptureRecorder | undefined;
+    let inference: InferenceObserver | undefined;
     let started = false;
     let settled = false;
     let finished = false;
@@ -719,6 +887,17 @@ export function createScopedProvider(raw: Provider): Provider {
       const cause = recorder?.termination(termination, error);
       if (error !== undefined) recorder?.end({ error, ...(cause ? { termination: cause } : {}) });
       else recorder?.end({ ...(cause ? { termination: cause } : {}) });
+      inference?.end(
+        undefined,
+        error,
+        cause ??
+          currentCaptureTurn()?.terminationCause ??
+          (options.signal?.aborted
+            ? 'aborted'
+            : termination === 'consumer_closed'
+              ? 'consumer_closed'
+              : 'incomplete'),
+      );
     };
 
     // Deferred to the first `next()`: the admission check, the operation and
@@ -727,22 +906,26 @@ export function createScopedProvider(raw: Provider): Provider {
     const start = (): void => {
       started = true;
       handle = openProviderOperation(raw, 'stream', options);
+      inference = createInferenceObserver(telemetry, raw, messages, options, true);
       // Capture opens at the first `next()`, in the scope that actually began
       // iteration — the same rule the operation itself follows.
       if (handle) recorder = beginCapture(raw, 'stream', handle.id, messages, options);
-      const source = handle
-        ? handle.run(() => {
-            if (raw.reportsRequestLifecycle !== true) recorder?.markDispatch();
-            return raw.stream(
-              messages,
-              instrumentedOptions(
-                options,
-                handle!,
-                raw.reportsRequestLifecycle === true ? recorder : undefined,
-              ),
-            );
-          })
-        : raw.stream(messages, options);
+      const invoke = () => {
+        if (raw.reportsRequestLifecycle !== true) {
+          recorder?.markDispatch();
+          inference?.onDispatch();
+        }
+        return raw.stream(
+          messages,
+          instrumentedOptions(
+            options,
+            handle,
+            raw.reportsRequestLifecycle === true ? recorder : undefined,
+            inference?.onDispatch,
+          ),
+        );
+      };
+      const source = handle ? handle.run(invoke) : invoke();
       // An adapter may return a bare async-iterable rather than a generator, so
       // take its iterator explicitly instead of assuming `next` sits on the
       // returned object.
@@ -780,6 +963,7 @@ export function createScopedProvider(raw: Provider): Provider {
             settleUnresolved('stream ended without a done chunk');
             return result;
           }
+          inference?.observe(result.value);
           if (result.value.type === 'done') {
             handle?.settle({
               cost: result.value.cost,
@@ -791,6 +975,7 @@ export function createScopedProvider(raw: Provider): Provider {
             // The terminal chunk closes the same captured operation as the
             // earlier text, thinking and tool-call deltas.
             recorder?.endStream(result.value);
+            inference?.end(result.value);
           } else {
             recorder?.observeChunk(result.value);
           }

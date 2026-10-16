@@ -1181,7 +1181,11 @@ enables it. An explicit config value wins. `trace.redact: true` always
 suppresses these attributes and the request stop sequences.
 
 Each JSON content attribute has a 16 KiB UTF-8 limit. Axl omits the entire
-attribute when it exceeds the limit so exported JSON remains valid. Rich media
+attribute when it exceeds the limit so exported JSON remains valid, and lists
+each omitted key in the span's `axl.gen_ai.content_omitted` string array, so a
+missing attribute is never mistaken for empty content. Long system prompts,
+tool results and large tool catalogs commonly exceed the limit; use the capture
+journal when you need complete content. Rich media
 bytes, URLs and provider-file references are excluded; text parts in ordinary
 messages remain. Rich system parts are omitted when the native API rendering
 is not known.

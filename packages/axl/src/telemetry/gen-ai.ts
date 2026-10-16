@@ -9,6 +9,8 @@ import type { SpanAttributes } from './types.js';
  * Keep convention churn in this module; axl.* attributes are a separate contract.
  */
 export const GEN_AI_CONTENT_ATTRIBUTE_MAX_BYTES = 16 * 1024;
+/** Opted-in content attributes left off for size or serializability, so absence is never silent. */
+export const GEN_AI_CONTENT_OMITTED_ATTRIBUTE = 'axl.gen_ai.content_omitted';
 
 const PROVIDER_NAMES: Readonly<Record<string, string>> = {
   openai: 'openai',
@@ -71,12 +73,13 @@ export function genAiInferenceStart(input: InferenceStart): {
     attributes['gen_ai.request.reasoning.level'] = input.effectiveReasoningLevel;
   }
   if (input.captureContent && !input.redact) {
+    const omitted: string[] = [];
     if (input.messages) {
       const separateSystem = SEPARATE_SYSTEM_INSTRUCTIONS.has(input.providerId);
       const history = separateSystem
         ? input.messages.filter((message) => message.role !== 'system')
         : input.messages;
-      setJsonContent(attributes, 'gen_ai.input.messages', toGenAiInputMessages(history));
+      setJsonContent(attributes, omitted, 'gen_ai.input.messages', toGenAiInputMessages(history));
       if (separateSystem) {
         const system = input.messages.filter((message) => message.role === 'system');
         // Native adapters differ on rich system parts; publish only known text
@@ -84,6 +87,7 @@ export function genAiInferenceStart(input: InferenceStart): {
         if (system.length && system.every((message) => typeof message.content === 'string')) {
           setJsonContent(
             attributes,
+            omitted,
             'gen_ai.system_instructions',
             system.map((message) => ({ type: 'text', content: message.content })),
           );
@@ -93,6 +97,7 @@ export function genAiInferenceStart(input: InferenceStart): {
     if (options.tools?.length) {
       setJsonContent(
         attributes,
+        omitted,
         'gen_ai.tool.definitions',
         options.tools.map((tool) => ({
           type: 'function',
@@ -102,6 +107,7 @@ export function genAiInferenceStart(input: InferenceStart): {
         })),
       );
     }
+    if (omitted.length) attributes[GEN_AI_CONTENT_OMITTED_ATTRIBUTE] = omitted;
   }
   return { name: `chat ${options.model}`, attributes };
 }
@@ -159,14 +165,18 @@ export function genAiInferenceEnd(input: InferenceEnd): SpanAttributes {
       ? input.errorType
       : 'error';
   }
-  if (input.captureContent && !input.redact && !input.omitContent && response) {
+  if (input.captureContent && !input.redact && input.omitContent) {
+    attributes[GEN_AI_CONTENT_OMITTED_ATTRIBUTE] = ['gen_ai.output.messages'];
+  } else if (input.captureContent && !input.redact && response) {
     const parts: Array<Record<string, unknown>> = [];
     if (response.content) parts.push({ type: 'text', content: response.content });
     if (response.thinking_content)
       parts.push({ type: 'reasoning', content: response.thinking_content });
     if (response.tool_calls) parts.push(...response.tool_calls.map(toToolCallPart));
+    const omitted: string[] = [];
     if (parts.length)
-      setJsonContent(attributes, 'gen_ai.output.messages', [{ role: 'assistant', parts }]);
+      setJsonContent(attributes, omitted, 'gen_ai.output.messages', [{ role: 'assistant', parts }]);
+    if (omitted.length) attributes[GEN_AI_CONTENT_OMITTED_ATTRIBUTE] = omitted;
   }
   return attributes;
 }
@@ -279,15 +289,22 @@ function toGenAiInputMessages(messages: readonly ChatMessage[]): Array<Record<st
   });
 }
 
-function setJsonContent(attributes: SpanAttributes, key: string, value: unknown): void {
+function setJsonContent(
+  attributes: SpanAttributes,
+  omitted: string[],
+  key: string,
+  value: unknown,
+): void {
   try {
     const json = JSON.stringify(value);
     // Omit an oversized attribute whole: slicing the string would break JSON
     // and slicing a message could break the upstream message/part schema.
     if (json && new TextEncoder().encode(json).byteLength <= GEN_AI_CONTENT_ATTRIBUTE_MAX_BYTES) {
       attributes[key] = json;
+      return;
     }
   } catch {
     // Caller-supplied tool schemas can be cyclic. Telemetry must not fail calls.
   }
+  omitted.push(key);
 }

@@ -361,7 +361,8 @@ Without redaction, stop sequences may be exported as a native string array
 even when message capture is off, so avoid putting secrets in them.
 
 Each JSON content attribute is capped at 16 KiB; an oversized attribute is
-omitted whole, retaining valid JSON. Axl excludes rich media bytes and
+omitted whole, retaining valid JSON, and its key is listed in
+`axl.gen_ai.content_omitted`. Axl excludes rich media bytes and
 locators, raw provider continuity metadata, provider credentials, and
 `providerOptions` values from this projection. User-authored text and tool
 schemas can still contain sensitive values when capture is enabled. Span error

@@ -2035,7 +2035,7 @@ Lifecycle, retention and reclamation rules: [integration.md](integration.md#diag
 | `enabled` | `boolean?` | `false` | Enable OTel spans after `runtime.initializeTelemetry()`. `@opentelemetry/api` is an optional peer dependency |
 | `tracerProvider` | `unknown?` | Global OTel provider | Application-supplied tracer provider. Axl never flushes or shuts it down |
 | `serviceName` | `string?` | `'axl'` | Tracer name passed to `getTracer()` |
-| `captureContent` | `boolean?` | `false` | Opt in to GenAI system instructions, input/output messages, and tool-definition attributes. If omitted, `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true` enables it; any other defined value leaves it off. An explicit `true` or `false` always wins over the environment. `trace.redact: true` suppresses content regardless of this setting |
+| `captureContent` | `boolean?` | `false` | Opt in to GenAI system instructions, input/output messages, and tool-definition attributes. If omitted, `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true` enables it; any other defined value leaves it off. An explicit `true` or `false` always wins over the environment. `trace.redact: true` suppresses content regardless of this setting. Each content attribute is capped at 16 KiB and omitted whole when larger; omitted keys are listed in the span's `axl.gen_ai.content_omitted` string array |
 
 Inference spans use the optional `SpanManager.startSpan?(name, attributes,
 options?)` method, where `options` is `{ kind?: 'client'; startTime?: number }`.

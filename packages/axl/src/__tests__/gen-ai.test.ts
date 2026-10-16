@@ -273,4 +273,50 @@ describe('pinned GenAI inference mapping', () => {
     expect(streamEnd).not.toHaveProperty('gen_ai.output.messages');
     expect(streamEnd['gen_ai.response.finish_reasons']).toEqual(['stop']);
   });
+
+  it('names every opted-in content attribute it omitted for size', () => {
+    const huge = '😀'.repeat(GEN_AI_CONTENT_ATTRIBUTE_MAX_BYTES / 2);
+    const start = genAiInferenceStart({
+      providerId: 'anthropic',
+      options,
+      stream: false,
+      captureContent: true,
+      messages: [
+        { role: 'system', content: huge },
+        { role: 'user', content: huge },
+      ],
+    }).attributes;
+    expect(start['axl.gen_ai.content_omitted']).toEqual([
+      'gen_ai.input.messages',
+      'gen_ai.system_instructions',
+    ]);
+    expect(
+      genAiInferenceEnd({ captureContent: true, response: { content: huge } })[
+        'axl.gen_ai.content_omitted'
+      ],
+    ).toEqual(['gen_ai.output.messages']);
+    expect(
+      genAiInferenceEnd({ captureContent: true, omitContent: true, response: {} })[
+        'axl.gen_ai.content_omitted'
+      ],
+    ).toEqual(['gen_ai.output.messages']);
+    // Nothing was omitted: no marker. Redaction suppresses content, not "omits" it.
+    const small = genAiInferenceStart({
+      providerId: 'openai',
+      options,
+      stream: false,
+      captureContent: true,
+      messages: [{ role: 'user', content: 'hi' }],
+    }).attributes;
+    expect(small).not.toHaveProperty('axl.gen_ai.content_omitted');
+    const redacted = genAiInferenceStart({
+      providerId: 'openai',
+      options,
+      stream: false,
+      captureContent: true,
+      redact: true,
+      messages: [{ role: 'user', content: huge }],
+    }).attributes;
+    expect(redacted).not.toHaveProperty('axl.gen_ai.content_omitted');
+  });
 });

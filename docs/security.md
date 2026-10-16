@@ -354,13 +354,14 @@ OTel inference spans export structural GenAI attributes when telemetry is
 enabled. `telemetry.captureContent` defaults to `false`; when true it adds JSON
 system instructions, input/output messages and tool definitions, which can
 contain prompts, reasoning text, tool arguments, and tool results. The environment variable
-`OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true` is a fallback only;
+`OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true` (case-insensitive) is a fallback only;
 an explicit `captureContent` value wins. `trace.redact: true` suppresses these
 content attributes even after opt-in, and also suppresses stop sequences.
 Without redaction, stop sequences may be exported as a native string array
 even when message capture is off, so avoid putting secrets in them.
 
-Each JSON content attribute is capped at 16 KiB; an oversized attribute is
+Each JSON content attribute is capped by `telemetry.maxContentAttributeBytes`
+(64 KiB by default); an oversized attribute is
 omitted whole, retaining valid JSON, and its key is listed in
 `axl.gen_ai.content_omitted`. Axl excludes rich media bytes and
 locators, raw provider continuity metadata, provider credentials, and

@@ -73,6 +73,7 @@ import {
 import { NoopSpanManager } from './telemetry/noop.js';
 import { createSpanManager } from './telemetry/index.js';
 import type { SpanManager, SpanHandle } from './telemetry/types.js';
+import { resolveContentAttributeMaxBytes } from './telemetry/gen-ai.js';
 
 /**
  * Function exported from an eval module that overrides the default
@@ -793,6 +794,8 @@ export class AxlRuntime extends EventEmitter {
   /** Raw adapter → its scoped facade. Keyed weakly so a registry that drops an
    *  adapter does not pin it here. */
   private scopedProviders = new WeakMap<Provider, Provider>();
+  /** Validated at construction so a bad bound fails loudly before any call. */
+  private readonly contentAttributeMaxBytes: number;
   private transcriptionProviderRegistry: TranscriptionProviderRegistry;
   private stateStore: StateStore;
   private executions = new Map<string, ExecutionInfo>();
@@ -876,6 +879,9 @@ export class AxlRuntime extends EventEmitter {
   constructor(config?: AxlConfig) {
     super();
     this.config = resolveConfig(config ?? {});
+    this.contentAttributeMaxBytes = resolveContentAttributeMaxBytes(
+      this.config.telemetry?.maxContentAttributeBytes,
+    );
     this.providerRegistry = new ProviderRegistry();
     this.transcriptionProviderRegistry = new TranscriptionProviderRegistry();
     this.stateStore = this.createStateStore();
@@ -1991,6 +1997,7 @@ export class AxlRuntime extends EventEmitter {
     const facade = createScopedProvider(raw, {
       getSpanManager: () => this.spanManager,
       captureContent: this.config.telemetry?.captureContent === true,
+      maxContentBytes: this.contentAttributeMaxBytes,
       redact: this.config.trace?.redact === true,
     });
     this.scopedProviders.set(raw, facade);

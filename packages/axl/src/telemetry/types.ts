@@ -8,6 +8,11 @@ export type TelemetryConfig = {
   serviceName?: string;
   /** Opt in to GenAI message and tool content on spans. Defaults to false. Trace redaction wins. */
   captureContent?: boolean;
+  /**
+   * Per-attribute UTF-8 bound for opted-in content. Defaults to 64 KiB. Larger
+   * attributes are omitted whole and named in `axl.gen_ai.content_omitted`.
+   */
+  maxContentAttributeBytes?: number;
 };
 
 /** OpenTelemetry-compatible scalar and native array attribute values. */

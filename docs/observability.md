@@ -1177,15 +1177,24 @@ attributes. The projection uses Axl's provider-neutral messages;
 `providerOptions` values are not exported, so a raw override can make this
 content view incomplete. If config omits the setting, the
 `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true` environment switch
-enables it. An explicit config value wins. `trace.redact: true` always
+(case-insensitive, like other OTel boolean variables) enables it. An explicit config value wins. `trace.redact: true` always
 suppresses these attributes and the request stop sequences.
 
-Each JSON content attribute has a 16 KiB UTF-8 limit. Axl omits the entire
-attribute when it exceeds the limit so exported JSON remains valid, and lists
-each omitted key in the span's `axl.gen_ai.content_omitted` string array, so a
-missing attribute is never mistaken for empty content. Long system prompts,
-tool results and large tool catalogs commonly exceed the limit; use the capture
-journal when you need complete content. Rich media
+Each JSON content attribute has a UTF-8 limit, 64 KiB by default. Axl omits
+the entire attribute when it exceeds the limit so exported JSON remains valid,
+and lists each omitted key in the span's `axl.gen_ai.content_omitted` string
+array, so a missing attribute is never mistaken for empty content. Set
+`telemetry.maxContentAttributeBytes` to change the limit:
+
+```ts
+telemetry: { enabled: true, captureContent: true, maxContentAttributeBytes: 256 * 1024 },
+```
+
+Raise it only as far as your pipeline accepts: OTLP exporters, collectors and
+backends commonly limit export-request or attribute size, and a rejected batch
+loses every span in it, not just the large one. Long-context calls will still
+exceed any span-friendly limit; use the capture journal when you need complete
+content. Rich media
 bytes, URLs and provider-file references are excluded; text parts in ordinary
 messages remain. Rich system parts are omitted when the native API rendering
 is not known.

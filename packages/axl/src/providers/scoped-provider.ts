@@ -38,8 +38,13 @@ import {
 import { redactCapturedRequest } from '../redaction.js';
 import type { CallTiming, ProviderResponse } from '../types.js';
 import { StallTimeoutError } from '../errors.js';
-import { GenAiStreamContent, genAiInferenceEnd, genAiInferenceStart } from '../telemetry/gen-ai.js';
-import type { SpanHandle, SpanManager } from '../telemetry/types.js';
+import {
+  GEN_AI_CONTENT_OMITTED_ATTRIBUTE,
+  GenAiStreamContent,
+  genAiInferenceEnd,
+  genAiInferenceStart,
+} from '../telemetry/gen-ai.js';
+import type { SpanAttributeValue, SpanHandle, SpanManager } from '../telemetry/types.js';
 import type { ChatMessage, ChatOptions, Provider, StreamChunk } from './types.js';
 
 /** Map a provider usage block onto the accounting usage buckets. */
@@ -650,6 +655,8 @@ function openProviderOperation(
 export type ScopedProviderTelemetry = {
   getSpanManager(): SpanManager | undefined;
   captureContent: boolean;
+  /** Validated per-attribute content bound. */
+  maxContentBytes: number;
   redact: boolean;
 };
 
@@ -690,11 +697,15 @@ function createInferenceObserver(
   const issuedAtEpochMs = Date.now();
   const issuedAtMonotonicMs = performance.now();
   const content =
-    telemetry.captureContent && !telemetry.redact && stream ? new GenAiStreamContent() : undefined;
+    telemetry.captureContent && !telemetry.redact && stream
+      ? new GenAiStreamContent(telemetry.maxContentBytes)
+      : undefined;
   let attempted = false;
   let closed = false;
   let span: SpanHandle | undefined;
   let firstChunkMs: number | undefined;
+  // Start and end each report omissions; one span attribute must carry both.
+  let startOmitted: SpanAttributeValue | undefined;
 
   return {
     onDispatch(): void {
@@ -734,7 +745,9 @@ function createInferenceObserver(
           messages,
           captureContent: telemetry.captureContent,
           redact: telemetry.redact,
+          maxContentBytes: telemetry.maxContentBytes,
         });
+        startOmitted = mapped.attributes[GEN_AI_CONTENT_OMITTED_ATTRIBUTE];
         span = manager.startSpan!(mapped.name, mapped.attributes, {
           kind: 'client',
           startTime: issuedAtEpochMs,
@@ -775,7 +788,15 @@ function createInferenceObserver(
           captureContent: telemetry.captureContent,
           redact: telemetry.redact,
           omitContent: captured?.omitContent,
+          maxContentBytes: telemetry.maxContentBytes,
         });
+        const endOmitted = attributes[GEN_AI_CONTENT_OMITTED_ATTRIBUTE];
+        if (Array.isArray(startOmitted) && Array.isArray(endOmitted)) {
+          attributes[GEN_AI_CONTENT_OMITTED_ATTRIBUTE] = [
+            ...(startOmitted as string[]),
+            ...(endOmitted as string[]),
+          ];
+        }
         for (const [key, value] of Object.entries(attributes)) {
           try {
             span.setAttribute(key, value);

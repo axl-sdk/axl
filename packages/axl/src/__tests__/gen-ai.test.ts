@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  GEN_AI_CONTENT_ATTRIBUTE_MAX_BYTES,
+  DEFAULT_GEN_AI_CONTENT_ATTRIBUTE_MAX_BYTES,
   GenAiStreamContent,
   genAiInferenceEnd,
   genAiInferenceStart,
@@ -63,7 +63,10 @@ describe('pinned GenAI inference mapping', () => {
 
   it('redacts and bounds separate system-instruction JSON independently', () => {
     const messages = [
-      { role: 'system' as const, content: '😀'.repeat(GEN_AI_CONTENT_ATTRIBUTE_MAX_BYTES / 2) },
+      {
+        role: 'system' as const,
+        content: '😀'.repeat(DEFAULT_GEN_AI_CONTENT_ATTRIBUTE_MAX_BYTES / 2),
+      },
       { role: 'user' as const, content: 'question' },
     ];
     const capped = genAiInferenceStart({
@@ -237,7 +240,7 @@ describe('pinned GenAI inference mapping', () => {
     expect(end['gen_ai.response.finish_reasons']).toEqual(['stop']);
     const hugeStop = genAiInferenceStart({
       providerId: 'openai',
-      options: { ...options, stop: ['x'.repeat(GEN_AI_CONTENT_ATTRIBUTE_MAX_BYTES)] },
+      options: { ...options, stop: ['x'.repeat(DEFAULT_GEN_AI_CONTENT_ATTRIBUTE_MAX_BYTES)] },
       stream: false,
     }).attributes;
     expect(hugeStop).not.toHaveProperty('gen_ai.request.stop_sequences');
@@ -249,19 +252,21 @@ describe('pinned GenAI inference mapping', () => {
       options,
       stream: false,
       captureContent: true,
-      messages: [{ role: 'user', content: '😀'.repeat(GEN_AI_CONTENT_ATTRIBUTE_MAX_BYTES / 2) }],
+      messages: [
+        { role: 'user', content: '😀'.repeat(DEFAULT_GEN_AI_CONTENT_ATTRIBUTE_MAX_BYTES / 2) },
+      ],
     }).attributes;
     expect(start).not.toHaveProperty('gen_ai.input.messages');
     expect(JSON.parse(start['gen_ai.tool.definitions'] as string)).toHaveLength(1);
     const end = genAiInferenceEnd({
       captureContent: true,
-      response: { content: 'x'.repeat(GEN_AI_CONTENT_ATTRIBUTE_MAX_BYTES) },
+      response: { content: 'x'.repeat(DEFAULT_GEN_AI_CONTENT_ATTRIBUTE_MAX_BYTES) },
     });
     expect(end).not.toHaveProperty('gen_ai.output.messages');
     const streamed = new GenAiStreamContent();
     streamed.observe({
       type: 'text_delta',
-      content: '😀'.repeat(GEN_AI_CONTENT_ATTRIBUTE_MAX_BYTES / 2),
+      content: '😀'.repeat(DEFAULT_GEN_AI_CONTENT_ATTRIBUTE_MAX_BYTES / 2),
     });
     const partial = streamed.snapshot();
     expect(partial.omitContent).toBe(true);
@@ -274,8 +279,36 @@ describe('pinned GenAI inference mapping', () => {
     expect(streamEnd['gen_ai.response.finish_reasons']).toEqual(['stop']);
   });
 
+  it('uses a caller-supplied content bound for start, end and streamed output', () => {
+    const text = 'x'.repeat(200);
+    const start = genAiInferenceStart({
+      providerId: 'openai',
+      options: { ...options, stop: [text] },
+      stream: false,
+      captureContent: true,
+      maxContentBytes: 100,
+      messages: [{ role: 'user', content: text }],
+    }).attributes;
+    expect(start).not.toHaveProperty('gen_ai.input.messages');
+    expect(start).not.toHaveProperty('gen_ai.request.stop_sequences');
+    expect(start['axl.gen_ai.content_omitted']).toContain('gen_ai.input.messages');
+    expect(
+      genAiInferenceEnd({
+        captureContent: true,
+        maxContentBytes: 100,
+        response: { content: text },
+      }),
+    ).not.toHaveProperty('gen_ai.output.messages');
+    const streamed = new GenAiStreamContent(100);
+    streamed.observe({ type: 'text_delta', content: text });
+    expect(streamed.snapshot().omitContent).toBe(true);
+    const roomy = new GenAiStreamContent(1000);
+    roomy.observe({ type: 'text_delta', content: text });
+    expect(roomy.snapshot()).toEqual({ response: { content: text }, omitContent: false });
+  });
+
   it('names every opted-in content attribute it omitted for size', () => {
-    const huge = '😀'.repeat(GEN_AI_CONTENT_ATTRIBUTE_MAX_BYTES / 2);
+    const huge = '😀'.repeat(DEFAULT_GEN_AI_CONTENT_ATTRIBUTE_MAX_BYTES / 2);
     const start = genAiInferenceStart({
       providerId: 'anthropic',
       options,

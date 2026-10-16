@@ -8,7 +8,22 @@ import type { SpanAttributes } from './types.js';
  * dated 2026-10-14. Shapes: model/gen-ai/gen-ai-{input,output}-messages.json.
  * Keep convention churn in this module; axl.* attributes are a separate contract.
  */
-export const GEN_AI_CONTENT_ATTRIBUTE_MAX_BYTES = 16 * 1024;
+// Per-attribute UTF-8 bound for opted-in content. 64 KiB fits typical prompts,
+// tool catalogs and answers; larger spans risk exporter, collector and backend
+// size limits that drop whole batches. `telemetry.maxContentAttributeBytes`
+// overrides it (16 KiB, the first bound, dropped typical agent prompts).
+export const DEFAULT_GEN_AI_CONTENT_ATTRIBUTE_MAX_BYTES = 64 * 1024;
+
+/** Validate `telemetry.maxContentAttributeBytes`; a bad bound fails at configuration, never per call. */
+export function resolveContentAttributeMaxBytes(value: number | undefined): number {
+  if (value === undefined) return DEFAULT_GEN_AI_CONTENT_ATTRIBUTE_MAX_BYTES;
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) {
+    throw new RangeError(
+      `config.telemetry.maxContentAttributeBytes must be a positive integer; got ${String(value)}`,
+    );
+  }
+  return value;
+}
 /** Opted-in content attributes left off for size or serializability, so absence is never silent. */
 export const GEN_AI_CONTENT_OMITTED_ATTRIBUTE = 'axl.gen_ai.content_omitted';
 
@@ -40,6 +55,8 @@ export type InferenceStart = {
   messages?: readonly ChatMessage[];
   captureContent?: boolean;
   redact?: boolean;
+  /** Per-attribute UTF-8 bound. Defaults to {@link DEFAULT_GEN_AI_CONTENT_ATTRIBUTE_MAX_BYTES}. */
+  maxContentBytes?: number;
 };
 
 export function genAiInferenceStart(input: InferenceStart): {
@@ -47,6 +64,7 @@ export function genAiInferenceStart(input: InferenceStart): {
   attributes: SpanAttributes;
 } {
   const { options } = input;
+  const limit = input.maxContentBytes ?? DEFAULT_GEN_AI_CONTENT_ATTRIBUTE_MAX_BYTES;
   const attributes: SpanAttributes = {
     'gen_ai.operation.name': 'chat',
     'gen_ai.provider.name': genAiProviderName(input.providerId),
@@ -65,7 +83,7 @@ export function genAiInferenceStart(input: InferenceStart): {
   if (options.maxTokens !== undefined) attributes['gen_ai.request.max_tokens'] = options.maxTokens;
   if (!input.redact && options.stop?.length) {
     const stop = JSON.stringify(options.stop);
-    if (new TextEncoder().encode(stop).byteLength <= GEN_AI_CONTENT_ATTRIBUTE_MAX_BYTES) {
+    if (new TextEncoder().encode(stop).byteLength <= limit) {
       attributes['gen_ai.request.stop_sequences'] = [...options.stop];
     }
   }
@@ -79,7 +97,13 @@ export function genAiInferenceStart(input: InferenceStart): {
       const history = separateSystem
         ? input.messages.filter((message) => message.role !== 'system')
         : input.messages;
-      setJsonContent(attributes, omitted, 'gen_ai.input.messages', toGenAiInputMessages(history));
+      setJsonContent(
+        attributes,
+        omitted,
+        limit,
+        'gen_ai.input.messages',
+        toGenAiInputMessages(history),
+      );
       if (separateSystem) {
         const system = input.messages.filter((message) => message.role === 'system');
         // Native adapters differ on rich system parts; publish only known text
@@ -88,6 +112,7 @@ export function genAiInferenceStart(input: InferenceStart): {
           setJsonContent(
             attributes,
             omitted,
+            limit,
             'gen_ai.system_instructions',
             system.map((message) => ({ type: 'text', content: message.content })),
           );
@@ -98,6 +123,7 @@ export function genAiInferenceStart(input: InferenceStart): {
       setJsonContent(
         attributes,
         omitted,
+        limit,
         'gen_ai.tool.definitions',
         options.tools.map((tool) => ({
           type: 'function',
@@ -133,6 +159,8 @@ export type InferenceEnd = {
   redact?: boolean;
   /** Content exceeded the per-attribute bound while streaming. */
   omitContent?: boolean;
+  /** Per-attribute UTF-8 bound. Defaults to {@link DEFAULT_GEN_AI_CONTENT_ATTRIBUTE_MAX_BYTES}. */
+  maxContentBytes?: number;
 };
 
 export function genAiInferenceEnd(input: InferenceEnd): SpanAttributes {
@@ -175,7 +203,13 @@ export function genAiInferenceEnd(input: InferenceEnd): SpanAttributes {
     if (response.tool_calls) parts.push(...response.tool_calls.map(toToolCallPart));
     const omitted: string[] = [];
     if (parts.length)
-      setJsonContent(attributes, omitted, 'gen_ai.output.messages', [{ role: 'assistant', parts }]);
+      setJsonContent(
+        attributes,
+        omitted,
+        input.maxContentBytes ?? DEFAULT_GEN_AI_CONTENT_ATTRIBUTE_MAX_BYTES,
+        'gen_ai.output.messages',
+        [{ role: 'assistant', parts }],
+      );
     if (omitted.length) attributes[GEN_AI_CONTENT_OMITTED_ATTRIBUTE] = omitted;
   }
   return attributes;
@@ -188,6 +222,8 @@ export class GenAiStreamContent {
   private readonly calls = new Map<string, { id: string; name: string; arguments: string }>();
   private size = 0;
   private overflow = false;
+
+  constructor(private readonly limit = DEFAULT_GEN_AI_CONTENT_ATTRIBUTE_MAX_BYTES) {}
 
   observe(chunk: StreamChunk): void {
     if (this.overflow || chunk.type === 'done') return;
@@ -228,10 +264,8 @@ export class GenAiStreamContent {
 
   private reserve(value: string): boolean {
     const bytes =
-      value.length > GEN_AI_CONTENT_ATTRIBUTE_MAX_BYTES
-        ? GEN_AI_CONTENT_ATTRIBUTE_MAX_BYTES + 1
-        : new TextEncoder().encode(value).byteLength;
-    if (this.size + bytes > GEN_AI_CONTENT_ATTRIBUTE_MAX_BYTES) {
+      value.length > this.limit ? this.limit + 1 : new TextEncoder().encode(value).byteLength;
+    if (this.size + bytes > this.limit) {
       this.overflow = true;
       this.text = '';
       this.reasoning = '';
@@ -292,6 +326,7 @@ function toGenAiInputMessages(messages: readonly ChatMessage[]): Array<Record<st
 function setJsonContent(
   attributes: SpanAttributes,
   omitted: string[],
+  limit: number,
   key: string,
   value: unknown,
 ): void {
@@ -299,7 +334,7 @@ function setJsonContent(
     const json = JSON.stringify(value);
     // Omit an oversized attribute whole: slicing the string would break JSON
     // and slicing a message could break the upstream message/part schema.
-    if (json && new TextEncoder().encode(json).byteLength <= GEN_AI_CONTENT_ATTRIBUTE_MAX_BYTES) {
+    if (json && new TextEncoder().encode(json).byteLength <= limit) {
       attributes[key] = json;
       return;
     }

@@ -119,6 +119,7 @@ import { parseDuration, parseCost } from './config.js';
 import type { StateStore } from './state/types.js';
 import type { McpManager } from './mcp/manager.js';
 import type { SpanManager } from './telemetry/types.js';
+import { resolveContentAttributeMaxBytes } from './telemetry/gen-ai.js';
 import type { MemoryManager } from './memory/manager.js';
 import type { RememberOptions, RecallOptions, VectorResult } from './memory/types.js';
 import {
@@ -1072,6 +1073,9 @@ export class WorkflowContext<TInput = unknown> {
           facade = createScopedProvider(provider, {
             getSpanManager: () => this.spanManager,
             captureContent: this.config.telemetry?.captureContent === true,
+            maxContentBytes: resolveContentAttributeMaxBytes(
+              this.config.telemetry?.maxContentAttributeBytes,
+            ),
             redact: this.config.trace?.redact === true,
           });
           this.ownScopedProviders.set(provider, facade);

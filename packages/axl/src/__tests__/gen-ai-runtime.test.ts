@@ -41,7 +41,7 @@ describe('runtime GenAI inference spans', () => {
 
   function runtime(
     raw: Provider,
-    options?: { captureContent?: boolean; redact?: boolean },
+    options?: { captureContent?: boolean; redact?: boolean; maxContentAttributeBytes?: number },
   ): AxlRuntime {
     const result = new AxlRuntime({
       defaultProvider: raw.name,
@@ -49,6 +49,9 @@ describe('runtime GenAI inference spans', () => {
         enabled: true,
         tracerProvider: provider,
         captureContent: options?.captureContent,
+        ...(options?.maxContentAttributeBytes !== undefined
+          ? { maxContentAttributeBytes: options.maxContentAttributeBytes }
+          : {}),
       },
       trace: { redact: options?.redact },
     });
@@ -627,6 +630,57 @@ describe('runtime GenAI inference spans', () => {
     expect(outcome.status).toBe('fulfilled');
     expect(outcome.accounting.knownCost).toBe(0.25);
     if (outcome.status === 'fulfilled') expect(outcome.value.content).toBe('ok');
+  });
+
+  it('applies the default 64 KiB and a configured content bound to chat and stream spans', async () => {
+    const prompt = 'p'.repeat(32 * 1024);
+    const answer = 'a'.repeat(32 * 1024);
+    const raw: Provider = {
+      name: 'sized',
+      async chat() {
+        return { content: answer };
+      },
+      async *stream() {
+        yield { type: 'text_delta', content: answer };
+        yield { type: 'done' };
+      },
+    };
+    // 32 KiB of content fits the default but exceeded the former 16 KiB bound.
+    const roomy = runtime(raw, { captureContent: true });
+    await roomy.initializeTelemetry();
+    await roomy.resolveProvider('sized:m').provider.chat([{ role: 'user', content: prompt }], {
+      model: 'm',
+    });
+    const fits = exporter.getFinishedSpans()[0].attributes;
+    expect(fits['gen_ai.input.messages']).toBeTypeOf('string');
+    expect(fits['gen_ai.output.messages']).toBeTypeOf('string');
+    expect(fits).not.toHaveProperty('axl.gen_ai.content_omitted');
+    exporter.reset();
+
+    const tight = runtime(raw, { captureContent: true, maxContentAttributeBytes: 1024 });
+    await tight.initializeTelemetry();
+    const facade = tight.resolveProvider('sized:m').provider;
+    await facade.chat([{ role: 'user', content: prompt }], { model: 'm' });
+    const chunks = facade.stream([{ role: 'user', content: 'go' }], { model: 'm' });
+    while (!(await chunks.next()).done) {
+      // Drain to the terminal done chunk so the stream span ends.
+    }
+    const [chat, stream] = exporter.getFinishedSpans().map((span) => span.attributes);
+    expect(chat).not.toHaveProperty('gen_ai.input.messages');
+    expect(chat['axl.gen_ai.content_omitted']).toEqual([
+      'gen_ai.input.messages',
+      'gen_ai.output.messages',
+    ]);
+    expect(stream['gen_ai.input.messages']).toBeTypeOf('string');
+    expect(stream['axl.gen_ai.content_omitted']).toEqual(['gen_ai.output.messages']);
+  });
+
+  it('rejects an invalid content bound when the runtime is constructed', () => {
+    for (const invalid of [0, -1, 1.5, Number.NaN, Infinity]) {
+      expect(
+        () => new AxlRuntime({ telemetry: { enabled: true, maxContentAttributeBytes: invalid } }),
+      ).toThrow(RangeError);
+    }
   });
 
   it('keeps content and stop sequences private when trace redaction is on', async () => {

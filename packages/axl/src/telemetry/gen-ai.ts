@@ -20,6 +20,10 @@ const PROVIDER_NAMES: Readonly<Record<string, string>> = {
   bedrock: 'aws.bedrock',
 };
 
+// These native adapters send system messages in a separate top-level API field.
+// Chat Completions and its compatible profiles keep system in the message list.
+const SEPARATE_SYSTEM_INSTRUCTIONS = new Set(['anthropic', 'google', 'openai-responses']);
+
 export function genAiProviderName(providerId: string): string {
   return PROVIDER_NAMES[providerId] ?? providerId;
 }
@@ -67,8 +71,25 @@ export function genAiInferenceStart(input: InferenceStart): {
     attributes['gen_ai.request.reasoning.level'] = input.effectiveReasoningLevel;
   }
   if (input.captureContent && !input.redact) {
-    if (input.messages)
-      setJsonContent(attributes, 'gen_ai.input.messages', toGenAiInputMessages(input.messages));
+    if (input.messages) {
+      const separateSystem = SEPARATE_SYSTEM_INSTRUCTIONS.has(input.providerId);
+      const history = separateSystem
+        ? input.messages.filter((message) => message.role !== 'system')
+        : input.messages;
+      setJsonContent(attributes, 'gen_ai.input.messages', toGenAiInputMessages(history));
+      if (separateSystem) {
+        const system = input.messages.filter((message) => message.role === 'system');
+        // Native adapters differ on rich system parts; publish only known text
+        // instructions, never an invented rendering or raw continuity data.
+        if (system.length && system.every((message) => typeof message.content === 'string')) {
+          setJsonContent(
+            attributes,
+            'gen_ai.system_instructions',
+            system.map((message) => ({ type: 'text', content: message.content })),
+          );
+        }
+      }
+    }
     if (options.tools?.length) {
       setJsonContent(
         attributes,

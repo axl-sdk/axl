@@ -12,6 +12,7 @@ import { agent } from '../agent.js';
 import { StallTimeoutError } from '../errors.js';
 import { AxlRuntime } from '../runtime.js';
 import { OpenAIProvider } from '../providers/openai.js';
+import { OpenAIResponsesProvider } from '../providers/openai-responses.js';
 import type { ChatOptions, Provider, StreamChunk } from '../providers/types.js';
 import { createScopedProvider } from '../providers/scoped-provider.js';
 import { OTelSpanManager } from '../telemetry/span-manager.js';
@@ -149,6 +150,63 @@ describe('runtime GenAI inference spans', () => {
     expect(spans).toHaveLength(2);
     expect(spans[0].attributes['gen_ai.request.reasoning.level']).toBe('xhigh');
     expect(spans[1].attributes).not.toHaveProperty('gen_ai.request.reasoning.level');
+  });
+
+  it('exports system instructions separately only when the real API does', async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        const url = input instanceof Request ? input.url : String(input);
+        return new Response(
+          JSON.stringify(
+            url.includes('/responses')
+              ? { id: 'resp-1', model: 'gpt-4o', status: 'completed', output: [] }
+              : {
+                  id: 'chat-1',
+                  model: 'gpt-4o',
+                  choices: [
+                    { message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' },
+                  ],
+                },
+          ),
+        );
+      }),
+    );
+    const messages = [
+      { role: 'system' as const, content: 'Be concise' },
+      { role: 'user' as const, content: 'Say ok' },
+    ];
+    const responsesRuntime = runtime(new OpenAIResponsesProvider({ apiKey: 'test-key' }), {
+      captureContent: true,
+    });
+    await responsesRuntime.initializeTelemetry();
+    await responsesRuntime
+      .resolveProvider('openai-responses:gpt-4o')
+      .provider.chat(messages, { model: 'gpt-4o' });
+    const chatRuntime = runtime(new OpenAIProvider({ apiKey: 'test-key' }), {
+      captureContent: true,
+    });
+    await chatRuntime.initializeTelemetry();
+    await chatRuntime.resolveProvider('openai:gpt-4o').provider.chat(messages, { model: 'gpt-4o' });
+
+    expect(bodies[0].instructions).toBe('Be concise');
+    expect(JSON.stringify(bodies[0].input)).not.toContain('Be concise');
+    expect((bodies[1].messages as Array<{ role: string }>)[0].role).toBe('system');
+    const spans = exporter.getFinishedSpans().filter((span) => span.name === 'chat gpt-4o');
+    expect(spans).toHaveLength(2);
+    expect(JSON.parse(spans[0].attributes['gen_ai.system_instructions'] as string)).toEqual([
+      { type: 'text', content: 'Be concise' },
+    ]);
+    expect(JSON.parse(spans[0].attributes['gen_ai.input.messages'] as string)).toEqual([
+      { role: 'user', parts: [{ type: 'text', content: 'Say ok' }] },
+    ]);
+    expect(spans[1].attributes).not.toHaveProperty('gen_ai.system_instructions');
+    expect(JSON.parse(spans[1].attributes['gen_ai.input.messages'] as string)).toEqual([
+      { role: 'system', parts: [{ type: 'text', content: 'Be concise' }] },
+      { role: 'user', parts: [{ type: 'text', content: 'Say ok' }] },
+    ]);
   });
 
   it('parents an inference span under the ask span without a capture scope', async () => {

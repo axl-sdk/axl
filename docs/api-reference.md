@@ -2024,6 +2024,27 @@ Lifecycle, retention and reclamation rules: [integration.md](integration.md#diag
 | `initializeMcp()` | `Promise<void>` | Connect to configured MCP servers |
 | `shutdown()` | `Promise<void>` | Abort all in-flight executions and close runtime-owned resources, including the span manager. It does not flush or shut down a supplied or global OpenTelemetry tracer provider; the application owns that provider's lifecycle |
 
+### OpenTelemetry configuration
+
+`AxlConfig.telemetry` accepts `TelemetryConfig`:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | `boolean?` | `false` | Enable OTel spans after `runtime.initializeTelemetry()`. `@opentelemetry/api` is an optional peer dependency |
+| `tracerProvider` | `unknown?` | Global OTel provider | Application-supplied tracer provider. Axl never flushes or shuts it down |
+| `serviceName` | `string?` | `'axl'` | Tracer name passed to `getTracer()` |
+| `captureContent` | `boolean?` | `false` | Opt in to GenAI system instructions, input/output messages, and tool-definition attributes. If omitted, `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true` enables it; any other defined value leaves it off. An explicit `true` or `false` always wins over the environment. `trace.redact: true` suppresses content regardless of this setting |
+
+Inference spans use the optional `SpanManager.startSpan?(name, attributes,
+options?)` method, where `options` is `{ kind?: 'client'; startTime?: number }`.
+`startTime` is epoch milliseconds at logical call initiation. The returned
+`SpanHandle` supports `setAttribute`, `addEvent`, `setStatus`, and `end`;
+attributes accept strings, numbers, booleans, and native arrays of each type.
+Existing custom managers that implement only `withSpanAsync`,
+`addEventToActiveSpan`, and `shutdown` remain valid; Axl skips inference spans
+when `startSpan` is absent. See [OpenTelemetry integration](observability.md#opentelemetry-integration)
+for span lifetime and content rules.
+
 ### Ad-hoc Context and Cost Tracking
 
 See [`runtime.createContext()`](#runtimecreatecontextoptions) and [`runtime.trackCost()`](#runtimetrackcostfn) above.

@@ -319,7 +319,11 @@ See [docs/migration/state-store-durability.md](./migration/state-store-durabilit
 
 ## Observability-Boundary Redaction
 
-`config.trace.redact: true` enables a three-layer filter that scrubs user/LLM content everywhere it would otherwise flow to observability consumers, while preserving structural metadata (IDs, keys, agent/tool/workflow names, roles, cost/token metrics, durations, timestamps, `askId`/`parentAskId`/`depth`) so observability stays useful under compliance mode.
+`config.trace.redact: true` enables a three-layer event/Studio filter and
+suppresses optional GenAI span content. It preserves structural metadata (IDs,
+keys, agent/tool/workflow names, roles, cost/token metrics, durations,
+timestamps, `askId`/`parentAskId`/`depth`) so observability stays useful under
+compliance mode.
 
 ```typescript
 const runtime = new AxlRuntime({
@@ -343,6 +347,25 @@ broadcast. Both endpoints still accept and persist the caller's raw input.
 Studio consumers should check the flag via `runtime.isRedactEnabled(): boolean` rather than reaching into the config (the full config was intentionally not exposed because `Readonly<T>` is shallow — consumers could mutate `trace.redact` via sub-object access). Separately, `GET /api/health` reports `readOnly: boolean` so a client can gate mutating UI affordances (e.g., the Eval Runner hides its Import / Run buttons in readOnly mode); the redact flag is not surfaced on the health endpoint because it's only consumed server-side at response serialization time.
 
 See [observability.md](./observability.md#pii-and-redaction) for the complete per-route scrubbed/preserved field table.
+
+### OpenTelemetry span content
+
+OTel inference spans export structural GenAI attributes when telemetry is
+enabled. `telemetry.captureContent` defaults to `false`; when true it adds JSON
+system instructions, input/output messages and tool definitions, which can
+contain prompts, reasoning text, tool arguments, and tool results. The environment variable
+`OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true` is a fallback only;
+an explicit `captureContent` value wins. `trace.redact: true` suppresses these
+content attributes even after opt-in, and also suppresses stop sequences.
+Without redaction, stop sequences may be exported as a native string array
+even when message capture is off, so avoid putting secrets in them.
+
+Each JSON content attribute is capped at 16 KiB; an oversized attribute is
+omitted whole, retaining valid JSON. Axl excludes rich media bytes and
+locators, raw provider continuity metadata, provider credentials, and
+`providerOptions` values from this projection. User-authored text and tool
+schemas can still contain sensitive values when capture is enabled. Span error
+status has no message; `error.type` carries only a short code or class.
 
 ### `ProviderError.body` is intentionally off the event stream
 

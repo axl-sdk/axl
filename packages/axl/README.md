@@ -509,22 +509,29 @@ const checkpointed = await ctx.checkpoint('expensive-op', async () => expensiveO
 
 ### OpenTelemetry Observability
 
-Automatic span emission for every `ctx.*` primitive with cost-per-span attribution. Install `@opentelemetry/api` as an optional peer dependency.
+Automatic spans for `ctx.*` primitives and dispatched model calls, including
+direct calls through a runtime provider facade. Install `@opentelemetry/api`
+as an optional peer dependency.
 
 ```typescript
 import { defineConfig, AxlRuntime } from '@axlsdk/axl';
+import { context, trace } from '@opentelemetry/api';
+import { AsyncLocalStorageContextManager } from '@opentelemetry/context-async-hooks';
 import {
   BasicTracerProvider,
   SimpleSpanProcessor,
 } from '@opentelemetry/sdk-trace-base';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
 
-const tracerProvider = new BasicTracerProvider();
-tracerProvider.addSpanProcessor(
-  new SimpleSpanProcessor(
-    new OTLPTraceExporter({ url: 'http://localhost:4318/v1/traces' }),
-  ),
-);
+const tracerProvider = new BasicTracerProvider({
+  spanProcessors: [
+    new SimpleSpanProcessor(
+      new OTLPTraceExporter({ url: 'http://localhost:4318/v1/traces' }),
+    ),
+  ],
+});
+context.setGlobalContextManager(new AsyncLocalStorageContextManager());
+trace.setGlobalTracerProvider(tracerProvider);
 
 const config = defineConfig({
   telemetry: {
@@ -536,11 +543,31 @@ const config = defineConfig({
 
 const runtime = new AxlRuntime(config);
 await runtime.initializeTelemetry();
+
+// After the application stops accepting work:
+await runtime.shutdown();
+await tracerProvider.shutdown();
+context.disable();
+trace.disable();
 ```
 
-**Span model:** `axl.workflow.execute` > `axl.agent.ask` > `axl.tool.call`. Also: `axl.ctx.spawn`, `axl.ctx.race`, `axl.ctx.vote`, `axl.ctx.budget`, `axl.ctx.awaitHuman`. Each span includes relevant attributes (cost, duration, token counts, etc.).
+**Span model:** `axl.workflow.execute` > `axl.agent.ask` > `chat {model}`
+for model calls, with `axl.tool.call` under an agent when tools run. Also:
+`axl.ctx.spawn`, `axl.ctx.race`, `axl.ctx.vote`, `axl.ctx.budget`,
+`axl.ctx.awaitHuman`. The CLIENT inference span uses standard `gen_ai.*`
+attributes. System instructions, messages, and tool content are off by default;
+enable them with `telemetry.captureContent: true`, subject to `trace.redact`. See
+[OpenTelemetry integration](../../docs/observability.md#opentelemetry-integration)
+for span content and lifecycle details.
 
-When disabled (default), `NoopSpanManager` provides zero overhead.
+When telemetry is disabled (default), `NoopSpanManager` skips inference-span
+mapping. The runtime never shuts down an application-owned tracer provider.
+
+For this Node setup, install the optional OTel packages used above:
+
+```bash
+npm install @opentelemetry/api @opentelemetry/context-async-hooks @opentelemetry/sdk-trace-base @opentelemetry/exporter-trace-otlp-http
+```
 
 ```typescript
 import { createSpanManager, NoopSpanManager } from '@axlsdk/axl';

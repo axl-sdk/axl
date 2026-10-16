@@ -23,6 +23,81 @@ const options = {
 };
 
 describe('pinned GenAI inference mapping', () => {
+  it('projects separate native system instructions once and keeps Chat Completions system turns in history', () => {
+    const messages = [
+      { role: 'system' as const, content: 'first instruction' },
+      { role: 'user' as const, content: 'question' },
+      { role: 'system' as const, content: 'second instruction' },
+    ];
+    for (const providerId of ['anthropic', 'google', 'openai-responses']) {
+      const attrs = genAiInferenceStart({
+        providerId,
+        options,
+        stream: false,
+        captureContent: true,
+        messages,
+      }).attributes;
+      expect(JSON.parse(attrs['gen_ai.system_instructions'] as string)).toEqual([
+        { type: 'text', content: 'first instruction' },
+        { type: 'text', content: 'second instruction' },
+      ]);
+      expect(JSON.parse(attrs['gen_ai.input.messages'] as string)).toEqual([
+        { role: 'user', parts: [{ type: 'text', content: 'question' }] },
+      ]);
+      expect(attrs['gen_ai.input.messages'] as string).not.toContain('instruction');
+    }
+    for (const providerId of ['openai', 'xai']) {
+      const attrs = genAiInferenceStart({
+        providerId,
+        options,
+        stream: false,
+        captureContent: true,
+        messages,
+      }).attributes;
+      expect(attrs).not.toHaveProperty('gen_ai.system_instructions');
+      expect(
+        JSON.parse(attrs['gen_ai.input.messages'] as string).map((m: { role: string }) => m.role),
+      ).toEqual(['system', 'user', 'system']);
+    }
+  });
+
+  it('redacts and bounds separate system-instruction JSON independently', () => {
+    const messages = [
+      { role: 'system' as const, content: '😀'.repeat(GEN_AI_CONTENT_ATTRIBUTE_MAX_BYTES / 2) },
+      { role: 'user' as const, content: 'question' },
+    ];
+    const capped = genAiInferenceStart({
+      providerId: 'anthropic',
+      options,
+      stream: false,
+      captureContent: true,
+      messages,
+    }).attributes;
+    expect(capped).not.toHaveProperty('gen_ai.system_instructions');
+    expect(JSON.parse(capped['gen_ai.input.messages'] as string)).toEqual([
+      { role: 'user', parts: [{ type: 'text', content: 'question' }] },
+    ]);
+    const redacted = genAiInferenceStart({
+      providerId: 'anthropic',
+      options,
+      stream: false,
+      captureContent: true,
+      redact: true,
+      messages: [{ role: 'system', content: 'private instruction' }],
+    }).attributes;
+    expect(redacted).not.toHaveProperty('gen_ai.system_instructions');
+    expect(redacted).not.toHaveProperty('gen_ai.input.messages');
+    const unknownRichSystem = genAiInferenceStart({
+      providerId: 'google',
+      options,
+      stream: false,
+      captureContent: true,
+      messages: [{ role: 'system', content: [{ type: 'text', text: 'rich system' }] }],
+    }).attributes;
+    expect(unknownRichSystem).not.toHaveProperty('gen_ai.system_instructions');
+    expect(JSON.parse(unknownRichSystem['gen_ai.input.messages'] as string)).toEqual([]);
+  });
+
   it('maps structural fields and native array attributes without opaque options', () => {
     const { name, attributes } = genAiInferenceStart({
       providerId: 'openai-responses',

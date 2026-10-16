@@ -1034,18 +1034,25 @@ exec.error;       // Error details if failed
 
 ## OpenTelemetry Integration
 
-Axl emits OpenTelemetry spans for every `ctx.*` primitive, enabling integration with any OTel-compatible backend (Jaeger, Honeycomb, Datadog, Grafana Tempo, etc.).
+Axl emits OpenTelemetry spans for `ctx.*` primitives and dispatched model calls,
+including direct calls through `runtime.resolveProvider()`. These spans can flow
+to any OTel-compatible backend.
 
 ### Setup
 
 ```typescript
 import { defineConfig, AxlRuntime } from '@axlsdk/axl';
+import { context, trace } from '@opentelemetry/api';
+import { AsyncLocalStorageContextManager } from '@opentelemetry/context-async-hooks';
 import { BasicTracerProvider, SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
 
 const exporter = new OTLPTraceExporter({ url: 'http://localhost:4318/v1/traces' });
-const provider = new BasicTracerProvider();
-provider.addSpanProcessor(new SimpleSpanProcessor(exporter));
+const provider = new BasicTracerProvider({
+  spanProcessors: [new SimpleSpanProcessor(exporter)],
+});
+context.setGlobalContextManager(new AsyncLocalStorageContextManager());
+trace.setGlobalTracerProvider(provider);
 
 const config = defineConfig({
   providers: {
@@ -1055,6 +1062,7 @@ const config = defineConfig({
     enabled: true,
     serviceName: 'support-bot',
     tracerProvider: provider,
+    captureContent: false, // default: no prompt, response, or tool-definition content
   },
 });
 
@@ -1066,27 +1074,34 @@ await runtime.initializeTelemetry();
 // After the application stops accepting work:
 await runtime.shutdown();
 await provider.shutdown(); // Flush and close the application-owned tracer provider
+context.disable();
+trace.disable();
 ```
 
 `runtime.shutdown()` leaves both supplied and global tracer providers running.
 Flush and shut down your provider after the runtime has finished its work. If
 another SDK owns the global provider, follow that SDK's shutdown procedure.
+If your application already initializes an OTel SDK and context manager, use
+that setup instead of registering another one in this example.
 
 **Peer dependency:** `@opentelemetry/api` is an optional peer dependency. Install it alongside your preferred SDK packages:
 
 ```bash
-npm install @opentelemetry/api @opentelemetry/sdk-trace-base
+npm install @opentelemetry/api @opentelemetry/context-async-hooks @opentelemetry/sdk-trace-base @opentelemetry/exporter-trace-otlp-http
 ```
 
 ### Span Model
 
-Every `ctx.*` primitive emits a span. Spans nest naturally: a workflow span contains agent spans, which contain tool call spans.
+Every `ctx.*` primitive emits a span. Spans nest naturally: a workflow span
+contains agent spans, which contain tool call spans. A dispatched model call
+also gets a `CLIENT` inference span under the active ask or application span.
 
 | Span Name | Key Attributes |
 |-----------|------------|
 | `axl.workflow.execute` | `axl.workflow.name`, `axl.workflow.duration`, `axl.workflow.cost` |
-| `axl.agent.ask` | `axl.agent.name`, `axl.agent.model`, `axl.agent.prompt_tokens`, `axl.agent.completion_tokens`, `axl.agent.cost`, `axl.agent.duration`, and — when the last provider call of the ask reported [`timing`](api-reference.md#calltiming) — `axl.agent.queued_ms`, `axl.agent.retry_ms`, `axl.agent.attempts`, `axl.agent.rate_limit_retries` (when reported), `axl.agent.ttfb_ms`, `axl.agent.wire_ms`, `axl.agent.first_token_ms` (streaming only) |
-| `axl.tool.call` | `axl.tool.name`, `axl.tool.duration`, `axl.tool.outcome`, `axl.tool.success`, `axl.tool.phase` (failed/cancelled) |
+| `axl.agent.ask` | `axl.agent.name`, `axl.agent.model`, `axl.agent.prompt_tokens`, `axl.agent.completion_tokens`, `axl.agent.cost`, `axl.agent.duration`, and — when the last provider call of the ask reported [`timing`](api-reference.md#calltiming) — `axl.agent.queued_ms`, `axl.agent.retry_ms`, `axl.agent.attempts`, `axl.agent.rate_limit_retries` (when reported), `axl.agent.ttfb_ms`, `axl.agent.wire_ms`, `axl.agent.first_token_ms` (streaming only). Also `gen_ai.operation.name=invoke_agent` and `gen_ai.agent.name` |
+| `axl.tool.call` | `axl.tool.name`, `axl.tool.duration`, `axl.tool.outcome`, `axl.tool.success`, `axl.tool.phase` (failed/cancelled). Also `gen_ai.operation.name=execute_tool`, `gen_ai.tool.name`, and `gen_ai.tool.call.id` |
+| `chat {model}` | `CLIENT` inference span: `gen_ai.operation.name=chat`, `gen_ai.provider.name`, request model/stream/parameters, reported response identity, finish reasons and usage, and time to first stream chunk when available. Opt-in content uses `gen_ai.system_instructions` or `gen_ai.input.messages` according to the provider API |
 | `axl.ctx.spawn` | `axl.spawn.count`, `axl.spawn.quorum`, `axl.spawn.completed` |
 | `axl.ctx.race` | `axl.race.participants`, `axl.race.winner` |
 | `axl.ctx.vote` | `axl.vote.strategy`, `axl.vote.result` |
@@ -1103,9 +1118,70 @@ span attributes. Axl-generated span status descriptions are also intentionally
 empty on errors; use the host error channel or redacted lifecycle event for
 diagnostics rather than exporting exception text through OTel.
 
+### GenAI inference spans
+
+The runtime-bound provider facade opens one `chat {model}` span when a model
+call is dispatched. It covers transport retries as one logical call. Streams
+open on first iteration and close on their terminal chunk, error, abort, stall,
+or consumer return; a stream never iterated creates no span. Calls refused
+before dispatch create none. Direct provider calls, judge calls, and context or
+session summary calls through the runtime also get spans without a request
+capture channel. For custom providers without a dispatch lifecycle hook, Axl
+uses invocation as its best available dispatch signal.
+
+The span starts at logical invocation time, including a queue before dispatch.
+`gen_ai.response.time_to_first_chunk` is elapsed seconds from invocation to
+the first returned stream chunk; it is distinct from the ask-level
+`axl.agent.first_token_ms`. `gen_ai.request.stop_sequences` and
+`gen_ai.response.finish_reasons` are native string-array attributes. The
+request reasoning level is emitted only when the provider reports a known
+effective native level and `providerOptions` is empty; an override can change
+the final wire body after that report. Unknown values are omitted rather than
+guessed. Response and token attributes are likewise omitted when not reported.
+`error.type` uses a short error class/code, never the error message.
+
+The `gen_ai.*` mapping follows the
+[GenAI semantic conventions pinned at `f3c6d0c` (2026-10-14)](https://github.com/open-telemetry/semantic-conventions-genai/tree/f3c6d0c9bb66ebd474668a3a0be25c61226f02c2).
+For example, the `openai-responses` provider ID exports as `openai`, `google`
+as `gcp.gen_ai`, and `xai` as `x_ai`.
+Those conventions have Development status and their `gen_ai.*` keys may change
+in a patch release; Axl's existing `axl.*` attributes remain stable.
+
+### GenAI content capture
+
+`telemetry.captureContent` is off by default. Set it to `true` to export
+`gen_ai.system_instructions`, `gen_ai.input.messages`, `gen_ai.output.messages`, and
+`gen_ai.tool.definitions` as JSON strings in the upstream message/part and tool
+shapes. Anthropic, Google, and OpenAI Responses send system text separately;
+Axl records those system turns as text parts in `gen_ai.system_instructions`
+and omits them from `gen_ai.input.messages`. OpenAI Chat Completions and its
+compatible APIs keep system-role turns in `gen_ai.input.messages` and omit
+`gen_ai.system_instructions`. The same system content never appears in both
+attributes. The projection uses Axl's provider-neutral messages;
+`providerOptions` values are not exported, so a raw override can make this
+content view incomplete. If config omits the setting, the
+`OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true` environment switch
+enables it. An explicit config value wins. `trace.redact: true` always
+suppresses these attributes and the request stop sequences.
+
+Each JSON content attribute has a 16 KiB UTF-8 limit. Axl omits the entire
+attribute when it exceeds the limit so exported JSON remains valid. Rich media
+bytes, URLs and provider-file references are excluded; text parts in ordinary
+messages remain. Rich system parts are omitted when the native API rendering
+is not known.
+Opaque reasoning-continuity metadata, provider credentials and
+`providerOptions` values are not projected. Stop sequences are a request parameter, so they can appear
+even when `captureContent` is off unless redaction is on. Treat an exporter as
+a trusted recipient when opting in: message text, tool schemas, reasoning text,
+and tool arguments or results can contain sensitive application data.
+
 ### Cost-Per-Span
 
-Axl emits **cost-per-span** as an OTel attribute. Because Axl already tracks LLM costs at every level (including cached token discounts), cost attribution across agents, workflows, and individual calls is available out of the box. This enables cost dashboards, per-customer cost attribution, and budget alerting via standard OTel tooling.
+Axl's existing `axl.*` spans carry cost attributes at the workflow and ask
+levels, including cached-token discounts. Inference spans carry standard
+`gen_ai.*` usage; they do not invent a cost when the provider or pricing table
+cannot establish one. Use `runtime.trackOutcome()` for authoritative spend
+accounting.
 
 ### Token Usage
 
@@ -1139,7 +1215,9 @@ ctx.log('refund_processed', { orderId, amount });
 
 ### Zero Overhead When Disabled
 
-When no telemetry exporter is configured, the runtime uses a `NoopSpanManager` that performs no allocations and has zero overhead. This is the default — you only pay for telemetry when you opt in.
+When telemetry is disabled, the runtime uses `NoopSpanManager` and performs no
+inference-span mapping. Custom `SpanManager` implementations without the new
+optional `startSpan` method keep their existing spans and skip inference spans.
 
 ### Prompt Version Tracking
 

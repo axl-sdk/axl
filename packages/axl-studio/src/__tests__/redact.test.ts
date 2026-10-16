@@ -23,6 +23,37 @@ import type {
 import type { EvalResult } from '@axlsdk/eval';
 
 describe('captured-request delivery redaction', () => {
+  it('scrubs imported external payloads while retaining name, outcome and accounting', () => {
+    const secret = 'private external input';
+    const line = JSON.stringify({
+      v: 1,
+      phase: 'end',
+      operationId: 'external-1',
+      kind: 'external',
+      name: 'vendor-search',
+      transportAttempts: 1,
+      outcomeStatus: 'ok',
+      cost: 0.2,
+      costProvenance: 'caller_reported',
+      usage: { inputTokens: 7 },
+      external: { request: { query: secret }, response: [secret] },
+      captured: { fidelity: 'runtime_request', redacted: false, truncated: false, omitted: [] },
+    });
+    const out = JSON.parse(redactRecordLine(line, true));
+    expect(out).toMatchObject({
+      kind: 'external',
+      name: 'vendor-search',
+      outcomeStatus: 'ok',
+      cost: 0.2,
+      usage: { inputTokens: 7 },
+      external: { request: '[redacted]', response: '[redacted]' },
+      captured: { redacted: true, omitted: ['externalPayload'] },
+    });
+    expect(out).not.toHaveProperty('provider');
+    expect(out).not.toHaveProperty('model');
+    expect(JSON.stringify(out)).not.toContain(secret);
+  });
+
   it('accepts additive v1 journal fields and scrubs an imported unredacted line', () => {
     const line = JSON.stringify({
       v: 1,

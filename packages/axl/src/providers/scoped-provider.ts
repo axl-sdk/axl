@@ -31,6 +31,7 @@ import {
   snapshotError,
   snapshotRequest,
   snapshotResponse,
+  type CapturedModelRequestRecord,
   type CapturedRequestRecord,
   type RequestCaptureChannel,
 } from '../diagnostics/capture.js';
@@ -355,10 +356,10 @@ class CaptureRecorder {
   }
 
   private emit(
-    partial: Pick<CapturedRequestRecord, 'phase' | 'transportAttempts'> &
-      Partial<CapturedRequestRecord>,
+    partial: Pick<CapturedModelRequestRecord, 'phase' | 'transportAttempts'> &
+      Partial<CapturedModelRequestRecord>,
   ): void {
-    const record: CapturedRequestRecord = {
+    const record: CapturedModelRequestRecord = {
       v: 1,
       operationId: this.operationId,
       kind: this.kind,

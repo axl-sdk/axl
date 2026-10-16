@@ -348,7 +348,7 @@ export type RequestRecord = {
   v: 1;
   phase: 'start' | 'attempt' | 'end';
   operationId: string;
-  kind: 'chat' | 'stream';
+  kind: 'chat' | 'stream' | 'external';
   caseIndex?: number;
   scorer?: string;
   executionId?: string;
@@ -368,8 +368,11 @@ export type RequestRecord = {
   timing?: { totalMs?: number; ttftMs?: number; [k: string]: unknown };
   /** 1-indexed transport attempt this record describes. */
   transportAttempts: number;
-  provider: string;
-  model: string;
+  /** Absent for an external operation. */
+  provider?: string;
+  model?: string;
+  name?: string;
+  external?: { request?: unknown; response?: unknown };
   request?: {
     messages: CapturedMessage[];
     tools?: Array<{ name: string; description?: string; parameters: unknown }>;

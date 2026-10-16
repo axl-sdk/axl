@@ -423,7 +423,9 @@ Declare paid work Axl cannot observe — a third-party API called from a tool, a
 
 ```typescript
 const rows = await ctx.withExternalOperation({ name: 'vendor-search' }, async (report) => {
+  report.capture({ request: { query } }); // optional caller JSON evidence
   const res = await vendor.search(query);
+  report.capture({ response: { count: res.rows.length } });
   report.setCost(res.billedUsd);       // finite, >= 0; explicit 0 means known-free
   return res.rows;
 });
@@ -433,7 +435,18 @@ Admission is checked **before** `fn` runs. The operation finalizes on return, th
 
 The amount must be **disjoint**: nested `ctx.ask` and other Axl operations account for themselves, and including them double-charges. `setCost(amount, usage?)` also accepts a partial `AccountingUsage`.
 
-`externalOperation` is the module-level equivalent for code without a `ctx`. Outside any accounting scope both still run `fn`, with a report that validates its argument but records nothing.
+When an opt-in request-capture channel and accounting scope are active,
+`report.capture({ request?, response? })` adds caller-supplied JSON evidence to
+the external operation's `end` journal line. Repeated calls update only the
+fields supplied, snapshotting each by value at the call. A cyclic, non-JSON or
+throwing-getter payload degrades that record to a stub; it never changes the
+operation result, error or charge. The same record bounds and `trace.redact`
+policy apply. The `external` record variant has `name`, timing, `outcomeStatus`,
+reported `cost`/`usage` and optional projected error; it has no `provider` or
+`model`. Cost is absent when unreported, including on a successful return.
+Outside a capturing accounting scope `capture()` is a safe no-op.
+
+`externalOperation` is the module-level equivalent for code without a `ctx`. Outside any accounting scope both still run `fn`; `setCost()` validates its argument but records nothing, and `capture()` is a no-op.
 
 ### `runtime.trackExecution(fn, options?)`
 
@@ -1926,6 +1939,9 @@ and `partial` stream output on interrupted calls. New start lines mark
 older v1 lines without it have unknown replay fidelity. Oversized end stubs
 retain `outcomeStatus`, usage, cost and structural finish/error/timing data while
 omitting the response payload. See [record fidelity and redaction](observability.md#what-a-record-contains).
+The discriminated `kind: 'external'` variant records a caller-declared operation
+by `name` without inventing a provider or model. Eval operation references and
+Studio diagnostics retain mixed model/external artifacts.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|

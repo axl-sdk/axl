@@ -107,6 +107,70 @@ async function importResult(
 // ── A13.19 — import/export roundtrip ─────────────────────────────────
 
 describe('A13.19 — import/export roundtrip', () => {
+  it('imports a mixed model/external sidecar and redacts external payload on records delivery', async () => {
+    const secret = 'PRIVATE_EXTERNAL_PAYLOAD';
+    const external = [
+      {
+        v: 1,
+        phase: 'start',
+        operationId: 'op_external',
+        kind: 'external',
+        name: 'vendor-search',
+        transportAttempts: 1,
+        request: { messages: [{ role: 'user', content: secret }] },
+        captured: { fidelity: 'runtime_request', redacted: false, truncated: false, omitted: [] },
+      },
+      {
+        v: 1,
+        phase: 'end',
+        operationId: 'op_external',
+        kind: 'external',
+        name: 'vendor-search',
+        transportAttempts: 1,
+        outcomeStatus: 'ok',
+        cost: 0.2,
+        costProvenance: 'caller_reported',
+        usage: { inputTokens: 4 },
+        external: { request: { query: secret }, response: { answer: secret } },
+        response: { content: secret, thinking: secret },
+        partial: { content: secret, thinking: secret },
+        correction: { stage: 'validate', reason: secret, feedbackMessage: secret },
+        unexpectedContent: secret,
+        captured: { fidelity: 'runtime_request', redacted: false, truncated: false, omitted: [] },
+      },
+    ];
+    const { app } = createTestServer(undefined, { artifactsRoot: root, redact: true });
+    const imported = await importResult(app, {
+      result: resultWithAccounting(),
+      requests: sidecar([...RECORDS, ...external]),
+    });
+    expect(imported.status).toBe(200);
+    const { data } = await readJson(imported);
+    const delivered = await (await app.request(`/api/evals/${data.id}/diagnostics/records`)).text();
+    const lines = delivered
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    expect(lines).toHaveLength(4);
+    expect(lines[3]).toMatchObject({
+      kind: 'external',
+      name: 'vendor-search',
+      outcomeStatus: 'ok',
+      cost: 0.2,
+      usage: { inputTokens: 4 },
+      external: { request: '[redacted]', response: '[redacted]' },
+      captured: { redacted: true, omitted: ['externalPayload'] },
+    });
+    expect(lines[3]).not.toHaveProperty('provider');
+    expect(lines[3]).not.toHaveProperty('model');
+    expect(lines[2]).not.toHaveProperty('request');
+    expect(lines[3]).not.toHaveProperty('response');
+    expect(lines[3]).not.toHaveProperty('partial');
+    expect(lines[3]).not.toHaveProperty('correction');
+    expect(lines[3]).not.toHaveProperty('unexpectedContent');
+    expect(delivered).not.toContain(secret);
+  });
+
   it('preserves accounting and re-owns the captured requests under the new id', async () => {
     const { app } = createTestServer(undefined, { artifactsRoot: root });
 

@@ -464,7 +464,9 @@ const graded = scorer({
   description: 'Grades with a hosted vendor grader',
   async score(output) {
     return externalOperation({ name: 'vendor-grade' }, async (report) => {
+      report.capture({ request: { answer: output } }); // optional diagnostic JSON
       const res = await callVendor(output);
+      report.capture({ response: { score: res.score } });
       report.setCost(res.usd); // counted, and lands in accounting.breakdown.external
       return res.score;
     });
@@ -476,6 +478,11 @@ An external operation that never calls `report.setCost` is counted as
 `reasons.external_unreported`, so the run reports "incomplete" rather than quietly
 under-reporting. Inside a workflow the `ctx.withExternalOperation` form is equivalent — see
 [`externalOperation`](./api-reference.md#externaloperationdescriptor-fn--ctxwithexternaloperationdescriptor-fn).
+In an eval run with `captureRequests` enabled, the external call receives its
+own `kind: 'external'` journal operation and item/scorer diagnostic reference.
+`report.capture()` is optional and does not affect accounting; test unreported
+cost separately from a reported `$0` and use a sentinel to verify payload
+redaction at the artifact or Studio boundary.
 
 To stop a run at a spend threshold, set `EvalConfig.budget` (or pass `--budget`). It is a
 threshold, not a reservation: cases already in flight are allowed to settle, so

@@ -31,7 +31,7 @@ export type RequestRecord = CapturedRequestRecord;
  */
 export type OperationRef = {
   operationId: string;
-  kind: 'chat' | 'stream';
+  kind: 'chat' | 'stream' | 'external';
   turn?: number;
   attempt?: number;
   status: 'recorded' | 'start_only' | 'truncated' | 'omitted';

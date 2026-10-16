@@ -33,6 +33,7 @@ import type {
 } from '../providers/types.js';
 import type { ProviderResponse, ToolCallMessage } from '../types.js';
 import { ProviderError } from '../providers/errors.js';
+import type { AccountingUsage } from '../accounting.js';
 
 // ---------------------------------------------------------------------------
 // Record shape (JSONL v1)
@@ -123,17 +124,16 @@ export type CapturedPhase = 'start' | 'attempt' | 'end';
  * One JSONL line. `v: 1` is the codec version; `@axlsdk/eval` re-exports this
  * as `RequestRecord` and owns the bundle/import validation around it.
  *
- * A `start` record carries the request; `attempt` records mark additional
- * transport attempts for the SAME logical operation (a 429 retry is not an
- * output repair); an `end` record carries the response or the error. An
- * operation that never returns therefore leaves a start record with no end —
- * which is exactly the call you most want to inspect.
+ * A model `start` carries the request; `attempt` marks another transport
+ * attempt for that same logical model call; `end` carries its response/error.
+ * An external `start` carries its name after admission; its `end` carries the
+ * caller's optional JSON evidence and reported settlement. A call that never
+ * returns leaves a start without an end.
  */
-export type CapturedRequestRecord = {
+type CapturedRecordBase = {
   v: 1;
   phase: CapturedPhase;
   operationId: string;
-  kind: 'chat' | 'stream';
   caseIndex?: number;
   scorer?: string;
   executionId?: string;
@@ -155,15 +155,10 @@ export type CapturedRequestRecord = {
   timing?: ProviderResponse['timing'];
   /** 1-indexed transport attempt this record describes. */
   transportAttempts: number;
-  provider: string;
-  model: string;
-  request?: CapturedRequest;
-  response?: CapturedResponse;
-  partial?: CapturedPartialResponse;
   /** Structural settlement retained when an oversized end line becomes a stub. */
   outcomeStatus?: 'ok' | 'error' | 'aborted' | 'stalled' | 'consumer_closed' | 'unfinished';
   /** The following settlement fields are populated on oversized end stubs. */
-  usage?: ProviderResponse['usage'];
+  usage?: ProviderResponse['usage'] | Partial<AccountingUsage>;
   cost?: number;
   costProvenance?: string;
   finishReason?: ProviderResponse['finishReason'];
@@ -205,10 +200,46 @@ export type CapturedRequestRecord = {
   bytes?: number;
 };
 
+/** JSON values accepted from `ExternalOperationReport.capture()`. */
+export type CapturedJsonValue =
+  | null
+  | boolean
+  | number
+  | string
+  | CapturedJsonValue[]
+  | { [key: string]: CapturedJsonValue };
+
+/** Model calls retain their existing required provider/model contract. */
+export type CapturedModelRequestRecord = CapturedRecordBase & {
+  kind: 'chat' | 'stream';
+  provider: string;
+  model: string;
+  request?: CapturedRequest;
+  response?: CapturedResponse;
+  partial?: CapturedPartialResponse;
+  name?: never;
+  external?: never;
+};
+
+/** Caller-declared work has a name and no invented provider or model. */
+export type CapturedExternalRequestRecord = CapturedRecordBase & {
+  kind: 'external';
+  name: string;
+  /** Caller JSON, snapshotted when `report.capture()` was called. On the end line. */
+  external?: { request?: CapturedJsonValue; response?: CapturedJsonValue };
+  provider?: never;
+  model?: never;
+  request?: never;
+  response?: never;
+  partial?: never;
+};
+
+export type CapturedRequestRecord = CapturedModelRequestRecord | CapturedExternalRequestRecord;
+
 /** A pointer from an eval item / scorer to one captured operation. */
 export type CapturedOperationRef = {
   operationId: string;
-  kind: 'chat' | 'stream';
+  kind: 'chat' | 'stream' | 'external';
   turn?: number;
   attempt?: number;
   status: 'recorded' | 'start_only' | 'truncated' | 'omitted';
@@ -407,6 +438,49 @@ export function snapshotError(error: unknown): CapturedError {
   return { message: String(error) };
 }
 
+/**
+ * Copy caller-supplied external payload by value, rejecting values JSON would
+ * silently omit or coerce. The caller's getter may throw; the report method
+ * catches that projection failure and never lets it affect external work.
+ */
+export function snapshotCapturedJson(value: unknown): CapturedJsonValue {
+  const ancestors = new WeakSet<object>();
+  const copy = (part: unknown): CapturedJsonValue => {
+    if (part === null || typeof part === 'string' || typeof part === 'boolean') return part;
+    if (typeof part === 'number' && Number.isFinite(part)) return part;
+    if (typeof part !== 'object') throw new TypeError('external capture requires JSON values');
+    if (ancestors.has(part)) throw new TypeError('external capture contains a cycle');
+    const prototype = Object.getPrototypeOf(part);
+    if (!Array.isArray(part) && prototype !== Object.prototype && prototype !== null) {
+      throw new TypeError('external capture requires plain JSON objects');
+    }
+    if (
+      Object.getOwnPropertySymbols(part).some(
+        (key) => Object.getOwnPropertyDescriptor(part, key)?.enumerable,
+      )
+    ) {
+      throw new TypeError('external capture cannot omit symbol keys');
+    }
+    ancestors.add(part);
+    try {
+      if (Array.isArray(part)) {
+        return Array.from({ length: part.length }, (_, index) => {
+          if (!Object.hasOwn(part, index))
+            throw new TypeError('external capture has an array hole');
+          return copy(part[index]);
+        });
+      }
+      const result: { [key: string]: CapturedJsonValue } = Object.create(null);
+      for (const key of Object.keys(part))
+        result[key] = copy((part as Record<string, unknown>)[key]);
+      return result;
+    } finally {
+      ancestors.delete(part);
+    }
+  };
+  return copy(value);
+}
+
 // ---------------------------------------------------------------------------
 // The channel
 // ---------------------------------------------------------------------------
@@ -502,20 +576,23 @@ export class RequestCaptureChannel {
       const outcomeStatus =
         record.phase !== 'end'
           ? undefined
-          : record.termination === 'aborted' ||
-              record.termination === 'stalled' ||
-              record.termination === 'consumer_closed'
-            ? record.termination
-            : record.error
-              ? 'error'
-              : record.response
-                ? 'ok'
-                : 'unfinished';
-      const stub: CapturedRequestRecord = {
+          : record.outcomeStatus !== undefined
+            ? record.outcomeStatus
+            : record.termination === 'aborted' ||
+                record.termination === 'stalled' ||
+                record.termination === 'consumer_closed'
+              ? record.termination
+              : record.error
+                ? 'error'
+                : record.response
+                  ? 'ok'
+                  : 'unfinished';
+      const stub = {
         v: 1,
         phase: record.phase,
         operationId: record.operationId,
         kind: record.kind,
+        ...(record.kind === 'external' ? { name: record.name } : {}),
         ...(record.caseIndex !== undefined ? { caseIndex: record.caseIndex } : {}),
         ...(record.scorer !== undefined ? { scorer: record.scorer } : {}),
         ...(record.executionId !== undefined ? { executionId: record.executionId } : {}),
@@ -534,10 +611,14 @@ export class RequestCaptureChannel {
         ...(record.durationMs !== undefined ? { durationMs: record.durationMs } : {}),
         ...(record.termination !== undefined ? { termination: record.termination } : {}),
         ...(outcomeStatus !== undefined ? { outcomeStatus } : {}),
-        ...(record.response?.usage !== undefined ? { usage: record.response.usage } : {}),
-        ...(record.response?.cost !== undefined ? { cost: record.response.cost } : {}),
-        ...(record.response?.costProvenance !== undefined
-          ? { costProvenance: record.response.costProvenance }
+        ...((record.usage ?? record.response?.usage) !== undefined
+          ? { usage: record.usage ?? record.response?.usage }
+          : {}),
+        ...((record.cost ?? record.response?.cost) !== undefined
+          ? { cost: record.cost ?? record.response?.cost }
+          : {}),
+        ...((record.costProvenance ?? record.response?.costProvenance) !== undefined
+          ? { costProvenance: record.costProvenance ?? record.response?.costProvenance }
           : {}),
         ...(record.response?.finishReason !== undefined
           ? { finishReason: record.response.finishReason }
@@ -574,8 +655,7 @@ export class RequestCaptureChannel {
             }
           : {}),
         transportAttempts: record.transportAttempts,
-        provider: record.provider,
-        model: record.model,
+        ...(record.kind !== 'external' ? { provider: record.provider, model: record.model } : {}),
         captured: {
           fidelity: 'runtime_request',
           redacted: record.captured.redacted,
@@ -589,11 +669,15 @@ export class RequestCaptureChannel {
           ...(record.captured.reason !== undefined ? { reason: record.captured.reason } : {}),
         },
         bytes,
-      };
+      } as CapturedRequestRecord;
       line = JSON.stringify(stub);
       bytes = Buffer.byteLength(line, 'utf-8');
       const existing = this.refs.get(record.operationId);
       if (existing) existing.status = 'truncated';
+      if (bytes > this.maxRecordBytes) {
+        this.stop('truncated', 'record identity exceeded the per-record capture limit');
+        return;
+      }
     }
     if (this.runBytes + bytes > this.maxRunBytes) {
       this.stop(

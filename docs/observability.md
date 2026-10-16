@@ -866,9 +866,9 @@ One JSONL line per phase of a model call, `v: 1`:
 
 | Phase | Carries |
 |---|---|
-| `start` | The request snapshotted before adapter invocation — messages, tools, schema and the allowlisted call options; emitted only after dispatch is observed (or, for a custom adapter without a lifecycle hook, when invoked) |
+| `start` | For model calls, the request snapshotted before adapter invocation — messages, tools, schema and allowlisted options; emitted only after dispatch is observed (or, for a custom adapter without a lifecycle hook, when invoked). For an external operation, its name and invocation time after admission |
 | `attempt` | An additional **transport** attempt for the same logical call (a 429 retry is not an output repair) |
-| `end` | The response, error, or an explicitly terminated stream; partial stream output survives when there is no terminal response |
+| `end` | The response, error, or an explicitly terminated stream; partial stream output survives when there is no terminal response. External operations carry the reported charge, outcome and optional caller JSON payload here |
 
 An `end` record for a **stream** also carries a `termination` string when the
 stream did not simply finish — the consumer broke out of the loop, aborted it,
@@ -902,12 +902,24 @@ the original provider result or accounting.
 point at the operations each owns, so you can go from a suspicious score
 straight to the request behind it.
 
+`externalOperation()` and `ctx.withExternalOperation()` also write `kind:
+'external'` start/end lines inside a capturing accounting scope. They carry a
+required `name`, invocation/settlement timing and a truthful `outcomeStatus`;
+they have no provider or model. `report.setCost()` contributes only the
+reported disjoint usage/cost with `caller_reported` provenance. Without a
+report, cost is absent, never fabricated as zero. `report.capture({ request?,
+response? })` snapshots caller JSON at the call and merges separately supplied
+fields; the optional payload appears under `end.external`. A projection failure
+or byte-bound overflow stubs the payload while retaining the operation's
+identity and available settlement. An operation denied before invocation has
+no journal lines. Capture outside the scope is a no-op.
+
 ### Fidelity: `runtime_request`, not wire bytes
 
-`fidelity` is always `'runtime_request'`. What is captured is the
-**provider-neutral request Axl submitted** — the messages, tools, schema and
-options as the runtime built them — *not* the adapter's serialized HTTP body.
-No field claims wire bytes, because the adapter is free to reshape them.
+The journal's `fidelity` marker remains `'runtime_request'`. For model calls,
+what is captured is the **provider-neutral request Axl submitted** — messages,
+tools, schema and options — *not* the adapter's serialized HTTP body. External
+payloads are explicitly caller supplied; Axl cannot verify their wire fidelity.
 
 Deliberate omissions are named rather than silently dropped, in
 `captured.omitted`:
@@ -928,7 +940,9 @@ data; it does not claim that the provider sent any on a particular call.
 Signals, functions, callbacks and configured provider credentials are never
 captured. Opaque `providerMetadata` comes from provider responses (or a custom
 adapter) and may itself be sensitive; treat an unredacted journal as model
-content. With `trace.redact`, that metadata is removed before storage.
+content. Caller JSON in an external record is likewise application-chosen and
+may include sensitive fields; with `trace.redact`, the whole external request
+and response payloads are masked before storage.
 
 ### Bounds
 

@@ -18,7 +18,12 @@ import { mkdtemp, rm, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { z } from 'zod';
-import { AxlRuntime, FileDiagnosticArtifactStore, RequestCaptureChannel } from '@axlsdk/axl';
+import {
+  AxlRuntime,
+  FileDiagnosticArtifactStore,
+  RequestCaptureChannel,
+  externalOperation,
+} from '@axlsdk/axl';
 import type {
   AxlRuntime as AxlRuntimeType,
   CapturedRequestRecord,
@@ -109,6 +114,50 @@ async function readRecords(
 // ── A11.3 / operation refs ───────────────────────────────────────────
 
 describe('A11.3 — judge calls are captured', () => {
+  it('attaches mixed model/external operations to the actual item and scorer', async () => {
+    const runtime = captureRuntime(2);
+    const externalJudge = scorer({
+      name: 'externalJudge',
+      description: 'third-party judge',
+      score: async () =>
+        externalOperation({ name: 'judge-api' }, async (report) => {
+          report.capture({ request: { rating: 'please score' }, response: { score: 1 } });
+          report.setCost(0.03);
+          return 1;
+        }),
+    });
+    const generate = askExecute();
+    const result = await runEval(
+      { workflow: 'w', dataset: ds(1), scorers: [externalJudge] } satisfies EvalConfig,
+      async (input, scopedRuntime) => {
+        const output = await generate(input, scopedRuntime);
+        await externalOperation({ name: 'search-api' }, async (report) => {
+          report.capture({ request: { query: 'q0' } });
+          report.setCost(0.02, { inputTokens: 4 });
+          return null;
+        });
+        return output;
+      },
+      runtime,
+      { captureRequests: true },
+    );
+    const itemRefs = result.items[0].diagnostics?.operations ?? [];
+    const scorerRefs = result.items[0].scoreDetails?.externalJudge?.diagnostics?.operations ?? [];
+    expect(itemRefs.map((ref) => ref.kind).sort()).toEqual(['chat', 'external']);
+    expect(scorerRefs).toMatchObject([{ kind: 'external', status: 'recorded' }]);
+    const records = await readRecords(runtime, result.diagnostics!.artifactId);
+    const externals = records.filter((record) => record.kind === 'external');
+    expect(externals).toHaveLength(4);
+    expect(externals.filter((record) => record.phase === 'end')).toMatchObject([
+      { name: 'search-api', outcomeStatus: 'ok', cost: 0.02, usage: { inputTokens: 4 } },
+      { name: 'judge-api', outcomeStatus: 'ok', cost: 0.03 },
+    ]);
+    expect(externals.every((record) => !('model' in record) && !('provider' in record))).toBe(true);
+    const sidecar = serializeRequestRecords(records);
+    expect(validateRequestSidecar(sidecar).ok).toBe(true);
+    await runtime.shutdown();
+  });
+
   it('keeps item and scorer refs when a dispatched request cannot be projected', async () => {
     const runtime = captureRuntime(2);
     const hostile = {
@@ -116,12 +165,10 @@ describe('A11.3 — judge calls are captured', () => {
       json_schema: { name: 'bad', schema: { validate() {} } },
     };
     const invoke = () =>
-      runtime
-        .resolveProvider('mock:m')
-        .provider.chat([{ role: 'user', content: 'go' }], {
-          model: 'm',
-          responseFormat: hostile as never,
-        });
+      runtime.resolveProvider('mock:m').provider.chat([{ role: 'user', content: 'go' }], {
+        model: 'm',
+        responseFormat: hostile as never,
+      });
     const judge = scorer({
       name: 'judge',
       description: 'calls provider',

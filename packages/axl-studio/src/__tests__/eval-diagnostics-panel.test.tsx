@@ -251,6 +251,57 @@ afterEach(() => {
 // ── Cases ────────────────────────────────────────────────────────
 
 describe('RunDiagnosticsPanel', () => {
+  it('renders imported mixed model and external operations without inventing a model or missing response', async () => {
+    const user = userEvent.setup();
+    const externalStart = baseRecord({
+      phase: 'start',
+      operationId: 'external-1',
+      kind: 'external',
+      name: 'vendor-search',
+      provider: undefined,
+      model: undefined,
+    });
+    const externalEnd = baseRecord({
+      phase: 'end',
+      operationId: 'external-1',
+      kind: 'external',
+      name: 'vendor-search',
+      provider: undefined,
+      model: undefined,
+      outcomeStatus: 'ok',
+      cost: 0.2,
+      usage: { inputTokens: 7 },
+      external: {
+        request: { query: 'private caller query' },
+        response: { answer: 'private caller result' },
+      },
+    });
+    const unfinished = baseRecord({
+      phase: 'start',
+      operationId: 'external-2',
+      kind: 'external',
+      name: 'pending-vendor',
+      provider: undefined,
+      model: undefined,
+    });
+    stubFetch({ records: ndjson([...operationLines(), externalStart, externalEnd, unfinished]) });
+    renderPanel(
+      <RunDiagnosticsPanel result={result(manifest({ records: 5 }))} evalName="qa-eval" />,
+    );
+    await user.click(screen.getByRole('button', { name: 'Show captured records' }));
+    const list = await screen.findByRole('list', { name: 'Captured request records' });
+    const rows = within(list).getAllByRole('listitem');
+    expect(rows).toHaveLength(3);
+    expect(within(rows[1]).getByText('vendor-search')).toBeInTheDocument();
+    expect(within(rows[1]).getByText('ok')).toBeInTheDocument();
+    expect(within(rows[1]).queryByText(/no response recorded/)).not.toBeInTheDocument();
+    await user.click(within(rows[1]).getByRole('button', { expanded: false }));
+    const detail = screen.getByTestId('operation-detail-1');
+    expect(within(detail).getByText(/private caller query/)).toBeInTheDocument();
+    expect(within(detail).getByText(/private caller result/)).toBeInTheDocument();
+    expect(within(detail).getByText('0.2 USD')).toBeInTheDocument();
+    expect(within(rows[2]).getByText('no end record')).toBeInTheDocument();
+  });
   it('A16.19 renders a complete manifest with counts, fidelity and a plain redaction statement', async () => {
     stubFetch({
       manifest: {

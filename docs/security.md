@@ -373,11 +373,22 @@ contain, so the same policy applies, twice:
 - **Again at delivery.** Studio re-applies redaction when streaming records out,
   because an artifact may have been written before the flag was switched on.
 
-Rich media never lands in an artifact: image, audio and file parts are replaced
-by descriptors. `providerOptions` contributes **keys only** — a credential
-passed through it cannot reach the file even unredacted.
+For model-call records, image, audio and file parts are replaced by descriptors.
+`providerOptions` contributes **keys only** — a credential passed through it
+cannot reach the file even unredacted. Caller JSON supplied to an external
+operation is different: an application can put arbitrary sensitive data,
+including media or credentials, in an unredacted artifact. Supply only the
+diagnostic fields you intend to retain, or enable `trace.redact`.
 Unredacted `providerMetadata` may contain opaque response material or
 application-supplied values; handle the artifact as sensitive model content.
+External operations can add arbitrary caller JSON through `report.capture()`.
+With `trace.redact`, both `external.request` and `external.response` are replaced
+with `'[redacted]'` before storage and again at Studio delivery. The operation
+name, outcome, timing, reported usage and cost remain available; an imported
+unredacted external record receives the same boundary scrub. Studio projects
+external lines onto known structural and accounting fields, dropping unexpected
+fields (including model-shaped request, response, partial and correction data)
+from imported sidecars before delivery.
 
 Capture is off unless a run asks for it, and asking requires a configured
 artifact root or store; there is no implicit location and no ambient default.

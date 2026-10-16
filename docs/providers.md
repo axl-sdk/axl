@@ -168,52 +168,44 @@ but never inherit exact pricing or GPT-5.6-specific capabilities.
 
 ### GPT-6 endpoint and pricing rules
 
-The exact `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-sol`, and `gpt-6-luna` IDs support the existing
-text, structured-output, streaming, and function-tool paths. Prefer
-`openai-responses:` for tools: Astra and 6.1 Sol tool calling requires Responses, while
-GPT-6 Sol and Luna Chat Completions function tools require an explicitly effective
-`reasoning_effort: 'none'`. Axl checks the final request after `providerOptions`
-merges and throws `UnsupportedModelOptionError` before dispatch for a forbidden
-combination. The error names the provider, effective model, rejected option,
-and an `openai-responses:` remedy. Unknown GPT-6-like IDs pass through without
-inheriting these exact-model rules or pricing.
+Use `openai-responses:gpt-6.1-sol` for agents with tools. Use
+`openai:gpt-6.1-sol` for Chat Completions without tools. Both endpoints support
+text, structured output, and streaming.
 
-Astra and 6.1 Sol map portable `effort: 'none'` to `low` and reject raw
-`none` or `minimal`; GPT-6 Sol and Luna accept `none`. All four accept native
-`max` on Responses. Chat accepts native `max` for Astra, GPT-6 Sol, and Luna;
-GPT-6.1 Sol Chat rejects it, so Axl maps portable `effort: 'max'` to `xhigh`
-and reports the clamp. A raw Chat `reasoning_effort: 'max'` is rejected before
-dispatch. Their default reasoning is
-active. With active reasoning, `temperature`, `top_p`, and `top_logprobs` are
-invalid on either endpoint; Chat also rejects `logprobs`, and Responses rejects
-`message.output_text.logprobs` in `include`. The portable `temperature` option
-is dropped in that state, the same as on GPT-5.x. A raw `providerOptions` field
-that sets any of these parameters is rejected with `UnsupportedModelOptionError`
-before dispatch. With GPT-6 Sol or Luna at effective `none`, both the portable option
-and the raw fields are sent where the endpoint accepts them.
+| Exact model ID | Chat tool calling | `effort: 'none'` | `effort: 'max'` |
+| --- | --- | --- | --- |
+| `gpt-6-astra` | Use Responses | Clamped to `low` | Native on both endpoints |
+| `gpt-6.1-sol` | Use Responses | Clamped to `low` | Native on Responses; clamped to `xhigh` on Chat |
+| `gpt-6-sol`, `gpt-6-luna` | Requires `effort: 'none'` | Supported | Native on both endpoints |
 
-Axl prices direct Standard GPT-6 text calls from the published input,
-cached-input, cache-write, and output rows. Above 272,000 **total input
-tokens**, the long-context row prices the whole call, including cache buckets
-and output. Non-Standard processing, regional billing, hosted tools, unverified
-media, missing usage, and unknown model IDs stay unpriced. `OPENAI_PRICING`
-is a smaller public flat compatibility table and deliberately omits GPT-6
-models because it cannot represent cache-write and context-tiered rates.
-Native direct OpenAI cost estimation uses the private catalog instead. The
-6.1 Sol Standard short-context rates per million tokens are $2 input, $0.10
-cached input, $2.50 cache writes, and $10 output; above 272,000 input tokens,
-the whole request uses $4, $0.20, $5, and $15. Sources: the
-[GPT-6 model guidance](https://developers.openai.com/api/docs/guides/latest-model)
-and [Standard pricing](https://developers.openai.com/api/docs/pricing), checked
-for 6.1 Sol on October 15, 2026. The earlier three GPT-6 IDs' verified live
-combinations and remaining limits (no
-invoice comparison for long-context or cache-write billing) are in the
+Axl reports effort clamps through `provider_diagnostic` events. Raw effort
+values in `providerOptions` must already be supported: for example, Chat
+`reasoning_effort: 'max'` is rejected for GPT-6.1 Sol. Invalid options and Chat
+tool combinations throw `UnsupportedModelOptionError` before a request is sent.
+Unknown model IDs do not inherit these exact-model rules or pricing.
+
+Reasoning is active by default. While active, Axl omits portable `temperature`
+and rejects raw `temperature`, `top_p`, and `top_logprobs` overrides. Chat also
+rejects `logprobs`; Responses rejects `message.output_text.logprobs` in
+`include`. With GPT-6 Sol or GPT-6 Luna at effective `none`, sampling options
+are forwarded where the endpoint accepts them.
+
+Direct Standard text cost estimates include input, cached input, cache writes,
+and output. Above 272,000 total input tokens, long-context rates apply to the
+whole request. Non-Standard processing, regional billing, hosted tools,
+unverified media, missing usage, and unknown model IDs remain unpriced.
+The exported `OPENAI_PRICING` compatibility table omits GPT-6 because its flat
+format cannot represent these rates; native OpenAI adapters use the detailed
+catalog in [`openai.ts`](../packages/axl/src/providers/openai.ts).
+
+See OpenAI's [model guide](https://developers.openai.com/api/docs/guides/latest-model)
+and [pricing](https://developers.openai.com/api/docs/pricing). Axl's
+[GPT-6.1 Sol live verification](./verification/gpt-61-sol-2026-10-15.md)
+confirmed the endpoint behavior above, including Chat's lower effort cap.
+Earlier GPT-6 results are in the
 [frontier verification record](./verification/frontier-model-refresh-2026-09-25.md)
-and its [remediation follow-up](./verification/frontier-owner-remediation-2026-09-26.md).
-GPT-6.1 Sol text, schema, Responses tool continuation, streaming usage, and
-effort/sampling handling passed the bounded
-[October 15 live verification](./verification/gpt-61-sol-2026-10-15.md).
-Long-context and cache-write invoice accuracy remain unverified.
+and [follow-up](./verification/frontier-owner-remediation-2026-09-26.md).
+Long-context and cache-write estimates have not been checked against invoices.
 
 ## Anthropic
 

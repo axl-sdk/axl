@@ -9,11 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Exact `gpt-6.1-sol` support on OpenAI Responses and Chat Completions: `none`→`low` on both endpoints, native `max` on Responses, and `max`→`xhigh` on Chat with a diagnostic. Chat tool and invalid-option combinations fail before dispatch. Direct Standard text cost estimates include cache and the 272K input-token boundary. Unsupported billing remains unpriced.
+- Support for `gpt-6.1-sol` with Standard cost estimates, including caching and long-context rates. Use Responses for tools and native `max` reasoning; Chat Completions maps `max` to `xhigh`. Both endpoints map `none` to `low`.
 
 ### Fixed
 
-- Corrected the public `OPENAI_PRICING` compatibility row for `o3-mini`: cached input is 50% of input cost ($0.55 per million tokens), matching OpenAI's published rate and Axl's native cost estimator. Existing public flat rows now have a parity test against native estimates.
+- Fixed understated `o3-mini` cached-input costs in the exported `OPENAI_PRICING` table. Cached input now uses 50% of the input rate, matching native OpenAI cost estimates.
 
 ## [0.25.2] - 2026-10-14
 

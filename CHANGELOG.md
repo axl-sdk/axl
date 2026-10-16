@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.3] - 2026-10-16
+
 ### Added
 
 - Support for `gpt-6.1-sol` with Standard cost estimates, including caching and long-context rates. Use Responses for tools and native `max` reasoning; Chat Completions maps `max` to `xhigh`. Both endpoints map `none` to `low`.

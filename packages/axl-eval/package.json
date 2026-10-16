@@ -1,6 +1,6 @@
 {
   "name": "@axlsdk/eval",
-  "version": "0.25.2",
+  "version": "0.25.3",
   "description": "Evaluation framework for Axl agentic workflows",
   "type": "module",
   "main": "./dist/index.cjs",

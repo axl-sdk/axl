@@ -580,8 +580,21 @@ function redactExternalRecord(
 
 /** Shared v1/v2 request-content boundary. Identity and numeric options remain useful. */
 export function redactCapturedRequestPayload<T extends CapturedRequest>(request: T): T {
+  // Older imported v1 lines may carry messages without an options block. The
+  // current writer always supplies one, but delivery redaction must preserve
+  // the historical omission rather than inventing replay configuration.
+  const { options: rawOptions, ...requestWithoutOptions } = request;
+  const options =
+    rawOptions && typeof rawOptions === 'object' && !Array.isArray(rawOptions)
+      ? rawOptions
+      : undefined;
+  const safeOptions = options ? { ...options } : undefined;
+  if (safeOptions) {
+    delete safeOptions.stop;
+    delete safeOptions.toolChoice;
+  }
   return {
-    ...request,
+    ...requestWithoutOptions,
     messages: request.messages.map((message) => {
       const { providerMetadata: _metadata, ...safeMessage } = message;
       void _metadata;
@@ -618,11 +631,15 @@ export function redactCapturedRequestPayload<T extends CapturedRequest>(request:
       : request.responseFormat
         ? { responseFormat: { ...request.responseFormat } }
         : {}),
-    options: {
-      ...request.options,
-      ...(request.options.stop ? { stop: request.options.stop.map(() => REDACTED) } : {}),
-      ...(request.options.toolChoice !== undefined ? { toolChoice: REDACTED } : {}),
-    },
+    ...(options
+      ? {
+          options: {
+            ...safeOptions,
+            ...(Array.isArray(options.stop) ? { stop: options.stop.map(() => REDACTED) } : {}),
+            ...(options.toolChoice !== undefined ? { toolChoice: REDACTED } : {}),
+          },
+        }
+      : {}),
     ...(request.providerOptionKeys ? { providerOptionKeys: [...request.providerOptionKeys] } : {}),
   } as T;
 }

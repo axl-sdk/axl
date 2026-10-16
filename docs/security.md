@@ -396,6 +396,8 @@ contain, so the same policy applies, twice:
   `captured.redacted: true`.
 - **Again at delivery.** Studio re-applies redaction when streaming records out,
   because an artifact may have been written before the flag was switched on.
+  Legacy imported v1 requests that have messages but no `options` block remain
+  redacted and retain that omission; delivery does not invent replay settings.
 
 If request or response projection fails, capture writes a bounded stub. Its
 reason uses only fixed failure labels, even when the thrown value has a custom

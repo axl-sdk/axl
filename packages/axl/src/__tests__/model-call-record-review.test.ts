@@ -91,7 +91,14 @@ describe('review boundaries for folded model calls', () => {
 
   it('redacts the same request content in v1 and v2, including tool prose and options', () => {
     const request = {
-      messages: [{ role: 'user', content: 'PRIVATE', agent: 'writer', providerMetadata: { token: 'PRIVATE' } }],
+      messages: [
+        {
+          role: 'user',
+          content: 'PRIVATE',
+          agent: 'writer',
+          providerMetadata: { token: 'PRIVATE' },
+        },
+      ],
       tools: [
         { name: 'safe_tool', description: 'PRIVATE', parameters: { description: 'PRIVATE' } },
       ],
@@ -135,6 +142,32 @@ describe('review boundaries for folded model calls', () => {
       usage: { total_tokens: 3 },
       cost: 0.02,
     });
+  });
+
+  it('redacts a partial imported v1 request without inventing missing options', () => {
+    const legacy = start({
+      request: { messages: [{ role: 'user', content: 'PRIVATE_LEGACY_PROMPT' }] },
+    });
+    const redacted = redactCapturedRequest(legacy);
+    expect(redacted).toMatchObject({
+      operationId: 'call',
+      provider: 'p',
+      model: 'm',
+      request: { messages: [{ role: 'user', content: '[redacted]' }] },
+      captured: { redacted: true },
+    });
+    expect(redacted.request).not.toHaveProperty('options');
+    expect(legacy.request).not.toHaveProperty('options');
+    expect(JSON.stringify(redacted)).not.toContain('PRIVATE_LEGACY_PROMPT');
+    const malformed = start({
+      request: {
+        messages: [{ role: 'user', content: 'PRIVATE_LEGACY_PROMPT' }],
+        options: 'PRIVATE_OPTIONS',
+      },
+    });
+    const malformedRedacted = redactCapturedRequest(malformed);
+    expect(malformedRedacted.request).not.toHaveProperty('options');
+    expect(JSON.stringify(malformedRedacted)).not.toMatch(/PRIVATE_LEGACY_PROMPT|PRIVATE_OPTIONS/);
   });
 
   it('snapshots nested custom JSON across iterator yields and after public schema parse', () => {

@@ -16,7 +16,7 @@ const tools = [
   },
 ];
 
-function captureFetch() {
+function captureFetch(reportedModel?: string | null) {
   const requests: Record<string, unknown>[] = [];
   const fetchMock = vi.fn(async (_url: unknown, init: RequestInit) => {
     const body = JSON.parse(init.body as string) as Record<string, unknown>;
@@ -24,7 +24,7 @@ function captureFetch() {
     if (String(_url).endsWith('/responses')) {
       return new Response(
         JSON.stringify({
-          model: body.model,
+          ...(reportedModel === null ? {} : { model: reportedModel ?? body.model }),
           output: [{ type: 'message', content: [{ type: 'output_text', text: 'ok' }] }],
           usage: { input_tokens: 100, output_tokens: 10, total_tokens: 110 },
         }),
@@ -33,7 +33,7 @@ function captureFetch() {
     }
     return new Response(
       JSON.stringify({
-        model: body.model,
+        ...(reportedModel === null ? {} : { model: reportedModel ?? body.model }),
         choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
         usage: { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 },
       }),
@@ -49,7 +49,7 @@ afterEach(() => {
 });
 
 describe('exact GPT-6 adapter boundary', () => {
-  it.each(['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna'])(
+  it.each(['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna'])(
     'maps %s on both endpoints and prices text',
     async (model) => {
       const { requests } = captureFetch();
@@ -61,7 +61,10 @@ describe('exact GPT-6 adapter boundary', () => {
         model,
         effort: 'max',
       });
-      expect(requests[0]).toMatchObject({ model, reasoning_effort: 'max' });
+      expect(requests[0]).toMatchObject({
+        model,
+        reasoning_effort: model === 'gpt-6.1-sol' ? 'xhigh' : 'max',
+      });
       expect(requests[1]).toMatchObject({ model, reasoning: { effort: 'max' } });
       expect(chat.cost).toBeGreaterThan(0);
       expect(responses.cost).toBe(chat.cost);
@@ -82,7 +85,7 @@ describe('exact GPT-6 adapter boundary', () => {
     });
   });
 
-  it.each(['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna'])(
+  it.each(['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna'])(
     'rejects forbidden Chat tools for %s with zero fetches',
     async (model) => {
       const { fetchMock } = captureFetch();
@@ -115,6 +118,140 @@ describe('exact GPT-6 adapter boundary', () => {
       providerOptions: { reasoning_effort: 'none' },
     });
     expect(requests.map((body) => body.reasoning_effort)).toEqual(['none', 'none']);
+  });
+
+  it('clamps 6.1 Sol none to low and rejects native minimal on both endpoints', async () => {
+    const { requests, fetchMock } = captureFetch();
+    const chat = new OpenAIProvider({ apiKey: 'test' });
+    const responses = new OpenAIResponsesProvider({ apiKey: 'test' });
+    await chat.chat(message, { model: 'gpt-6.1-sol', effort: 'none' });
+    await responses.chat(message, { model: 'gpt-6.1-sol', effort: 'none' });
+    expect(requests[0].reasoning_effort).toBe('low');
+    expect(requests[1].reasoning).toMatchObject({ effort: 'low' });
+    for (const provider of [chat, responses]) {
+      expect(provider.effortResolution({ model: 'gpt-6.1-sol', effort: 'none' })).toMatchObject({
+        requested: 'none',
+        effective: 'low',
+        clamped: true,
+      });
+      await expect(
+        provider.chat(message, {
+          model: 'gpt-6.1-sol',
+          providerOptions:
+            provider instanceof OpenAIProvider
+              ? { reasoning_effort: 'minimal' }
+              : { reasoning: { effort: 'minimal' } },
+        }),
+      ).rejects.toMatchObject({ option: 'reasoning effort', model: 'gpt-6.1-sol' });
+    }
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('clamps 6.1 Sol portable max on Chat only and rejects raw Chat max before fetch', async () => {
+    const { requests, fetchMock } = captureFetch();
+    const chat = new OpenAIProvider({ apiKey: 'test' });
+    const responses = new OpenAIResponsesProvider({ apiKey: 'test' });
+    await chat.chat(message, { model: 'gpt-6.1-sol', effort: 'max' });
+    await responses.chat(message, { model: 'gpt-6.1-sol', effort: 'max' });
+    expect(requests[0].reasoning_effort).toBe('xhigh');
+    expect(requests[1].reasoning).toMatchObject({ effort: 'max' });
+    expect(chat.effortResolution({ model: 'gpt-6.1-sol', effort: 'max' })).toMatchObject({
+      requested: 'max',
+      effective: 'xhigh',
+      clamped: true,
+    });
+    expect(responses.effortResolution({ model: 'gpt-6.1-sol', effort: 'max' })).toBeUndefined();
+    await chat.chat(message, {
+      model: 'gpt-6-sol',
+      effort: 'max',
+      providerOptions: { model: 'gpt-6.1-sol' },
+    });
+    await chat.chat(message, {
+      model: 'gpt-6.1-sol',
+      effort: 'max',
+      providerOptions: { model: 'gpt-6-sol' },
+    });
+    expect(requests[2].reasoning_effort).toBe('xhigh');
+    expect(requests[3].reasoning_effort).toBe('max');
+    await expect(
+      chat.chat(message, {
+        model: 'gpt-6.1-sol',
+        providerOptions: { reasoning_effort: 'max' },
+      }),
+    ).rejects.toMatchObject({ option: 'reasoning effort', model: 'gpt-6.1-sol' });
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  it('6.1 Sol Chat rejects tools even with portable or raw none, while Responses sends tools', async () => {
+    const { requests, fetchMock } = captureFetch();
+    const chat = new OpenAIProvider({ apiKey: 'test' });
+    const responses = new OpenAIResponsesProvider({ apiKey: 'test' });
+    for (const effort of [undefined, 'none' as const]) {
+      await expect(
+        chat.chat(message, { model: 'gpt-6.1-sol', tools, effort }),
+      ).rejects.toMatchObject({
+        option: 'Chat Completions tool calling',
+        model: 'gpt-6.1-sol',
+      });
+    }
+    await expect(
+      chat.chat(message, {
+        model: 'gpt-6.1-sol',
+        tools,
+        providerOptions: { reasoning_effort: 'none' },
+      }),
+    ).rejects.toMatchObject({ option: 'reasoning effort', model: 'gpt-6.1-sol' });
+    expect(fetchMock).not.toHaveBeenCalled();
+    await responses.chat(message, { model: 'gpt-6.1-sol', tools, effort: 'high' });
+    expect(requests[0].tools).toHaveLength(1);
+  });
+
+  it('6.1 Sol rejects raw sampling with a valid remove-only remedy', async () => {
+    const { fetchMock } = captureFetch();
+    for (const [provider, options, rejected] of [
+      [new OpenAIProvider({ apiKey: 'test' }), { top_p: 0.9 }, 'top_p'],
+      [new OpenAIProvider({ apiKey: 'test' }), { logprobs: true }, 'logprobs'],
+      [new OpenAIResponsesProvider({ apiKey: 'test' }), { top_logprobs: 1 }, 'top_logprobs'],
+      [
+        new OpenAIResponsesProvider({ apiKey: 'test' }),
+        { include: ['message.output_text.logprobs'] },
+        'message.output_text.logprobs',
+      ],
+    ] as const) {
+      try {
+        await provider.chat(message, { model: 'gpt-6.1-sol', providerOptions: options });
+        throw new Error('expected rejection');
+      } catch (error) {
+        expect(error).toBeInstanceOf(UnsupportedModelOptionError);
+        expect(error).toMatchObject({ option: rejected, model: 'gpt-6.1-sol' });
+        expect((error as UnsupportedModelOptionError).remediation).toContain('Remove');
+        expect((error as UnsupportedModelOptionError).remediation).not.toContain(
+          'set reasoning effort',
+        );
+      }
+    }
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('6.1 Sol validates the final providerOptions model in both override directions', async () => {
+    const { requests, fetchMock } = captureFetch();
+    const chat = new OpenAIProvider({ apiKey: 'test' });
+    await expect(
+      chat.chat(message, {
+        model: 'gpt-6-sol',
+        tools,
+        effort: 'none',
+        providerOptions: { model: 'gpt-6.1-sol' },
+      }),
+    ).rejects.toMatchObject({ option: 'Chat Completions tool calling', model: 'gpt-6.1-sol' });
+    expect(fetchMock).not.toHaveBeenCalled();
+    await chat.chat(message, {
+      model: 'gpt-6.1-sol',
+      tools,
+      effort: 'none',
+      providerOptions: { model: 'gpt-6-sol' },
+    });
+    expect(requests[0]).toMatchObject({ model: 'gpt-6-sol', reasoning_effort: 'none' });
   });
 
   it('validates the final model and tools after both directions of native overrides', async () => {
@@ -218,7 +355,7 @@ describe('GPT-6 sampling policy: portable options stripped, raw overrides reject
     { name: 'Chat', create: () => new OpenAIProvider({ apiKey: 'test' }) },
     { name: 'Responses', create: () => new OpenAIResponsesProvider({ apiKey: 'test' }) },
   ] as const;
-  const models = ['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna'];
+  const models = ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna'];
 
   for (const endpoint of endpoints) {
     it.each(models)(
@@ -239,7 +376,11 @@ describe('GPT-6 sampling policy: portable options stripped, raw overrides reject
         await endpoint.create().chat(message, { model, temperature: 0.4 });
         expect(requests).toHaveLength(1);
         expect(requests[0]).not.toHaveProperty('temperature');
-        expect(requests[0]).not.toHaveProperty('reasoning_effort');
+        if (endpoint.name === 'Chat') {
+          expect(requests[0]).not.toHaveProperty('reasoning_effort');
+        } else {
+          expect(requests[0]).not.toHaveProperty('reasoning.effort');
+        }
       },
     );
 
@@ -328,6 +469,7 @@ describe('GPT-6 sampling policy: portable options stripped, raw overrides reject
 describe('GPT-6 Standard estimator', () => {
   const rows = [
     ['gpt-6-astra', [10, 1, 12.5, 50], [20, 2, 25, 75]],
+    ['gpt-6.1-sol', [2, 0.1, 2.5, 10], [4, 0.2, 5, 15]],
     ['gpt-6-sol', [2, 0.2, 2.5, 10], [4, 0.4, 5, 15]],
     ['gpt-6-luna', [0.1, 0.01, 0.125, 0.5], [0.2, 0.02, 0.25, 0.75]],
   ] as const;
@@ -356,28 +498,75 @@ describe('GPT-6 Standard estimator', () => {
     ).toBeUndefined();
   });
 
-  it('keeps unknown billing, media, and hosted tools unpriced', () => {
-    const usage = { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 };
-    expect(
-      estimateDirectOpenAICost('gpt-6-sol', usage, { request: { service_tier: 'fast' } }),
-    ).toBeUndefined();
-    expect(
-      estimateDirectOpenAICost('gpt-6-sol', usage, { request: { region: 'eu' } }),
-    ).toBeUndefined();
-    expect(
-      estimateDirectOpenAICost('gpt-6-sol', usage, {
-        request: { tools: [{ type: 'web_search' }] },
-      }),
-    ).toBeUndefined();
-    expect(
-      estimateDirectOpenAICost('gpt-6-sol', { ...usage, audio_input_tokens: 1 }),
-    ).toBeUndefined();
-    expect(
-      estimateDirectOpenAICost('gpt-6-sol', { ...usage, prompt_tokens: Number.NaN }),
-    ).toBeUndefined();
-    expect(
-      estimateDirectOpenAICost('gpt-6-sol', { ...usage, total_tokens: Number.NaN }),
-    ).toBeUndefined();
-    expect(estimateDirectOpenAICost('gpt-6-sol', { ...usage, total_tokens: 109 })).toBeUndefined();
+  it.each(['gpt-6-sol', 'gpt-6.1-sol'])(
+    'keeps unknown billing, media, and hosted tools unpriced for %s',
+    (model) => {
+      const usage = { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 };
+      expect(
+        estimateDirectOpenAICost(model, usage, { request: { service_tier: 'fast' } }),
+      ).toBeUndefined();
+      expect(
+        estimateDirectOpenAICost(model, usage, { request: { service_tier: 'ultrafast' } }),
+      ).toBeUndefined();
+      expect(estimateDirectOpenAICost(model, usage, { request: { region: 'eu' } })).toBeUndefined();
+      expect(
+        estimateDirectOpenAICost(model, usage, {
+          request: { tools: [{ type: 'web_search' }] },
+        }),
+      ).toBeUndefined();
+      expect(
+        estimateDirectOpenAICost(model, usage, { baseUrl: 'https://example.test/v1' }),
+      ).toBeUndefined();
+      expect(estimateDirectOpenAICost(model, { ...usage, audio_input_tokens: 1 })).toBeUndefined();
+      expect(
+        estimateDirectOpenAICost(model, { ...usage, prompt_tokens: Number.NaN }),
+      ).toBeUndefined();
+      expect(
+        estimateDirectOpenAICost(model, { ...usage, total_tokens: Number.NaN }),
+      ).toBeUndefined();
+      expect(estimateDirectOpenAICost(model, { ...usage, total_tokens: 109 })).toBeUndefined();
+    },
+  );
+
+  it.each([
+    ['Chat', () => new OpenAIProvider({ apiKey: 'test' })],
+    ['Responses', () => new OpenAIResponsesProvider({ apiKey: 'test' })],
+  ] as const)(
+    '%s prices the reported model first, then the final request model when missing',
+    async (_endpoint, create) => {
+      captureFetch('gpt-6.1-sol-2099-01-01');
+      const provider = create();
+      const requested = { model: 'gpt-6-sol', providerOptions: { model: 'gpt-6.1-sol' } };
+      const unknown = await provider.chat(message, requested);
+      expect(unknown.cost).toBeUndefined();
+
+      captureFetch(null);
+      const fallback = await provider.chat(message, requested);
+      expect(fallback.cost).toBeCloseTo((100 * 2 + 10 * 10) / 1_000_000, 12);
+    },
+  );
+
+  it.each([
+    ['Chat', () => new OpenAIProvider({ apiKey: 'test' })],
+    ['Responses', () => new OpenAIResponsesProvider({ apiKey: 'test' })],
+  ] as const)('%s stream returns terminal 6.1 Sol Standard cost', async (endpoint, create) => {
+    const event =
+      endpoint === 'Chat'
+        ? 'data: {"model":"gpt-6.1-sol","choices":[],"usage":{"prompt_tokens":100,"completion_tokens":10,"total_tokens":110}}\n\ndata: [DONE]\n\n'
+        : 'event: response.completed\ndata: {"response":{"model":"gpt-6.1-sol","usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110}}}\n\n';
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(event));
+        controller.close();
+      },
+    });
+    globalThis.fetch = vi.fn(async () => new Response(body, { status: 200 })) as typeof fetch;
+    const chunks = [];
+    for await (const chunk of create().stream(message, { model: 'gpt-6.1-sol' })) {
+      chunks.push(chunk);
+    }
+    const done = chunks.find((chunk) => chunk.type === 'done');
+    expect(done?.usage?.total_tokens).toBe(110);
+    expect(done?.cost).toBeCloseTo((100 * 2 + 10 * 10) / 1_000_000, 12);
   });
 });

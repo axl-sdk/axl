@@ -12,7 +12,7 @@ OpenAI's, Anthropic's, and Gemini's own endpoints an identifiable quota or spend
 The base catalog and pricing were reviewed against first-party documentation on
 August 3, 2026; native image transport was refreshed on September 2, and the
 GPT-6, Claude Opus 5.5, and Gemini 3.8 Flash contracts were checked on September 25,
-and the Claude Haiku 5.5 and Sonnet 5.5 contracts on October 7.
+Claude Haiku 5.5 and Sonnet 5.5 on October 7, and GPT-6.1 Sol on October 15.
 Exact known
 IDs receive their documented parameter and pricing behavior. Other IDs may pass
 through to the provider but remain unpriced and do not inherit model-specific
@@ -48,6 +48,7 @@ models below use the `openai-responses:` prefix and share `openai` configuration
 ```
 openai-responses:gpt-5.6        # Alias of GPT-5.6 Sol
 openai-responses:gpt-6-astra    # GPT-6 highest capability
+openai-responses:gpt-6.1-sol    # GPT-6.1 Sol; tools use Responses
 openai-responses:gpt-6-sol      # GPT-6 balanced reasoning
 openai-responses:gpt-6-luna     # GPT-6 efficient reasoning
 openai-responses:gpt-5.6-sol    # Highest-capability GPT-5.6 variant
@@ -68,6 +69,7 @@ Responses adapter does not support, such as stop sequences.
 ```
 openai:gpt-5.6                  # Alias of GPT-5.6 Sol
 openai:gpt-6-astra              # GPT-6 text; tools require Responses
+openai:gpt-6.1-sol              # GPT-6.1 Sol text; tools require Responses
 openai:gpt-6-sol                # GPT-6 text; Chat tools require explicit none effort
 openai:gpt-6-luna               # GPT-6 text; Chat tools require explicit none effort
 openai:gpt-5.6-sol              # Highest-capability GPT-5.6 variant
@@ -166,38 +168,44 @@ but never inherit exact pricing or GPT-5.6-specific capabilities.
 
 ### GPT-6 endpoint and pricing rules
 
-The exact `gpt-6-astra`, `gpt-6-sol`, and `gpt-6-luna` IDs support the existing
-text, structured-output, streaming, and function-tool paths. Prefer
-`openai-responses:` for tools: Astra tool calling requires Responses, while Sol
-and Luna Chat Completions function tools require an explicitly effective
-`reasoning_effort: 'none'`. Axl checks the final request after `providerOptions`
-merges and throws `UnsupportedModelOptionError` before dispatch for a forbidden
-combination. The error names the provider, effective model, rejected option,
-and an `openai-responses:` remedy. Unknown GPT-6-like IDs pass through without
-inheriting these exact-model rules or pricing.
+Use `openai-responses:gpt-6.1-sol` for agents with tools. Use
+`openai:gpt-6.1-sol` for Chat Completions without tools. Both endpoints support
+text, structured output, and streaming.
 
-Astra maps portable `effort: 'none'` to `low`; Sol and Luna accept `none`. All
-three accept native `max` on Responses and Chat. Their default reasoning is
-active. With active reasoning, `temperature`, `top_p`, and `top_logprobs` are
-invalid on either endpoint; Chat also rejects `logprobs`, and Responses rejects
-`message.output_text.logprobs` in `include`. The portable `temperature` option
-is dropped in that state, the same as on GPT-5.x. A raw `providerOptions` field
-that sets any of these parameters is rejected with `UnsupportedModelOptionError`
-before dispatch. With Sol or Luna at effective `none`, both the portable option
-and the raw fields are sent where the endpoint accepts them.
+| Exact model ID | Chat tool calling | `effort: 'none'` | `effort: 'max'` |
+| --- | --- | --- | --- |
+| `gpt-6-astra` | Use Responses | Clamped to `low` | Native on both endpoints |
+| `gpt-6.1-sol` | Use Responses | Clamped to `low` | Native on Responses; clamped to `xhigh` on Chat |
+| `gpt-6-sol`, `gpt-6-luna` | Requires `effort: 'none'` | Supported | Native on both endpoints |
 
-Axl prices direct Standard GPT-6 text calls from the published input,
-cached-input, cache-write, and output rows. Above 272,000 **total input
-tokens**, the long-context row prices the whole call, including cache buckets
-and output. Non-Standard processing, regional billing, hosted tools, unverified
-media, missing usage, and unknown model IDs stay unpriced. `OPENAI_PRICING`
-keeps its public flat shape. Sources: the
-[GPT-6 model guidance](https://developers.openai.com/api/docs/guides/latest-model)
-and [Standard pricing](https://developers.openai.com/api/docs/pricing), checked
-September 25, 2026. The verified live combinations and remaining limits (no
-invoice comparison for long-context or cache-write billing) are in the
+Axl reports effort clamps through `provider_diagnostic` events. Raw effort
+values in `providerOptions` must already be supported: for example, Chat
+`reasoning_effort: 'max'` is rejected for GPT-6.1 Sol. Invalid options and Chat
+tool combinations throw `UnsupportedModelOptionError` before a request is sent.
+Unknown model IDs do not inherit these exact-model rules or pricing.
+
+Reasoning is active by default. While active, Axl omits portable `temperature`
+and rejects raw `temperature`, `top_p`, and `top_logprobs` overrides. Chat also
+rejects `logprobs`; Responses rejects `message.output_text.logprobs` in
+`include`. With GPT-6 Sol or GPT-6 Luna at effective `none`, sampling options
+are forwarded where the endpoint accepts them.
+
+Direct Standard text cost estimates include input, cached input, cache writes,
+and output. Above 272,000 total input tokens, long-context rates apply to the
+whole request. Non-Standard processing, regional billing, hosted tools,
+unverified media, missing usage, and unknown model IDs remain unpriced.
+The exported `OPENAI_PRICING` compatibility table omits GPT-6 because its flat
+format cannot represent these rates; native OpenAI adapters use the detailed
+catalog in [`openai.ts`](../packages/axl/src/providers/openai.ts).
+
+See OpenAI's [model guide](https://developers.openai.com/api/docs/guides/latest-model)
+and [pricing](https://developers.openai.com/api/docs/pricing). Axl's
+[GPT-6.1 Sol live verification](./verification/gpt-61-sol-2026-10-15.md)
+confirmed the endpoint behavior above, including Chat's lower effort cap.
+Earlier GPT-6 results are in the
 [frontier verification record](./verification/frontier-model-refresh-2026-09-25.md)
-and its [remediation follow-up](./verification/frontier-owner-remediation-2026-09-26.md).
+and [follow-up](./verification/frontier-owner-remediation-2026-09-26.md).
+Long-context and cache-write estimates have not been checked against invoices.
 
 ## Anthropic
 
@@ -1281,6 +1289,8 @@ agent({ model: 'google:gemini-3.8-flash', effort: 'high', includeThoughts: true 
 | **OpenAI Chat** (GPT-5.6) | `reasoning_effort: 'none'` | `reasoning_effort: 'low'` | `reasoning_effort: 'medium'` | `reasoning_effort: 'high'` | `reasoning_effort: 'xhigh'` | capped to `'xhigh'` | nearest effort level* |
 | **OpenAI Responses** (GPT-5.6) | `reasoning.effort: 'none'` | `reasoning.effort: 'low'` | `reasoning.effort: 'medium'` | `reasoning.effort: 'high'` | `reasoning.effort: 'xhigh'` | `reasoning.effort: 'max'` | nearest effort level* |
 | **OpenAI Chat / Responses** (GPT-6 Astra) | `low` (clamped) | `low` | `medium` | `high` | `xhigh` | `max` | nearest effort level* |
+| **OpenAI Chat** (GPT-6.1 Sol) | `low` (clamped) | `low` | `medium` | `high` | `xhigh` | `xhigh` (clamped) | nearest effort level* |
+| **OpenAI Responses** (GPT-6.1 Sol) | `low` (clamped) | `low` | `medium` | `high` | `xhigh` | `max` | nearest effort level* |
 | **OpenAI Chat / Responses** (GPT-6 Sol/Luna) | `none` | `low` | `medium` | `high` | `xhigh` | `max` | nearest effort level* |
 | **Anthropic** (Claude 5) | model-specific: `disabled`, `between_tools` (Sonnet 5.5), or adaptive `'low'` on always-on models | adaptive + `effort: 'low'` | adaptive + `effort: 'medium'` | adaptive + `effort: 'high'` | adaptive + `effort: 'xhigh'` | adaptive + `effort: 'max'` | unsupported |
 | **Anthropic** (Opus 4.8 / 4.7) | disabled | adaptive + `effort: 'low'` | adaptive + `effort: 'medium'` | adaptive + `effort: 'high'` | adaptive + `effort: 'xhigh'` | adaptive + `effort: 'max'` | manual `budget_tokens` |
@@ -1554,11 +1564,13 @@ Providers charge less for tokens served from cache. The rates differ by provider
 
 | Model era | Models | Cache multiplier |
 |-----------|--------|-----------------|
-| gpt-4o / o1 | `gpt-4o`, `gpt-4o-mini`, `o1`, `o1-mini`, `o1-pro` | **50%** of input rate |
-| gpt-4.1 / o3 / o4 | `gpt-4.1`, `gpt-4.1-mini`, `gpt-4.1-nano`, `o3`, `o3-mini`, `o3-pro`, `o4-mini` | **25%** of input rate |
+| gpt-4o / o1 / o3-mini | `gpt-4o`, `gpt-4o-mini`, `o1`, `o3-mini` | **50%** of input rate |
+| gpt-4.1 / o3 / o4 | `gpt-4.1`, `gpt-4.1-mini`, `gpt-4.1-nano`, `o3`, `o4-mini` | **25%** of input rate |
 | gpt-5 | `gpt-5`, `gpt-5-mini`, `gpt-5-nano`, and exact known GPT-5.x IDs | model-specific |
 
-Only documented snapshot forms inherit a base model's price. An arbitrary suffix does not.
+The [`o3-mini` model page](https://developers.openai.com/api/docs/models/o3-mini)
+publishes $0.55 per million cached input tokens. Only snapshot IDs explicitly
+listed in Axl's catalog have prices; an arbitrary suffix remains unpriced.
 
 #### Prompt caching
 

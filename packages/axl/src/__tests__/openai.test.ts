@@ -8,7 +8,28 @@ import {
   supportsXhigh,
   clampReasoningEffort,
   estimateDirectOpenAICost,
+  estimateOpenAICost,
 } from '../providers/openai.js';
+import { priceFromTable } from '../providers/openai-compatible.js';
+
+it('keeps each public flat OpenAI price row aligned with the native catalog', () => {
+  const prompt = 100;
+  const cached = 40;
+  const completion = 20;
+  for (const model of Object.keys(OPENAI_PRICING)) {
+    const flat = priceFromTable(OPENAI_PRICING, model, prompt, completion, cached, 'exact');
+    expect(estimateOpenAICost(model, prompt, completion, cached), model).toBeCloseTo(flat!, 12);
+  }
+});
+
+it('charges o3-mini cached input at the published $0.55 per million', () => {
+  const expected = 0.00132; // 600 ordinary × $1.10 + 400 cached × $0.55 + 100 output × $4.40, per million
+  expect(priceFromTable(OPENAI_PRICING, 'o3-mini', 1000, 100, 400, 'exact')).toBeCloseTo(
+    expected,
+    12,
+  );
+  expect(estimateOpenAICost('o3-mini', 1000, 100, 400)).toBeCloseTo(expected, 12);
+});
 
 // ── Mock fetch ──────────────────────────────────────────────────────────
 

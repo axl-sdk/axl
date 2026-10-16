@@ -281,6 +281,17 @@ export function resolveConfig(config: AxlConfig): AxlConfig {
       level: process.env.AXL_TRACE_LEVEL as 'off' | 'steps' | 'full',
     };
   }
+  // OTel's content-capture switch is a fallback, not an override. A runtime
+  // explicitly opting out must stay private even in an opted-in process.
+  if (
+    resolved.telemetry?.captureContent === undefined &&
+    process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT !== undefined
+  ) {
+    resolved.telemetry = {
+      ...resolved.telemetry,
+      captureContent: process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT === 'true',
+    };
+  }
 
   // Standard API key env vars are a FALLBACK: they fill a provider's `apiKey`
   // (creating the provider entry if needed) only when the config sets none.

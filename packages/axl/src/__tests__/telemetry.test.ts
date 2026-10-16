@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { NoopSpanManager } from '../telemetry/noop.js';
 import { createSpanManager } from '../telemetry/index.js';
 import { OTelSpanManager } from '../telemetry/span-manager.js';
+import type { SpanManager } from '../telemetry/types.js';
 
 // OTel SDK imports for testing
 import {
@@ -22,6 +23,10 @@ import { createSequenceProvider } from './helpers.js';
 
 describe('telemetry', () => {
   describe('NoopSpanManager', () => {
+    it('has no explicit inference-span API', () => {
+      const manager: SpanManager = new NoopSpanManager();
+      expect(manager.startSpan).toBeUndefined();
+    });
     it('executes fn and returns result', async () => {
       const mgr = new NoopSpanManager();
       const result = await mgr.withSpanAsync('test', {}, async () => 42);
@@ -109,6 +114,32 @@ describe('OTelSpanManager', () => {
     expect(spans[0].name).toBe('test.span');
     expect(spans[0].attributes['test.key']).toBe('value');
     expect(spans[0].attributes['test.num']).toBe(42);
+  });
+
+  it('starts one CLIENT span under the active parent and ends it only once', async () => {
+    await manager.withSpanAsync('ask', {}, async () => {
+      const span = manager.startSpan(
+        'chat test-model',
+        {
+          'gen_ai.operation.name': 'chat',
+          'gen_ai.request.stop_sequences': ['one', 'two'],
+        },
+        { kind: 'client' },
+      );
+      span.setAttribute('gen_ai.response.finish_reasons', ['stop']);
+      span.setStatus('ok');
+      span.end();
+      span.end();
+    });
+    const spans = exporter.getFinishedSpans();
+    expect(spans).toHaveLength(2);
+    const parent = spans.find((span) => span.name === 'ask')!;
+    const inference = spans.find((span) => span.name === 'chat test-model')!;
+    expect(inference.kind).toBe(2); // OTel SpanKind.CLIENT
+    expect(inference.parentSpanContext?.spanId).toBe(parent.spanContext().spanId);
+    expect(inference.attributes['gen_ai.request.stop_sequences']).toEqual(['one', 'two']);
+    expect(inference.attributes['gen_ai.response.finish_reasons']).toEqual(['stop']);
+    expect(inference.status.code).toBe(1);
   });
 
   it('returns the function result', async () => {

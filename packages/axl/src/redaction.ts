@@ -44,6 +44,7 @@ import type {
 import { getEventSchemaVersion } from './event-schema.js';
 import type {
   CapturedExternalRequestRecord,
+  CapturedRequest,
   CapturedRequestRecord,
 } from './diagnostics/capture.js';
 
@@ -118,8 +119,8 @@ function redactInputDescriptor<T extends { parts: readonly unknown[] }>(input: T
   return {
     ...input,
     parts: input.parts.map((part) => {
-      if (!part || typeof part !== 'object' || !('type' in part) || part.type === 'text')
-        return part;
+      if (!part || typeof part !== 'object' || !('type' in part)) return part;
+      if (part.type === 'text') return { ...part };
       const value = part as { locator?: unknown; label?: unknown };
       return {
         ...part,
@@ -577,6 +578,54 @@ function redactExternalRecord(
   };
 }
 
+/** Shared v1/v2 request-content boundary. Identity and numeric options remain useful. */
+export function redactCapturedRequestPayload<T extends CapturedRequest>(request: T): T {
+  return {
+    ...request,
+    messages: request.messages.map((message) => {
+      const { providerMetadata: _metadata, ...safeMessage } = message;
+      return {
+        ...safeMessage,
+        content: message.content === null ? null : REDACTED,
+        ...(message.input ? { input: redactInputDescriptor(message.input) } : {}),
+        ...(message.tool_calls
+          ? {
+              tool_calls: message.tool_calls.map((call) => ({
+                ...call,
+                function: { ...call.function, arguments: REDACTED },
+              })),
+            }
+          : {}),
+      };
+    }),
+    ...(request.tools
+      ? {
+          tools: request.tools.map((tool) => ({
+            ...tool,
+            ...(tool.description !== undefined ? { description: REDACTED } : {}),
+            parameters: REDACTED,
+          })),
+        }
+      : {}),
+    ...(request.responseFormat?.type === 'json_schema'
+      ? {
+          responseFormat: {
+            ...request.responseFormat,
+            json_schema: { ...request.responseFormat.json_schema, schema: REDACTED },
+          },
+        }
+      : request.responseFormat
+        ? { responseFormat: { ...request.responseFormat } }
+        : {}),
+    options: {
+      ...request.options,
+      ...(request.options.stop ? { stop: request.options.stop.map(() => REDACTED) } : {}),
+      ...(request.options.toolChoice !== undefined ? { toolChoice: REDACTED } : {}),
+    },
+    ...(request.providerOptionKeys ? { providerOptionKeys: [...request.providerOptionKeys] } : {}),
+  } as T;
+}
+
 export function redactCapturedRequest(record: CapturedRequestRecord): CapturedRequestRecord {
   if (record.kind === 'external') {
     return redactExternalRecord(record);
@@ -595,25 +644,7 @@ export function redactCapturedRequest(record: CapturedRequestRecord): CapturedRe
     },
   };
   if (record.request) {
-    out.request = {
-      ...record.request,
-      messages: record.request.messages.map((message) => {
-        const { providerMetadata: _metadata, ...safeMessage } = message;
-        return {
-          ...safeMessage,
-          content: message.content === null ? null : REDACTED,
-          ...(message.input ? { input: redactInputDescriptor(message.input) } : {}),
-          ...(message.tool_calls
-            ? {
-                tool_calls: message.tool_calls.map((call) => ({
-                  ...call,
-                  function: { ...call.function, arguments: REDACTED },
-                })),
-              }
-            : {}),
-        };
-      }),
-    };
+    out.request = redactCapturedRequestPayload(record.request);
   }
   if (record.response) {
     const { providerMetadata: _metadata, ...safeResponse } = record.response;

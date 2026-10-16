@@ -1943,6 +1943,31 @@ The discriminated `kind: 'external'` variant records a caller-declared operation
 by `name` without inventing a provider or model. Eval operation references and
 Studio diagnostics retain mixed model/external artifacts.
 
+`foldJournal(lines)` accepts decoded v1 journal lines and returns one validated
+`FoldedOperationRecord` per operation id. The union distinguishes
+`ModelCallRecord` (`kind: 'chat' | 'stream'`, with provider/model) from
+`ExternalOperationRecord` (`kind: 'external'`, with name). Each is `v: 2`;
+`modelCallRecordSchema`, `externalOperationRecordSchema`, and
+`foldedOperationRecordSchema` validate their respective forms. The exported
+`capturedJournalLineSchema` validates a decoded v1 line. An invalid line or
+contradictory identity/phase throws `AxlError('INVALID_CAPTURE_JOURNAL')`.
+Interleaved operation ids are supported; exact duplicate lines are ignored.
+Validation snapshots strict JSON by value, including unknown additive v1
+fields, so later mutations to an input line cannot change the folded record.
+
+The model record has `id`, `kind`, `provider`, `model`, optional `purpose`,
+`startedAt`/`endedAt`, `ids`, `attributes`, optional `gate`, `request`, `usage`,
+`cost`, `costProvenance`, `timing`, `captured`, and a closed `outcome`. Outcome
+statuses are `ok`, `error`, `aborted`, `stalled`, `consumer_closed`, and
+`unfinished`. A settled stub keeps its known status with `payloadOmitted: true`;
+`unfinished` means no end line was captured. Legacy timestamps and purpose are
+absent when the journal did not report them. `captured.replayable` is true only
+for an unredacted, untruncated request with the continuity marker and no
+omissions or provider option values. `redactModelCallRecord(record)` returns a
+redacted copy and clears replayability while retaining ids, attributes,
+timing, usage, and cost. The folded form is a consumption format; artifacts
+continue to store v1 phase lines.
+
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `root` | `string?` | — | Directory for the built-in `FileDiagnosticArtifactStore`. One of `root` or `store` is required for capture |

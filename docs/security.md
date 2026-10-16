@@ -364,7 +364,8 @@ contain, so the same policy applies, twice:
 
 - **Before the write.** When `trace.redact` is on, every record passes through
   `redactCapturedRequest()` before it reaches the sink. Message content, tool-call
-  arguments, response content and thinking, partial stream output, error
+  arguments, tool descriptions and schemas, output schemas, stop strings,
+  tool choice, response content and thinking, partial stream output, error
   messages and gate `reason` / `feedbackMessage` become `'[redacted]'`.
   Opaque `providerMetadata` is removed from both request and response, with
   the omission recorded; structure (roles, counts, model, provider, timings,
@@ -372,6 +373,12 @@ contain, so the same policy applies, twice:
   `captured.redacted: true`.
 - **Again at delivery.** Studio re-applies redaction when streaming records out,
   because an artifact may have been written before the flag was switched on.
+
+For folded `v: 2` records, `redactModelCallRecord()` returns a copy. It also
+scrubs tool definitions, output schemas, optional tool choice, partial output,
+opaque provider metadata, gate text, and caller-supplied external payloads.
+The copy keeps ids, attributes, timing, usage and cost; it sets
+`captured.replayable: false`. The original record is unchanged.
 
 For model-call records, image, audio and file parts are replaced by descriptors.
 `providerOptions` contributes **keys only** — a credential passed through it

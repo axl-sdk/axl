@@ -862,6 +862,17 @@ result.json` it also writes `result.requests.jsonl` beside the result.
 
 ### What a record contains
 
+Call `foldJournal(decodedLines)` to assemble the v1 phase journal into one
+`v: 2` record per operation. It correlates interleaved ids, keeps the largest
+reported transport attempt count, and validates the result through the public
+Zod schemas. A start without an end becomes `outcome.status: 'unfinished'`;
+an end without a start keeps its known outcome but has no request and cannot
+claim exact replay. Invalid versions and contradictory lines fail with
+`AxlError('INVALID_CAPTURE_JOURNAL')`. The folded union keeps external
+operations separate from model calls: external records have `name` and no
+provider/model. See the [API reference](api-reference.md#diagnostic-artifacts)
+for the full v2 shape and schema names.
+
 One JSONL line per phase of a model call, `v: 1`:
 
 | Phase | Carries |

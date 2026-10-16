@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Built-in provider chat responses and terminal stream chunks now expose normalized finish reason, raw vendor reason or status, and provider-reported response id and model when available. `MockProvider.sequence()` can script the same metadata for tests.
 - Opt-in request journals now preserve response thinking and continuity metadata, streamed partial output, dispatch/settlement timing, truthful ask/summary/judge identity, and branch-local repair links. A new continuity marker distinguishes current snapshots from older v1 records; interrupted streams and oversized end stubs retain their actual outcome and available usage/cost evidence. Redaction also scrubs the new content surfaces and removes opaque provider metadata.
 - Capturing scopes now include `externalOperation()` / `ctx.withExternalOperation()` as named `kind: 'external'` journal entries without fabricated provider/model fields. The new optional `report.capture({ request?, response? })` snapshots caller JSON for diagnostics; bounded stubs and redaction preserve the operation result and reported accounting. Eval references and Studio diagnostics accept mixed model/external artifacts.
+- `foldJournal()` now assembles v1 capture lines into validated, self-contained v2 model-call or external-operation records. Public Zod schemas, record types, and `redactModelCallRecord()` support typed consumers while preserving legacy unknowns and settled stub outcomes.
 
 ### Fixed
 

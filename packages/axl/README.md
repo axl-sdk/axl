@@ -595,6 +595,9 @@ eval history row that owns them is saved, deleted with it, and reclaimed by a
 startup pass plus a periodic sweep. See
 [observability.md](../../docs/observability.md#captured-requests-opt-in) and
 [integration.md](../../docs/integration.md#diagnostic-artifact-storage).
+`foldJournal()` assembles the v1 phase lines into validated v2 model or external
+operation records; `redactModelCallRecord()` returns a redacted copy for a
+consumer boundary. See the [record contract](../../docs/api-reference.md#diagnostic-artifacts).
 
 Compatible loaded ESM/CJS copies share accounting, admission, and capture in
 one JavaScript realm. Cross-copy work emits one warning identifying both copies;

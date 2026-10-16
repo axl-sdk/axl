@@ -224,6 +224,15 @@ describe('resolveConfig()', () => {
     );
     process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT = 'false';
     expect(resolveConfig({}).telemetry?.captureContent).toBe(false);
+    // OTel boolean env vars: "true" is case-insensitive; anything else is false.
+    for (const value of ['TRUE', 'True']) {
+      process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT = value;
+      expect(resolveConfig({}).telemetry?.captureContent).toBe(true);
+    }
+    for (const value of ['1', 'yes', '']) {
+      process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT = value;
+      expect(resolveConfig({}).telemetry?.captureContent).toBe(false);
+    }
     delete process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT;
     expect(resolveConfig({}).telemetry?.captureContent ?? false).toBe(false);
   });

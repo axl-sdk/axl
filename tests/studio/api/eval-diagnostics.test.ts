@@ -105,7 +105,7 @@ const LEGACY_RECORDS = readFileSync(
   .map((line) => JSON.parse(line) as Record<string, unknown>);
 
 async function importResult(
-  app: { request: (p: string, init?: RequestInit) => Promise<Response> },
+  app: { request: (p: string, init?: RequestInit) => Response | Promise<Response> },
   body: Record<string, unknown>,
 ) {
   return app.request('/api/evals/import', {

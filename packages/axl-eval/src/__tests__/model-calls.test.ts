@@ -28,6 +28,7 @@ import {
   runEval,
   scorer,
   type ModelCallInput,
+  type ModelCallOutput,
 } from '../index.js';
 
 const capture = {
@@ -227,7 +228,8 @@ describe('model-call eval helpers', () => {
     const consumer = new RecordingProvider('fixture', '{"fresh":true}');
     const replayRuntime = runtimeWith(consumer);
     expect((await replayModelCall()(input(captured), replayRuntime)).output).toEqual({
-      fresh: true,
+      content: '{"fresh":true}',
+      json: { fresh: true },
     });
     expect(consumer.calls).toHaveLength(1);
     expect(consumer.calls[0].messages).toEqual(producer.calls[0].messages);
@@ -466,16 +468,16 @@ describe('model-call eval helpers', () => {
     const ds = modelCallDataset([generation], {
       annotate: () => ({ expected: 'recorded answer' }),
     });
-    const quality = scorer<string, ModelCallInput, { expected: string }>({
+    const quality = scorer<ModelCallOutput, ModelCallInput, { expected: string }>({
       name: 'quality',
       description: 'exact recorded output',
-      score: (output, _input, annotation) => (output === annotation?.expected ? 1 : 0),
+      score: (output, _input, annotation) => (output.content === annotation?.expected ? 1 : 0),
     });
     const evalConfig = defineEval({ workflow: 'recorded', dataset: ds, scorers: [quality] });
     const judgeProvider = new RecordingProvider('judge', '{"score":0.75,"reasoning":"okay"}', 0.02);
     const runtime = runtimeWith(judgeProvider, 'judge');
     const original = await runEval(evalConfig, recordedModelCall(), runtime);
-    expect(original.items[0].output).toBe('recorded answer');
+    expect(original.items[0].output).toEqual({ content: 'recorded answer' });
     expect(original.summary.scorers.quality.mean).toBe(1);
     expect(original.accounting?.knownCost).toBe(0);
     expect(judgeProvider.calls).toHaveLength(0);
@@ -494,10 +496,45 @@ describe('model-call eval helpers', () => {
     expect(() => evalCompare(original, rescored)).not.toThrow();
   });
 
+  it('rescores a recorded tool-call turn with its tool calls and response identity', async () => {
+    const base = record({ responseFormat: { type: 'json_object' } });
+    if (base.outcome.status !== 'ok' || !('response' in base.outcome)) throw new Error('fixture');
+    const toolTurn: ModelCallRecord = modelCallRecordSchema.parse({
+      ...base,
+      outcome: {
+        status: 'ok',
+        response: {
+          content: '',
+          thinking: 'look it up',
+          tool_calls: [
+            { id: 't1', type: 'function', function: { name: 'lookup', arguments: '{"q":1}' } },
+          ],
+          finishReason: 'tool_calls',
+          rawFinishReason: 'tool_use',
+          responseId: 'msg_1',
+          responseModel: 'm-2026',
+          providerMetadata: { thinking: { signature: 'opaque' } },
+        },
+      },
+    });
+    // Opaque continuity data is replay input, not scorable output.
+    expect((await recordedModelCall()(input(toolTurn))).output).toEqual({
+      content: '',
+      thinking: 'look it up',
+      tool_calls: [
+        { id: 't1', type: 'function', function: { name: 'lookup', arguments: '{"q":1}' } },
+      ],
+      finishReason: 'tool_calls',
+      rawFinishReason: 'tool_use',
+      responseId: 'msg_1',
+      responseModel: 'm-2026',
+    });
+  });
+
   it('returns text or parsed JSON without reconstructing the original Zod validator', async () => {
     const executor = recordedModelCall();
     const text = record({ content: 'plain' });
-    expect((await executor(input(text))).output).toBe('plain');
+    expect((await executor(input(text))).output).toEqual({ content: 'plain' });
     const jsonRecord = record({
       content: '{"value":"string"}',
       responseFormat: {
@@ -508,14 +545,17 @@ describe('model-call eval helpers', () => {
         },
       },
     });
-    expect((await executor(input(jsonRecord))).output).toEqual({ value: 'string' });
+    expect((await executor(input(jsonRecord))).output).toEqual({
+      content: '{"value":"string"}',
+      json: { value: 'string' },
+    });
     const { request: _request, ...withoutRequest } = text;
     void _request;
     const stub: ModelCallRecord = modelCallRecordSchema.parse({
       ...withoutRequest,
       captured: { ...text.captured, replayable: false, truncated: true, omitted: ['record'] },
     });
-    expect((await executor(input(stub))).output).toBe('plain');
+    expect((await executor(input(stub))).output).toEqual({ content: 'plain' });
     for (const unavailable of [
       { ...text, captured: { ...text.captured, redacted: true, replayable: false } },
       {
@@ -573,7 +613,10 @@ describe('model-call eval helpers', () => {
     const ds = modelCallDataset([original]);
     const config = defineEval({ workflow: 'replay', dataset: ds, scorers: [] });
     const result = await runEval(config, replayModelCall(), runtime);
-    expect(result.items[0].output).toEqual({ answer: 'fresh' });
+    expect(result.items[0].output).toEqual({
+      content: '{"answer":"fresh"}',
+      json: { answer: 'fresh' },
+    });
     expect(result.accounting?.knownCost).toBe(0.03);
     expect(provider.calls).toHaveLength(1);
     const call = provider.calls[0];
@@ -618,7 +661,7 @@ describe('model-call eval helpers', () => {
     const runtime = runtimeWith(originalProvider);
     runtime.registerProvider('other', overrideProvider);
     const executor = replayModelCall({ model: 'other:new' });
-    expect((await executor(input(stream), runtime)).output).toBe('fresh stream');
+    expect((await executor(input(stream), runtime)).output).toEqual({ content: 'fresh stream' });
     expect(overrideProvider.calls).toHaveLength(1);
     expect(overrideProvider.calls[0]).toMatchObject({ kind: 'stream', options: { model: 'new' } });
     expect(originalProvider.calls).toHaveLength(0);
@@ -638,7 +681,7 @@ describe('model-call eval helpers', () => {
     expect(provider.calls).toHaveLength(0);
     expect(
       (await replayModelCall({ model: 'registered-alias:m' })(input(captured), runtime)).output,
-    ).toBe('fresh answer');
+    ).toEqual({ content: 'fresh answer' });
     expect(provider.calls).toHaveLength(1);
   });
 
@@ -654,13 +697,15 @@ describe('model-call eval helpers', () => {
     const captured = record({ provider: 'custom', model: 'namespace:model' });
     const provider = new RecordingProvider('custom');
     const runtime = runtimeWith(provider);
-    expect((await replayModelCall()(input(captured), runtime)).output).toBe('fresh answer');
+    expect((await replayModelCall()(input(captured), runtime)).output).toEqual({
+      content: 'fresh answer',
+    });
     expect(provider.calls).toHaveLength(1);
     expect(provider.calls[0].options.model).toBe('namespace:model');
   });
 
-  it('stops on terminal stream done and returns empty text for a tool-call-only stream', async () => {
-    const captured = record({ kind: 'stream' });
+  it('stops on terminal stream done and returns the streamed tool call and response metadata', async () => {
+    const captured = record({ kind: 'stream', responseFormat: { type: 'json_object' } });
     let closed = false;
     const provider: Provider = {
       name: 'fixture',
@@ -669,8 +714,16 @@ describe('model-call eval helpers', () => {
       },
       async *stream() {
         try {
-          yield { type: 'tool_call_delta' as const, id: 't', name: 'lookup', arguments: '{}' };
-          yield { type: 'done' };
+          yield { type: 'thinking_delta' as const, content: 'need data' };
+          yield { type: 'tool_call_delta' as const, id: 't', name: 'lookup', arguments: '{"q"' };
+          yield { type: 'tool_call_delta' as const, id: 't', arguments: ':1}' };
+          yield {
+            type: 'done' as const,
+            finishReason: 'tool_calls' as const,
+            rawFinishReason: 'tool_use',
+            responseId: 'resp_1',
+            responseModel: 'm-2026',
+          };
           await new Promise<never>(() => {});
         } finally {
           closed = true;
@@ -679,7 +732,18 @@ describe('model-call eval helpers', () => {
     };
     const runtime = new AxlRuntime({ defaultProvider: 'fixture', trace: { enabled: false } });
     runtime.registerProvider('fixture', provider);
-    expect((await replayModelCall()(input(captured), runtime)).output).toBe('');
+    // A JSON-format turn that answers with a tool call has no text to parse.
+    expect((await replayModelCall()(input(captured), runtime)).output).toEqual({
+      content: '',
+      thinking: 'need data',
+      tool_calls: [
+        { id: 't', type: 'function', function: { name: 'lookup', arguments: '{"q":1}' } },
+      ],
+      finishReason: 'tool_calls',
+      rawFinishReason: 'tool_use',
+      responseId: 'resp_1',
+      responseModel: 'm-2026',
+    });
     expect(closed).toBe(true);
   });
 
@@ -701,7 +765,7 @@ describe('model-call eval helpers', () => {
     });
   });
 
-  it('returns empty model text for a tool-call-only replay without executing the tool', async () => {
+  it('returns the tool call of a tool-call-only replay without executing the tool', async () => {
     const captured = record();
     let calls = 0;
     const provider: Provider = {
@@ -713,6 +777,8 @@ describe('model-call eval helpers', () => {
           tool_calls: [
             { id: 't', type: 'function', function: { name: 'lookup', arguments: '{}' } },
           ],
+          finishReason: 'tool_calls',
+          responseId: 'chat_1',
           cost: 0.01,
         };
       },
@@ -722,7 +788,12 @@ describe('model-call eval helpers', () => {
     };
     const runtime = new AxlRuntime({ defaultProvider: 'fixture', trace: { enabled: false } });
     runtime.registerProvider('fixture', provider);
-    expect((await replayModelCall()(input(captured), runtime)).output).toBe('');
+    expect((await replayModelCall()(input(captured), runtime)).output).toEqual({
+      content: '',
+      tool_calls: [{ id: 't', type: 'function', function: { name: 'lookup', arguments: '{}' } }],
+      finishReason: 'tool_calls',
+      responseId: 'chat_1',
+    });
     expect(calls).toBe(1);
   });
 

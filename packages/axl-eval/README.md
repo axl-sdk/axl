@@ -764,8 +764,9 @@ external operations visible. `modelCallDataset()` produces ordinary eval items;
 filter out `kind: 'external'` explicitly when the source is mixed. Pass
 `recordedModelCall()` to `runEval()` to score saved model outputs with no new
 generation calls, or `replayModelCall({ model: 'provider:model' })` to make one
-new provider call per item. The output is model text or parsed JSON, not an
-agent result or executed tool output. See the [testing recipe](../../docs/testing.md#seeing-the-request-behind-a-score).
+new provider call per item. The output is a `ModelCallOutput` — `content`,
+parsed `json` when JSON was requested, and any `tool_calls`, finish reason and
+response identity — not an agent result or executed tool output. See the [testing recipe](../../docs/testing.md#seeing-the-request-behind-a-score).
 
 A returned cost can no longer override that measurement — it would let a workflow
 understate what it spent. Report one anyway if it is useful to compare against:

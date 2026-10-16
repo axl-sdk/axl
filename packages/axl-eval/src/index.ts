@@ -8,6 +8,7 @@ export {
 } from './model-calls.js';
 export type {
   ModelCallInput,
+  ModelCallOutput,
   ModelCallDatasetOptions,
   ReplayModelCallOptions,
 } from './model-calls.js';

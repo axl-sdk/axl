@@ -2737,9 +2737,28 @@ attaches typed ground truth for scorers.
 
 Both executor factories return an ordinary `executeWorkflow` callback accepted
 by `runEval` and core's `EvalExecuteWorkflow` type. They return `{ output }`
-with no historical cost claim. `recordedModelCall` reads a complete,
-unredacted successful response without a model call. It returns text, or parses
-JSON for a captured `json_object`/`json_schema` request. JSON parsing does not
+with no historical cost claim. Both outputs are a `ModelCallOutput`:
+
+```ts
+type ModelCallOutput = {
+  content: string;            // model text ('' for a tool-call-only turn)
+  json?: unknown;             // parsed content when the request asked for JSON
+  thinking?: string;
+  tool_calls?: ToolCallMessage[];
+  finishReason?: FinishReason;
+  rawFinishReason?: string;
+  responseId?: string;
+  responseModel?: string;
+};
+```
+
+Field names match a recorded `ok` outcome's `response`, so a scorer can compare
+a replay against `input.recorded` directly; opaque `providerMetadata` is not
+part of the output. Type a scorer as `scorer<ModelCallOutput, ModelCallInput>`.
+`recordedModelCall` reads a complete, unredacted successful response without a
+model call. `json` is set for a captured `json_object`/`json_schema` request;
+unparseable text throws `AxlError('INVALID_MODEL_CALL_JSON')`, except that a
+tool-call turn with empty text has no `json`. JSON parsing does not
 reconstruct the original Zod refinements or transforms. A request stub can
 still supply scorable text when its outcome has a complete response; without
 the request, its response format is unknown. Missing, redacted, omitted, or
@@ -2753,8 +2772,9 @@ refuses a missing, redacted, truncated, omitted or otherwise non-replayable
 request before dispatch. A full `provider:model` override selects a different
 model; a bare captured model is resolved with its captured provider. Custom
 registry aliases that cannot be resolved safely require an explicit override.
-Replay executes no tool calls from the response. Its output is model text or
-parsed JSON, and only the **new** call is measured as spend by `runEval`.
+Replay executes no tool calls from the response; the calls the new model
+chose are returned in `tool_calls`, with its finish reason and response
+identity. Only the **new** call is measured as spend by `runEval`.
 A replayed stream stops at its terminal `done`; EOF before `done` raises a
 typed incomplete-stream error instead of returning partial text.
 `RunEvalOptions.signal` is checked between cases and scorers; the existing

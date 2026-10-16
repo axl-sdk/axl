@@ -570,20 +570,28 @@ To rescore captured model outputs, load the journal, turn its model calls into
 a dataset, then use the normal eval runner:
 
 ```ts
-import { defineEval, loadModelCalls, modelCallDataset, recordedModelCall, replayModelCall, runEval, scorer } from '@axlsdk/eval';
+import { defineEval, loadModelCalls, modelCallDataset, recordedModelCall, replayModelCall, runEval, scorer, type ModelCallInput, type ModelCallOutput } from '@axlsdk/eval';
 
 const records = await loadModelCalls('result.requests.jsonl');
 const captured = modelCallDataset(records, {
   filter: (record) => record.kind !== 'external',
 });
-const scorers = [scorer({ name: 'nonempty', description: 'model returned content', score: (output) => String(output).length > 0 ? 1 : 0 })];
+const scorers = [
+  scorer<ModelCallOutput, ModelCallInput>({
+    name: 'answered',
+    description: 'model returned text or chose a tool',
+    score: (output) => (output.content.length > 0 || output.tool_calls ? 1 : 0),
+  }),
+];
 const config = defineEval({ workflow: 'captured', dataset: captured, scorers });
 const rescored = await runEval(config, recordedModelCall(), runtime);
 const replayed = await runEval(config, replayModelCall({ model: 'openai:gpt-4o' }), runtime);
 ```
 
-Recorded output is model text, or parsed JSON when the captured request asked
-for JSON; it is not an agent result or executed tool output. The recorded run
+Both executors return a `ModelCallOutput`: `content`, parsed `json` when the
+captured request asked for JSON, plus any `tool_calls`, `thinking`, finish
+reason and response identity. A tool-call turn is scored on the tool it chose,
+not as empty text. It is not an agent result or executed tool output. The recorded run
 does no generation calls, so only explicitly configured LLM judges can spend.
 Replay makes one new provider call per item and never executes returned tool
 calls. The runtime measures that new spend without carrying forward the

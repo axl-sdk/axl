@@ -10,8 +10,12 @@ import {
   type ChatMessage,
   type ChatOptions,
   type EvalExecuteWorkflow,
+  type FinishReason,
   type FoldedOperationRecord,
   type ModelCallRecord,
+  type ProviderResponse,
+  type StreamChunk,
+  type ToolCallMessage,
 } from '@axlsdk/axl';
 import { dataset, type Dataset } from './dataset.js';
 
@@ -30,6 +34,23 @@ export type ModelCallDatasetOptions<TAnnotations> = {
 };
 
 export type ReplayModelCallOptions = { model?: string };
+
+/**
+ * The `output` both executors return: one model response, field-named like a
+ * recorded `ok` outcome's `response` so a scorer can compare a replay with
+ * `input.recorded` directly. Tool calls are part of the answer, not dropped.
+ */
+export type ModelCallOutput = {
+  content: string;
+  /** Parsed `content`, present when the request asked for JSON and the model answered in text. */
+  json?: unknown;
+  thinking?: string;
+  tool_calls?: ToolCallMessage[];
+  finishReason?: FinishReason;
+  rawFinishReason?: string;
+  responseId?: string;
+  responseModel?: string;
+};
 
 type Located = { value: unknown; location: string; position: number };
 function invalid(location: string, message: string): never {
@@ -243,11 +264,25 @@ function readInput(input: unknown): ModelCallRecord {
     );
   return parsed.data;
 }
-function outputContent(content: string, record: ModelCallRecord): unknown {
+type ResponseFields = Omit<ModelCallOutput, 'json'>;
+function modelCallOutput(response: ResponseFields, record: ModelCallRecord): ModelCallOutput {
+  const output: ModelCallOutput = {
+    content: response.content,
+    ...(response.thinking ? { thinking: response.thinking } : {}),
+    ...(response.tool_calls?.length ? { tool_calls: response.tool_calls } : {}),
+    ...(response.finishReason !== undefined ? { finishReason: response.finishReason } : {}),
+    ...(response.rawFinishReason !== undefined
+      ? { rawFinishReason: response.rawFinishReason }
+      : {}),
+    ...(response.responseId !== undefined ? { responseId: response.responseId } : {}),
+    ...(response.responseModel !== undefined ? { responseModel: response.responseModel } : {}),
+  };
   const format = record.request?.responseFormat?.type;
-  if (format !== 'json_object' && format !== 'json_schema') return content;
+  if (format !== 'json_object' && format !== 'json_schema') return output;
+  // A tool-call turn under a JSON format legitimately carries no text yet.
+  if (output.content === '' && output.tool_calls) return output;
   try {
-    return JSON.parse(content) as unknown;
+    return { ...output, json: JSON.parse(output.content) as unknown };
   } catch {
     throw new AxlError(
       'INVALID_MODEL_CALL_JSON',
@@ -255,8 +290,24 @@ function outputContent(content: string, record: ModelCallRecord): unknown {
     );
   }
 }
+function providerOutput(response: ProviderResponse, record: ModelCallRecord): ModelCallOutput {
+  return modelCallOutput(
+    {
+      content: response.content,
+      ...(response.thinking_content !== undefined ? { thinking: response.thinking_content } : {}),
+      ...(response.tool_calls !== undefined ? { tool_calls: response.tool_calls } : {}),
+      ...(response.finishReason !== undefined ? { finishReason: response.finishReason } : {}),
+      ...(response.rawFinishReason !== undefined
+        ? { rawFinishReason: response.rawFinishReason }
+        : {}),
+      ...(response.responseId !== undefined ? { responseId: response.responseId } : {}),
+      ...(response.responseModel !== undefined ? { responseModel: response.responseModel } : {}),
+    },
+    record,
+  );
+}
 
-/** Rescore captured output without calling a provider or returning historical cost. */
+/** Rescore captured output (a {@link ModelCallOutput}) without calling a provider or returning historical cost. */
 export function recordedModelCall(): EvalExecuteWorkflow {
   return async (input) => {
     const record = readInput(input);
@@ -267,7 +318,8 @@ export function recordedModelCall(): EvalExecuteWorkflow {
         'RECORDED_OUTPUT_UNAVAILABLE',
         `model call ${record.id} has no complete successful output (${record.outcome.status})`,
       );
-    return { output: outputContent(record.outcome.response.content, record) };
+    // Copies named response fields only; opaque providerMetadata is replay input, not output.
+    return { output: modelCallOutput(record.outcome.response, record) };
   };
 }
 
@@ -392,7 +444,7 @@ function chatMessages(request: NonNullable<ModelCallRecord['request']>): ChatMes
   });
 }
 
-/** Replay one captured provider call; tool calls in its response are not executed. */
+/** Replay one captured provider call into a {@link ModelCallOutput}; returned tool calls are not executed. */
 export function replayModelCall(options: ReplayModelCallOptions = {}): EvalExecuteWorkflow {
   return async (input, runtime) => {
     const record = readInput(input);
@@ -424,19 +476,49 @@ export function replayModelCall(options: ReplayModelCallOptions = {}): EvalExecu
     };
     if (record.kind === 'chat') {
       const response = await resolved.provider.chat(messages, callOptions);
-      return { output: outputContent(response.content, record) };
+      return { output: providerOutput(response, record) };
     }
     let content = '';
-    let completed = false;
+    let thinking = '';
+    // Same accumulation as the ask loop: deltas keyed by id, name set, arguments appended.
+    const calls = new Map<string, { id: string; name: string; arguments: string }>();
+    let done: Extract<StreamChunk, { type: 'done' }> | undefined;
     for await (const chunk of resolved.provider.stream(messages, callOptions)) {
       if (chunk.type === 'text_delta') content += chunk.content;
-      if (chunk.type === 'done') {
-        completed = true;
+      else if (chunk.type === 'thinking_delta') thinking += chunk.content;
+      else if (chunk.type === 'tool_call_delta') {
+        const call = calls.get(chunk.id) ?? { id: chunk.id, name: '', arguments: '' };
+        if (chunk.name) call.name = chunk.name;
+        if (chunk.arguments) call.arguments += chunk.arguments;
+        calls.set(chunk.id, call);
+      } else if (chunk.type === 'done') {
+        done = chunk;
         break;
       }
     }
-    if (!completed)
+    if (!done)
       throw new AxlError('MODEL_CALL_STREAM_INCOMPLETE', 'replayed stream ended without done');
-    return { output: outputContent(content, record) };
+    return {
+      output: providerOutput(
+        {
+          content,
+          ...(thinking ? { thinking_content: thinking } : {}),
+          ...(calls.size
+            ? {
+                tool_calls: [...calls.values()].map((call) => ({
+                  id: call.id,
+                  type: 'function' as const,
+                  function: { name: call.name, arguments: call.arguments },
+                })),
+              }
+            : {}),
+          ...(done.finishReason !== undefined ? { finishReason: done.finishReason } : {}),
+          ...(done.rawFinishReason !== undefined ? { rawFinishReason: done.rawFinishReason } : {}),
+          ...(done.responseId !== undefined ? { responseId: done.responseId } : {}),
+          ...(done.responseModel !== undefined ? { responseModel: done.responseModel } : {}),
+        },
+        record,
+      ),
+    };
   };
 }

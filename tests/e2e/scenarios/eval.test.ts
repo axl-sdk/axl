@@ -491,7 +491,7 @@ const historical = await loadModelCalls(${JSON.stringify(fixture)});
 export default {
   workflow: 'recorded-legacy',
   dataset: modelCallDataset(historical, { filter: (record) => record.outcome.status === 'ok' }),
-  scorers: [{ name: 'recorded-answer', score: (output) => output === 'legacy answer' ? 1 : 0 }],
+  scorers: [{ name: 'recorded-answer', score: (output) => output.content === 'legacy answer' ? 1 : 0 }],
 };
 export const executeWorkflow = recordedModelCall();
 `,
@@ -506,7 +506,7 @@ export const executeWorkflow = recordedModelCall();
       };
       expect(run).toContain('recorded-legacy');
       expect(result.items).toHaveLength(1);
-      expect(result.items[0].output).toBe('legacy answer');
+      expect(result.items[0].output).toEqual({ content: 'legacy answer' });
       expect(result.items[0].scores['recorded-answer']).toBe(1);
       expect(result.accounting.knownCost).toBe(0);
 
@@ -523,7 +523,7 @@ export const executeWorkflow = recordedModelCall();
         accounting: { scope: string; knownCost: number };
       };
       expect(rescored.items).toHaveLength(1);
-      expect(rescored.items[0].output).toBe('legacy answer');
+      expect(rescored.items[0].output).toEqual({ content: 'legacy answer' });
       expect(rescored.items[0].scores['recorded-answer']).toBe(1);
       expect(rescored.accounting.scope).toBe('rescore');
       expect(rescored.accounting.knownCost).toBe(0);

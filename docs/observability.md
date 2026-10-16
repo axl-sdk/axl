@@ -957,8 +957,8 @@ data; it does not claim that the provider sent any on a particular call.
 `loadModelCalls()` turns a v1 journal artifact or v2 record file into validated
 folded operations. `modelCallDataset()` maps model records into ordinary eval
 items; mixed artifacts require an explicit filter for `kind: 'external'`.
-Use `recordedModelCall()` with `runEval()` to rescore stored model text or
-parsed JSON without new generation calls. Use `replayModelCall({ model? })` to
+Use `recordedModelCall()` with `runEval()` to rescore a stored response (text,
+parsed JSON, tool calls, finish reason) without new generation calls. Use `replayModelCall({ model? })` to
 send the captured request to a model again; the new call's usage and cost are
 measured separately. Replay covers one provider call and its recorded history,
 not the surrounding agent or tools. See the [eval helper contract](api-reference.md#captured-model-call-eval-helpers)

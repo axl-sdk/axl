@@ -12,6 +12,8 @@
  * stub reading and the cap's retention semantics.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
@@ -906,6 +908,37 @@ describe('RunDiagnosticsPanel', () => {
     // Nothing was cut off and nothing failed to parse.
     expect(screen.queryByText(/could not be parsed/)).not.toBeInTheDocument();
     expect(screen.queryByText(/Download the .jsonl for the rest/)).not.toBeInTheDocument();
+  });
+
+  it('renders all four operation outcomes from the genuine 0.25.3 journal', async () => {
+    const user = userEvent.setup();
+    const historical = readFileSync(
+      resolve(
+        import.meta.dirname,
+        '../../../axl/src/__tests__/fixtures/model-call-record/axl-0253.jsonl',
+      ),
+      'utf8',
+    );
+    stubFetch({ records: historical });
+
+    renderPanel(
+      <RunDiagnosticsPanel result={result(manifest({ records: 7 }))} evalName="legacy" />,
+    );
+    await user.click(screen.getByRole('button', { name: 'Show captured records' }));
+
+    const list = await screen.findByRole('list', { name: 'Captured request records' });
+    const rows = within(list).getAllByRole('listitem');
+    expect(rows).toHaveLength(4);
+    expect(within(rows[0]).getByText('case 0')).toBeInTheDocument();
+    expect(within(rows[1]).getByText(/synthetic bad request/)).toBeInTheDocument();
+    expect(
+      within(rows[2]).getByText(/terminated: stream closed by the consumer/),
+    ).toBeInTheDocument();
+    expect(within(rows[3]).getByText(/no response recorded/)).toBeInTheDocument();
+
+    await user.click(within(rows[0]).getByRole('button'));
+    const detail = await screen.findByTestId('operation-detail-0');
+    expect(within(detail).getByText(/legacy answer/)).toBeInTheDocument();
   });
 });
 

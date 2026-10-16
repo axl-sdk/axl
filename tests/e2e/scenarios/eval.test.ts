@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { z } from 'zod';
-import { execSync } from 'node:child_process';
+import { execFileSync, execSync } from 'node:child_process';
 import { writeFileSync, readFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -469,6 +469,67 @@ export async function executeWorkflow(input) {
 
     // Clean up
     rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('CLI loads a genuine 0.25.3 journal through an eval module and rescores its saved output', () => {
+    const ROOT = join(import.meta.dirname, '../../..');
+    const fixture = join(
+      ROOT,
+      'packages/axl/src/__tests__/fixtures/model-call-record/axl-0253.jsonl',
+    );
+    const dir = mkdtempSync(join(ROOT, 'tests/e2e/.tmp-legacy-model-call-'));
+    const evalFile = join(dir, 'legacy.eval.mjs');
+    const resultsFile = join(dir, 'legacy-results.json');
+    const rescoredFile = join(dir, 'legacy-rescored.json');
+    const cli = join(ROOT, 'packages/axl-eval/dist/cli.js');
+    try {
+      writeFileSync(
+        evalFile,
+        `
+import { loadModelCalls, modelCallDataset, recordedModelCall } from '@axlsdk/eval';
+const historical = await loadModelCalls(${JSON.stringify(fixture)});
+export default {
+  workflow: 'recorded-legacy',
+  dataset: modelCallDataset(historical, { filter: (record) => record.outcome.status === 'ok' }),
+  scorers: [{ name: 'recorded-answer', score: (output) => output === 'legacy answer' ? 1 : 0 }],
+};
+export const executeWorkflow = recordedModelCall();
+`,
+      );
+      const run = execFileSync(process.execPath, [cli, evalFile, '--output', resultsFile], {
+        cwd: dir,
+        encoding: 'utf8',
+      });
+      const result = JSON.parse(readFileSync(resultsFile, 'utf8')) as {
+        items: Array<{ output: unknown; scores: Record<string, number> }>;
+        accounting: { knownCost: number };
+      };
+      expect(run).toContain('recorded-legacy');
+      expect(result.items).toHaveLength(1);
+      expect(result.items[0].output).toBe('legacy answer');
+      expect(result.items[0].scores['recorded-answer']).toBe(1);
+      expect(result.accounting.knownCost).toBe(0);
+
+      execFileSync(
+        process.execPath,
+        [cli, 'rescore', resultsFile, evalFile, '--output', rescoredFile],
+        {
+          cwd: dir,
+          encoding: 'utf8',
+        },
+      );
+      const rescored = JSON.parse(readFileSync(rescoredFile, 'utf8')) as {
+        items: Array<{ output: unknown; scores: Record<string, number> }>;
+        accounting: { scope: string; knownCost: number };
+      };
+      expect(rescored.items).toHaveLength(1);
+      expect(rescored.items[0].output).toBe('legacy answer');
+      expect(rescored.items[0].scores['recorded-answer']).toBe(1);
+      expect(rescored.accounting.scope).toBe('rescore');
+      expect(rescored.accounting.knownCost).toBe(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('axl-eval compare produces comparison output', async () => {

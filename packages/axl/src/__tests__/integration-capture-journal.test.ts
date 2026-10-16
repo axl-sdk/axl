@@ -8,6 +8,7 @@
  * live-provider spend authorization.
  */
 import { SpanKind } from '@opentelemetry/api';
+import { loadModelCalls, modelCallDataset, replayModelCall } from '@axlsdk/eval';
 import {
   BasicTracerProvider,
   InMemorySpanExporter,
@@ -18,11 +19,11 @@ import { z } from 'zod';
 
 import { agent } from '../agent.js';
 import { RequestCaptureChannel } from '../diagnostics/capture.js';
-import type { CapturedRequest, CapturedRequestRecord } from '../diagnostics/capture.js';
+import type { CapturedRequestRecord } from '../diagnostics/capture.js';
 import { AxlRuntime } from '../runtime.js';
 import { tool } from '../tool.js';
 import { workflow } from '../workflow.js';
-import type { ChatMessage, ChatOptions, StreamChunk, ToolDefinition } from '../providers/types.js';
+import type { ChatMessage, StreamChunk } from '../providers/types.js';
 
 const OPENAI_MODEL = 'gpt-4.1-nano';
 const ANTHROPIC_MODEL = 'claude-haiku-4-5';
@@ -223,7 +224,6 @@ describe.skipIf(!process.env.ANTHROPIC_API_KEY)('journal live — Anthropic', ()
 
   it('L8: replay of captured turn two retains signed thinking and tool history', async () => {
     const runtime = runtimeFor('anthropic');
-    const { provider } = runtime.resolveProvider(`anthropic:${ANTHROPIC_MODEL}`);
     const lookup = tool({
       name: 'lookup_code',
       description: 'Return the fixed code.',
@@ -292,27 +292,15 @@ describe.skipIf(!process.env.ANTHROPIC_API_KEY)('journal live — Anthropic', ()
     });
     expect(turnTwo.request?.tools?.[0].name).toBe('lookup_code');
 
-    // This reconstructs one provider-neutral request from the captured line.
-    // It does not re-run an agent, a tool, or the first model turn.
-    const replayRequest = turnTwo.request as CapturedRequest;
-    const replayMessages = structuredClone(replayRequest.messages) as unknown as ChatMessage[];
-    const replayTools: ToolDefinition[] = replayRequest.tools!.map((entry) => ({
-      type: 'function',
-      function: {
-        name: entry.name,
-        description: entry.description ?? '',
-        parameters: structuredClone(entry.parameters),
-      },
-    }));
-    const replay = await captured(runtime, () =>
-      provider.chat(replayMessages, {
-        model: replayRequest.options.model,
-        maxTokens: replayRequest.options.maxTokens,
-        thinkingBudget: replayRequest.options.thinkingBudget,
-        toolChoice: replayRequest.options.toolChoice as ChatOptions['toolChoice'],
-        tools: replayTools,
-      }),
-    );
+    // Use the public production-to-eval path. It folds the journal, validates
+    // replayability, and reconstructs only the captured second provider call.
+    const folded = await loadModelCalls(originalRecords);
+    const dataset = modelCallDataset(folded, { filter: (record) => record.ids.turn === 2 });
+    const items = await dataset.getItems();
+    expect(items).toHaveLength(1);
+    expect(items[0].input.recorded.captured.replayable).toBe(true);
+    expect(items[0].input.request?.messages).toEqual(turnTwo.request?.messages);
+    const replay = await captured(runtime, () => replayModelCall()(items[0].input, runtime));
     expect(replay.outcome.status).toBe('fulfilled');
     expect(replay.outcome.accounting.operations.total).toBe(1);
     const { start: replayStart, end: replayEnd } = expectPair(replay.records, 'chat');

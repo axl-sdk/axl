@@ -9,6 +9,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { readFileSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -92,6 +93,16 @@ const RECORDS = [
     captured: { fidelity: 'runtime_request', redacted: false, truncated: false, omitted: [] },
   },
 ];
+const LEGACY_RECORDS = readFileSync(
+  new URL(
+    '../../../packages/axl/src/__tests__/fixtures/model-call-record/axl-0253.jsonl',
+    import.meta.url,
+  ),
+  'utf8',
+)
+  .trim()
+  .split('\n')
+  .map((line) => JSON.parse(line) as Record<string, unknown>);
 
 async function importResult(
   app: { request: (p: string, init?: RequestInit) => Promise<Response> },
@@ -107,7 +118,7 @@ async function importResult(
 // ── A13.19 — import/export roundtrip ─────────────────────────────────
 
 describe('A13.19 — import/export roundtrip', () => {
-  it('imports a mixed model/external sidecar and redacts external payload on records delivery', async () => {
+  it('imports genuine legacy model lines with current external lines and redacts the records boundary', async () => {
     const secret = 'PRIVATE_EXTERNAL_PAYLOAD';
     const external = [
       {
@@ -142,7 +153,7 @@ describe('A13.19 — import/export roundtrip', () => {
     const { app } = createTestServer(undefined, { artifactsRoot: root, redact: true });
     const imported = await importResult(app, {
       result: resultWithAccounting(),
-      requests: sidecar([...RECORDS, ...external]),
+      requests: sidecar([...LEGACY_RECORDS, ...external]),
     });
     expect(imported.status).toBe(200);
     const { data } = await readJson(imported);
@@ -151,8 +162,10 @@ describe('A13.19 — import/export roundtrip', () => {
       .split('\n')
       .filter(Boolean)
       .map((line) => JSON.parse(line));
-    expect(lines).toHaveLength(4);
-    expect(lines[3]).toMatchObject({
+    expect(lines).toHaveLength(9);
+    expect(lines[0]).toMatchObject({ v: 1, caseIndex: 0, phase: 'start', kind: 'chat' });
+    expect(lines[6]).toMatchObject({ v: 1, caseIndex: 3, phase: 'start', kind: 'chat' });
+    expect(lines[8]).toMatchObject({
       kind: 'external',
       name: 'vendor-search',
       outcomeStatus: 'ok',
@@ -161,13 +174,15 @@ describe('A13.19 — import/export roundtrip', () => {
       external: { request: '[redacted]', response: '[redacted]' },
       captured: { redacted: true, omitted: ['externalPayload'] },
     });
-    expect(lines[3]).not.toHaveProperty('provider');
-    expect(lines[3]).not.toHaveProperty('model');
-    expect(lines[2]).not.toHaveProperty('request');
-    expect(lines[3]).not.toHaveProperty('response');
-    expect(lines[3]).not.toHaveProperty('partial');
-    expect(lines[3]).not.toHaveProperty('correction');
-    expect(lines[3]).not.toHaveProperty('unexpectedContent');
+    expect(lines[8]).not.toHaveProperty('provider');
+    expect(lines[8]).not.toHaveProperty('model');
+    expect(lines[7]).not.toHaveProperty('request');
+    expect(lines[8]).not.toHaveProperty('response');
+    expect(lines[8]).not.toHaveProperty('partial');
+    expect(lines[8]).not.toHaveProperty('correction');
+    expect(lines[8]).not.toHaveProperty('unexpectedContent');
+    expect(delivered).not.toContain('legacy answer');
+    expect(delivered).not.toContain('synthetic bad request');
     expect(delivered).not.toContain(secret);
   });
 
@@ -176,7 +191,7 @@ describe('A13.19 — import/export roundtrip', () => {
 
     const res = await importResult(app, {
       result: resultWithAccounting(),
-      requests: sidecar(RECORDS),
+      requests: sidecar(LEGACY_RECORDS),
     });
     expect(res.status).toBe(200);
     const { data } = await readJson(res);
@@ -195,7 +210,7 @@ describe('A13.19 — import/export roundtrip', () => {
     expect(entry.data.diagnostics.status).toBe('complete');
 
     const manifest = await readJson(await app.request(`/api/evals/${newId}/diagnostics`));
-    expect(manifest.data.records).toBe(2);
+    expect(manifest.data.records).toBe(7);
     expect(manifest.data.fidelity).toBe('runtime_request');
 
     const recordsRes = await app.request(`/api/evals/${newId}/diagnostics/records`);
@@ -206,7 +221,7 @@ describe('A13.19 — import/export roundtrip', () => {
       .filter(Boolean)
       .map((l) => JSON.parse(l));
     // Export must reproduce what was imported, or the bundle is not a bundle.
-    expect(roundTripped).toEqual(RECORDS);
+    expect(roundTripped).toEqual(LEGACY_RECORDS);
 
     // And the exported sidecar re-imports cleanly — the roundtrip closes.
     const again = await importResult(app, { result: resultWithAccounting(), requests: text });

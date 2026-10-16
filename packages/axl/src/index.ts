@@ -336,6 +336,7 @@ export type {
   ChatMessage,
   ToolCallMessage,
   ProviderResponse,
+  FinishReason,
   StreamChunk,
   CallTiming,
   ChatOptions,

@@ -53,6 +53,10 @@ describe('HandleSupport workflow', () => {
 | `MockProvider.replay(file)` | Recorded sessions | Replays a recorded session from a JSON file. See snapshot testing below. |
 | `MockProvider.fn(handler)` | Custom logic | Custom response function receiving `(messages, callIndex)`. Returns `{ content, tool_calls? }`. |
 
+`MockProvider.sequence()` also accepts `finishReason`, `rawFinishReason`,
+`responseId`, and `responseModel` on each scripted response. The same fields
+appear on its streamed terminal `done` chunk, so tests can assert both paths.
+
 MockProvider also supports tool call simulation:
 
 ```typescript

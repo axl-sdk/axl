@@ -441,6 +441,12 @@ export class MockProvider implements Provider {
     throwIfAborted(options.signal);
     yield {
       type: 'done',
+      ...(response.finishReason !== undefined ? { finishReason: response.finishReason } : {}),
+      ...(response.rawFinishReason !== undefined
+        ? { rawFinishReason: response.rawFinishReason }
+        : {}),
+      ...(response.responseId !== undefined ? { responseId: response.responseId } : {}),
+      ...(response.responseModel !== undefined ? { responseModel: response.responseModel } : {}),
       usage: response.usage,
       // Forwarded like `chat()` does. Without it a streamed mock ask reported no
       // cost at all, so `ctx.budget` and every cost assertion silently saw zero
@@ -460,6 +466,10 @@ export class MockProvider implements Provider {
       content: string;
       tool_calls?: ToolCallMessage[];
       providerMetadata?: Record<string, unknown>;
+      finishReason?: ProviderResponse['finishReason'];
+      rawFinishReason?: string;
+      responseId?: string;
+      responseModel?: string;
       usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
       cost?: number;
       /** Deterministic provider-call timing, surfaced on `ProviderResponse.timing`
@@ -485,6 +495,10 @@ export class MockProvider implements Provider {
       const resp = responses[callIndex];
       return {
         content: resp.content,
+        ...(resp.finishReason !== undefined ? { finishReason: resp.finishReason } : {}),
+        ...(resp.rawFinishReason !== undefined ? { rawFinishReason: resp.rawFinishReason } : {}),
+        ...(resp.responseId !== undefined ? { responseId: resp.responseId } : {}),
+        ...(resp.responseModel !== undefined ? { responseModel: resp.responseModel } : {}),
         tool_calls: resp.tool_calls,
         providerMetadata: resp.providerMetadata,
         usage: resp.usage ?? { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },

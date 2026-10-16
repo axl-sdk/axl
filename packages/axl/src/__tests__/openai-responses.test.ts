@@ -1497,6 +1497,8 @@ describe('OpenAIResponsesProvider', () => {
         { type: 'text_delta', content: 'world!' },
         {
           type: 'done',
+          finishReason: 'stop',
+          rawFinishReason: 'completed',
           usage: {
             prompt_tokens: 10,
             completion_tokens: 5,

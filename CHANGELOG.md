@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Built-in provider chat responses and terminal stream chunks now expose normalized finish reason, raw vendor reason or status, and provider-reported response id and model when available. `MockProvider.sequence()` can script the same metadata for tests.
+
 ### Fixed
 
 - `runtime.shutdown()` no longer shuts down an application-supplied or global OpenTelemetry tracer provider. This keeps other tracing tools working after an Axl runtime stops. **Migration:** if you relied on Axl to close the provider, call its `shutdown()` yourself after `runtime.shutdown()`.

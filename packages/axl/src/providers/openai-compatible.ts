@@ -28,6 +28,7 @@ import type { RecordedAudioSource } from '../transcription.js';
 import { UnsupportedModelInputError } from '../errors.js';
 import { firstRichPart, richInputParts, type RichModality } from './rich-input.js';
 import { resolveAudioFormat } from './audio-format.js';
+import { openAIChatFinishReason, reportedString } from './response-metadata.js';
 
 /**
  * Input modalities a profile declares for the OpenAI-compatible wire format.
@@ -1168,9 +1169,18 @@ export class OpenAICompatibleProvider implements Provider {
       response: json,
     });
     const costProvenance = this.costProvenance(cost);
+    const rawFinishReason = reportedString(json.choices?.[0]?.finish_reason);
 
     return {
       content,
+      ...(rawFinishReason !== undefined
+        ? {
+            rawFinishReason,
+            finishReason: openAIChatFinishReason(rawFinishReason),
+          }
+        : {}),
+      ...(reportedString(json.id) !== undefined ? { responseId: json.id } : {}),
+      ...(reportedString(json.model) !== undefined ? { responseModel: json.model } : {}),
       costProvenance,
       thinking_content: thinking || undefined,
       tool_calls: message.tool_calls?.map((tc) => ({
@@ -1239,6 +1249,9 @@ export class OpenAICompatibleProvider implements Provider {
     let buffer = '';
     let usageData: OpenAIUsage | undefined;
     let pricingResponse: OpenAIModelResponse | undefined;
+    let responseId: string | undefined;
+    let responseModel: string | undefined;
+    let rawFinishReason: string | undefined;
 
     const capture = this.profile.reasoning.capture;
     const thinkScanner = capture === 'think_tags' ? new ThinkTagScanner() : undefined;
@@ -1298,6 +1311,11 @@ export class OpenAICompatibleProvider implements Provider {
       );
       return {
         type: 'done',
+        ...(rawFinishReason !== undefined
+          ? { rawFinishReason, finishReason: openAIChatFinishReason(rawFinishReason) }
+          : {}),
+        ...(responseId !== undefined ? { responseId } : {}),
+        ...(responseModel !== undefined ? { responseModel } : {}),
         usage,
         cost,
         costProvenance: this.costProvenance(cost),
@@ -1356,6 +1374,10 @@ export class OpenAICompatibleProvider implements Provider {
               timing: timing.streamTiming(),
             });
           }
+
+          responseId = reportedString(parsed.id) ?? responseId;
+          responseModel = reportedString(parsed.model) ?? responseModel;
+          rawFinishReason = reportedString(parsed.choices?.[0]?.finish_reason) ?? rawFinishReason;
 
           if (
             parsed.model !== undefined ||
@@ -1499,7 +1521,8 @@ type OpenAIChatMessage = {
 };
 
 type OpenAIChatResponse = {
-  choices: Array<{ message: OpenAIChatMessage; finish_reason: string }>;
+  id?: string;
+  choices: Array<{ message: OpenAIChatMessage; finish_reason?: string | null }>;
   usage?: OpenAIUsage;
 } & OpenAIModelResponse;
 
@@ -1511,6 +1534,7 @@ type OpenAIModelResponse = {
 };
 
 type OpenAIStreamChunk = {
+  id?: string;
   error?: { message?: string; [key: string]: unknown };
   choices?: Array<{
     delta: {
@@ -1524,7 +1548,7 @@ type OpenAIStreamChunk = {
         function?: { name?: string; arguments?: string };
       }>;
     };
-    finish_reason: string | null;
+    finish_reason?: string | null;
   }>;
   usage?: OpenAIUsage;
 } & OpenAIModelResponse;

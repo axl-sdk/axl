@@ -50,6 +50,11 @@ const provider = MockProvider.sequence([
   { content: 'Hi', timing: { queuedMs: 40, attempts: 1, retryMs: 0, ttfbMs: 12, wireMs: 90 } },
 ]);
 
+// Response metadata is also scripted for both chat() and stream() done.
+const providerWithMetadata = MockProvider.sequence([
+  { content: 'Partial', finishReason: 'length', rawFinishReason: 'max_tokens', responseId: 'msg_1', responseModel: 'served-model' },
+]);
+
 // Chunked mode — convenience over `sequence()`. Takes plain content
 // strings and splits each into fixed-size chunks (default 4 chars ≈
 // 1 token). Use to exercise partial-JSON parsing, structural-boundary

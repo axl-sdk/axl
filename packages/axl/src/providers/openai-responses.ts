@@ -29,6 +29,7 @@ import { assertSafeProviderBaseUrl } from '../http-transport.js';
 import type { InputContentPart, InputMediaSource } from '../input.js';
 import { UnsupportedModelInputError } from '../errors.js';
 import { firstRichPart, type RichModality } from './rich-input.js';
+import { openAIResponsesFinishReason, reportedString } from './response-metadata.js';
 
 function base64FromSource(source: Extract<InputMediaSource, { type: 'bytes' | 'base64' }>): string {
   return source.type === 'base64'
@@ -611,9 +612,17 @@ export class OpenAIResponsesProvider implements Provider {
 
     const providerMetadata =
       reasoningItems.length > 0 ? { openaiReasoningItems: reasoningItems } : undefined;
+    const finish = openAIResponsesFinishReason(
+      reportedString(json.status),
+      reportedString(json.incomplete_details?.reason),
+      toolCalls.length > 0,
+    );
 
     return {
       content,
+      ...finish,
+      ...(reportedString(json.id) !== undefined ? { responseId: json.id } : {}),
+      ...(reportedString(json.model) !== undefined ? { responseModel: json.model } : {}),
       thinking_content: thinkingContent || undefined,
       tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
       usage,
@@ -659,6 +668,7 @@ export class OpenAIResponsesProvider implements Provider {
 
     // Track current function_call item for argument deltas
     const callIdMap = new Map<number, string>();
+    const identity: { responseId?: string; responseModel?: string } = {};
     // Must persist across read() calls — event: and data: lines may arrive in separate chunks
     let eventType = '';
 
@@ -688,12 +698,15 @@ export class OpenAIResponsesProvider implements Provider {
             } catch {
               continue;
             }
+            identity.responseId = reportedString(data.response?.id) ?? identity.responseId;
+            identity.responseModel = reportedString(data.response?.model) ?? identity.responseModel;
 
             const chunk = this.handleStreamEvent(
               eventType,
               data,
               model,
               callIdMap,
+              identity,
               request,
               timing,
             );
@@ -708,8 +721,13 @@ export class OpenAIResponsesProvider implements Provider {
         }
       }
 
-      // Stream ended without a completed event
-      yield { type: 'done' };
+      // Stream ended without a terminal status. Preserve identity already
+      // reported on an earlier frame, without inventing a finish reason.
+      yield {
+        type: 'done',
+        ...(identity.responseId !== undefined ? { responseId: identity.responseId } : {}),
+        ...(identity.responseModel !== undefined ? { responseModel: identity.responseModel } : {}),
+      };
     } finally {
       reader.releaseLock();
     }
@@ -720,6 +738,7 @@ export class OpenAIResponsesProvider implements Provider {
     data: ResponsesStreamEventData,
     model: string,
     callIdMap: Map<number, string>,
+    identity: { responseId?: string; responseModel?: string },
     request: Record<string, unknown> | undefined,
     /** Needed only by the `response.failed` branch, which throws mid-stream. */
     timing: CallTimingRecorder,
@@ -754,7 +773,8 @@ export class OpenAIResponsesProvider implements Provider {
         };
       }
 
-      case 'response.completed': {
+      case 'response.completed':
+      case 'response.incomplete': {
         const response = data.response as ResponsesAPIResponse | undefined;
         const usage = toResponsesUsage(response?.usage);
 
@@ -771,8 +791,20 @@ export class OpenAIResponsesProvider implements Provider {
                 response,
               })
             : undefined;
+        const finish = openAIResponsesFinishReason(
+          reportedString(response?.status) ??
+            (eventType === 'response.completed' ? 'completed' : 'incomplete'),
+          reportedString(response?.incomplete_details?.reason),
+          (response?.output?.some((item) => item.type === 'function_call') ?? false) ||
+            callIdMap.size > 0,
+        );
         return {
           type: 'done',
+          ...finish,
+          ...(identity.responseId !== undefined ? { responseId: identity.responseId } : {}),
+          ...(identity.responseModel !== undefined
+            ? { responseModel: identity.responseModel }
+            : {}),
           usage,
           cost,
           costProvenance: tableEstimate(cost),
@@ -845,6 +877,8 @@ type ResponsesInputItem =
 
 type ResponsesAPIResponse = {
   id: string;
+  status?: string;
+  incomplete_details?: { reason?: string } | null;
   output: Array<
     | {
         type: 'message';

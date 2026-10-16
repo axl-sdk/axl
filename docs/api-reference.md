@@ -2123,6 +2123,19 @@ Anthropic cache creation is included in
 each bucket at its actual multiplier. Aggregate-only cache-write usage remains observable but
 is deliberately unpriced.
 
+**Provider response metadata** — `ProviderResponse` and terminal `StreamChunk`
+(`type: 'done'`) can carry four optional fields:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `finishReason` | `'stop' \| 'length' \| 'tool_calls' \| 'content_filter' \| 'refusal' \| 'other'` | Provider-neutral terminal reason; an unrecognized reported reason maps to `'other'` |
+| `rawFinishReason` | `string` | The vendor's reported finish reason or terminal status used for normalization |
+| `responseId` | `string` | Provider-reported response identifier |
+| `responseModel` | `string` | Provider-reported serving model |
+
+Missing wire fields remain absent. In particular, `responseModel` is never
+filled from the requested model. See [provider mappings](providers.md#response-metadata).
+
 `ProviderResponse.diagnostics?.reasoningContextReset` and the terminal stream
 `done.diagnostics` carry the same `ReasoningContextReset`: `droppedBlocks` plus
 per-reason counts (`prefix_binding_mismatch`, `model_binding_mismatch`,

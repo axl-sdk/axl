@@ -1972,7 +1972,7 @@ Lifecycle, retention and reclamation rules: [integration.md](integration.md#diag
 |--------|---------|-------------|
 | `initializeTelemetry()` | `Promise<void>` | Enable OpenTelemetry span emission. Call before executing workflows |
 | `initializeMcp()` | `Promise<void>` | Connect to configured MCP servers |
-| `shutdown()` | `Promise<void>` | Abort all in-flight executions, close MCP connections, memory manager, state store, and span manager |
+| `shutdown()` | `Promise<void>` | Abort all in-flight executions and close runtime-owned resources, including the span manager. It does not flush or shut down a supplied or global OpenTelemetry tracer provider; the application owns that provider's lifecycle |
 
 ### Ad-hoc Context and Cost Tracking
 

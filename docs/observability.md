@@ -1007,7 +1007,15 @@ const runtime = new AxlRuntime(config);
 await runtime.initializeTelemetry();
 
 // All workflow executions now emit OTel spans automatically
+
+// After the application stops accepting work:
+await runtime.shutdown();
+await provider.shutdown(); // Flush and close the application-owned tracer provider
 ```
+
+`runtime.shutdown()` leaves both supplied and global tracer providers running.
+Flush and shut down your provider after the runtime has finished its work. If
+another SDK owns the global provider, follow that SDK's shutdown procedure.
 
 **Peer dependency:** `@opentelemetry/api` is an optional peer dependency. Install it alongside your preferred SDK packages:
 

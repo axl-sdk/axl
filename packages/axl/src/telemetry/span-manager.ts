@@ -20,7 +20,6 @@ interface OTelTracer {
 /** Minimal interface for an OTel tracer provider. */
 interface OTelTracerProvider {
   getTracer(name: string): OTelTracer;
-  shutdown?(): Promise<void>;
 }
 
 /** Minimal interface for the @opentelemetry/api module. */
@@ -39,12 +38,10 @@ interface OTelApi {
 export class OTelSpanManager implements SpanManager {
   private tracer: OTelTracer;
   private otelApi: OTelApi;
-  private tracerProvider: OTelTracerProvider;
 
-  private constructor(otelApi: OTelApi, tracer: OTelTracer, tracerProvider: OTelTracerProvider) {
+  private constructor(otelApi: OTelApi, tracer: OTelTracer) {
     this.otelApi = otelApi;
     this.tracer = tracer;
-    this.tracerProvider = tracerProvider;
   }
 
   static async create(config: TelemetryConfig): Promise<OTelSpanManager> {
@@ -63,7 +60,7 @@ export class OTelSpanManager implements SpanManager {
     const serviceName = config.serviceName ?? 'axl';
     const tracer = tracerProvider.getTracer(serviceName);
 
-    return new OTelSpanManager(otelApi, tracer, tracerProvider);
+    return new OTelSpanManager(otelApi, tracer);
   }
 
   async withSpanAsync<T>(
@@ -120,9 +117,7 @@ export class OTelSpanManager implements SpanManager {
     }
   }
 
-  async shutdown(): Promise<void> {
-    if (this.tracerProvider && typeof this.tracerProvider.shutdown === 'function') {
-      await this.tracerProvider.shutdown();
-    }
-  }
+  // Axl uses an application-owned provider, whether supplied or global.
+  // Its lifecycle, including flush and shutdown, belongs to the application.
+  async shutdown(): Promise<void> {}
 }

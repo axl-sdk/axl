@@ -26,6 +26,6 @@ export interface SpanManager {
   ): Promise<T>;
   /** Add an event to the currently active span (if any). */
   addEventToActiveSpan(name: string, attributes?: Record<string, string | number | boolean>): void;
-  /** Gracefully shut down (flush pending spans). */
+  /** Release manager-owned resources. External tracer providers remain application-owned. */
   shutdown(): Promise<void>;
 }

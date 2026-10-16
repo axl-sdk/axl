@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `runtime.shutdown()` no longer shuts down an application-supplied or global OpenTelemetry tracer provider. This keeps other tracing tools working after an Axl runtime stops. **Migration:** if you relied on Axl to close the provider, call its `shutdown()` yourself after `runtime.shutdown()`.
+
 ## [0.25.3] - 2026-10-16
 
 ### Added

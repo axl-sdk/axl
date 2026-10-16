@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { NoopSpanManager } from '../telemetry/noop.js';
 import { createSpanManager } from '../telemetry/index.js';
 import { OTelSpanManager } from '../telemetry/span-manager.js';
@@ -15,6 +15,7 @@ import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { agent } from '../agent.js';
 import { WorkflowContext } from '../context.js';
+import { AxlRuntime } from '../runtime.js';
 import { ProviderRegistry } from '../providers/registry.js';
 import { tool } from '../tool.js';
 import { createSequenceProvider } from './helpers.js';
@@ -247,14 +248,39 @@ describe('OTelSpanManager', () => {
     expect(spans[0].events[0].name).toBe('active.event');
   });
 
-  it('shutdown flushes provider', async () => {
-    await manager.withSpanAsync('test.shutdown', {}, async () => 'done');
-    // Spans are recorded before shutdown
-    const spansBefore = exporter.getFinishedSpans();
-    expect(spansBefore.length).toBeGreaterThanOrEqual(1);
-    // shutdown should resolve without error
-    await manager.shutdown();
-  });
+  it.each(['supplied', 'global'] as const)(
+    'runtime shutdown leaves the %s tracer provider running',
+    async (selection) => {
+      const shutdown = vi.spyOn(provider, 'shutdown');
+      const forceFlush = vi.spyOn(provider, 'forceFlush');
+      // The OTel API normally returns a proxy for the global provider. Return
+      // the registered provider itself so this path exercises ownership too.
+      const globalProvider =
+        selection === 'global'
+          ? vi.spyOn(trace, 'getTracerProvider').mockReturnValue(provider)
+          : undefined;
+      const runtime = new AxlRuntime({
+        telemetry: {
+          enabled: true,
+          ...(selection === 'supplied' ? { tracerProvider: provider } : {}),
+        },
+      });
+
+      try {
+        await runtime.initializeTelemetry();
+        await runtime.shutdown();
+
+        expect(shutdown).not.toHaveBeenCalled();
+        expect(forceFlush).not.toHaveBeenCalled();
+        provider.getTracer('after-axl-shutdown').startSpan('still-running').end();
+        expect(exporter.getFinishedSpans().some((span) => span.name === 'still-running')).toBe(
+          true,
+        );
+      } finally {
+        globalProvider?.mockRestore();
+      }
+    },
+  );
 
   it('emits axl.agent.handoff span with source and target attributes', async () => {
     // Use the OTelSpanManager directly to verify handoff span creation

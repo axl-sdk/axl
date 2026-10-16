@@ -93,7 +93,9 @@ import { firstRichPart } from './providers/rich-input.js';
 import type { ProviderRegistry } from './providers/registry.js';
 import { createScopedProvider } from './providers/scoped-provider.js';
 import {
+  currentCaptureTurn,
   runWithCaptureTurnSlot,
+  setCaptureTerminationCause,
   setCaptureTurn,
   type CapturedCorrection,
 } from './diagnostics/capture.js';
@@ -2249,6 +2251,7 @@ export class WorkflowContext<TInput = unknown> {
     // Set before `continue`ing to a retry turn; read when emitting the next
     // agent_call so consumers can see *why* a given LLM call is a retry.
     let pendingRetryReason: 'schema' | 'validate' | 'guardrail' | undefined;
+    let pendingRejectedCallId: string | undefined;
     // The correction that will be visible in the NEXT turn's submitted
     // conversation: which gate rejected the last output, why, and the exact
     // feedback text appended for the model. Set beside `pendingRetryReason` on
@@ -2486,6 +2489,8 @@ export class WorkflowContext<TInput = unknown> {
       pendingRetryReason = undefined;
       const correction = pendingCorrection;
       pendingCorrection = undefined;
+      const rejectedCallId = pendingRejectedCallId;
+      pendingRejectedCallId = undefined;
 
       // Stamp this turn's identity for opt-in request capture. `currentMessages`
       // at this point IS the conversation about to be submitted, so the record
@@ -2493,10 +2498,18 @@ export class WorkflowContext<TInput = unknown> {
       const askFrame = askStorage.getStore();
       setCaptureTurn({
         executionId: this.executionId,
+        ...(this.workflowName !== undefined ? { workflow: this.workflowName } : {}),
+        agent: agent._name,
+        ...(askFrame?.depth !== undefined ? { depth: askFrame.depth } : {}),
+        ...(typeof this.metadata.sessionId === 'string' && this.metadata.sessionId.length > 0
+          ? { sessionId: this.metadata.sessionId }
+          : {}),
+        purpose: 'ask',
         ...(askFrame?.askId !== undefined ? { askId: askFrame.askId } : {}),
         ...(askFrame?.parentAskId !== undefined ? { parentAskId: askFrame.parentAskId } : {}),
         turn: turns,
         ...(retryReason ? { retryReason } : {}),
+        ...(rejectedCallId ? { rejectedCallId } : {}),
         ...(correction ? { correction } : {}),
       });
 
@@ -2668,6 +2681,10 @@ export class WorkflowContext<TInput = unknown> {
                   tool_calls: undefined,
                   usage: chunk.usage,
                   cost: chunk.cost,
+                  finishReason: chunk.finishReason,
+                  rawFinishReason: chunk.rawFinishReason,
+                  responseId: chunk.responseId,
+                  responseModel: chunk.responseModel,
                   providerMetadata: chunk.providerMetadata,
                   diagnostics: chunk.diagnostics,
                   timing: chunk.timing,
@@ -2675,6 +2692,15 @@ export class WorkflowContext<TInput = unknown> {
               }
             }
           } catch (error) {
+            if (stallReason !== undefined && providerSettlementSignal?.reason === stallReason) {
+              setCaptureTerminationCause('stalled');
+            } else if (
+              providerSettlementSignal?.aborted ||
+              this.currentSignal?.aborted ||
+              (error instanceof Error && error.name === 'AbortError')
+            ) {
+              setCaptureTerminationCause('aborted');
+            }
             if (iterator.return) {
               try {
                 void Promise.resolve(iterator.return(undefined)).catch(() => {});
@@ -3260,6 +3286,7 @@ export class WorkflowContext<TInput = unknown> {
                 response.providerMetadata,
               );
               pendingRetryReason = 'guardrail';
+              pendingRejectedCallId = currentCaptureTurn()?.callId;
               pendingCorrection = {
                 stage: 'guardrail',
                 reason: blockReason,
@@ -3353,6 +3380,7 @@ export class WorkflowContext<TInput = unknown> {
                 response.providerMetadata,
               );
               pendingRetryReason = 'schema';
+              pendingRejectedCallId = currentCaptureTurn()?.callId;
               pendingCorrection = {
                 stage: 'schema',
                 ...(schemaReason !== undefined ? { reason: schemaReason } : {}),
@@ -3457,6 +3485,7 @@ export class WorkflowContext<TInput = unknown> {
                 response.providerMetadata,
               );
               pendingRetryReason = 'validate';
+              pendingRejectedCallId = currentCaptureTurn()?.callId;
               pendingCorrection = {
                 stage: 'validate',
                 reason: validateResult.reason ?? 'Validation failed',
@@ -4043,6 +4072,20 @@ export class WorkflowContext<TInput = unknown> {
     let summaryResponse: ProviderResponse;
     try {
       this.currentSignal?.throwIfAborted();
+      const askFrame = askStorage.getStore();
+      setCaptureTurn({
+        executionId: this.executionId,
+        ...(this.workflowName !== undefined ? { workflow: this.workflowName } : {}),
+        agent: agentName,
+        ...(askFrame?.depth !== undefined ? { depth: askFrame.depth } : {}),
+        ...(askFrame?.askId !== undefined ? { askId: askFrame.askId } : {}),
+        ...(askFrame?.parentAskId !== undefined ? { parentAskId: askFrame.parentAskId } : {}),
+        ...(typeof this.metadata.sessionId === 'string' && this.metadata.sessionId.length > 0
+          ? { sessionId: this.metadata.sessionId }
+          : {}),
+        purpose: 'summary',
+        turn: 0,
+      });
       summaryResponse = await requestSummary(summaryProvider, {
         model: summaryModel,
         prompt: summaryPrompt,

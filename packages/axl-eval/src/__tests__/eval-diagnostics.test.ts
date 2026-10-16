@@ -109,6 +109,51 @@ async function readRecords(
 // ── A11.3 / operation refs ───────────────────────────────────────────
 
 describe('A11.3 — judge calls are captured', () => {
+  it('keeps item and scorer refs when a dispatched request cannot be projected', async () => {
+    const runtime = captureRuntime(2);
+    const hostile = {
+      type: 'json_schema',
+      json_schema: { name: 'bad', schema: { validate() {} } },
+    };
+    const invoke = () =>
+      runtime
+        .resolveProvider('mock:m')
+        .provider.chat([{ role: 'user', content: 'go' }], {
+          model: 'm',
+          responseFormat: hostile as never,
+        });
+    const judge = scorer({
+      name: 'judge',
+      description: 'calls provider',
+      score: async () => {
+        await invoke();
+        return 1;
+      },
+    });
+    const result = await runEval(
+      { workflow: 'w', dataset: ds(1), scorers: [judge] } satisfies EvalConfig,
+      async () => {
+        await invoke();
+        return { output: 'out' };
+      },
+      runtime,
+      { captureRequests: true },
+    );
+    const itemRefs = result.items[0].diagnostics?.operations ?? [];
+    const judgeRefs = result.items[0].scoreDetails?.judge?.diagnostics?.operations ?? [];
+    expect(itemRefs).toMatchObject([{ status: 'omitted' }]);
+    expect(judgeRefs).toMatchObject([{ status: 'omitted' }]);
+    const starts = (await readRecords(runtime, result.diagnostics!.artifactId)).filter(
+      (record) => record.phase === 'start',
+    );
+    expect(starts).toHaveLength(2);
+    expect(starts.map((record) => record.operationId).sort()).toEqual(
+      [...itemRefs, ...judgeRefs].map((ref) => ref.operationId).sort(),
+    );
+    expect(starts.every((record) => record.captured.omitted.includes('record'))).toBe(true);
+    await runtime.shutdown();
+  });
+
   it('attaches judging operations to the scorer detail, not just to the item', async () => {
     const runtime = captureRuntime(6);
     const judge = judgeOn(runtime);
@@ -134,11 +179,20 @@ describe('A11.3 — judge calls are captured', () => {
     // the judge's model rather than a mislabelled generation call.
     expect(judgeRecords.every((r) => r.scorer === 'judge')).toBe(true);
     expect(judgeRecords.every((r) => r.provider === 'judgep')).toBe(true);
+    expect(
+      judgeRecords.filter((r) => r.phase === 'start').every((r) => r.purpose === 'judge'),
+    ).toBe(true);
+    expect(
+      judgeRecords.filter((r) => r.phase === 'start').every((r) => r.askId === undefined),
+    ).toBe(true);
     // The case's own generation calls stay unlabelled, so a reader can tell
     // the two apart inside one artifact.
     const generation = records.filter((r) => r.scorer === undefined);
     expect(generation.length).toBeGreaterThan(0);
     expect(generation.every((r) => r.provider === 'mock')).toBe(true);
+    expect(generation.filter((r) => r.phase === 'start').every((r) => r.purpose === 'ask')).toBe(
+      true,
+    );
     await runtime.shutdown();
   });
 
@@ -764,7 +818,6 @@ describe('the JSONL codec and its import guard', () => {
       phase: 'end',
       kind: 'chat',
       model: 'mock:m',
-      startedAt: 1,
       ...over,
     }) as CapturedRequestRecord;
 
@@ -776,6 +829,39 @@ describe('the JSONL codec and its import guard', () => {
     const validated = validateRequestSidecar(text);
     expect(validated.ok).toBe(true);
     expect(parseRequestRecords((validated as { lines: string[] }).lines)).toEqual(records);
+  });
+
+  it('preserves additive v1 journal fields while accepting legacy records without them', () => {
+    const current = record({
+      operationId: 'current',
+      phase: 'start',
+      purpose: 'ask',
+      workflow: 'flow',
+      agent: 'agent',
+      rejectedCallId: 'previous',
+      captured: {
+        fidelity: 'runtime_request',
+        redacted: false,
+        truncated: false,
+        continuityCaptured: true,
+        omitted: [],
+      },
+    });
+    const legacy = record({
+      operationId: 'legacy',
+      phase: 'start',
+      captured: { fidelity: 'runtime_request', redacted: false, truncated: false, omitted: [] },
+    });
+    const validated = validateRequestSidecar(serializeRequestRecords([current, legacy]));
+    expect(validated.ok).toBe(true);
+    const [newRecord, oldRecord] = parseRequestRecords((validated as { lines: string[] }).lines);
+    expect(newRecord).toMatchObject({
+      purpose: 'ask',
+      workflow: 'flow',
+      rejectedCallId: 'previous',
+      captured: { continuityCaptured: true },
+    });
+    expect(oldRecord.captured.continuityCaptured).toBeUndefined();
   });
 
   it('serializes an empty set without a stray blank line', () => {

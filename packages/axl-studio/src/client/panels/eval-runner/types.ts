@@ -333,6 +333,7 @@ export type CapturedMessage = {
     function: { name: string; arguments: string };
   }>;
   tool_call_id?: string;
+  providerMetadata?: Record<string, unknown>;
 };
 
 /**
@@ -351,10 +352,20 @@ export type RequestRecord = {
   caseIndex?: number;
   scorer?: string;
   executionId?: string;
+  workflow?: string;
+  agent?: string;
+  depth?: number;
+  sessionId?: string;
+  purpose?: 'ask' | 'summary' | 'judge' | 'direct';
   askId?: string;
   parentAskId?: string;
   turn?: number;
   retryReason?: 'schema' | 'validate' | 'guardrail';
+  rejectedCallId?: string;
+  startedAt?: string;
+  endedAt?: string;
+  durationMs?: number;
+  timing?: { totalMs?: number; ttftMs?: number; [k: string]: unknown };
   /** 1-indexed transport attempt this record describes. */
   transportAttempts: number;
   provider: string;
@@ -379,13 +390,36 @@ export type RequestRecord = {
   };
   response?: {
     content: string;
+    thinking?: string;
     tool_calls?: unknown[];
+    finishReason?: 'stop' | 'length' | 'tool_calls' | 'content_filter' | 'refusal' | 'other';
+    rawFinishReason?: string;
+    responseId?: string;
+    responseModel?: string;
+    providerMetadata?: Record<string, unknown>;
     usage?: { inputTokens?: number; outputTokens?: number; [k: string]: unknown };
     cost?: number;
     costProvenance?: string;
     timing?: { totalMs?: number; ttftMs?: number; [k: string]: unknown };
   };
-  error?: { name?: string; message: string; code?: string; status?: number };
+  partial?: { content?: string; thinking?: string; tool_calls?: unknown[] };
+  outcomeStatus?: 'ok' | 'error' | 'aborted' | 'stalled' | 'consumer_closed' | 'unfinished';
+  usage?: { inputTokens?: number; outputTokens?: number; [k: string]: unknown };
+  cost?: number;
+  costProvenance?: string;
+  finishReason?: 'stop' | 'length' | 'tool_calls' | 'content_filter' | 'refusal' | 'other';
+  rawFinishReason?: string;
+  responseId?: string;
+  responseModel?: string;
+  error?: {
+    name?: string;
+    message: string;
+    code?: string;
+    status?: number;
+    retryable?: boolean;
+    requestId?: string;
+    retryAfterMs?: number;
+  };
   /** Why an operation ended without a response, when it ended deliberately. */
   termination?: string;
   correction?: { stage: string; reason?: string; feedbackMessage: string };
@@ -394,6 +428,7 @@ export type RequestRecord = {
     /** Whether THIS record's content was scrubbed. */
     redacted: boolean;
     truncated: boolean;
+    continuityCaptured?: true;
     omitted: string[];
     /**
      * Why this record is a stub, when it is one.

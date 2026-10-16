@@ -456,35 +456,64 @@ export function redactHistoricalEvent(event: HistoricalAxlEvent): HistoricalAxlE
  * redaction is on, and this function unconditionally scrubs when called.
  */
 export function redactCapturedRequest(record: CapturedRequestRecord): CapturedRequestRecord {
+  const hasProviderMetadata =
+    record.request?.messages.some((message) => message.providerMetadata !== undefined) ||
+    record.response?.providerMetadata !== undefined;
   const out: CapturedRequestRecord = {
     ...record,
-    captured: { ...record.captured, redacted: true },
+    captured: {
+      ...record.captured,
+      redacted: true,
+      omitted: hasProviderMetadata
+        ? [...new Set([...record.captured.omitted, 'providerMetadata'])]
+        : [...record.captured.omitted],
+    },
   };
   if (record.request) {
     out.request = {
       ...record.request,
-      messages: record.request.messages.map((message) => ({
-        ...message,
-        content: message.content === null ? null : REDACTED,
-        ...(message.input ? { input: redactInputDescriptor(message.input) } : {}),
-        ...(message.tool_calls
-          ? {
-              tool_calls: message.tool_calls.map((call) => ({
-                ...call,
-                function: { ...call.function, arguments: REDACTED },
-              })),
-            }
-          : {}),
-      })),
+      messages: record.request.messages.map((message) => {
+        const { providerMetadata: _metadata, ...safeMessage } = message;
+        return {
+          ...safeMessage,
+          content: message.content === null ? null : REDACTED,
+          ...(message.input ? { input: redactInputDescriptor(message.input) } : {}),
+          ...(message.tool_calls
+            ? {
+                tool_calls: message.tool_calls.map((call) => ({
+                  ...call,
+                  function: { ...call.function, arguments: REDACTED },
+                })),
+              }
+            : {}),
+        };
+      }),
     };
   }
   if (record.response) {
+    const { providerMetadata: _metadata, ...safeResponse } = record.response;
     out.response = {
-      ...record.response,
+      ...safeResponse,
       content: REDACTED,
+      ...(record.response.thinking !== undefined ? { thinking: REDACTED } : {}),
       ...(record.response.tool_calls
         ? {
             tool_calls: record.response.tool_calls.map((call) => ({
+              ...call,
+              function: { ...call.function, arguments: REDACTED },
+            })),
+          }
+        : {}),
+    };
+  }
+  if (record.partial) {
+    out.partial = {
+      ...record.partial,
+      ...(record.partial.content !== undefined ? { content: REDACTED } : {}),
+      ...(record.partial.thinking !== undefined ? { thinking: REDACTED } : {}),
+      ...(record.partial.tool_calls
+        ? {
+            tool_calls: record.partial.tool_calls.map((call) => ({
               ...call,
               function: { ...call.function, arguments: REDACTED },
             })),

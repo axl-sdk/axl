@@ -32,6 +32,7 @@ import type {
   ToolDefinition,
 } from '../providers/types.js';
 import type { ProviderResponse, ToolCallMessage } from '../types.js';
+import { ProviderError } from '../providers/errors.js';
 
 // ---------------------------------------------------------------------------
 // Record shape (JSONL v1)
@@ -47,6 +48,8 @@ export type CapturedMessage = {
   name?: string;
   tool_calls?: ToolCallMessage[];
   tool_call_id?: string;
+  /** Opaque response-derived continuity data required for later model turns. */
+  providerMetadata?: Record<string, unknown>;
 };
 
 /** The provider-neutral request, snapshotted by value at invocation. */
@@ -74,7 +77,13 @@ export type CapturedRequest = {
 /** What came back, projected to the fields that explain a turn. */
 export type CapturedResponse = {
   content: string;
+  thinking?: string;
   tool_calls?: ToolCallMessage[];
+  finishReason?: ProviderResponse['finishReason'];
+  rawFinishReason?: string;
+  responseId?: string;
+  responseModel?: string;
+  providerMetadata?: Record<string, unknown>;
   usage?: ProviderResponse['usage'];
   cost?: number;
   costProvenance?: string;
@@ -87,6 +96,16 @@ export type CapturedError = {
   message: string;
   code?: string;
   status?: number;
+  retryable?: boolean;
+  requestId?: string;
+  retryAfterMs?: number;
+};
+
+/** Output observed before a stream ended without a terminal response. */
+export type CapturedPartialResponse = {
+  content?: string;
+  thinking?: string;
+  tool_calls?: ToolCallMessage[];
 };
 
 /** The gate that rejected the previous turn and the correction fed back in. */
@@ -118,16 +137,39 @@ export type CapturedRequestRecord = {
   caseIndex?: number;
   scorer?: string;
   executionId?: string;
+  workflow?: string;
+  agent?: string;
+  depth?: number;
+  sessionId?: string;
+  purpose?: 'ask' | 'summary' | 'judge' | 'direct';
   askId?: string;
   parentAskId?: string;
   turn?: number;
   retryReason?: 'schema' | 'validate' | 'guardrail';
+  rejectedCallId?: string;
+  /** Dispatch and settlement timestamps; absent in older v1 journals. */
+  startedAt?: string;
+  endedAt?: string;
+  durationMs?: number;
+  /** Failed provider timing, if available, without a success response. */
+  timing?: ProviderResponse['timing'];
   /** 1-indexed transport attempt this record describes. */
   transportAttempts: number;
   provider: string;
   model: string;
   request?: CapturedRequest;
   response?: CapturedResponse;
+  partial?: CapturedPartialResponse;
+  /** Structural settlement retained when an oversized end line becomes a stub. */
+  outcomeStatus?: 'ok' | 'error' | 'aborted' | 'stalled' | 'consumer_closed' | 'unfinished';
+  /** The following settlement fields are populated on oversized end stubs. */
+  usage?: ProviderResponse['usage'];
+  cost?: number;
+  costProvenance?: string;
+  finishReason?: ProviderResponse['finishReason'];
+  rawFinishReason?: string;
+  responseId?: string;
+  responseModel?: string;
   error?: CapturedError;
   /**
    * Why an operation ended without a response, when it ended deliberately.
@@ -144,6 +186,8 @@ export type CapturedRequestRecord = {
     redacted: boolean;
     /** `true` when the record was replaced by a stub over `maxRecordBytes`. */
     truncated: boolean;
+    /** New v1 request projection retained opaque continuity data if present. */
+    continuityCaptured?: true;
     /** What could not be represented, e.g. `['media']`. */
     omitted: string[];
     /**
@@ -244,8 +288,14 @@ function captureMessage(message: ChatMessage): CapturedMessage {
     if (descriptor) out.input = descriptor;
   }
   if (message.name !== undefined) out.name = message.name;
-  if (message.tool_calls) out.tool_calls = message.tool_calls.map((call) => ({ ...call }));
+  if (message.tool_calls)
+    out.tool_calls = message.tool_calls.map((call) => ({
+      ...call,
+      function: { ...call.function },
+    }));
   if (message.tool_call_id !== undefined) out.tool_call_id = message.tool_call_id;
+  if (message.providerMetadata !== undefined)
+    out.providerMetadata = structuredClone(message.providerMetadata);
   return out;
 }
 
@@ -260,7 +310,7 @@ function captureTools(tools: ToolDefinition[] | undefined): CapturedRequest['too
   return tools.map((tool) => ({
     name: tool.function.name,
     ...(tool.function.description ? { description: tool.function.description } : {}),
-    parameters: tool.function.parameters,
+    parameters: structuredClone(tool.function.parameters),
   }));
 }
 
@@ -281,10 +331,11 @@ export function snapshotRequest(
     ? Object.keys(options.providerOptions)
     : undefined;
   if (providerOptionKeys && providerOptionKeys.length > 0) omitted.push('providerOptionValues');
+  const tools = captureTools(options.tools);
   return {
     request: {
       messages: messages.map(captureMessage),
-      ...(captureTools(options.tools) ? { tools: captureTools(options.tools) } : {}),
+      ...(tools ? { tools } : {}),
       ...(options.responseFormat
         ? { responseFormat: structuredClone(options.responseFormat) }
         : {}),
@@ -297,7 +348,9 @@ export function snapshotRequest(
         ...(options.includeThoughts !== undefined
           ? { includeThoughts: options.includeThoughts }
           : {}),
-        ...(options.toolChoice !== undefined ? { toolChoice: options.toolChoice } : {}),
+        ...(options.toolChoice !== undefined
+          ? { toolChoice: structuredClone(options.toolChoice) }
+          : {}),
         ...(options.stop !== undefined ? { stop: [...options.stop] } : {}),
         ...(options.promptCache !== undefined ? { promptCache: options.promptCache } : {}),
       },
@@ -311,7 +364,21 @@ export function snapshotRequest(
 export function snapshotResponse(response: ProviderResponse): CapturedResponse {
   return {
     content: response.content,
-    ...(response.tool_calls ? { tool_calls: response.tool_calls.map((c) => ({ ...c })) } : {}),
+    ...(response.thinking_content !== undefined ? { thinking: response.thinking_content } : {}),
+    ...(response.tool_calls
+      ? {
+          tool_calls: response.tool_calls.map((c) => ({ ...c, function: { ...c.function } })),
+        }
+      : {}),
+    ...(response.finishReason !== undefined ? { finishReason: response.finishReason } : {}),
+    ...(response.rawFinishReason !== undefined
+      ? { rawFinishReason: response.rawFinishReason }
+      : {}),
+    ...(response.responseId !== undefined ? { responseId: response.responseId } : {}),
+    ...(response.responseModel !== undefined ? { responseModel: response.responseModel } : {}),
+    ...(response.providerMetadata !== undefined
+      ? { providerMetadata: structuredClone(response.providerMetadata) }
+      : {}),
     ...(response.usage ? { usage: { ...response.usage } } : {}),
     ...(response.cost !== undefined ? { cost: response.cost } : {}),
     ...(response.costProvenance !== undefined ? { costProvenance: response.costProvenance } : {}),
@@ -328,6 +395,13 @@ export function snapshotError(error: unknown): CapturedError {
       message: error.message,
       ...(typeof withFields.code === 'string' ? { code: withFields.code } : {}),
       ...(typeof withFields.status === 'number' ? { status: withFields.status } : {}),
+      ...(error instanceof ProviderError
+        ? {
+            retryable: error.retryable,
+            ...(error.requestId !== undefined ? { requestId: error.requestId } : {}),
+            ...(error.retryAfterMs !== undefined ? { retryAfterMs: error.retryAfterMs } : {}),
+          }
+        : {}),
     };
   }
   return { message: String(error) };
@@ -425,6 +499,18 @@ export class RequestCaptureChannel {
     }
     let bytes = Buffer.byteLength(line, 'utf-8');
     if (bytes > this.maxRecordBytes) {
+      const outcomeStatus =
+        record.phase !== 'end'
+          ? undefined
+          : record.termination === 'aborted' ||
+              record.termination === 'stalled' ||
+              record.termination === 'consumer_closed'
+            ? record.termination
+            : record.error
+              ? 'error'
+              : record.response
+                ? 'ok'
+                : 'unfinished';
       const stub: CapturedRequestRecord = {
         v: 1,
         phase: record.phase,
@@ -432,7 +518,61 @@ export class RequestCaptureChannel {
         kind: record.kind,
         ...(record.caseIndex !== undefined ? { caseIndex: record.caseIndex } : {}),
         ...(record.scorer !== undefined ? { scorer: record.scorer } : {}),
+        ...(record.executionId !== undefined ? { executionId: record.executionId } : {}),
+        ...(record.workflow !== undefined ? { workflow: record.workflow } : {}),
+        ...(record.agent !== undefined ? { agent: record.agent } : {}),
+        ...(record.depth !== undefined ? { depth: record.depth } : {}),
+        ...(record.sessionId !== undefined ? { sessionId: record.sessionId } : {}),
+        ...(record.purpose !== undefined ? { purpose: record.purpose } : {}),
+        ...(record.askId !== undefined ? { askId: record.askId } : {}),
+        ...(record.parentAskId !== undefined ? { parentAskId: record.parentAskId } : {}),
         ...(record.turn !== undefined ? { turn: record.turn } : {}),
+        ...(record.retryReason !== undefined ? { retryReason: record.retryReason } : {}),
+        ...(record.rejectedCallId !== undefined ? { rejectedCallId: record.rejectedCallId } : {}),
+        ...(record.startedAt !== undefined ? { startedAt: record.startedAt } : {}),
+        ...(record.endedAt !== undefined ? { endedAt: record.endedAt } : {}),
+        ...(record.durationMs !== undefined ? { durationMs: record.durationMs } : {}),
+        ...(record.termination !== undefined ? { termination: record.termination } : {}),
+        ...(outcomeStatus !== undefined ? { outcomeStatus } : {}),
+        ...(record.response?.usage !== undefined ? { usage: record.response.usage } : {}),
+        ...(record.response?.cost !== undefined ? { cost: record.response.cost } : {}),
+        ...(record.response?.costProvenance !== undefined
+          ? { costProvenance: record.response.costProvenance }
+          : {}),
+        ...(record.response?.finishReason !== undefined
+          ? { finishReason: record.response.finishReason }
+          : {}),
+        ...(record.response?.rawFinishReason !== undefined
+          ? { rawFinishReason: record.response.rawFinishReason }
+          : {}),
+        ...(record.response?.responseId !== undefined
+          ? { responseId: record.response.responseId }
+          : {}),
+        ...(record.response?.responseModel !== undefined
+          ? { responseModel: record.response.responseModel }
+          : {}),
+        ...((record.timing ?? record.response?.timing)
+          ? { timing: record.timing ?? record.response?.timing }
+          : {}),
+        ...(record.error
+          ? {
+              error: {
+                message: '[truncated]',
+                ...(record.error.name !== undefined ? { name: record.error.name } : {}),
+                ...(record.error.code !== undefined ? { code: record.error.code } : {}),
+                ...(record.error.status !== undefined ? { status: record.error.status } : {}),
+                ...(record.error.retryable !== undefined
+                  ? { retryable: record.error.retryable }
+                  : {}),
+                ...(record.error.requestId !== undefined
+                  ? { requestId: record.error.requestId }
+                  : {}),
+                ...(record.error.retryAfterMs !== undefined
+                  ? { retryAfterMs: record.error.retryAfterMs }
+                  : {}),
+              },
+            }
+          : {}),
         transportAttempts: record.transportAttempts,
         provider: record.provider,
         model: record.model,
@@ -440,7 +580,7 @@ export class RequestCaptureChannel {
           fidelity: 'runtime_request',
           redacted: record.captured.redacted,
           truncated: true,
-          omitted: ['record'],
+          omitted: [...new Set([...record.captured.omitted, 'record'])],
           // Carried, not dropped: a projection stub that is itself over-size
           // would otherwise come back indistinguishable from an ordinary
           // over-size record, which is the one distinction `reason` exists to
@@ -597,11 +737,21 @@ export function runWithCaptureCorrelation<T>(
 /** Per-turn identity the context knows and the facade does not. */
 export type CaptureTurnContext = {
   executionId?: string;
+  workflow?: string;
+  agent?: string;
+  depth?: number;
+  sessionId?: string;
+  purpose?: 'ask' | 'summary' | 'judge' | 'direct';
   askId?: string;
   parentAskId?: string;
   turn?: number;
   retryReason?: 'schema' | 'validate' | 'guardrail';
+  rejectedCallId?: string;
   correction?: CapturedCorrection;
+  /** Written by the facade after dispatch, read by the next repair turn. */
+  callId?: string;
+  /** First-wins cause written by the ask loop before closing a stream. */
+  terminationCause?: 'aborted' | 'stalled' | 'consumer_closed';
 };
 
 /**
@@ -630,4 +780,16 @@ export function runWithCaptureTurnSlot<T>(fn: () => T): T {
 export function setCaptureTurn(turn: CaptureTurnContext): void {
   const slot = turnStorage.getStore();
   if (slot) slot.current = turn;
+}
+
+/** @internal Keep the last dispatched call in this ask branch for repair linkage. */
+export function setCaptureCallId(callId: string): void {
+  const slot = turnStorage.getStore();
+  if (slot) slot.current.callId = callId;
+}
+
+/** @internal Label a context-driven stream close before the facade sees return(). */
+export function setCaptureTerminationCause(cause: CaptureTurnContext['terminationCause']): void {
+  const slot = turnStorage.getStore();
+  if (slot) slot.current.terminationCause = cause;
 }

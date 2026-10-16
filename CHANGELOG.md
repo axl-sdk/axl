@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Built-in provider chat responses and terminal stream chunks now expose normalized finish reason, raw vendor reason or status, and provider-reported response id and model when available. `MockProvider.sequence()` can script the same metadata for tests.
+- Opt-in request journals now preserve response thinking and continuity metadata, streamed partial output, dispatch/settlement timing, truthful ask/summary/judge identity, and branch-local repair links. A new continuity marker distinguishes current snapshots from older v1 records; interrupted streams and oversized end stubs retain their actual outcome and available usage/cost evidence. Redaction also scrubs the new content surfaces and removes opaque provider metadata.
 
 ### Fixed
 

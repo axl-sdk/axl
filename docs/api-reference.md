@@ -1918,6 +1918,15 @@ call without importing the optional `@axlsdk/eval` peer dependency.
 
 Storage for [captured requests](observability.md#captured-requests-opt-in), configured by `config.diagnostics.artifacts`:
 
+`CapturedRequestRecord` remains JSONL codec `v: 1`. Its additive fields include
+`workflow`, `agent`, `depth`, `sessionId`, `purpose`, `rejectedCallId`, optional
+dispatch/settlement timestamps and duration, response finish/identity metadata,
+and `partial` stream output on interrupted calls. New start lines mark
+`captured.continuityCaptured: true` after a continuity-aware request snapshot;
+older v1 lines without it have unknown replay fidelity. Oversized end stubs
+retain `outcomeStatus`, usage, cost and structural finish/error/timing data while
+omitting the response payload. See [record fidelity and redaction](observability.md#what-a-record-contains).
+
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `root` | `string?` | — | Directory for the built-in `FileDiagnosticArtifactStore`. One of `root` or `store` is required for capture |

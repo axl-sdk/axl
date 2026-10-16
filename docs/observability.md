@@ -866,9 +866,9 @@ One JSONL line per phase of a model call, `v: 1`:
 
 | Phase | Carries |
 |---|---|
-| `start` | The request as submitted — messages, tools, schema and the allowlisted call options |
+| `start` | The request snapshotted before adapter invocation — messages, tools, schema and the allowlisted call options; emitted only after dispatch is observed (or, for a custom adapter without a lifecycle hook, when invoked) |
 | `attempt` | An additional **transport** attempt for the same logical call (a 429 retry is not an output repair) |
-| `end` | The response, or the error |
+| `end` | The response, error, or an explicitly terminated stream; partial stream output survives when there is no terminal response |
 
 An `end` record for a **stream** also carries a `termination` string when the
 stream did not simply finish — the consumer broke out of the loop, aborted it,
@@ -877,11 +877,26 @@ it a sealed stream and a call that genuinely never came back are
 indistinguishable, since both leave a `start` with no response.
 
 Every record carries the identity needed to place it: `operationId`, `kind`,
-`provider`, `model`, `transportAttempts`, plus `executionId` / `askId` /
-`parentAskId` / `turn`, the `caseIndex` and `scorer` of the eval scope it ran
-in, and — on a repair turn — `retryReason` and a `correction`
+`provider`, `model`, `transportAttempts`, plus available `executionId`,
+`workflow`, `agent`, `depth`, `sessionId`, `askId`, `parentAskId`, `turn`,
+`purpose` (`ask`, `summary`, `judge`, or `direct`), and eval `caseIndex` /
+`scorer`. A repair turn carries `retryReason`, the branch-local
+`rejectedCallId` of the answer it replaces, and a `correction`
 (`{ stage, reason, feedbackMessage }`) saying which gate rejected the previous
 answer and what the model was told about it.
+Summaries created inside an ask retain that ask's known `askId` and
+`parentAskId` but do not inherit its repair state; a direct runtime summary
+with no ask has neither ID.
+
+New records carry `startedAt` on dispatch and `endedAt` / `durationMs` on
+settlement. Older v1 records lack these fields; their timing is unknown. A
+completed response keeps text, thinking, tool calls, usage, cost, provider
+timing, finish reason and provider-reported response identity when available.
+An interrupted stream keeps observed text, thinking and tool-call deltas in
+`partial`, with `termination` distinguishing `aborted`, `stalled` and
+`consumer_closed`. A failed provider call keeps structural retry hints and
+request ID without serializing the provider error body. Capture does not change
+the original provider result or accounting.
 
 `EvalItem.diagnostics.operations` and `ScorerDetail.diagnostics.operations`
 point at the operations each owns, so you can go from a suspicious score
@@ -903,7 +918,17 @@ Deliberate omissions are named rather than silently dropped, in
 - `record` — the whole record exceeded the per-record byte bound and was
   replaced by a stub carrying its size
 
-Signals, functions, callbacks and credentials are never captured.
+New start records carry `captured.continuityCaptured: true` when the request
+snapshot used the continuity-aware projection, including calls with no opaque
+metadata to retain.
+Older v1 starts without this marker cannot claim exact replayability, even if
+their omission list is empty. The marker says the projection supported this
+data; it does not claim that the provider sent any on a particular call.
+
+Signals, functions, callbacks and configured provider credentials are never
+captured. Opaque `providerMetadata` comes from provider responses (or a custom
+adapter) and may itself be sensitive; treat an unredacted journal as model
+content. With `trace.redact`, that metadata is removed before storage.
 
 ### Bounds
 
@@ -934,6 +959,11 @@ names the error's class, never its message — it is written straight to the sin
 rather than through redaction, so it must not be able to carry any of the call.
 A projection stub that is itself over-size keeps its reason through the
 re-stub.
+
+An oversized `end` stub still carries its actual `outcomeStatus`, structural
+error identity, usage, cost, finish/response identity and timing when known.
+Its response payload is omitted. A settled call therefore never looks like an
+unfinished call merely because its answer crossed a capture byte bound.
 
 Writes are queued, never awaited by the provider path. A sink that throws stops
 capture with status `unavailable`. In every one of these cases the run

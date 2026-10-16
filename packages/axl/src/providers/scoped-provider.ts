@@ -27,6 +27,7 @@ import {
   currentCaptureChannel,
   currentCaptureCorrelation,
   currentCaptureTurn,
+  setCaptureCallId,
   snapshotError,
   snapshotRequest,
   snapshotResponse,
@@ -35,6 +36,7 @@ import {
 } from '../diagnostics/capture.js';
 import { redactCapturedRequest } from '../redaction.js';
 import type { CallTiming, ProviderResponse } from '../types.js';
+import { StallTimeoutError } from '../errors.js';
 import type { ChatMessage, ChatOptions, Provider, StreamChunk } from './types.js';
 
 /** Map a provider usage block onto the accounting usage buckets. */
@@ -157,22 +159,10 @@ function beginCapture(
     // and a message rehydrated from an older session may carry a content part
     // no current adapter names.
     //
-    // ONE record is lost, not the run's. An eval where one case in 200 carries
-    // an odd content part must not surrender the other 199 cases of evidence,
-    // so this degrades exactly as the per-record byte bound does: a stub in
-    // place of the record, and capture continues.
-    stubRecord(
-      channel,
-      {
-        operationId,
-        kind,
-        provider: raw.name ?? 'unknown',
-        model: options.model,
-        transportAttempts: 1,
-      },
-      'start',
-      `the request could not be captured: ${describeCaptureFailure(error)}`,
-    );
+    // An unexpected recorder failure must not fail provider work. In
+    // particular, no record can be written here: a built-in adapter may still
+    // be refused at its dispatch admission check.
+    void error;
     return undefined;
   }
 }
@@ -184,6 +174,23 @@ type StubIdentity = {
   provider: string;
   model: string;
   transportAttempts: number;
+  caseIndex?: number;
+  scorer?: string;
+  executionId?: string;
+  workflow?: string;
+  agent?: string;
+  depth?: number;
+  sessionId?: string;
+  purpose?: CapturedRequestRecord['purpose'];
+  askId?: string;
+  parentAskId?: string;
+  turn?: number;
+  retryReason?: CapturedRequestRecord['retryReason'];
+  rejectedCallId?: string;
+  startedAt?: string;
+  endedAt?: string;
+  durationMs?: number;
+  outcomeStatus?: CapturedRequestRecord['outcomeStatus'];
 };
 
 /**
@@ -208,6 +215,23 @@ function stubRecord(
     transportAttempts: identity.transportAttempts,
     provider: identity.provider,
     model: identity.model,
+    ...(identity.caseIndex !== undefined ? { caseIndex: identity.caseIndex } : {}),
+    ...(identity.scorer !== undefined ? { scorer: identity.scorer } : {}),
+    ...(identity.executionId !== undefined ? { executionId: identity.executionId } : {}),
+    ...(identity.workflow !== undefined ? { workflow: identity.workflow } : {}),
+    ...(identity.agent !== undefined ? { agent: identity.agent } : {}),
+    ...(identity.depth !== undefined ? { depth: identity.depth } : {}),
+    ...(identity.sessionId !== undefined ? { sessionId: identity.sessionId } : {}),
+    ...(identity.purpose !== undefined ? { purpose: identity.purpose } : {}),
+    ...(identity.askId !== undefined ? { askId: identity.askId } : {}),
+    ...(identity.parentAskId !== undefined ? { parentAskId: identity.parentAskId } : {}),
+    ...(identity.turn !== undefined ? { turn: identity.turn } : {}),
+    ...(identity.retryReason !== undefined ? { retryReason: identity.retryReason } : {}),
+    ...(identity.rejectedCallId !== undefined ? { rejectedCallId: identity.rejectedCallId } : {}),
+    ...(identity.startedAt !== undefined ? { startedAt: identity.startedAt } : {}),
+    ...(identity.endedAt !== undefined ? { endedAt: identity.endedAt } : {}),
+    ...(identity.durationMs !== undefined ? { durationMs: identity.durationMs } : {}),
+    ...(identity.outcomeStatus !== undefined ? { outcomeStatus: identity.outcomeStatus } : {}),
     captured: {
       fidelity: 'runtime_request',
       redacted: channel.redact,
@@ -246,9 +270,57 @@ function describeCaptureFailure(error: unknown): string {
 class CaptureRecorder {
   private attempts = 0;
   private ended = false;
+  private startedAtMs: number | undefined;
   private readonly turn: ReturnType<typeof currentCaptureTurn>;
+  private readonly liveTurn: ReturnType<typeof currentCaptureTurn>;
   private readonly correlation: ReturnType<typeof currentCaptureCorrelation>;
   private readonly omitted: string[];
+  private readonly request: ReturnType<typeof snapshotRequest>['request'] | undefined;
+  private readonly projectionFailure: string | undefined;
+  private readonly model: string;
+  private readonly signal: AbortSignal | undefined;
+  private readonly textDeltas: string[] = [];
+  private readonly thinkingDeltas: string[] = [];
+  private readonly toolCallDeltas = new Map<
+    string,
+    { id: string; name: string; arguments: string }
+  >();
+
+  private stubIdentity(outcomeStatus?: CapturedRequestRecord['outcomeStatus']): StubIdentity {
+    const endedAtMs = outcomeStatus !== undefined ? Date.now() : undefined;
+    return {
+      operationId: this.operationId,
+      kind: this.kind,
+      provider: this.provider,
+      model: this.model,
+      transportAttempts: Math.max(1, this.attempts),
+      ...(this.correlation?.caseIndex !== undefined
+        ? { caseIndex: this.correlation.caseIndex }
+        : {}),
+      ...(this.correlation?.scorer !== undefined ? { scorer: this.correlation.scorer } : {}),
+      ...(this.turn?.executionId !== undefined ? { executionId: this.turn.executionId } : {}),
+      ...(this.turn?.workflow !== undefined ? { workflow: this.turn.workflow } : {}),
+      ...(this.turn?.agent !== undefined ? { agent: this.turn.agent } : {}),
+      ...(this.turn?.depth !== undefined ? { depth: this.turn.depth } : {}),
+      ...(this.turn?.sessionId !== undefined ? { sessionId: this.turn.sessionId } : {}),
+      purpose: this.correlation?.scorer ? 'judge' : (this.turn?.purpose ?? 'direct'),
+      ...(this.turn?.askId !== undefined ? { askId: this.turn.askId } : {}),
+      ...(this.turn?.parentAskId !== undefined ? { parentAskId: this.turn.parentAskId } : {}),
+      ...(this.turn?.turn !== undefined ? { turn: this.turn.turn } : {}),
+      ...(this.turn?.retryReason !== undefined ? { retryReason: this.turn.retryReason } : {}),
+      ...(this.turn?.rejectedCallId !== undefined
+        ? { rejectedCallId: this.turn.rejectedCallId }
+        : {}),
+      ...(this.startedAtMs !== undefined
+        ? { startedAt: new Date(this.startedAtMs).toISOString() }
+        : {}),
+      ...(endedAtMs !== undefined ? { endedAt: new Date(endedAtMs).toISOString() } : {}),
+      ...(endedAtMs !== undefined && this.startedAtMs !== undefined
+        ? { durationMs: Math.max(0, endedAtMs - this.startedAtMs) }
+        : {}),
+      ...(outcomeStatus !== undefined ? { outcomeStatus } : {}),
+    };
+  }
 
   constructor(
     private readonly channel: RequestCaptureChannel,
@@ -256,23 +328,30 @@ class CaptureRecorder {
     private readonly kind: 'chat' | 'stream',
     private readonly operationId: string,
     messages: readonly ChatMessage[],
-    private readonly options: ChatOptions,
+    options: ChatOptions,
   ) {
-    const turn = currentCaptureTurn();
+    const ambientTurn = currentCaptureTurn();
+    // A direct provider call inside a tool still runs under the surrounding
+    // ask's ALS frame. Only ctx.ask's marked request or an explicit summary
+    // call belongs to that turn; all other facade calls are direct.
+    const turn =
+      options.accountingModelUri !== undefined || ambientTurn?.purpose === 'summary'
+        ? ambientTurn
+        : undefined;
     const correlation = currentCaptureCorrelation();
-    this.turn = turn;
-    this.correlation = correlation;
-    const { request, omitted } = snapshotRequest(messages, options);
-    this.omitted = omitted;
-    channel.noteOperation({
-      operationId,
-      kind,
-      ...(turn?.turn !== undefined ? { turn: turn.turn } : {}),
-      status: 'start_only',
-      ...(correlation?.caseIndex !== undefined ? { caseIndex: correlation.caseIndex } : {}),
-      ...(correlation?.scorer !== undefined ? { scorer: correlation.scorer } : {}),
-    });
-    this.emit({ phase: 'start', transportAttempts: 1, request });
+    this.liveTurn = turn;
+    this.turn = turn ? { ...turn } : undefined;
+    this.correlation = correlation ? { ...correlation } : undefined;
+    this.model = options.model;
+    this.signal = options.signal;
+    try {
+      const snapshot = snapshotRequest(messages, options);
+      this.request = snapshot.request;
+      this.omitted = snapshot.omitted;
+    } catch (error) {
+      this.omitted = ['record'];
+      this.projectionFailure = `the request could not be captured: ${describeCaptureFailure(error)}`;
+    }
   }
 
   private emit(
@@ -284,16 +363,24 @@ class CaptureRecorder {
       operationId: this.operationId,
       kind: this.kind,
       provider: this.provider,
-      model: this.options.model,
+      model: this.model,
       ...(this.correlation?.caseIndex !== undefined
         ? { caseIndex: this.correlation.caseIndex }
         : {}),
       ...(this.correlation?.scorer !== undefined ? { scorer: this.correlation.scorer } : {}),
       ...(this.turn?.executionId !== undefined ? { executionId: this.turn.executionId } : {}),
+      ...(this.turn?.workflow !== undefined ? { workflow: this.turn.workflow } : {}),
+      ...(this.turn?.agent !== undefined ? { agent: this.turn.agent } : {}),
+      ...(this.turn?.depth !== undefined ? { depth: this.turn.depth } : {}),
+      ...(this.turn?.sessionId !== undefined ? { sessionId: this.turn.sessionId } : {}),
+      purpose: this.correlation?.scorer ? 'judge' : (this.turn?.purpose ?? 'direct'),
       ...(this.turn?.askId !== undefined ? { askId: this.turn.askId } : {}),
       ...(this.turn?.parentAskId !== undefined ? { parentAskId: this.turn.parentAskId } : {}),
       ...(this.turn?.turn !== undefined ? { turn: this.turn.turn } : {}),
       ...(this.turn?.retryReason !== undefined ? { retryReason: this.turn.retryReason } : {}),
+      ...(this.turn?.rejectedCallId !== undefined
+        ? { rejectedCallId: this.turn.rejectedCallId }
+        : {}),
       ...(this.turn?.correction !== undefined ? { correction: this.turn.correction } : {}),
       captured: {
         fidelity: 'runtime_request',
@@ -314,7 +401,12 @@ class CaptureRecorder {
    * of them may throw. `RequestCaptureChannel.write()` is already total for the
    * same reason; this extends that discipline to the producers.
    */
-  private guarded(what: string, phase: CapturedRequestRecord['phase'], step: () => void): void {
+  private guarded(
+    what: string,
+    phase: CapturedRequestRecord['phase'],
+    step: () => void,
+    outcomeStatus?: CapturedRequestRecord['outcomeStatus'],
+  ): void {
     try {
       step();
     } catch (error) {
@@ -330,13 +422,7 @@ class CaptureRecorder {
       // the operation, and it sets the flag itself.
       stubRecord(
         this.channel,
-        {
-          operationId: this.operationId,
-          kind: this.kind,
-          provider: this.provider,
-          model: this.options.model,
-          transportAttempts: Math.max(1, this.attempts),
-        },
+        this.stubIdentity(outcomeStatus),
         phase,
         `${what} could not be captured: ${describeCaptureFailure(error)}`,
       );
@@ -346,7 +432,46 @@ class CaptureRecorder {
   /** A transport attempt beyond the first: the SAME operation, retried. */
   markDispatch(): void {
     this.attempts += 1;
-    if (this.attempts <= 1) return;
+    if (this.attempts === 1) {
+      const startedAtMs = Date.now();
+      this.startedAtMs = startedAtMs;
+      if (this.turn) setCaptureCallId(this.operationId);
+      this.guarded('a request', 'start', () => {
+        // Register the full eval correlation before either write path. An
+        // oversized write and an unprojectable request both update this ref
+        // to a sticky loss verdict; registering afterwards would overwrite
+        // the verdict, while returning early from a projection stub would
+        // leave its case/scorer identity absent from eval diagnostics.
+        this.channel.noteOperation({
+          operationId: this.operationId,
+          kind: this.kind,
+          ...(this.turn?.turn !== undefined ? { turn: this.turn.turn } : {}),
+          status: 'start_only',
+          ...(this.correlation?.caseIndex !== undefined
+            ? { caseIndex: this.correlation.caseIndex }
+            : {}),
+          ...(this.correlation?.scorer !== undefined ? { scorer: this.correlation.scorer } : {}),
+        });
+        if (this.projectionFailure) {
+          stubRecord(this.channel, this.stubIdentity(), 'start', this.projectionFailure);
+          return;
+        }
+        this.emit({
+          phase: 'start',
+          transportAttempts: 1,
+          startedAt: new Date(startedAtMs).toISOString(),
+          ...(this.request ? { request: this.request } : {}),
+          captured: {
+            fidelity: 'runtime_request',
+            redacted: false,
+            truncated: false,
+            continuityCaptured: true,
+            omitted: this.omitted,
+          },
+        });
+      });
+      return;
+    }
     this.guarded('a transport attempt', 'attempt', () => {
       this.emit({ phase: 'attempt', transportAttempts: this.attempts });
       this.channel.noteOperation({
@@ -358,24 +483,137 @@ class CaptureRecorder {
     });
   }
 
+  /** Accumulate only while capture is active; the ordinary stream allocates nothing here. */
+  observeChunk(chunk: StreamChunk): void {
+    if (this.attempts === 0 || this.ended) return;
+    try {
+      if (chunk.type === 'text_delta') this.textDeltas.push(chunk.content);
+      else if (chunk.type === 'thinking_delta') this.thinkingDeltas.push(chunk.content);
+      else if (chunk.type === 'tool_call_delta') {
+        const current = this.toolCallDeltas.get(chunk.id) ?? {
+          id: chunk.id,
+          name: '',
+          arguments: '',
+        };
+        if (chunk.name) current.name = chunk.name;
+        if (chunk.arguments) current.arguments += chunk.arguments;
+        this.toolCallDeltas.set(chunk.id, current);
+      }
+    } catch {
+      // A custom adapter can expose a throwing chunk getter. The returned
+      // chunk remains the adapter's; mark the journal incomplete instead of
+      // changing the model call's result.
+      if (!this.omitted.includes('streamChunk')) this.omitted.push('streamChunk');
+    }
+  }
+
+  private observedToolCalls(): ProviderResponse['tool_calls'] {
+    return this.toolCallDeltas.size
+      ? [...this.toolCallDeltas.values()].map((call) => ({
+          id: call.id,
+          type: 'function' as const,
+          function: { name: call.name, arguments: call.arguments },
+        }))
+      : undefined;
+  }
+
+  endStream(chunk: Extract<StreamChunk, { type: 'done' }>): void {
+    try {
+      const toolCalls = this.observedToolCalls();
+      this.end({
+        response: {
+          content: this.textDeltas.join(''),
+          ...(this.thinkingDeltas.length ? { thinking_content: this.thinkingDeltas.join('') } : {}),
+          ...(toolCalls ? { tool_calls: toolCalls } : {}),
+          ...(chunk.usage ? { usage: chunk.usage } : {}),
+          ...(chunk.cost !== undefined ? { cost: chunk.cost } : {}),
+          ...(chunk.costProvenance !== undefined ? { costProvenance: chunk.costProvenance } : {}),
+          ...(chunk.providerMetadata !== undefined
+            ? { providerMetadata: chunk.providerMetadata }
+            : {}),
+          ...(chunk.finishReason !== undefined ? { finishReason: chunk.finishReason } : {}),
+          ...(chunk.rawFinishReason !== undefined
+            ? { rawFinishReason: chunk.rawFinishReason }
+            : {}),
+          ...(chunk.responseId !== undefined ? { responseId: chunk.responseId } : {}),
+          ...(chunk.responseModel !== undefined ? { responseModel: chunk.responseModel } : {}),
+          ...(chunk.timing !== undefined ? { timing: chunk.timing } : {}),
+        },
+      });
+    } catch (error) {
+      // A terminal chunk whose getter throws cannot be projected safely. It
+      // still settled successfully on the provider path, so retain that fact.
+      this.ended = true;
+      stubRecord(
+        this.channel,
+        this.stubIdentity('ok'),
+        'end',
+        `a response could not be captured: ${describeCaptureFailure(error)}`,
+      );
+    }
+  }
+
+  /** Context's first-wins stamp outranks the fallback; a signal is next. */
+  termination(fallback: string | undefined, error?: unknown): string | undefined {
+    if (this.liveTurn?.terminationCause) return this.liveTurn.terminationCause;
+    if (this.signal?.aborted) {
+      const reason = this.signal.reason;
+      return reason instanceof Error && reason.name === 'StallTimeout' ? 'stalled' : 'aborted';
+    }
+    if (error instanceof StallTimeoutError) return 'stalled';
+    if (error instanceof Error && error.name === 'AbortError') return 'aborted';
+    return fallback;
+  }
+
   end(outcome: { response?: ProviderResponse; error?: unknown; termination?: string }): void {
-    if (this.ended) return;
+    if (this.ended || this.attempts === 0) return;
     this.ended = true;
-    this.guarded('a response', 'end', () => {
-      this.emit({
-        phase: 'end',
-        transportAttempts: Math.max(1, this.attempts),
-        ...(outcome.response ? { response: snapshotResponse(outcome.response) } : {}),
-        ...('error' in outcome ? { error: snapshotError(outcome.error) } : {}),
-        ...(outcome.termination !== undefined ? { termination: outcome.termination } : {}),
-      });
-      this.channel.noteOperation({
-        operationId: this.operationId,
-        kind: this.kind,
-        attempt: Math.max(1, this.attempts),
-        status: 'recorded',
-      });
-    });
+    this.guarded(
+      'a response',
+      'end',
+      () => {
+        const endedAtMs = Date.now();
+        const errorTiming =
+          'error' in outcome ? safeTiming(outcome.error as { timing?: CallTiming }) : undefined;
+        this.emit({
+          phase: 'end',
+          transportAttempts: Math.max(1, this.attempts),
+          endedAt: new Date(endedAtMs).toISOString(),
+          ...(this.startedAtMs !== undefined
+            ? { durationMs: Math.max(0, endedAtMs - this.startedAtMs) }
+            : {}),
+          ...(outcome.response ? { response: snapshotResponse(outcome.response) } : {}),
+          ...(!outcome.response &&
+          (this.textDeltas.length || this.thinkingDeltas.length || this.toolCallDeltas.size)
+            ? {
+                partial: {
+                  ...(this.textDeltas.length ? { content: this.textDeltas.join('') } : {}),
+                  ...(this.thinkingDeltas.length ? { thinking: this.thinkingDeltas.join('') } : {}),
+                  ...(this.observedToolCalls() ? { tool_calls: this.observedToolCalls() } : {}),
+                },
+              }
+            : {}),
+          ...('error' in outcome ? { error: snapshotError(outcome.error) } : {}),
+          ...(errorTiming ? { timing: errorTiming } : {}),
+          ...(outcome.termination !== undefined ? { termination: outcome.termination } : {}),
+        });
+        this.channel.noteOperation({
+          operationId: this.operationId,
+          kind: this.kind,
+          attempt: Math.max(1, this.attempts),
+          status: 'recorded',
+        });
+      },
+      outcome.termination === 'aborted' ||
+        outcome.termination === 'stalled' ||
+        outcome.termination === 'consumer_closed'
+        ? outcome.termination
+        : 'error' in outcome
+          ? 'error'
+          : outcome.response
+            ? 'ok'
+            : 'unfinished',
+    );
   }
 }
 
@@ -416,9 +654,17 @@ export function createScopedProvider(raw: Provider): Provider {
     // rewrite history.
     const recorder = beginCapture(raw, 'chat', handle.id, messages, options);
     try {
-      const response = await handle.run(() =>
-        raw.chat(messages, instrumentedOptions(options, handle, recorder)),
-      );
+      const response = await handle.run(() => {
+        if (raw.reportsRequestLifecycle !== true) recorder?.markDispatch();
+        return raw.chat(
+          messages,
+          instrumentedOptions(
+            options,
+            handle,
+            raw.reportsRequestLifecycle === true ? recorder : undefined,
+          ),
+        );
+      });
       handle.settle({
         cost: response.cost,
         provenance: response.costProvenance,
@@ -432,7 +678,7 @@ export function createScopedProvider(raw: Provider): Provider {
       // AdmissionDeniedError raised by our own dispatch hook has already
       // retracted the operation, and `settleFailure` is a no-op after that.
       handle.settleFailure();
-      recorder?.end({ error });
+      recorder?.end({ error, termination: recorder.termination(undefined, error) });
       throw error;
     }
   };
@@ -469,8 +715,9 @@ export function createScopedProvider(raw: Provider): Provider {
       if (settled) return;
       settled = true;
       handle?.settleFailure();
-      if (error !== undefined) recorder?.end({ error, termination });
-      else recorder?.end({ termination });
+      const cause = recorder?.termination(termination, error);
+      if (error !== undefined) recorder?.end({ error, ...(cause ? { termination: cause } : {}) });
+      else recorder?.end({ ...(cause ? { termination: cause } : {}) });
     };
 
     // Deferred to the first `next()`: the admission check, the operation and
@@ -483,7 +730,17 @@ export function createScopedProvider(raw: Provider): Provider {
       // iteration — the same rule the operation itself follows.
       if (handle) recorder = beginCapture(raw, 'stream', handle.id, messages, options);
       const source = handle
-        ? handle.run(() => raw.stream(messages, instrumentedOptions(options, handle!, recorder)))
+        ? handle.run(() => {
+            if (raw.reportsRequestLifecycle !== true) recorder?.markDispatch();
+            return raw.stream(
+              messages,
+              instrumentedOptions(
+                options,
+                handle!,
+                raw.reportsRequestLifecycle === true ? recorder : undefined,
+              ),
+            );
+          })
         : raw.stream(messages, options);
       // An adapter may return a bare async-iterable rather than a generator, so
       // take its iterator explicitly instead of assuming `next` sits on the
@@ -530,18 +787,11 @@ export function createScopedProvider(raw: Provider): Provider {
               timing: safeTiming(result.value),
             });
             settled = true;
-            // The `done` chunk is a stream's response: link its usage/cost to
-            // the same operation id the start record opened.
-            recorder?.end({
-              response: {
-                content: '',
-                ...(result.value.usage ? { usage: result.value.usage } : {}),
-                ...(result.value.cost !== undefined ? { cost: result.value.cost } : {}),
-                ...(result.value.costProvenance !== undefined
-                  ? { costProvenance: result.value.costProvenance }
-                  : {}),
-              } as ProviderResponse,
-            });
+            // The terminal chunk closes the same captured operation as the
+            // earlier text, thinking and tool-call deltas.
+            recorder?.endStream(result.value);
+          } else {
+            recorder?.observeChunk(result.value);
           }
           return result;
         } catch (error) {
@@ -554,14 +804,14 @@ export function createScopedProvider(raw: Provider): Provider {
         finished = true;
         // The runtime's stall-timeout close and a consumer `break` both land
         // here.
-        settleUnresolved('stream closed by the consumer');
+        settleUnresolved('consumer_closed');
         // `return` is optional on a plain async iterator.
         if (inner?.return) return inner.return(value as never);
         return { value: value as never, done: true };
       },
       async throw(error?: unknown): Promise<IteratorResult<StreamChunk>> {
         finished = true;
-        settleUnresolved('stream aborted by the consumer', error);
+        settleUnresolved('consumer_closed', error);
         if (inner?.throw) return inner.throw(error);
         throw error;
       },

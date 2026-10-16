@@ -364,9 +364,11 @@ contain, so the same policy applies, twice:
 
 - **Before the write.** When `trace.redact` is on, every record passes through
   `redactCapturedRequest()` before it reaches the sink. Message content, tool-call
-  arguments, response content, error messages and gate `reason` /
-  `feedbackMessage` become `'[redacted]'`; structure (roles, counts, model,
-  provider, timings, ids) survives, and the record is stamped
+  arguments, response content and thinking, partial stream output, error
+  messages and gate `reason` / `feedbackMessage` become `'[redacted]'`.
+  Opaque `providerMetadata` is removed from both request and response, with
+  the omission recorded; structure (roles, counts, model, provider, timings,
+  ids, usage and cost) survives, and the record is stamped
   `captured.redacted: true`.
 - **Again at delivery.** Studio re-applies redaction when streaming records out,
   because an artifact may have been written before the flag was switched on.
@@ -374,6 +376,8 @@ contain, so the same policy applies, twice:
 Rich media never lands in an artifact: image, audio and file parts are replaced
 by descriptors. `providerOptions` contributes **keys only** — a credential
 passed through it cannot reach the file even unredacted.
+Unredacted `providerMetadata` may contain opaque response material or
+application-supplied values; handle the artifact as sensitive model content.
 
 Capture is off unless a run asks for it, and asking requires a configured
 artifact root or store; there is no implicit location and no ambient default.

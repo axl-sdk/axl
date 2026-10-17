@@ -1,9 +1,10 @@
 /**
- * Provider-gated journal evidence for model-call capture plan L1–L8.
+ * Provider-gated journal evidence for model-call capture plan L1–L9.
  *
- * Eleven logical requests at most: two each for OpenAI Chat and Responses,
+ * Thirteen logical requests at most: two each for OpenAI Chat and Responses,
  * one Anthropic truncation, one Gemini tool call, one OpenAI 4xx, one
- * Anthropic aborted stream, and three Anthropic thinking/tool replay calls.
+ * Anthropic aborted stream, three Anthropic thinking/tool replay calls, and
+ * two OpenAI tool-call stream calls (capture, then replay).
  * L7 shares the L1 chat request. Keep caps small and run only with an explicit
  * live-provider spend authorization.
  */
@@ -343,6 +344,66 @@ describe.skipIf(!geminiKey)('journal live — Gemini', () => {
     expect(end.response?.finishReason).toBe('tool_calls');
     expect(end.response?.rawFinishReason).toBe('STOP');
     expectWireIdentity(end);
+    await runtime.shutdown();
+  });
+});
+
+describe.skipIf(!process.env.OPENAI_API_KEY)('journal live — stream replay', () => {
+  it('L9: replaying a captured tool-call stream returns the tool call', async () => {
+    const runtime = runtimeFor('openai');
+    const { provider } = runtime.resolveProvider(`openai:${OPENAI_MODEL}`);
+    const original = await captured(runtime, async () => {
+      for await (const chunk of provider.stream(
+        [{ role: 'user', content: 'Find the weather in Boston.' }],
+        {
+          model: OPENAI_MODEL,
+          maxTokens: 64,
+          tools: [
+            {
+              type: 'function',
+              function: {
+                name: 'lookup_weather',
+                description: 'Look up weather for a city',
+                parameters: {
+                  type: 'object',
+                  properties: { city: { type: 'string' } },
+                  required: ['city'],
+                },
+              },
+            },
+          ],
+          toolChoice: 'required',
+        },
+      )) {
+        if (chunk.type === 'done') break;
+      }
+    });
+    expect(original.outcome.status).toBe('fulfilled');
+    const { end } = expectPair(original.records, 'stream');
+    expect(end.response?.tool_calls?.[0].function.name).toBe('lookup_weather');
+
+    const items = await modelCallDataset(await loadModelCalls(original.records)).getItems();
+    expect(items).toHaveLength(1);
+    const replay = await captured(runtime, () => replayModelCall()(items[0].input, runtime));
+    expect(replay.outcome.status).toBe('fulfilled');
+    expect(replay.outcome.accounting.operations.total).toBe(1);
+    expectPair(replay.records, 'stream');
+    if (replay.outcome.status !== 'fulfilled') throw replay.outcome.error;
+    const { output } = replay.outcome.value as {
+      output: {
+        tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }>;
+        finishReason?: string;
+        responseId?: string;
+      };
+    };
+    expect(output.tool_calls).toHaveLength(1);
+    expect(output.tool_calls?.[0].id).toMatch(/\S/);
+    expect(output.tool_calls?.[0].function.name).toBe('lookup_weather');
+    expect(JSON.parse(output.tool_calls![0].function.arguments)).toMatchObject({
+      city: expect.stringMatching(/boston/i),
+    });
+    expect(output.finishReason).toBe('tool_calls');
+    expect(output.responseId).toMatch(/\S/);
     await runtime.shutdown();
   });
 });

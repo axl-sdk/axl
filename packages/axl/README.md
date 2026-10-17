@@ -509,9 +509,8 @@ const checkpointed = await ctx.checkpoint('expensive-op', async () => expensiveO
 
 ### OpenTelemetry Observability
 
-Automatic spans for `ctx.*` primitives and dispatched model calls, including
-direct calls through a runtime provider facade. Install `@opentelemetry/api`
-as an optional peer dependency.
+Automatic spans for `ctx.*` primitives and every model call Axl sends. Install
+`@opentelemetry/api` as an optional peer dependency.
 
 ```typescript
 import { defineConfig, AxlRuntime } from '@axlsdk/axl';
@@ -554,14 +553,12 @@ trace.disable();
 **Span model:** `axl.workflow.execute` > `axl.agent.ask` > `chat {model}`
 for model calls, with `axl.tool.call` under an agent when tools run. Also:
 `axl.ctx.spawn`, `axl.ctx.race`, `axl.ctx.vote`, `axl.ctx.budget`,
-`axl.ctx.awaitHuman`. The CLIENT inference span uses standard `gen_ai.*`
-attributes. System instructions, messages, and tool content are off by default;
-enable them with `telemetry.captureContent: true`, subject to `trace.redact`. See
-[OpenTelemetry integration](../../docs/observability.md#opentelemetry-integration)
-for span content and lifecycle details.
+`axl.ctx.awaitHuman`. Model-call spans use standard `gen_ai.*` attributes.
+Prompt and response content is off by default; see
+[content capture](../../docs/observability.md#genai-content-capture).
 
-When telemetry is disabled (default), `NoopSpanManager` skips inference-span
-mapping. The runtime never shuts down an application-owned tracer provider.
+When telemetry is disabled (default), `NoopSpanManager` adds no overhead. Axl
+never shuts down your tracer provider; do that after `runtime.shutdown()`.
 
 For this Node setup, install the optional OTel packages used above:
 
@@ -622,11 +619,9 @@ eval history row that owns them is saved, deleted with it, and reclaimed by a
 startup pass plus a periodic sweep. See
 [observability.md](../../docs/observability.md#captured-requests-opt-in) and
 [integration.md](../../docs/integration.md#diagnostic-artifact-storage).
-`foldJournal()` assembles the v1 phase lines into validated v2 model or external
-operation records; `redactModelCallRecord()` returns a redacted copy for a
-consumer boundary. See the [record contract](../../docs/api-reference.md#diagnostic-artifacts).
-Captured model requests retain tool `strict` and runtime message `origin` for
-faithful single-call replay through `@axlsdk/eval`.
+`foldJournal()` turns journal lines into one validated record per call, and
+`redactModelCallRecord()` returns a redacted copy. See
+[What a record contains](../../docs/observability.md#what-a-record-contains).
 
 Compatible loaded ESM/CJS copies share accounting, admission, and capture in
 one JavaScript realm. Cross-copy work emits one warning identifying both copies;

@@ -759,14 +759,10 @@ different rail from accounting: a failing, truncated or redacted capture leaves
 the numbers byte-identical and reports the loss on `diagnostics.status`. See
 [observability.md](../../docs/observability.md#captured-requests-opt-in).
 
-`loadModelCalls()` validates a v1 capture journal or v2 record file and keeps
-external operations visible. `modelCallDataset()` produces ordinary eval items;
-filter out `kind: 'external'` explicitly when the source is mixed. Pass
-`recordedModelCall()` to `runEval()` to score saved model outputs with no new
-generation calls, or `replayModelCall({ model: 'provider:model' })` to make one
-new provider call per item. The output is a `ModelCallOutput` — `content`,
-parsed `json` when JSON was requested, and any `tool_calls`, finish reason and
-response identity — not an agent result or executed tool output. See the [testing recipe](../../docs/testing.md#seeing-the-request-behind-a-score).
+Captured calls can become a dataset: `loadModelCalls()` + `modelCallDataset()`,
+then `recordedModelCall()` to rescore saved answers with no new calls, or
+`replayModelCall({ model })` to send each request again. See the
+[testing recipe](../../docs/testing.md#seeing-the-request-behind-a-score).
 
 A returned cost can no longer override that measurement — it would let a workflow
 understate what it spent. Report one anyway if it is useful to compare against:

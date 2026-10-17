@@ -478,11 +478,11 @@ An external operation that never calls `report.setCost` is counted as
 `reasons.external_unreported`, so the run reports "incomplete" rather than quietly
 under-reporting. Inside a workflow the `ctx.withExternalOperation` form is equivalent — see
 [`externalOperation`](./api-reference.md#externaloperationdescriptor-fn--ctxwithexternaloperationdescriptor-fn).
-In an eval run with `captureRequests` enabled, the external call receives its
-own `kind: 'external'` journal operation and item/scorer diagnostic reference.
-`report.capture()` is optional and does not affect accounting; test unreported
-cost separately from a reported `$0` and use a sentinel to verify payload
-redaction at the artifact or Studio boundary.
+With `captureRequests` on, the operation is also journaled as `kind: 'external'`
+and linked from the item or scorer diagnostics. `report.capture()` is optional
+and never affects accounting. When testing, assert unreported cost separately
+from a reported `$0`, and put a sentinel string in captured payloads to check
+redaction.
 
 To stop a run at a spend threshold, set `EvalConfig.budget` (or pass `--budget`). It is a
 threshold, not a reservation: cases already in flight are allowed to settle, so
@@ -589,16 +589,16 @@ const replayed = await runEval(config, replayModelCall({ model: 'openai:gpt-4o' 
 ```
 
 Both executors return a `ModelCallOutput`: `content`, parsed `json` when the
-captured request asked for JSON, plus any `tool_calls`, `thinking`, finish
-reason and response identity. A tool-call turn is scored on the tool it chose,
-not as empty text. It is not an agent result or executed tool output. The recorded run
-does no generation calls, so only explicitly configured LLM judges can spend.
-Replay makes one new provider call per item and never executes returned tool
-calls. The runtime measures that new spend without carrying forward the
-historical charge. A captured request with missing or omitted data is refused
-before replay dispatch. The runner's `signal` stops cases and scorers between
-operations; its ordinary `executeWorkflow` callback does not receive the
-signal, so an in-flight replay is not cancelled by that option.
+request asked for JSON, and any `tool_calls`, `thinking`, finish reason and
+response id/model. A tool-call turn is scored on the tool it chose. This is one
+model response, not an agent result: tools are never run.
+
+- **Recorded** makes no generation calls; only LLM judges you configure spend.
+- **Replay** makes one new provider call per item, charged as new spend. A
+  record with omitted or missing request data is refused before anything is
+  sent.
+- **Cancellation.** The runner's `signal` stops between cases and scorers, but
+  does not cancel a replay call already in flight.
 
 Three things to know before asserting on capture in a test:
 

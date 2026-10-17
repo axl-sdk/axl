@@ -862,82 +862,93 @@ result.json` it also writes `result.requests.jsonl` beside the result.
 
 ### What a record contains
 
-Call `foldJournal(decodedLines)` to assemble the v1 phase journal into one
-`v: 2` record per operation. It correlates interleaved ids, keeps the largest
-reported transport attempt count, and validates the result through the public
-Zod schemas. A start without an end becomes `outcome.status: 'unfinished'`;
-an end without a start keeps its known outcome but has no request and cannot
-claim exact replay. Invalid versions and contradictory lines fail with
-`AxlError('INVALID_CAPTURE_JOURNAL')`. The folded union keeps external
-operations separate from model calls: external records have `name` and no
-provider/model. See the [API reference](api-reference.md#diagnostic-artifacts)
-for the full v2 shape and schema names.
-
-One JSONL line per phase of a model call, `v: 1`:
+The journal is JSONL with one line per phase of each operation (`v: 1`):
 
 | Phase | Carries |
 |---|---|
-| `start` | For model calls, the request snapshotted before adapter invocation — messages, tools, schema and allowlisted options; emitted only after dispatch is observed (or, for a custom adapter without a lifecycle hook, when invoked). For an external operation, its name and invocation time after admission |
-| `attempt` | An additional **transport** attempt for the same logical call (a 429 retry is not an output repair) |
-| `end` | The response, error, or an explicitly terminated stream; partial stream output survives when there is no terminal response. External operations carry the reported charge, outcome and optional caller JSON payload here |
+| `start` | The request Axl gave the provider adapter: messages, tools, output schema and allowlisted options. Written when the call is sent |
+| `attempt` | One more **transport** attempt for the same call, such as a 429 retry. A repair after a rejected answer is a new call, not an attempt |
+| `end` | The response or error. A stream that ended early keeps the text, thinking and tool-call deltas received so far |
 
-An `end` record for a **stream** also carries a `termination` string when the
-stream did not simply finish — the consumer broke out of the loop, aborted it,
-the stream stopped without a `done` chunk, or it threw mid-iteration. Without
-it a sealed stream and a call that genuinely never came back are
-indistinguishable, since both leave a `start` with no response.
+A stream's `end` line also carries `termination` when the stream did not simply
+finish: the consumer broke out of the loop or aborted it, the stream stalled,
+or it threw. Without it, a closed stream and a call that never came back would
+look the same.
 
-Every record carries the identity needed to place it: `operationId`, `kind`,
-`provider`, `model`, `transportAttempts`, plus available `executionId`,
-`workflow`, `agent`, `depth`, `sessionId`, `askId`, `parentAskId`, `turn`,
-`purpose` (`ask`, `summary`, `judge`, or `direct`), and eval `caseIndex` /
-`scorer`. A repair turn carries `retryReason`, the branch-local
-`rejectedCallId` of the answer it replaces, and a `correction`
-(`{ stage, reason, feedbackMessage }`) saying which gate rejected the previous
-answer and what the model was told about it.
-Summaries created inside an ask retain that ask's known `askId` and
-`parentAskId` but do not inherit its repair state; a direct runtime summary
-with no ask has neither ID.
+To work with whole calls instead of phases, pass the parsed lines to
+`foldJournal()`. It returns one validated `v: 2` record per operation:
 
-New records carry `startedAt` on dispatch and `endedAt` / `durationMs` on
-settlement. Older v1 records lack these fields; their timing is unknown. A
-completed response keeps text, thinking, tool calls, usage, cost, provider
-timing, finish reason and provider-reported response identity when available.
-The request keeps `strict` on offered tool definitions and `origin: 'runtime'`
-on messages where Axl set it; both can change the provider request on replay.
-An interrupted stream keeps observed text, thinking and tool-call deltas in
-`partial`, with `termination` distinguishing `aborted`, `stalled` and
-`consumer_closed`. A failed provider call keeps structural retry hints and
-request ID without serializing the provider error body. Capture does not change
-the original provider result or accounting. If projection fails, the stub's
-reason uses a fixed failure class label; custom error names, codes and tags
-never enter the artifact.
+```ts
+import { foldJournal } from '@axlsdk/axl';
+
+const opened = await runtime.openDiagnosticArtifact(artifactId);
+const lines = [];
+for await (const line of opened!.lines) lines.push(JSON.parse(line));
+
+for (const record of foldJournal(lines)) {
+  if (record.kind === 'external') continue; // see "External operations" below
+  console.log(record.purpose, record.model, record.outcome.status, record.cost);
+}
+```
+
+A call with a `start` but no `end` folds to `outcome.status: 'unfinished'`.
+Malformed or contradictory lines throw `AxlError('INVALID_CAPTURE_JOURNAL')`.
+The [API reference](api-reference.md#diagnostic-artifacts) lists every field
+and the exported Zod schemas.
+
+What each journal line tells you about its call (folded records group the
+location and eval fields under `ids` and the repair fields under `gate`):
+
+| Field | Meaning |
+|---|---|
+| `executionId`, `workflow`, `agent`, `sessionId`, `askId`, `parentAskId`, `depth`, `turn` | Where the call ran |
+| `purpose` | Why Axl made the call: `ask`, `summary`, `judge`, or `direct` (`runtime.resolveProvider()`) |
+| `caseIndex`, `scorer` | The eval item and scorer that own the call |
+| `retryReason`, `rejectedCallId`, `correction` | On a repair turn: which answer was rejected, which gate rejected it, and what the model was told (`{ stage, reason, feedbackMessage }`) |
+| `startedAt`, `endedAt`, `durationMs` | When the call was sent and when it finished. Absent on journals from older versions |
+| `response` | Text, thinking, tool calls, usage, cost, timing, finish reason, and the provider's response id and model when reported |
+| `partial` | What an interrupted stream had produced |
+| `error` | Error class, retry hints and request id. Never the provider's error body |
+
+A summary made during an ask keeps that ask's ids but is not a repair turn.
 
 `EvalItem.diagnostics.operations` and `ScorerDetail.diagnostics.operations`
 point at the operations each owns, so you can go from a suspicious score
 straight to the request behind it.
 
-`externalOperation()` and `ctx.withExternalOperation()` also write `kind:
-'external'` start/end lines inside a capturing accounting scope. They carry a
-required `name`, invocation/settlement timing and a truthful `outcomeStatus`;
-they have no provider or model. `report.setCost()` contributes only the
-reported disjoint usage/cost with `caller_reported` provenance. Without a
-report, cost is absent, never fabricated as zero. `report.capture({ request?,
-response? })` snapshots caller JSON at the call and merges separately supplied
-fields; the optional payload appears under `end.external`. A projection failure
-or byte-bound overflow stubs the payload while retaining the operation's
-identity and available settlement. An operation denied before invocation has
-no journal lines. Capture outside the scope is a no-op.
+Capture never changes what the provider returned or what the run is charged.
+
+### External operations
+
+Work you wrap in `externalOperation()` or `ctx.withExternalOperation()` also
+appears in the journal, as `kind: 'external'` with your `name` and no provider
+or model. Its cost is whatever you passed to `report.setCost()`; if you never
+call it, cost is absent, not zero. To keep diagnostic payloads, call
+`report.capture()`:
+
+```ts
+await externalOperation({ name: 'vendor-grade' }, async (report) => {
+  report.capture({ request: { answer } });
+  const res = await callVendor(answer);
+  report.capture({ response: { score: res.score } });
+  report.setCost(res.usd);
+  return res.score;
+});
+```
+
+The payload is stored under `end.external`. Outside a capturing run,
+`report.capture()` does nothing, and an operation refused before it starts
+writes no lines.
 
 ### Fidelity: `runtime_request`, not wire bytes
 
-The journal's `fidelity` marker remains `'runtime_request'`. For model calls,
-what is captured is the **provider-neutral request Axl submitted** — messages,
-tools, schema and options — *not* the adapter's serialized HTTP body. External
-payloads are explicitly caller supplied; Axl cannot verify their wire fidelity.
+`fidelity` is always `'runtime_request'`. A model-call record holds the
+**provider-neutral request Axl submitted** (messages, tools, schema and
+options), *not* the adapter's HTTP body, which the adapter is free to reshape.
+External payloads are whatever your code supplied.
 
-Deliberate omissions are named rather than silently dropped, in
-`captured.omitted`:
+Deliberate omissions are named in `captured.omitted` instead of dropped
+silently:
 
 - `media` — image/audio/file parts become descriptors (type, size, hash-free)
 - `providerOptionValues` — `providerOptions` contributes **keys only**, so a
@@ -945,31 +956,45 @@ Deliberate omissions are named rather than silently dropped, in
 - `record` — the whole record exceeded the per-record byte bound and was
   replaced by a stub carrying its size
 
-New start records carry `captured.continuityCaptured: true` when the request
-snapshot used the continuity-aware projection, including calls with no opaque
-metadata to retain.
-Older v1 starts without this marker cannot claim exact replayability, even if
-their omission list is empty. The marker says the projection supported this
-data; it does not claim that the provider sent any on a particular call.
+Records also keep the request details that change what a replay sends: `strict`
+on tool definitions, and `origin: 'runtime'` on messages Axl added.
+`captured.continuityCaptured: true` marks a record written by a version that
+also keeps provider continuity data, such as reasoning state. Records without
+it come from older versions and can't be replayed exactly.
+
+Signals, functions, callbacks and configured provider credentials are never
+captured. Everything else in an unredacted journal can be sensitive: message
+content, opaque `providerMetadata` from provider responses, and any JSON you
+pass to `report.capture()`. Turn on `trace.redact` to scrub it before storage;
+see [Security](security.md#captured-requests).
 
 ### From captured traffic to an eval
 
-`loadModelCalls()` turns a v1 journal artifact or v2 record file into validated
-folded operations. `modelCallDataset()` maps model records into ordinary eval
-items; mixed artifacts require an explicit filter for `kind: 'external'`.
-Use `recordedModelCall()` with `runEval()` to rescore a stored response (text,
-parsed JSON, tool calls, finish reason) without new generation calls. Use `replayModelCall({ model? })` to
-send the captured request to a model again; the new call's usage and cost are
-measured separately. Replay covers one provider call and its recorded history,
-not the surrounding agent or tools. See the [eval helper contract](api-reference.md#captured-model-call-eval-helpers)
-and [testing recipe](testing.md#seeing-the-request-behind-a-score).
+Captured calls can become an eval dataset, so you can rescore real traffic or
+try it on another model:
 
-Signals, functions, callbacks and configured provider credentials are never
-captured. Opaque `providerMetadata` comes from provider responses (or a custom
-adapter) and may itself be sensitive; treat an unredacted journal as model
-content. Caller JSON in an external record is likewise application-chosen and
-may include sensitive fields; with `trace.redact`, the whole external request
-and response payloads are masked before storage.
+```ts
+import { defineEval, loadModelCalls, modelCallDataset, recordedModelCall, replayModelCall, runEval } from '@axlsdk/eval';
+
+const records = await loadModelCalls('result.requests.jsonl');
+const dataset = modelCallDataset(records, { filter: (r) => r.kind !== 'external' });
+const config = defineEval({ workflow: 'captured', dataset, scorers }); // your scorers
+
+// Score the saved answers; no new model calls.
+await runEval(config, recordedModelCall(), runtime);
+// Send each captured request again, here to a different model.
+await runEval(config, replayModelCall({ model: 'openai:gpt-4o' }), runtime);
+```
+
+- `recordedModelCall()` scores the stored response; only LLM judges spend.
+- `replayModelCall()` makes one new provider call per item and charges it as
+  new spend. It replays that single call, not the agent around it, and never
+  runs returned tool calls.
+- Both return a `ModelCallOutput` (`content`, parsed `json`, `tool_calls`, and
+  more), so a tool-call turn is scored on the tool it chose.
+
+See the [testing recipe](testing.md#seeing-the-request-behind-a-score) and the
+[helper reference](api-reference.md#captured-model-call-eval-helpers).
 
 ### Bounds
 
@@ -1001,10 +1026,9 @@ rather than through redaction, so it must not be able to carry any of the call.
 A projection stub that is itself over-size keeps its reason through the
 re-stub.
 
-An oversized `end` stub still carries its actual `outcomeStatus`, structural
-error identity, usage, cost, finish/response identity and timing when known.
-Its response payload is omitted. A settled call therefore never looks like an
-unfinished call merely because its answer crossed a capture byte bound.
+An over-size `end` stub drops the response but keeps the outcome, usage, cost,
+finish reason, error class and timing, so a finished call never looks
+unfinished just because its answer was large.
 
 Writes are queued, never awaited by the provider path. A sink that throws stops
 capture with status `unavailable`. In every one of these cases the run
@@ -1050,9 +1074,8 @@ exec.error;       // Error details if failed
 
 ## OpenTelemetry Integration
 
-Axl emits OpenTelemetry spans for `ctx.*` primitives and dispatched model calls,
-including direct calls through `runtime.resolveProvider()`. These spans can flow
-to any OTel-compatible backend.
+Axl emits OpenTelemetry spans for `ctx.*` primitives and for every model call
+it sends, so you can trace runs in any OTel-compatible backend.
 
 ### Setup
 
@@ -1117,7 +1140,7 @@ also gets a `CLIENT` inference span under the active ask or application span.
 | `axl.workflow.execute` | `axl.workflow.name`, `axl.workflow.duration`, `axl.workflow.cost` |
 | `axl.agent.ask` | `axl.agent.name`, `axl.agent.model`, `axl.agent.prompt_tokens`, `axl.agent.completion_tokens`, `axl.agent.cost`, `axl.agent.duration`, and — when the last provider call of the ask reported [`timing`](api-reference.md#calltiming) — `axl.agent.queued_ms`, `axl.agent.retry_ms`, `axl.agent.attempts`, `axl.agent.rate_limit_retries` (when reported), `axl.agent.ttfb_ms`, `axl.agent.wire_ms`, `axl.agent.first_token_ms` (streaming only). Also `gen_ai.operation.name=invoke_agent` and `gen_ai.agent.name` |
 | `axl.tool.call` | `axl.tool.name`, `axl.tool.duration`, `axl.tool.outcome`, `axl.tool.success`, `axl.tool.phase` (failed/cancelled). Also `gen_ai.operation.name=execute_tool`, `gen_ai.tool.name`, and `gen_ai.tool.call.id` |
-| `chat {model}` | `CLIENT` inference span: `gen_ai.operation.name=chat`, `gen_ai.provider.name`, request model/stream/parameters, reported response identity, finish reasons and usage, and time to first stream chunk when available. Opt-in content uses `gen_ai.system_instructions` or `gen_ai.input.messages` according to the provider API |
+| `chat {model}` | `CLIENT` inference span: `gen_ai.operation.name=chat`, `gen_ai.provider.name`, request model, stream flag and parameters (stop sequences and finish reasons as string arrays), reported response id/model, finish reasons, usage, and time to first stream chunk. See [GenAI inference spans](#genai-inference-spans) |
 | `axl.ctx.spawn` | `axl.spawn.count`, `axl.spawn.quorum`, `axl.spawn.completed` |
 | `axl.ctx.race` | `axl.race.participants`, `axl.race.winner` |
 | `axl.ctx.vote` | `axl.vote.strategy`, `axl.vote.result` |
@@ -1136,73 +1159,77 @@ diagnostics rather than exporting exception text through OTel.
 
 ### GenAI inference spans
 
-The runtime-bound provider facade opens one `chat {model}` span when a model
-call is dispatched. It covers transport retries as one logical call. Streams
-open on first iteration and close on their terminal chunk, error, abort, stall,
-or consumer return; a stream never iterated creates no span. Calls refused
-before dispatch create none. Direct provider calls, judge calls, and context or
-session summary calls through the runtime also get spans without a request
-capture channel. For custom providers without a dispatch lifecycle hook, Axl
-uses invocation as its best available dispatch signal.
+Each model call Axl sends gets one `chat {model}` span, following the OTel
+GenAI conventions. That includes agent asks, LLM judges, context and session
+summaries, and direct calls through `runtime.resolveProvider()`.
 
-The span starts at logical invocation time, including a queue before dispatch.
-`gen_ai.response.time_to_first_chunk` is elapsed seconds from invocation to
-the first returned stream chunk; it is distinct from the ask-level
-`axl.agent.first_token_ms`. `gen_ai.request.stop_sequences` and
-`gen_ai.response.finish_reasons` are native string-array attributes. The
-request reasoning level is emitted only when the provider reports a known
-effective native level and `providerOptions` is empty; an override can change
-the final wire body after that report. Unknown values are omitted rather than
-guessed. Response and token attributes are likewise omitted when not reported.
-`error.type` uses a short error class/code, never the error message.
+- **One span per logical call.** Transport retries stay inside it. A call
+  refused before it is sent gets no span.
+- **Timing starts at invocation**, so time spent queued for a rate limit is
+  included. For streams, `gen_ai.response.time_to_first_chunk` is seconds until
+  the first chunk; it differs from the ask-level `axl.agent.first_token_ms`.
+- **Streams** open the span on first iteration and close it when the stream
+  finishes, fails, is aborted, stalls or the consumer stops. A stream you never
+  iterate creates no span.
+- **Missing means unknown.** Response ids, token counts and the reasoning level
+  are set only when the provider reports them. The reasoning level is also left
+  out when `providerOptions` is set, since an override can change the request.
+- **Errors carry no message.** `error.type` is a short error class or code.
 
-The `gen_ai.*` mapping follows the
+Axl follows the
 [GenAI semantic conventions pinned at `f3c6d0c` (2026-10-14)](https://github.com/open-telemetry/semantic-conventions-genai/tree/f3c6d0c9bb66ebd474668a3a0be25c61226f02c2).
-For example, the `openai-responses` provider ID exports as `openai`, `google`
-as `gcp.gen_ai`, and `xai` as `x_ai`.
-Those conventions have Development status and their `gen_ai.*` keys may change
-in a patch release; Axl's existing `axl.*` attributes remain stable.
+Some provider ids are renamed to match: `openai-responses` exports as `openai`,
+`google` as `gcp.gen_ai`, and `xai` as `x_ai`. Those conventions are still in
+Development status, so `gen_ai.*` keys may change in a patch release. Axl's
+`axl.*` attributes are stable.
 
 ### GenAI content capture
 
-`telemetry.captureContent` is off by default. Set it to `true` to export
-`gen_ai.system_instructions`, `gen_ai.input.messages`, `gen_ai.output.messages`, and
-`gen_ai.tool.definitions` as JSON strings in the upstream message/part and tool
-shapes. Anthropic, Google, and OpenAI Responses send system text separately;
-Axl records those system turns as text parts in `gen_ai.system_instructions`
-and omits them from `gen_ai.input.messages`. OpenAI Chat Completions and its
-compatible APIs keep system-role turns in `gen_ai.input.messages` and omit
-`gen_ai.system_instructions`. The same system content never appears in both
-attributes. The projection uses Axl's provider-neutral messages;
-`providerOptions` values are not exported, so a raw override can make this
-content view incomplete. If config omits the setting, the
-`OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true` environment switch
-(case-insensitive, like other OTel boolean variables) enables it. An explicit config value wins. `trace.redact: true` always
-suppresses these attributes and the request stop sequences.
+By default, inference spans carry no prompts, responses or tool definitions.
+To export them, opt in:
 
-Each JSON content attribute has a UTF-8 limit, 64 KiB by default. Axl omits
-the entire attribute when it exceeds the limit so exported JSON remains valid,
-and lists each omitted key in the span's `axl.gen_ai.content_omitted` string
-array, so a missing attribute is never mistaken for empty content. Set
-`telemetry.maxContentAttributeBytes` to change the limit:
+```ts
+telemetry: { enabled: true, captureContent: true },
+```
+
+If config leaves `captureContent` unset,
+`OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true` (any case) turns it
+on. `trace.redact: true` always turns it off.
+
+**What's exported.** Four JSON-string attributes in the upstream message and
+tool shapes: `gen_ai.input.messages`, `gen_ai.output.messages`,
+`gen_ai.tool.definitions` and `gen_ai.system_instructions`. Where the system
+prompt goes depends on how the provider's API takes it, so it never appears
+twice:
+
+| Provider | System prompt appears in |
+|---|---|
+| Anthropic, Google, OpenAI Responses | `gen_ai.system_instructions` |
+| OpenAI Chat Completions and compatible APIs | `gen_ai.input.messages`, as system-role turns |
+
+**What's left out.** Media bytes, URLs and provider file references; rich
+system parts whose provider rendering is unknown; provider continuity metadata;
+credentials; and `providerOptions` values. Content comes from Axl's
+provider-neutral messages, so a raw `providerOptions` override is not reflected.
+
+**Size limit.** Each content attribute is limited to 64 KiB of UTF-8 by
+default. A larger one is left out whole, so exported JSON is always valid, and
+its key is listed in `axl.gen_ai.content_omitted`. Change the limit with
+`telemetry.maxContentAttributeBytes`:
 
 ```ts
 telemetry: { enabled: true, captureContent: true, maxContentAttributeBytes: 256 * 1024 },
 ```
 
-Raise it only as far as your pipeline accepts: OTLP exporters, collectors and
-backends commonly limit export-request or attribute size, and a rejected batch
-loses every span in it, not just the large one. Long-context calls will still
-exceed any span-friendly limit; use the capture journal when you need complete
-content. Rich media
-bytes, URLs and provider-file references are excluded; text parts in ordinary
-messages remain. Rich system parts are omitted when the native API rendering
-is not known.
-Opaque reasoning-continuity metadata, provider credentials and
-`providerOptions` values are not projected. Stop sequences are a request parameter, so they can appear
-even when `captureContent` is off unless redaction is on. Treat an exporter as
-a trusted recipient when opting in: message text, tool schemas, reasoning text,
-and tool arguments or results can contain sensitive application data.
+Raise it only as far as your pipeline accepts. Exporters, collectors and
+backends often cap request or attribute size, and a rejected batch loses every
+span in it. For complete content on long-context calls, use
+[request capture](#captured-requests-opt-in) instead.
+
+Treat your exporter as trusted when you opt in: messages, reasoning, tool
+arguments and tool results can all hold sensitive data. Stop sequences are a
+request parameter and are exported even with content capture off; see
+[Security](security.md#opentelemetry-span-content).
 
 ### Cost-Per-Span
 
@@ -1244,9 +1271,9 @@ ctx.log('refund_processed', { orderId, amount });
 
 ### Zero Overhead When Disabled
 
-When telemetry is disabled, the runtime uses `NoopSpanManager` and performs no
-inference-span mapping. Custom `SpanManager` implementations without the new
-optional `startSpan` method keep their existing spans and skip inference spans.
+When telemetry is disabled, the runtime uses `NoopSpanManager` and does no span
+work. A custom `SpanManager` without the optional `startSpan` method keeps its
+existing spans but gets no inference spans.
 
 ### Prompt Version Tracking
 

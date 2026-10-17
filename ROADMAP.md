@@ -27,9 +27,8 @@
   store with leases, retention mirroring, writer-applied redaction, and
   Studio import/export; compatible ESM/CJS and duplicate loads share the
   accounting and capture context so budgets do not lose cross-copy work.
-  Journals preserve model-call identity, outcomes and replay continuity, and
-  include reported external operations. Validated folded records feed ordinary
-  eval datasets, recorded-output scoring and single-call replay.
+  Journals record why each call ran and how it ended, including external
+  operations, and captured calls can be rescored or replayed as an eval dataset.
   Studio presents spend with its completeness
   everywhere and keeps its client mirror pinned to the eval package by a
   drift test. See [observability.md](docs/observability.md),

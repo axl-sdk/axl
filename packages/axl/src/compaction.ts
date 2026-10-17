@@ -2,6 +2,11 @@ import { createHash } from 'node:crypto';
 import { summarizeModelInput } from './input.js';
 import type { Provider } from './providers/types.js';
 import type { ChatMessage, ProviderResponse } from './types.js';
+import {
+  currentCaptureTurn,
+  runWithCaptureTurnSlot,
+  setCaptureTurn,
+} from './diagnostics/capture.js';
 
 /**
  * Client-side history compaction shared by the two summarizers: session
@@ -33,17 +38,36 @@ export function requestSummary(
   provider: Provider,
   options: { model: string; prompt: string; signal?: AbortSignal },
 ): Promise<ProviderResponse> {
-  return provider.chat(
-    [
-      { role: 'system', content: SUMMARY_SYSTEM_PROMPT },
-      { role: 'user', content: options.prompt },
-    ],
-    {
-      model: options.model,
-      maxTokens: SUMMARY_MAX_TOKENS,
-      ...(options.signal ? { signal: options.signal } : {}),
-    },
-  );
+  const call = () =>
+    provider.chat(
+      [
+        { role: 'system', content: SUMMARY_SYSTEM_PROMPT },
+        { role: 'user', content: options.prompt },
+      ],
+      {
+        model: options.model,
+        maxTokens: SUMMARY_MAX_TOKENS,
+        ...(options.signal ? { signal: options.signal } : {}),
+      },
+    );
+  const parent = currentCaptureTurn();
+  // The summary is its own call, not a repair of the surrounding ask turn.
+  // A child slot retains structural identity without leaking callId or retry
+  // state into the next ordinary turn.
+  return runWithCaptureTurnSlot(() => {
+    setCaptureTurn({
+      ...(parent?.executionId !== undefined ? { executionId: parent.executionId } : {}),
+      ...(parent?.workflow !== undefined ? { workflow: parent.workflow } : {}),
+      ...(parent?.agent !== undefined ? { agent: parent.agent } : {}),
+      ...(parent?.depth !== undefined ? { depth: parent.depth } : {}),
+      ...(parent?.sessionId !== undefined ? { sessionId: parent.sessionId } : {}),
+      ...(parent?.askId !== undefined ? { askId: parent.askId } : {}),
+      ...(parent?.parentAskId !== undefined ? { parentAskId: parent.parentAskId } : {}),
+      purpose: 'summary',
+      turn: 0,
+    });
+    return call();
+  });
 }
 
 /** The runtime-authored message that carries a summary into a model request. */

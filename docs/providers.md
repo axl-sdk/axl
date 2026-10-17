@@ -1698,6 +1698,28 @@ Every built-in adapter stamps it whenever it returns a `cost`. It is optional: a
 stamp is recorded as `'adapter_reported'`, so a custom adapter that ignores the field keeps
 working and is simply reported as undeclared rather than being mislabeled.
 
+### Response metadata
+
+Built-in adapters expose `finishReason`, `rawFinishReason`, `responseId`, and
+`responseModel` on `chat()` responses and streamed terminal `done` chunks when
+the corresponding wire fields are present. The normalized finish reasons are
+`stop`, `length`, `tool_calls`, `content_filter`, `refusal`, and `other`.
+
+| Wire source | Normalization |
+|---|---|
+| OpenAI Chat and compatible profiles: `finish_reason` | Known values (`stop`, `length`, `tool_calls`, `content_filter`, `refusal`) pass through; other values become `other` |
+| OpenAI Responses: `status` and `incomplete_details.reason` | `completed` → `stop`, or `tool_calls` when this response actually contains a function call; `incomplete` with `max_output_tokens` → `length`, with `content_filter` → `content_filter`; other reported statuses or reasons → `other` |
+| Anthropic: `stop_reason` | `end_turn` and `stop_sequence` → `stop`; `max_tokens` → `length`; `tool_use` → `tool_calls`; `refusal` → `refusal`; other values → `other` |
+| Gemini `generateContent`: candidate `finishReason` | `STOP` → `stop`, or `tool_calls` when the candidate contains a function call; `MAX_TOKENS` → `length`. The existing error path still rejects other terminal candidate reasons |
+| Gemini Interactions: terminal `status` | `completed` → `stop`; `requires_action` with a function-call step → `tool_calls`. Streaming accepts both `interaction.completed` and `interaction.requires_action` terminal events. Other terminal statuses retain the existing error behavior |
+
+`rawFinishReason` preserves the reported vendor reason or status (for example,
+`STOP`, `end_turn`, `completed`, or `max_output_tokens`). For Responses streams,
+the terminal event itself supplies `completed` or `incomplete` when the response
+object omits `status`. Response ids and models come from the response, never
+from the request. Missing metadata stays absent, including on a stream whose
+provider never sent a terminal status.
+
 ### Custom providers
 
 Custom providers that implement the `Provider` interface return `cost` from `chat()` and `stream()`. Axl does not impose any pricing logic on custom providers — cost estimation is entirely up to the implementation. Setting `costProvenance` is optional; omitting it maps to `'adapter_reported'`.

@@ -42,7 +42,11 @@ import type {
   ToolLifecycleEventV2,
 } from './types.js';
 import { getEventSchemaVersion } from './event-schema.js';
-import type { CapturedRequestRecord } from './diagnostics/capture.js';
+import type {
+  CapturedExternalRequestRecord,
+  CapturedRequest,
+  CapturedRequestRecord,
+} from './diagnostics/capture.js';
 
 export const REDACTED = '[redacted]';
 
@@ -115,8 +119,8 @@ function redactInputDescriptor<T extends { parts: readonly unknown[] }>(input: T
   return {
     ...input,
     parts: input.parts.map((part) => {
-      if (!part || typeof part !== 'object' || !('type' in part) || part.type === 'text')
-        return part;
+      if (!part || typeof part !== 'object' || !('type' in part)) return part;
+      if (part.type === 'text') return { ...part };
       const value = part as { locator?: unknown; label?: unknown };
       return {
         ...part,
@@ -455,16 +459,147 @@ export function redactHistoricalEvent(event: HistoricalAxlEvent): HistoricalAxlE
  * Pure, like every other rule in this file: the caller decides whether
  * redaction is on, and this function unconditionally scrubs when called.
  */
-export function redactCapturedRequest(record: CapturedRequestRecord): CapturedRequestRecord {
-  const out: CapturedRequestRecord = {
-    ...record,
-    captured: { ...record.captured, redacted: true },
+/**
+ * Imported v1 lines only validate version/id/phase. A line claiming external
+ * kind can still carry model-shaped fields or arbitrary extra keys. Project a
+ * closed external shape at delivery so those fields cannot bypass redaction.
+ */
+function redactExternalRecord(
+  record: CapturedExternalRequestRecord,
+): CapturedExternalRequestRecord {
+  const raw = record as unknown as Record<string, unknown>;
+  const finite = (value: unknown): value is number =>
+    typeof value === 'number' && Number.isFinite(value);
+  const text = (value: unknown): value is string => typeof value === 'string';
+  const timestamp = (value: unknown): value is string =>
+    text(value) && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value);
+  const external =
+    raw.external && typeof raw.external === 'object' && !Array.isArray(raw.external)
+      ? (raw.external as Record<string, unknown>)
+      : undefined;
+  const hasRequest = external !== undefined && Object.hasOwn(external, 'request');
+  const hasResponse = external !== undefined && Object.hasOwn(external, 'response');
+  const captured =
+    raw.captured && typeof raw.captured === 'object' && !Array.isArray(raw.captured)
+      ? (raw.captured as Record<string, unknown>)
+      : {};
+  const omitted = Array.isArray(captured.omitted)
+    ? captured.omitted.filter(
+        (item): item is 'record' | 'externalPayload' =>
+          item === 'record' || item === 'externalPayload',
+      )
+    : [];
+  if (hasRequest || hasResponse) omitted.push('externalPayload');
+  const usage =
+    raw.usage && typeof raw.usage === 'object' && !Array.isArray(raw.usage)
+      ? (raw.usage as Record<string, unknown>)
+      : undefined;
+  const usageFields = [
+    'inputTokens',
+    'outputTokens',
+    'reasoningTokens',
+    'cachedTokens',
+    'cacheWriteTokens',
+    'audioSeconds',
+  ] as const;
+  const safeUsage: Record<string, number> = {};
+  for (const key of usageFields) {
+    if (finite(usage?.[key]) && usage[key] >= 0) safeUsage[key] = usage[key];
+  }
+  const error =
+    raw.error && typeof raw.error === 'object' && !Array.isArray(raw.error)
+      ? (raw.error as Record<string, unknown>)
+      : undefined;
+  const safeError = error
+    ? {
+        message: REDACTED,
+        ...(text(error.name) ? { name: error.name } : {}),
+        ...(text(error.code) ? { code: error.code } : {}),
+        ...(finite(error.status) ? { status: error.status } : {}),
+        ...(typeof error.retryable === 'boolean' ? { retryable: error.retryable } : {}),
+        ...(text(error.requestId) ? { requestId: error.requestId } : {}),
+        ...(finite(error.retryAfterMs) ? { retryAfterMs: error.retryAfterMs } : {}),
+      }
+    : undefined;
+  const status = raw.outcomeStatus;
+  const validStatus =
+    status === 'ok' ||
+    status === 'error' ||
+    status === 'aborted' ||
+    status === 'stalled' ||
+    status === 'consumer_closed' ||
+    status === 'unfinished';
+  const purpose = raw.purpose;
+  const validPurpose =
+    purpose === 'ask' || purpose === 'summary' || purpose === 'judge' || purpose === 'direct';
+  return {
+    v: 1,
+    phase: record.phase,
+    operationId: record.operationId,
+    kind: 'external',
+    name: text(raw.name) ? raw.name : 'unknown',
+    transportAttempts:
+      finite(raw.transportAttempts) && raw.transportAttempts >= 1 ? raw.transportAttempts : 1,
+    ...(finite(raw.caseIndex) ? { caseIndex: raw.caseIndex } : {}),
+    ...(text(raw.scorer) ? { scorer: raw.scorer } : {}),
+    ...(text(raw.executionId) ? { executionId: raw.executionId } : {}),
+    ...(text(raw.workflow) ? { workflow: raw.workflow } : {}),
+    ...(text(raw.agent) ? { agent: raw.agent } : {}),
+    ...(finite(raw.depth) ? { depth: raw.depth } : {}),
+    ...(text(raw.sessionId) ? { sessionId: raw.sessionId } : {}),
+    ...(validPurpose ? { purpose } : {}),
+    ...(text(raw.askId) ? { askId: raw.askId } : {}),
+    ...(text(raw.parentAskId) ? { parentAskId: raw.parentAskId } : {}),
+    ...(finite(raw.turn) ? { turn: raw.turn } : {}),
+    ...(timestamp(raw.startedAt) ? { startedAt: raw.startedAt } : {}),
+    ...(timestamp(raw.endedAt) ? { endedAt: raw.endedAt } : {}),
+    ...(finite(raw.durationMs) && raw.durationMs >= 0 ? { durationMs: raw.durationMs } : {}),
+    ...(validStatus ? { outcomeStatus: status } : {}),
+    ...(Object.keys(safeUsage).length > 0 ? { usage: safeUsage } : {}),
+    ...(finite(raw.cost) && raw.cost >= 0 ? { cost: raw.cost } : {}),
+    ...(raw.costProvenance === 'caller_reported' ? { costProvenance: 'caller_reported' } : {}),
+    ...(safeError ? { error: safeError } : {}),
+    ...(hasRequest || hasResponse
+      ? {
+          external: {
+            ...(hasRequest ? { request: REDACTED } : {}),
+            ...(hasResponse ? { response: REDACTED } : {}),
+          },
+        }
+      : {}),
+    ...(finite(raw.bytes) && raw.bytes >= 0 ? { bytes: raw.bytes } : {}),
+    captured: {
+      fidelity: 'runtime_request',
+      redacted: true,
+      truncated: captured.truncated === true,
+      omitted: [...new Set(omitted)],
+      ...(captured.reason !== undefined ? { reason: REDACTED } : {}),
+    },
   };
-  if (record.request) {
-    out.request = {
-      ...record.request,
-      messages: record.request.messages.map((message) => ({
-        ...message,
+}
+
+/** Shared v1/v2 request-content boundary. Identity and numeric options remain useful. */
+export function redactCapturedRequestPayload<T extends CapturedRequest>(request: T): T {
+  // Older imported v1 lines may carry messages without an options block. The
+  // current writer always supplies one, but delivery redaction must preserve
+  // the historical omission rather than inventing replay configuration.
+  const { options: rawOptions, ...requestWithoutOptions } = request;
+  const options =
+    rawOptions && typeof rawOptions === 'object' && !Array.isArray(rawOptions)
+      ? rawOptions
+      : undefined;
+  const safeOptions = options ? { ...options } : undefined;
+  if (safeOptions) {
+    delete safeOptions.stop;
+    delete safeOptions.toolChoice;
+  }
+  return {
+    ...requestWithoutOptions,
+    messages: request.messages.map((message) => {
+      const { providerMetadata: _metadata, ...safeMessage } = message;
+      void _metadata;
+      return {
+        ...safeMessage,
         content: message.content === null ? null : REDACTED,
         ...(message.input ? { input: redactInputDescriptor(message.input) } : {}),
         ...(message.tool_calls
@@ -475,16 +610,85 @@ export function redactCapturedRequest(record: CapturedRequestRecord): CapturedRe
               })),
             }
           : {}),
-      })),
-    };
+      };
+    }),
+    ...(request.tools
+      ? {
+          tools: request.tools.map((tool) => ({
+            ...tool,
+            ...(tool.description !== undefined ? { description: REDACTED } : {}),
+            parameters: REDACTED,
+          })),
+        }
+      : {}),
+    ...(request.responseFormat?.type === 'json_schema'
+      ? {
+          responseFormat: {
+            ...request.responseFormat,
+            json_schema: { ...request.responseFormat.json_schema, schema: REDACTED },
+          },
+        }
+      : request.responseFormat
+        ? { responseFormat: { ...request.responseFormat } }
+        : {}),
+    ...(options
+      ? {
+          options: {
+            ...safeOptions,
+            ...(Array.isArray(options.stop) ? { stop: options.stop.map(() => REDACTED) } : {}),
+            ...(options.toolChoice !== undefined ? { toolChoice: REDACTED } : {}),
+          },
+        }
+      : {}),
+    ...(request.providerOptionKeys ? { providerOptionKeys: [...request.providerOptionKeys] } : {}),
+  } as T;
+}
+
+export function redactCapturedRequest(record: CapturedRequestRecord): CapturedRequestRecord {
+  if (record.kind === 'external') {
+    return redactExternalRecord(record);
+  }
+  const hasProviderMetadata =
+    record.request?.messages.some((message) => message.providerMetadata !== undefined) ||
+    record.response?.providerMetadata !== undefined;
+  const out: CapturedRequestRecord = {
+    ...record,
+    captured: {
+      ...record.captured,
+      redacted: true,
+      omitted: hasProviderMetadata
+        ? [...new Set([...record.captured.omitted, 'providerMetadata'])]
+        : [...record.captured.omitted],
+    },
+  };
+  if (record.request) {
+    out.request = redactCapturedRequestPayload(record.request);
   }
   if (record.response) {
+    const { providerMetadata: _metadata, ...safeResponse } = record.response;
+    void _metadata;
     out.response = {
-      ...record.response,
+      ...safeResponse,
       content: REDACTED,
+      ...(record.response.thinking !== undefined ? { thinking: REDACTED } : {}),
       ...(record.response.tool_calls
         ? {
             tool_calls: record.response.tool_calls.map((call) => ({
+              ...call,
+              function: { ...call.function, arguments: REDACTED },
+            })),
+          }
+        : {}),
+    };
+  }
+  if (record.partial) {
+    out.partial = {
+      ...record.partial,
+      ...(record.partial.content !== undefined ? { content: REDACTED } : {}),
+      ...(record.partial.thinking !== undefined ? { thinking: REDACTED } : {}),
+      ...(record.partial.tool_calls
+        ? {
+            tool_calls: record.partial.tool_calls.map((call) => ({
               ...call,
               function: { ...call.function, arguments: REDACTED },
             })),

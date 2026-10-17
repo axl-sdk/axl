@@ -759,6 +759,11 @@ different rail from accounting: a failing, truncated or redacted capture leaves
 the numbers byte-identical and reports the loss on `diagnostics.status`. See
 [observability.md](../../docs/observability.md#captured-requests-opt-in).
 
+Captured calls can become a dataset: `loadModelCalls()` + `modelCallDataset()`,
+then `recordedModelCall()` to rescore saved answers with no new calls, or
+`replayModelCall({ model })` to send each request again. See the
+[testing recipe](../../docs/testing.md#seeing-the-request-behind-a-score).
+
 A returned cost can no longer override that measurement — it would let a workflow
 understate what it spent. Report one anyway if it is useful to compare against:
 

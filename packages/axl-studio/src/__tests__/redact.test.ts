@@ -11,6 +11,7 @@ import {
   redactEvalHistoryList,
   redactPendingDecision,
   redactPendingDecisionList,
+  redactRecordLine,
 } from '../server/redact.js';
 import type {
   ExecutionInfo,
@@ -20,6 +21,109 @@ import type {
   ToolCallFailure,
 } from '@axlsdk/axl';
 import type { EvalResult } from '@axlsdk/eval';
+
+describe('captured-request delivery redaction', () => {
+  it('scrubs imported external payloads while retaining name, outcome and accounting', () => {
+    const secret = 'private external input';
+    const line = JSON.stringify({
+      v: 1,
+      phase: 'end',
+      operationId: 'external-1',
+      kind: 'external',
+      name: 'vendor-search',
+      transportAttempts: 1,
+      outcomeStatus: 'ok',
+      cost: 0.2,
+      costProvenance: 'caller_reported',
+      usage: { inputTokens: 7 },
+      external: { request: { query: secret }, response: [secret] },
+      captured: { fidelity: 'runtime_request', redacted: false, truncated: false, omitted: [] },
+    });
+    const out = JSON.parse(redactRecordLine(line, true));
+    expect(out).toMatchObject({
+      kind: 'external',
+      name: 'vendor-search',
+      outcomeStatus: 'ok',
+      cost: 0.2,
+      usage: { inputTokens: 7 },
+      external: { request: '[redacted]', response: '[redacted]' },
+      captured: { redacted: true, omitted: ['externalPayload'] },
+    });
+    expect(out).not.toHaveProperty('provider');
+    expect(out).not.toHaveProperty('model');
+    expect(JSON.stringify(out)).not.toContain(secret);
+  });
+
+  it('accepts additive v1 journal fields and scrubs an imported unredacted line', () => {
+    const line = JSON.stringify({
+      v: 1,
+      phase: 'end',
+      operationId: 'op-1',
+      kind: 'stream',
+      transportAttempts: 1,
+      provider: 'anthropic',
+      model: 'm',
+      workflow: 'workflow',
+      agent: 'agent',
+      depth: 1,
+      purpose: 'ask',
+      rejectedCallId: 'op-0',
+      startedAt: '2026-01-01T00:00:00.000Z',
+      endedAt: '2026-01-01T00:00:01.000Z',
+      durationMs: 1000,
+      response: {
+        content: 'secret answer',
+        thinking: 'secret reasoning',
+        providerMetadata: { anthropicThinkingBlocks: [{ signature: 'secret signature' }] },
+        finishReason: 'stop',
+        rawFinishReason: 'end_turn',
+        responseId: 'msg-1',
+        usage: { prompt_tokens: 4, completion_tokens: 2, total_tokens: 6 },
+        cost: 0.01,
+      },
+      partial: { content: 'secret partial', thinking: 'secret partial reasoning' },
+      captured: { fidelity: 'runtime_request', redacted: false, truncated: false, omitted: [] },
+    });
+    const out = JSON.parse(redactRecordLine(line, true));
+    expect(out).toMatchObject({
+      operationId: 'op-1',
+      workflow: 'workflow',
+      agent: 'agent',
+      depth: 1,
+      purpose: 'ask',
+      rejectedCallId: 'op-0',
+      durationMs: 1000,
+      response: {
+        finishReason: 'stop',
+        rawFinishReason: 'end_turn',
+        responseId: 'msg-1',
+        cost: 0.01,
+      },
+      captured: { redacted: true },
+    });
+    expect(out.response.providerMetadata).toBeUndefined();
+    expect(JSON.stringify(out)).not.toMatch(/secret/);
+    expect(redactRecordLine(line, false)).toBe(line);
+    // Older v1 records did not carry continuity/timing fields and remain valid.
+    const legacy = JSON.stringify({
+      v: 1,
+      phase: 'start',
+      operationId: 'old',
+      kind: 'chat',
+      transportAttempts: 1,
+      provider: 'openai',
+      model: 'm',
+      request: {
+        messages: [{ role: 'user', content: 'secret old prompt' }],
+        options: { model: 'm' },
+      },
+      captured: { fidelity: 'runtime_request', redacted: false, truncated: false, omitted: [] },
+    });
+    const old = JSON.parse(redactRecordLine(legacy, true));
+    expect(old.captured.continuityCaptured).toBeUndefined();
+    expect(old.request.messages[0].content).toBe('[redacted]');
+  });
+});
 
 // AxlEvent fixture helper — supplies the base fields every event needs so
 // per-test fixtures stay focused on the variant-specific surface.

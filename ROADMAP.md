@@ -27,6 +27,8 @@
   store with leases, retention mirroring, writer-applied redaction, and
   Studio import/export; compatible ESM/CJS and duplicate loads share the
   accounting and capture context so budgets do not lose cross-copy work.
+  Journals record why each call ran and how it ended, including external
+  operations, and captured calls can be rescored or replayed as an eval dataset.
   Studio presents spend with its completeness
   everywhere and keeps its client mirror pinned to the eval package by a
   drift test. See [observability.md](docs/observability.md),
@@ -70,7 +72,10 @@
   confidently wrong number. Normalized usage exposes
   `audio_input_tokens` / `audio_output_tokens`.
 
-- **OpenTelemetry** — Automatic span emission for every `ctx.*` primitive with cost-per-span attribution
+- **OpenTelemetry** — Workflow and primitive spans with cost attribution, plus
+  standard GenAI CLIENT spans for dispatched model calls. Content is opt-in and
+  redaction-aware; application-owned tracer providers remain running after Axl
+  shuts down.
 - **Memory Primitives** — `ctx.remember()`, `ctx.recall()`, `ctx.forget()` with session/global scope and semantic vector search
 - **Agent Guardrails** — Input/output validation at the agent boundary with retry, throw, or custom policies
 - **Gate-Retry Feedback Control** — Guardrail, schema, and `validate` retries deliver the correction as a user turn after the rejected attempt (works on every provider, including Gemini models that reject a terminal model turn); a single `retryFeedback` hook on `AskOptions` / `DelegateOptions` lets callers rewrite that turn or stop retrying with the gate's typed error. See [api-reference.md#custom-retry-feedback](docs/api-reference.md#custom-retry-feedback).

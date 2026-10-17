@@ -32,6 +32,8 @@ import type {
   ToolDefinition,
 } from '../providers/types.js';
 import type { ProviderResponse, ToolCallMessage } from '../types.js';
+import { ProviderError } from '../providers/errors.js';
+import type { AccountingUsage } from '../accounting.js';
 
 // ---------------------------------------------------------------------------
 // Record shape (JSONL v1)
@@ -45,15 +47,21 @@ export type CapturedMessage = {
   /** Bounded descriptor for the non-text parts, when there were any. */
   input?: ModelInputDescriptor;
   name?: string;
+  /** Agent provenance carried by the provider-neutral conversation. */
+  agent?: ChatMessage['agent'];
+  /** Runtime provenance that can affect provider prompt-cache placement. */
+  origin?: ChatMessage['origin'];
   tool_calls?: ToolCallMessage[];
   tool_call_id?: string;
+  /** Opaque response-derived continuity data required for later model turns. */
+  providerMetadata?: Record<string, unknown>;
 };
 
 /** The provider-neutral request, snapshotted by value at invocation. */
 export type CapturedRequest = {
   messages: CapturedMessage[];
   /** Tool definitions as the model sees them: names + JSON-Schema parameters. */
-  tools?: Array<{ name: string; description?: string; parameters: unknown }>;
+  tools?: Array<{ name: string; description?: string; parameters: unknown; strict?: boolean }>;
   responseFormat?: ResponseFormat;
   /** Allowlisted call options only. Never signals, functions or credentials. */
   options: {
@@ -74,7 +82,13 @@ export type CapturedRequest = {
 /** What came back, projected to the fields that explain a turn. */
 export type CapturedResponse = {
   content: string;
+  thinking?: string;
   tool_calls?: ToolCallMessage[];
+  finishReason?: ProviderResponse['finishReason'];
+  rawFinishReason?: string;
+  responseId?: string;
+  responseModel?: string;
+  providerMetadata?: Record<string, unknown>;
   usage?: ProviderResponse['usage'];
   cost?: number;
   costProvenance?: string;
@@ -87,6 +101,16 @@ export type CapturedError = {
   message: string;
   code?: string;
   status?: number;
+  retryable?: boolean;
+  requestId?: string;
+  retryAfterMs?: number;
+};
+
+/** Output observed before a stream ended without a terminal response. */
+export type CapturedPartialResponse = {
+  content?: string;
+  thinking?: string;
+  tool_calls?: ToolCallMessage[];
 };
 
 /** The gate that rejected the previous turn and the correction fed back in. */
@@ -104,30 +128,47 @@ export type CapturedPhase = 'start' | 'attempt' | 'end';
  * One JSONL line. `v: 1` is the codec version; `@axlsdk/eval` re-exports this
  * as `RequestRecord` and owns the bundle/import validation around it.
  *
- * A `start` record carries the request; `attempt` records mark additional
- * transport attempts for the SAME logical operation (a 429 retry is not an
- * output repair); an `end` record carries the response or the error. An
- * operation that never returns therefore leaves a start record with no end —
- * which is exactly the call you most want to inspect.
+ * A model `start` carries the request; `attempt` marks another transport
+ * attempt for that same logical model call; `end` carries its response/error.
+ * An external `start` carries its name after admission; its `end` carries the
+ * caller's optional JSON evidence and reported settlement. A call that never
+ * returns leaves a start without an end.
  */
-export type CapturedRequestRecord = {
+type CapturedRecordBase = {
   v: 1;
   phase: CapturedPhase;
   operationId: string;
-  kind: 'chat' | 'stream';
   caseIndex?: number;
   scorer?: string;
   executionId?: string;
+  workflow?: string;
+  agent?: string;
+  depth?: number;
+  sessionId?: string;
+  purpose?: 'ask' | 'summary' | 'judge' | 'direct';
   askId?: string;
   parentAskId?: string;
   turn?: number;
   retryReason?: 'schema' | 'validate' | 'guardrail';
+  rejectedCallId?: string;
+  /** Dispatch and settlement timestamps; absent in older v1 journals. */
+  startedAt?: string;
+  endedAt?: string;
+  durationMs?: number;
+  /** Failed provider timing, if available, without a success response. */
+  timing?: ProviderResponse['timing'];
   /** 1-indexed transport attempt this record describes. */
   transportAttempts: number;
-  provider: string;
-  model: string;
-  request?: CapturedRequest;
-  response?: CapturedResponse;
+  /** Structural settlement retained when an oversized end line becomes a stub. */
+  outcomeStatus?: 'ok' | 'error' | 'aborted' | 'stalled' | 'consumer_closed' | 'unfinished';
+  /** The following settlement fields are populated on oversized end stubs. */
+  usage?: ProviderResponse['usage'] | Partial<AccountingUsage>;
+  cost?: number;
+  costProvenance?: string;
+  finishReason?: ProviderResponse['finishReason'];
+  rawFinishReason?: string;
+  responseId?: string;
+  responseModel?: string;
   error?: CapturedError;
   /**
    * Why an operation ended without a response, when it ended deliberately.
@@ -144,6 +185,8 @@ export type CapturedRequestRecord = {
     redacted: boolean;
     /** `true` when the record was replaced by a stub over `maxRecordBytes`. */
     truncated: boolean;
+    /** New v1 request projection retained opaque continuity data if present. */
+    continuityCaptured?: true;
     /** What could not be represented, e.g. `['media']`. */
     omitted: string[];
     /**
@@ -161,10 +204,46 @@ export type CapturedRequestRecord = {
   bytes?: number;
 };
 
+/** JSON values accepted from `ExternalOperationReport.capture()`. */
+export type CapturedJsonValue =
+  | null
+  | boolean
+  | number
+  | string
+  | CapturedJsonValue[]
+  | { [key: string]: CapturedJsonValue };
+
+/** Model calls retain their existing required provider/model contract. */
+export type CapturedModelRequestRecord = CapturedRecordBase & {
+  kind: 'chat' | 'stream';
+  provider: string;
+  model: string;
+  request?: CapturedRequest;
+  response?: CapturedResponse;
+  partial?: CapturedPartialResponse;
+  name?: never;
+  external?: never;
+};
+
+/** Caller-declared work has a name and no invented provider or model. */
+export type CapturedExternalRequestRecord = CapturedRecordBase & {
+  kind: 'external';
+  name: string;
+  /** Caller JSON, snapshotted when `report.capture()` was called. On the end line. */
+  external?: { request?: CapturedJsonValue; response?: CapturedJsonValue };
+  provider?: never;
+  model?: never;
+  request?: never;
+  response?: never;
+  partial?: never;
+};
+
+export type CapturedRequestRecord = CapturedModelRequestRecord | CapturedExternalRequestRecord;
+
 /** A pointer from an eval item / scorer to one captured operation. */
 export type CapturedOperationRef = {
   operationId: string;
-  kind: 'chat' | 'stream';
+  kind: 'chat' | 'stream' | 'external';
   turn?: number;
   attempt?: number;
   status: 'recorded' | 'start_only' | 'truncated' | 'omitted';
@@ -244,8 +323,16 @@ function captureMessage(message: ChatMessage): CapturedMessage {
     if (descriptor) out.input = descriptor;
   }
   if (message.name !== undefined) out.name = message.name;
-  if (message.tool_calls) out.tool_calls = message.tool_calls.map((call) => ({ ...call }));
+  if (message.agent !== undefined) out.agent = message.agent;
+  if (message.origin !== undefined) out.origin = message.origin;
+  if (message.tool_calls)
+    out.tool_calls = message.tool_calls.map((call) => ({
+      ...call,
+      function: { ...call.function },
+    }));
   if (message.tool_call_id !== undefined) out.tool_call_id = message.tool_call_id;
+  if (message.providerMetadata !== undefined)
+    out.providerMetadata = structuredClone(message.providerMetadata);
   return out;
 }
 
@@ -260,7 +347,8 @@ function captureTools(tools: ToolDefinition[] | undefined): CapturedRequest['too
   return tools.map((tool) => ({
     name: tool.function.name,
     ...(tool.function.description ? { description: tool.function.description } : {}),
-    parameters: tool.function.parameters,
+    parameters: structuredClone(tool.function.parameters),
+    ...(tool.function.strict !== undefined ? { strict: tool.function.strict } : {}),
   }));
 }
 
@@ -281,10 +369,11 @@ export function snapshotRequest(
     ? Object.keys(options.providerOptions)
     : undefined;
   if (providerOptionKeys && providerOptionKeys.length > 0) omitted.push('providerOptionValues');
+  const tools = captureTools(options.tools);
   return {
     request: {
       messages: messages.map(captureMessage),
-      ...(captureTools(options.tools) ? { tools: captureTools(options.tools) } : {}),
+      ...(tools ? { tools } : {}),
       ...(options.responseFormat
         ? { responseFormat: structuredClone(options.responseFormat) }
         : {}),
@@ -297,7 +386,9 @@ export function snapshotRequest(
         ...(options.includeThoughts !== undefined
           ? { includeThoughts: options.includeThoughts }
           : {}),
-        ...(options.toolChoice !== undefined ? { toolChoice: options.toolChoice } : {}),
+        ...(options.toolChoice !== undefined
+          ? { toolChoice: structuredClone(options.toolChoice) }
+          : {}),
         ...(options.stop !== undefined ? { stop: [...options.stop] } : {}),
         ...(options.promptCache !== undefined ? { promptCache: options.promptCache } : {}),
       },
@@ -311,7 +402,21 @@ export function snapshotRequest(
 export function snapshotResponse(response: ProviderResponse): CapturedResponse {
   return {
     content: response.content,
-    ...(response.tool_calls ? { tool_calls: response.tool_calls.map((c) => ({ ...c })) } : {}),
+    ...(response.thinking_content !== undefined ? { thinking: response.thinking_content } : {}),
+    ...(response.tool_calls
+      ? {
+          tool_calls: response.tool_calls.map((c) => ({ ...c, function: { ...c.function } })),
+        }
+      : {}),
+    ...(response.finishReason !== undefined ? { finishReason: response.finishReason } : {}),
+    ...(response.rawFinishReason !== undefined
+      ? { rawFinishReason: response.rawFinishReason }
+      : {}),
+    ...(response.responseId !== undefined ? { responseId: response.responseId } : {}),
+    ...(response.responseModel !== undefined ? { responseModel: response.responseModel } : {}),
+    ...(response.providerMetadata !== undefined
+      ? { providerMetadata: structuredClone(response.providerMetadata) }
+      : {}),
     ...(response.usage ? { usage: { ...response.usage } } : {}),
     ...(response.cost !== undefined ? { cost: response.cost } : {}),
     ...(response.costProvenance !== undefined ? { costProvenance: response.costProvenance } : {}),
@@ -328,9 +433,59 @@ export function snapshotError(error: unknown): CapturedError {
       message: error.message,
       ...(typeof withFields.code === 'string' ? { code: withFields.code } : {}),
       ...(typeof withFields.status === 'number' ? { status: withFields.status } : {}),
+      ...(error instanceof ProviderError
+        ? {
+            retryable: error.retryable,
+            ...(error.requestId !== undefined ? { requestId: error.requestId } : {}),
+            ...(error.retryAfterMs !== undefined ? { retryAfterMs: error.retryAfterMs } : {}),
+          }
+        : {}),
     };
   }
   return { message: String(error) };
+}
+
+/**
+ * Copy caller-supplied external payload by value, rejecting values JSON would
+ * silently omit or coerce. The caller's getter may throw; the report method
+ * catches that projection failure and never lets it affect external work.
+ */
+export function snapshotCapturedJson(value: unknown): CapturedJsonValue {
+  const ancestors = new WeakSet<object>();
+  const copy = (part: unknown): CapturedJsonValue => {
+    if (part === null || typeof part === 'string' || typeof part === 'boolean') return part;
+    if (typeof part === 'number' && Number.isFinite(part)) return part;
+    if (typeof part !== 'object') throw new TypeError('external capture requires JSON values');
+    if (ancestors.has(part)) throw new TypeError('external capture contains a cycle');
+    const prototype = Object.getPrototypeOf(part);
+    if (!Array.isArray(part) && prototype !== Object.prototype && prototype !== null) {
+      throw new TypeError('external capture requires plain JSON objects');
+    }
+    if (
+      Object.getOwnPropertySymbols(part).some(
+        (key) => Object.getOwnPropertyDescriptor(part, key)?.enumerable,
+      )
+    ) {
+      throw new TypeError('external capture cannot omit symbol keys');
+    }
+    ancestors.add(part);
+    try {
+      if (Array.isArray(part)) {
+        return Array.from({ length: part.length }, (_, index) => {
+          if (!Object.hasOwn(part, index))
+            throw new TypeError('external capture has an array hole');
+          return copy(part[index]);
+        });
+      }
+      const result: { [key: string]: CapturedJsonValue } = Object.create(null);
+      for (const key of Object.keys(part))
+        result[key] = copy((part as Record<string, unknown>)[key]);
+      return result;
+    } finally {
+      ancestors.delete(part);
+    }
+  };
+  return copy(value);
 }
 
 // ---------------------------------------------------------------------------
@@ -425,22 +580,94 @@ export class RequestCaptureChannel {
     }
     let bytes = Buffer.byteLength(line, 'utf-8');
     if (bytes > this.maxRecordBytes) {
-      const stub: CapturedRequestRecord = {
+      const outcomeStatus =
+        record.phase !== 'end'
+          ? undefined
+          : record.outcomeStatus !== undefined
+            ? record.outcomeStatus
+            : record.termination === 'aborted' ||
+                record.termination === 'stalled' ||
+                record.termination === 'consumer_closed'
+              ? record.termination
+              : record.error
+                ? 'error'
+                : record.response
+                  ? 'ok'
+                  : 'unfinished';
+      const stub = {
         v: 1,
         phase: record.phase,
         operationId: record.operationId,
         kind: record.kind,
+        ...(record.kind === 'external' ? { name: record.name } : {}),
         ...(record.caseIndex !== undefined ? { caseIndex: record.caseIndex } : {}),
         ...(record.scorer !== undefined ? { scorer: record.scorer } : {}),
+        ...(record.executionId !== undefined ? { executionId: record.executionId } : {}),
+        ...(record.workflow !== undefined ? { workflow: record.workflow } : {}),
+        ...(record.agent !== undefined ? { agent: record.agent } : {}),
+        ...(record.depth !== undefined ? { depth: record.depth } : {}),
+        ...(record.sessionId !== undefined ? { sessionId: record.sessionId } : {}),
+        ...(record.purpose !== undefined ? { purpose: record.purpose } : {}),
+        ...(record.askId !== undefined ? { askId: record.askId } : {}),
+        ...(record.parentAskId !== undefined ? { parentAskId: record.parentAskId } : {}),
         ...(record.turn !== undefined ? { turn: record.turn } : {}),
+        ...(record.retryReason !== undefined ? { retryReason: record.retryReason } : {}),
+        ...(record.rejectedCallId !== undefined ? { rejectedCallId: record.rejectedCallId } : {}),
+        ...(record.startedAt !== undefined ? { startedAt: record.startedAt } : {}),
+        ...(record.endedAt !== undefined ? { endedAt: record.endedAt } : {}),
+        ...(record.durationMs !== undefined ? { durationMs: record.durationMs } : {}),
+        ...(record.termination !== undefined ? { termination: record.termination } : {}),
+        ...(outcomeStatus !== undefined ? { outcomeStatus } : {}),
+        ...((record.usage ?? record.response?.usage) !== undefined
+          ? { usage: record.usage ?? record.response?.usage }
+          : {}),
+        ...((record.cost ?? record.response?.cost) !== undefined
+          ? { cost: record.cost ?? record.response?.cost }
+          : {}),
+        ...((record.costProvenance ?? record.response?.costProvenance) !== undefined
+          ? { costProvenance: record.costProvenance ?? record.response?.costProvenance }
+          : {}),
+        ...(record.response?.finishReason !== undefined
+          ? { finishReason: record.response.finishReason }
+          : {}),
+        ...(record.response?.rawFinishReason !== undefined
+          ? { rawFinishReason: record.response.rawFinishReason }
+          : {}),
+        ...(record.response?.responseId !== undefined
+          ? { responseId: record.response.responseId }
+          : {}),
+        ...(record.response?.responseModel !== undefined
+          ? { responseModel: record.response.responseModel }
+          : {}),
+        ...((record.timing ?? record.response?.timing)
+          ? { timing: record.timing ?? record.response?.timing }
+          : {}),
+        ...(record.error
+          ? {
+              error: {
+                message: '[truncated]',
+                ...(record.error.name !== undefined ? { name: record.error.name } : {}),
+                ...(record.error.code !== undefined ? { code: record.error.code } : {}),
+                ...(record.error.status !== undefined ? { status: record.error.status } : {}),
+                ...(record.error.retryable !== undefined
+                  ? { retryable: record.error.retryable }
+                  : {}),
+                ...(record.error.requestId !== undefined
+                  ? { requestId: record.error.requestId }
+                  : {}),
+                ...(record.error.retryAfterMs !== undefined
+                  ? { retryAfterMs: record.error.retryAfterMs }
+                  : {}),
+              },
+            }
+          : {}),
         transportAttempts: record.transportAttempts,
-        provider: record.provider,
-        model: record.model,
+        ...(record.kind !== 'external' ? { provider: record.provider, model: record.model } : {}),
         captured: {
           fidelity: 'runtime_request',
           redacted: record.captured.redacted,
           truncated: true,
-          omitted: ['record'],
+          omitted: [...new Set([...record.captured.omitted, 'record'])],
           // Carried, not dropped: a projection stub that is itself over-size
           // would otherwise come back indistinguishable from an ordinary
           // over-size record, which is the one distinction `reason` exists to
@@ -449,11 +676,15 @@ export class RequestCaptureChannel {
           ...(record.captured.reason !== undefined ? { reason: record.captured.reason } : {}),
         },
         bytes,
-      };
+      } as CapturedRequestRecord;
       line = JSON.stringify(stub);
       bytes = Buffer.byteLength(line, 'utf-8');
       const existing = this.refs.get(record.operationId);
       if (existing) existing.status = 'truncated';
+      if (bytes > this.maxRecordBytes) {
+        this.stop('truncated', 'record identity exceeded the per-record capture limit');
+        return;
+      }
     }
     if (this.runBytes + bytes > this.maxRunBytes) {
       this.stop(
@@ -597,11 +828,21 @@ export function runWithCaptureCorrelation<T>(
 /** Per-turn identity the context knows and the facade does not. */
 export type CaptureTurnContext = {
   executionId?: string;
+  workflow?: string;
+  agent?: string;
+  depth?: number;
+  sessionId?: string;
+  purpose?: 'ask' | 'summary' | 'judge' | 'direct';
   askId?: string;
   parentAskId?: string;
   turn?: number;
   retryReason?: 'schema' | 'validate' | 'guardrail';
+  rejectedCallId?: string;
   correction?: CapturedCorrection;
+  /** Written by the facade after dispatch, read by the next repair turn. */
+  callId?: string;
+  /** First-wins cause written by the ask loop before closing a stream. */
+  terminationCause?: 'aborted' | 'stalled' | 'consumer_closed';
 };
 
 /**
@@ -630,4 +871,16 @@ export function runWithCaptureTurnSlot<T>(fn: () => T): T {
 export function setCaptureTurn(turn: CaptureTurnContext): void {
   const slot = turnStorage.getStore();
   if (slot) slot.current = turn;
+}
+
+/** @internal Keep the last dispatched call in this ask branch for repair linkage. */
+export function setCaptureCallId(callId: string): void {
+  const slot = turnStorage.getStore();
+  if (slot) slot.current.callId = callId;
+}
+
+/** @internal Label a context-driven stream close before the facade sees return(). */
+export function setCaptureTerminationCause(cause: CaptureTurnContext['terminationCause']): void {
+  const slot = turnStorage.getStore();
+  if (slot) slot.current.terminationCause = cause;
 }

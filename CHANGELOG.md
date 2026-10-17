@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-10-16
+
+### Changed
+
+- **Breaking:** `runtime.shutdown()` no longer shuts down your OpenTelemetry tracer provider, so other tracing keeps working after Axl stops. **Migration:** if you relied on Axl to close the provider, call its `shutdown()` yourself after `runtime.shutdown()`.
+
+### Added
+
+- **OpenTelemetry GenAI spans.** Every model call Axl sends, including judge, summary and direct calls, now gets a standard `chat {model}` span, and ask/tool spans gain `gen_ai.*` attributes alongside `axl.*`. Prompt and response content is off by default; turn it on with `telemetry.captureContent` (or `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true`). Each content attribute is capped at 64 KiB (`telemetry.maxContentAttributeBytes`), and omitted ones are listed in `axl.gen_ai.content_omitted`. `trace.redact` always suppresses content. The `gen_ai.*` keys follow Development-status conventions and may change in a patch release. See [observability.md](docs/observability.md#genai-inference-spans).
+- **Response metadata.** Built-in provider responses and final stream chunks now report the finish reason (normalized and raw), response id and served model. `MockProvider.sequence()` can script them.
+- **Richer request journals.** Captured calls now record thinking, partial stream output, start/end times, why the call was made (`ask`, `summary`, `judge`, `direct`), and which rejected answer a repair replaces. Redaction covers the new content.
+- **External operations in journals.** `externalOperation()` / `ctx.withExternalOperation()` now appear in capture as `kind: 'external'`, and `report.capture({ request, response })` saves diagnostic JSON for them.
+- **`foldJournal()`** turns journal lines into one validated record per call, with exported Zod schemas and `redactModelCallRecord()`.
+- **Evals from captured traffic.** `@axlsdk/eval` adds `loadModelCalls()`, `modelCallDataset()`, `recordedModelCall()` (rescore saved answers, no new calls) and `replayModelCall()` (send one captured request again, optionally to another model). Both return a `ModelCallOutput`, so tool-call turns are scored on the tool chosen. See [testing.md](docs/testing.md#seeing-the-request-behind-a-score).
+
+### Fixed
+
+- Studio no longer fails the diagnostics stream on imported captured-request lines without a `request.options` block; it redacts them like any other line.
+
 ## [0.25.3] - 2026-10-16
 
 ### Added
@@ -2272,7 +2291,9 @@ Initial public open-source release on npm under the `@axlsdk` scope. No new feat
 - `createServer()` factory, `ConnectionManager` for channel subscriptions, `CostAggregator` for cost tracking
 - Eight panels: Agent Playground, Workflow Runner, Trace Explorer, Cost Dashboard, Memory Browser, Session Manager, Tool Inspector, Eval Runner
 
-[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.25.2...HEAD
+[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.26.0...HEAD
+[0.26.0]: https://github.com/axl-sdk/axl/compare/v0.25.3...v0.26.0
+[0.25.3]: https://github.com/axl-sdk/axl/compare/v0.25.2...v0.25.3
 [0.25.2]: https://github.com/axl-sdk/axl/compare/v0.25.1...v0.25.2
 [0.25.1]: https://github.com/axl-sdk/axl/compare/v0.25.0...v0.25.1
 [0.25.0]: https://github.com/axl-sdk/axl/compare/v0.24.3...v0.25.0

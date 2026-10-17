@@ -11,6 +11,37 @@ defaults) — those rot, and the source is the ground truth.
 3. Package `README.md` — package-level quick start.
 4. `CLAUDE.md` / `.claude/rules/` — durable conventions for agents; never a changelog.
 
+## Writing style
+
+Public docs (`docs/`, package READMEs, `CHANGELOG.md`, `ROADMAP.md`) are written for
+the people using Axl. Specs and plans under `.internal/` can be as detailed as the
+design needs.
+
+- **Organize guides around tasks.** Start a section with what it lets the reader do,
+  then show a short, runnable example, then cover the details. Show a concept before
+  you explain how the pieces fit together.
+- **Use the reader's words.** Avoid internal or review vocabulary ("facade",
+  "projection", "settlement", "admission", "truthful", "disjoint") in public docs. Say
+  "the request Axl sent", "when the call finished", "the repair retry".
+- **Say what happens, not what doesn't.** Write "cost is absent when you didn't report
+  one," not "never fabricated as zero." Answering a reviewer's objection belongs in the
+  spec.
+- **Put each fact in one place.** Field lists, defaults and exhaustive guarantees go in
+  `docs/api-reference.md`; guides link to them. State a caveat once and link to it from
+  elsewhere.
+- **Use structure where it helps scanning.** Use a table for field → meaning or
+  provider → behavior. Use bullets for lists of three or more parallel items. Keep
+  paragraphs to about five lines.
+- **Don't write rot-prone words.** "New", "now" and "older v1 records" only make sense
+  in `CHANGELOG.md`; elsewhere describe current behavior.
+- **Keep changelog entries scannable.** Start with a short bold label, then say what a
+  user can now do in one or two sentences, followed by any migration step or caveat. Leave
+  out implementation detail and link to the guide.
+- **Keep READMEs brief.** A package README gets a capability sentence, a minimal example
+  and a link to the guide, not the full contract.
+- **Fix as you go.** When you edit near a passage that breaks these rules, rewrite it in
+  the same change, keeping every factual claim.
+
 ## Where each subsystem is documented (update these when you touch it)
 | Subsystem | Authoritative docs |
 |---|---|

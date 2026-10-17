@@ -73,7 +73,10 @@ export type {
   CaptureCorrelation,
   CapturedCorrection,
   CapturedError,
+  CapturedExternalRequestRecord,
+  CapturedJsonValue,
   CapturedMessage,
+  CapturedModelRequestRecord,
   CapturedOperationRef,
   CapturedPhase,
   CapturedRequest,
@@ -83,6 +86,20 @@ export type {
   RequestCaptureSink,
   RequestCaptureStatus,
 } from './diagnostics/capture.js';
+export {
+  capturedJournalLineSchema,
+  externalOperationRecordSchema,
+  foldJournal,
+  foldedOperationRecordSchema,
+  modelCallRecordSchema,
+  redactModelCallRecord,
+} from './diagnostics/model-call-record.js';
+export type {
+  ExternalOperationRecord,
+  FoldedOperationRecord,
+  ModelCallRecord,
+} from './diagnostics/model-call-record.js';
+export type { SpanAttributeValue, SpanAttributes } from './telemetry/types.js';
 
 // Module-resolution helpers — internal but exported so the eval CLI and
 // Studio middleware share one implementation of the ESM/CJS interop walk.
@@ -336,6 +353,7 @@ export type {
   ChatMessage,
   ToolCallMessage,
   ProviderResponse,
+  FinishReason,
   StreamChunk,
   CallTiming,
   ChatOptions,

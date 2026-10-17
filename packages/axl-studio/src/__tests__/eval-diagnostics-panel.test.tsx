@@ -12,6 +12,8 @@
  * stub reading and the cap's retention semantics.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
@@ -251,6 +253,57 @@ afterEach(() => {
 // ── Cases ────────────────────────────────────────────────────────
 
 describe('RunDiagnosticsPanel', () => {
+  it('renders imported mixed model and external operations without inventing a model or missing response', async () => {
+    const user = userEvent.setup();
+    const externalStart = baseRecord({
+      phase: 'start',
+      operationId: 'external-1',
+      kind: 'external',
+      name: 'vendor-search',
+      provider: undefined,
+      model: undefined,
+    });
+    const externalEnd = baseRecord({
+      phase: 'end',
+      operationId: 'external-1',
+      kind: 'external',
+      name: 'vendor-search',
+      provider: undefined,
+      model: undefined,
+      outcomeStatus: 'ok',
+      cost: 0.2,
+      usage: { inputTokens: 7 },
+      external: {
+        request: { query: 'private caller query' },
+        response: { answer: 'private caller result' },
+      },
+    });
+    const unfinished = baseRecord({
+      phase: 'start',
+      operationId: 'external-2',
+      kind: 'external',
+      name: 'pending-vendor',
+      provider: undefined,
+      model: undefined,
+    });
+    stubFetch({ records: ndjson([...operationLines(), externalStart, externalEnd, unfinished]) });
+    renderPanel(
+      <RunDiagnosticsPanel result={result(manifest({ records: 5 }))} evalName="qa-eval" />,
+    );
+    await user.click(screen.getByRole('button', { name: 'Show captured records' }));
+    const list = await screen.findByRole('list', { name: 'Captured request records' });
+    const rows = within(list).getAllByRole('listitem');
+    expect(rows).toHaveLength(3);
+    expect(within(rows[1]).getByText('vendor-search')).toBeInTheDocument();
+    expect(within(rows[1]).getByText('ok')).toBeInTheDocument();
+    expect(within(rows[1]).queryByText(/no response recorded/)).not.toBeInTheDocument();
+    await user.click(within(rows[1]).getByRole('button', { expanded: false }));
+    const detail = screen.getByTestId('operation-detail-1');
+    expect(within(detail).getByText(/private caller query/)).toBeInTheDocument();
+    expect(within(detail).getByText(/private caller result/)).toBeInTheDocument();
+    expect(within(detail).getByText('0.2 USD')).toBeInTheDocument();
+    expect(within(rows[2]).getByText('no end record')).toBeInTheDocument();
+  });
   it('A16.19 renders a complete manifest with counts, fidelity and a plain redaction statement', async () => {
     stubFetch({
       manifest: {
@@ -855,6 +908,37 @@ describe('RunDiagnosticsPanel', () => {
     // Nothing was cut off and nothing failed to parse.
     expect(screen.queryByText(/could not be parsed/)).not.toBeInTheDocument();
     expect(screen.queryByText(/Download the .jsonl for the rest/)).not.toBeInTheDocument();
+  });
+
+  it('renders all four operation outcomes from the genuine 0.25.3 journal', async () => {
+    const user = userEvent.setup();
+    const historical = readFileSync(
+      resolve(
+        import.meta.dirname,
+        '../../../axl/src/__tests__/fixtures/model-call-record/axl-0253.jsonl',
+      ),
+      'utf8',
+    );
+    stubFetch({ records: historical });
+
+    renderPanel(
+      <RunDiagnosticsPanel result={result(manifest({ records: 7 }))} evalName="legacy" />,
+    );
+    await user.click(screen.getByRole('button', { name: 'Show captured records' }));
+
+    const list = await screen.findByRole('list', { name: 'Captured request records' });
+    const rows = within(list).getAllByRole('listitem');
+    expect(rows).toHaveLength(4);
+    expect(within(rows[0]).getByText('case 0')).toBeInTheDocument();
+    expect(within(rows[1]).getByText(/synthetic bad request/)).toBeInTheDocument();
+    expect(
+      within(rows[2]).getByText(/terminated: stream closed by the consumer/),
+    ).toBeInTheDocument();
+    expect(within(rows[3]).getByText(/no response recorded/)).toBeInTheDocument();
+
+    await user.click(within(rows[0]).getByRole('button'));
+    const detail = await screen.findByTestId('operation-detail-0');
+    expect(within(detail).getByText(/legacy answer/)).toBeInTheDocument();
   });
 });
 

@@ -8,7 +8,7 @@ describe('Sessions E2E', () => {
   it('deduplicates only the current matching input across fresh handles and rich requests', async () => {
     const provider = MockProvider.fn((_messages, callIndex) => ({ content: `reply-${callIndex}` }));
     const { runtime } = createTestRuntime(provider);
-    const a = agent({ name: 'dedup-agent', model: 'mock:test' });
+    const a = agent({ name: 'dedup-agent', model: 'mock:test', system: '' });
     runtime.register(
       workflow({
         name: 'dedup-wf',
@@ -119,7 +119,10 @@ describe('Sessions E2E', () => {
     // After 3 sends with maxMessages=2: trim keeps last 2, then add user+assistant = 4
     expect(history.length).toBe(4);
     // Session stores object inputs as JSON strings, text outputs as-is
-    const contents = history.map((m) => m.content);
+    const contents = history.map((m) => {
+      if (typeof m.content !== 'string') throw new Error('Expected text-only session history');
+      return m.content;
+    });
     // Oldest messages from turn 1 should be gone
     expect(contents.some((c) => c.includes('msg-1'))).toBe(false);
     expect(contents).not.toContain('reply-1');
@@ -135,7 +138,7 @@ describe('Sessions E2E', () => {
         : 'reply',
     }));
     const { runtime } = createTestRuntime(provider);
-    const a = agent({ name: 'summary-agent', model: 'mock:test' });
+    const a = agent({ name: 'summary-agent', model: 'mock:test', system: '' });
     runtime.register(
       workflow({
         name: 'summary-wf',

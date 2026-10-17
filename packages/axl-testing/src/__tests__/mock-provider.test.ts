@@ -57,6 +57,33 @@ describe('MockProvider.sequence()', () => {
     const r = await provider.chat([{ role: 'user', content: 'go' }], {});
     expect(r.tool_calls).toEqual(toolCalls);
   });
+
+  it('scripts the same response metadata for chat and stream', async () => {
+    const scripted = {
+      content: 'partial',
+      finishReason: 'length' as const,
+      rawFinishReason: 'max_tokens',
+      responseId: 'msg_mock',
+      responseModel: 'served-model',
+    };
+    const provider = MockProvider.sequence([scripted, scripted]);
+    const chat = await provider.chat([{ role: 'user', content: 'go' }], { model: 'requested' });
+    expect(chat).toMatchObject(scripted);
+
+    const chunks = [];
+    for await (const chunk of provider.stream([{ role: 'user', content: 'go' }], {
+      model: 'requested',
+    })) {
+      chunks.push(chunk);
+    }
+    expect(chunks.find((chunk) => chunk.type === 'done')).toMatchObject({
+      type: 'done',
+      finishReason: 'length',
+      rawFinishReason: 'max_tokens',
+      responseId: 'msg_mock',
+      responseModel: 'served-model',
+    });
+  });
 });
 
 // ── MockProvider.echo() ──────────────────────────────────────────────────────

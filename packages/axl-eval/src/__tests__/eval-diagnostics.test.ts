@@ -18,7 +18,12 @@ import { mkdtemp, rm, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { z } from 'zod';
-import { AxlRuntime, FileDiagnosticArtifactStore, RequestCaptureChannel } from '@axlsdk/axl';
+import {
+  AxlRuntime,
+  FileDiagnosticArtifactStore,
+  RequestCaptureChannel,
+  externalOperation,
+} from '@axlsdk/axl';
 import type {
   AxlRuntime as AxlRuntimeType,
   CapturedRequestRecord,
@@ -109,6 +114,93 @@ async function readRecords(
 // ── A11.3 / operation refs ───────────────────────────────────────────
 
 describe('A11.3 — judge calls are captured', () => {
+  it('attaches mixed model/external operations to the actual item and scorer', async () => {
+    const runtime = captureRuntime(2);
+    const externalJudge = scorer({
+      name: 'externalJudge',
+      description: 'third-party judge',
+      score: async () =>
+        externalOperation({ name: 'judge-api' }, async (report) => {
+          report.capture({ request: { rating: 'please score' }, response: { score: 1 } });
+          report.setCost(0.03);
+          return 1;
+        }),
+    });
+    const generate = askExecute();
+    const result = await runEval(
+      { workflow: 'w', dataset: ds(1), scorers: [externalJudge] } satisfies EvalConfig,
+      async (input, scopedRuntime) => {
+        const output = await generate(input, scopedRuntime);
+        await externalOperation({ name: 'search-api' }, async (report) => {
+          report.capture({ request: { query: 'q0' } });
+          report.setCost(0.02, { inputTokens: 4 });
+          return null;
+        });
+        return output;
+      },
+      runtime,
+      { captureRequests: true },
+    );
+    const itemRefs = result.items[0].diagnostics?.operations ?? [];
+    const scorerRefs = result.items[0].scoreDetails?.externalJudge?.diagnostics?.operations ?? [];
+    expect(itemRefs.map((ref) => ref.kind).sort()).toEqual(['chat', 'external']);
+    expect(scorerRefs).toMatchObject([{ kind: 'external', status: 'recorded' }]);
+    const records = await readRecords(runtime, result.diagnostics!.artifactId);
+    const externals = records.filter((record) => record.kind === 'external');
+    expect(externals).toHaveLength(4);
+    expect(externals.filter((record) => record.phase === 'end')).toMatchObject([
+      { name: 'search-api', outcomeStatus: 'ok', cost: 0.02, usage: { inputTokens: 4 } },
+      { name: 'judge-api', outcomeStatus: 'ok', cost: 0.03 },
+    ]);
+    expect(externals.every((record) => !('model' in record) && !('provider' in record))).toBe(true);
+    const sidecar = serializeRequestRecords(records);
+    expect(validateRequestSidecar(sidecar).ok).toBe(true);
+    await runtime.shutdown();
+  });
+
+  it('keeps item and scorer refs when a dispatched request cannot be projected', async () => {
+    const runtime = captureRuntime(2);
+    const hostile = {
+      type: 'json_schema',
+      json_schema: { name: 'bad', schema: { validate() {} } },
+    };
+    const invoke = () =>
+      runtime.resolveProvider('mock:m').provider.chat([{ role: 'user', content: 'go' }], {
+        model: 'm',
+        responseFormat: hostile as never,
+      });
+    const judge = scorer({
+      name: 'judge',
+      description: 'calls provider',
+      score: async () => {
+        await invoke();
+        return 1;
+      },
+    });
+    const result = await runEval(
+      { workflow: 'w', dataset: ds(1), scorers: [judge] } satisfies EvalConfig,
+      async () => {
+        await invoke();
+        return { output: 'out' };
+      },
+      runtime,
+      { captureRequests: true },
+    );
+    const itemRefs = result.items[0].diagnostics?.operations ?? [];
+    const judgeRefs = result.items[0].scoreDetails?.judge?.diagnostics?.operations ?? [];
+    expect(itemRefs).toMatchObject([{ status: 'omitted' }]);
+    expect(judgeRefs).toMatchObject([{ status: 'omitted' }]);
+    const starts = (await readRecords(runtime, result.diagnostics!.artifactId)).filter(
+      (record) => record.phase === 'start',
+    );
+    expect(starts).toHaveLength(2);
+    expect(starts.map((record) => record.operationId).sort()).toEqual(
+      [...itemRefs, ...judgeRefs].map((ref) => ref.operationId).sort(),
+    );
+    expect(starts.every((record) => record.captured.omitted.includes('record'))).toBe(true);
+    await runtime.shutdown();
+  });
+
   it('attaches judging operations to the scorer detail, not just to the item', async () => {
     const runtime = captureRuntime(6);
     const judge = judgeOn(runtime);
@@ -134,11 +226,20 @@ describe('A11.3 — judge calls are captured', () => {
     // the judge's model rather than a mislabelled generation call.
     expect(judgeRecords.every((r) => r.scorer === 'judge')).toBe(true);
     expect(judgeRecords.every((r) => r.provider === 'judgep')).toBe(true);
+    expect(
+      judgeRecords.filter((r) => r.phase === 'start').every((r) => r.purpose === 'judge'),
+    ).toBe(true);
+    expect(
+      judgeRecords.filter((r) => r.phase === 'start').every((r) => r.askId === undefined),
+    ).toBe(true);
     // The case's own generation calls stay unlabelled, so a reader can tell
     // the two apart inside one artifact.
     const generation = records.filter((r) => r.scorer === undefined);
     expect(generation.length).toBeGreaterThan(0);
     expect(generation.every((r) => r.provider === 'mock')).toBe(true);
+    expect(generation.filter((r) => r.phase === 'start').every((r) => r.purpose === 'ask')).toBe(
+      true,
+    );
     await runtime.shutdown();
   });
 
@@ -764,7 +865,6 @@ describe('the JSONL codec and its import guard', () => {
       phase: 'end',
       kind: 'chat',
       model: 'mock:m',
-      startedAt: 1,
       ...over,
     }) as CapturedRequestRecord;
 
@@ -776,6 +876,39 @@ describe('the JSONL codec and its import guard', () => {
     const validated = validateRequestSidecar(text);
     expect(validated.ok).toBe(true);
     expect(parseRequestRecords((validated as { lines: string[] }).lines)).toEqual(records);
+  });
+
+  it('preserves additive v1 journal fields while accepting legacy records without them', () => {
+    const current = record({
+      operationId: 'current',
+      phase: 'start',
+      purpose: 'ask',
+      workflow: 'flow',
+      agent: 'agent',
+      rejectedCallId: 'previous',
+      captured: {
+        fidelity: 'runtime_request',
+        redacted: false,
+        truncated: false,
+        continuityCaptured: true,
+        omitted: [],
+      },
+    });
+    const legacy = record({
+      operationId: 'legacy',
+      phase: 'start',
+      captured: { fidelity: 'runtime_request', redacted: false, truncated: false, omitted: [] },
+    });
+    const validated = validateRequestSidecar(serializeRequestRecords([current, legacy]));
+    expect(validated.ok).toBe(true);
+    const [newRecord, oldRecord] = parseRequestRecords((validated as { lines: string[] }).lines);
+    expect(newRecord).toMatchObject({
+      purpose: 'ask',
+      workflow: 'flow',
+      rejectedCallId: 'previous',
+      captured: { continuityCaptured: true },
+    });
+    expect(oldRecord.captured.continuityCaptured).toBeUndefined();
   });
 
   it('serializes an empty set without a stray blank line', () => {

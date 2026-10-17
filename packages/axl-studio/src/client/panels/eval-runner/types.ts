@@ -322,6 +322,8 @@ export type CapturedMessage = {
   content: string | null;
   input?: { kind?: string; [key: string]: unknown };
   name?: string;
+  agent?: string;
+  origin?: 'runtime';
   /**
    * Mirror of core's `ToolCallMessage` (`packages/axl/src/types.ts`), which is
    * the shape `redactCapturedRequest` reaches into. Flattening it here would
@@ -333,6 +335,7 @@ export type CapturedMessage = {
     function: { name: string; arguments: string };
   }>;
   tool_call_id?: string;
+  providerMetadata?: Record<string, unknown>;
 };
 
 /**
@@ -347,21 +350,34 @@ export type RequestRecord = {
   v: 1;
   phase: 'start' | 'attempt' | 'end';
   operationId: string;
-  kind: 'chat' | 'stream';
+  kind: 'chat' | 'stream' | 'external';
   caseIndex?: number;
   scorer?: string;
   executionId?: string;
+  workflow?: string;
+  agent?: string;
+  depth?: number;
+  sessionId?: string;
+  purpose?: 'ask' | 'summary' | 'judge' | 'direct';
   askId?: string;
   parentAskId?: string;
   turn?: number;
   retryReason?: 'schema' | 'validate' | 'guardrail';
+  rejectedCallId?: string;
+  startedAt?: string;
+  endedAt?: string;
+  durationMs?: number;
+  timing?: { totalMs?: number; ttftMs?: number; [k: string]: unknown };
   /** 1-indexed transport attempt this record describes. */
   transportAttempts: number;
-  provider: string;
-  model: string;
+  /** Absent for an external operation. */
+  provider?: string;
+  model?: string;
+  name?: string;
+  external?: { request?: unknown; response?: unknown };
   request?: {
     messages: CapturedMessage[];
-    tools?: Array<{ name: string; description?: string; parameters: unknown }>;
+    tools?: Array<{ name: string; description?: string; parameters: unknown; strict?: boolean }>;
     responseFormat?: unknown;
     options: {
       model: string;
@@ -379,13 +395,36 @@ export type RequestRecord = {
   };
   response?: {
     content: string;
+    thinking?: string;
     tool_calls?: unknown[];
+    finishReason?: 'stop' | 'length' | 'tool_calls' | 'content_filter' | 'refusal' | 'other';
+    rawFinishReason?: string;
+    responseId?: string;
+    responseModel?: string;
+    providerMetadata?: Record<string, unknown>;
     usage?: { inputTokens?: number; outputTokens?: number; [k: string]: unknown };
     cost?: number;
     costProvenance?: string;
     timing?: { totalMs?: number; ttftMs?: number; [k: string]: unknown };
   };
-  error?: { name?: string; message: string; code?: string; status?: number };
+  partial?: { content?: string; thinking?: string; tool_calls?: unknown[] };
+  outcomeStatus?: 'ok' | 'error' | 'aborted' | 'stalled' | 'consumer_closed' | 'unfinished';
+  usage?: { inputTokens?: number; outputTokens?: number; [k: string]: unknown };
+  cost?: number;
+  costProvenance?: string;
+  finishReason?: 'stop' | 'length' | 'tool_calls' | 'content_filter' | 'refusal' | 'other';
+  rawFinishReason?: string;
+  responseId?: string;
+  responseModel?: string;
+  error?: {
+    name?: string;
+    message: string;
+    code?: string;
+    status?: number;
+    retryable?: boolean;
+    requestId?: string;
+    retryAfterMs?: number;
+  };
   /** Why an operation ended without a response, when it ended deliberately. */
   termination?: string;
   correction?: { stage: string; reason?: string; feedbackMessage: string };
@@ -394,6 +433,7 @@ export type RequestRecord = {
     /** Whether THIS record's content was scrubbed. */
     redacted: boolean;
     truncated: boolean;
+    continuityCaptured?: true;
     omitted: string[];
     /**
      * Why this record is a stub, when it is one.

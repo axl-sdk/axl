@@ -33,6 +33,17 @@
 import { AdmissionDeniedError, AxlError } from './errors.js';
 import { sharedContext, sharedGuard, thisCopy, warnCrossCopy } from './shared-context.js';
 import type { CallTiming } from './types.js';
+import {
+  currentCaptureChannel,
+  currentCaptureCorrelation,
+  currentCaptureTurn,
+  snapshotCapturedJson,
+  snapshotError,
+  type CapturedExternalRequestRecord,
+  type CapturedJsonValue,
+  type RequestCaptureChannel,
+} from './diagnostics/capture.js';
+import { redactCapturedRequest } from './redaction.js';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -163,6 +174,14 @@ export type ExternalOperationReport = {
    *   second call.
    */
   setCost(amountUsd: number, usage?: Partial<AccountingUsage>): void;
+  /**
+   * Snapshot caller-supplied JSON evidence. Repeated calls merge the supplied
+   * request and response independently; omitted fields retain prior values.
+   * Capture is diagnostic only: invalid payloads degrade its journal record
+   * without changing this operation's result or charge. Outside a capturing
+   * accounting scope this is a safe no-op.
+   */
+  capture(payload: { request?: unknown; response?: unknown }): void;
 };
 
 /** Descriptor for `withExternalOperation` / {@link externalOperation}. */
@@ -938,6 +957,189 @@ export async function runInAccountingScope<T>(
 // External operations
 // ---------------------------------------------------------------------------
 
+/** Capture is subordinate to settlement; none of these methods may throw. */
+class ExternalJournal {
+  private readonly startedAtMs = Date.now();
+  private ended = false;
+  private payload: { request?: CapturedJsonValue; response?: CapturedJsonValue } = {};
+  private projectionFailure: string | undefined;
+  private readonly identity: Omit<
+    CapturedExternalRequestRecord,
+    'phase' | 'captured' | 'startedAt' | 'endedAt' | 'durationMs' | 'outcomeStatus'
+  >;
+
+  constructor(
+    private readonly channel: RequestCaptureChannel,
+    operationId: string,
+    name: string,
+  ) {
+    const correlation = currentCaptureCorrelation();
+    const turn = currentCaptureTurn();
+    this.identity = {
+      v: 1,
+      operationId,
+      kind: 'external',
+      name,
+      transportAttempts: 1,
+      ...(correlation?.caseIndex !== undefined ? { caseIndex: correlation.caseIndex } : {}),
+      ...(correlation?.scorer !== undefined ? { scorer: correlation.scorer } : {}),
+      ...(turn?.executionId !== undefined ? { executionId: turn.executionId } : {}),
+      ...(turn?.workflow !== undefined ? { workflow: turn.workflow } : {}),
+      ...(turn?.agent !== undefined ? { agent: turn.agent } : {}),
+      ...(turn?.depth !== undefined ? { depth: turn.depth } : {}),
+      ...(turn?.sessionId !== undefined ? { sessionId: turn.sessionId } : {}),
+      purpose: correlation?.scorer ? 'judge' : (turn?.purpose ?? 'direct'),
+      ...(turn?.askId !== undefined ? { askId: turn.askId } : {}),
+      ...(turn?.parentAskId !== undefined ? { parentAskId: turn.parentAskId } : {}),
+      ...(turn?.turn !== undefined ? { turn: turn.turn } : {}),
+    };
+  }
+
+  start(): void {
+    try {
+      this.channel.noteOperation({
+        operationId: this.identity.operationId,
+        kind: 'external',
+        status: 'start_only',
+        ...(this.identity.turn !== undefined ? { turn: this.identity.turn } : {}),
+        ...(this.identity.caseIndex !== undefined ? { caseIndex: this.identity.caseIndex } : {}),
+        ...(this.identity.scorer !== undefined ? { scorer: this.identity.scorer } : {}),
+      });
+      this.write({ phase: 'start', startedAt: new Date(this.startedAtMs).toISOString() });
+    } catch {
+      // The callback has not begun, so no capture defect may refuse it.
+    }
+  }
+
+  capture(payload: { request?: unknown; response?: unknown }): void {
+    if (this.ended) return;
+    try {
+      if (!payload || typeof payload !== 'object') {
+        throw new TypeError('external capture requires an object');
+      }
+      const hasRequest = Object.hasOwn(payload, 'request');
+      const hasResponse = Object.hasOwn(payload, 'response');
+      // Project both before assigning either: a throwing second getter cannot
+      // partly apply one report.capture() call. Earlier calls remain intact.
+      const request = hasRequest ? snapshotCapturedJson(payload.request) : undefined;
+      const response = hasResponse ? snapshotCapturedJson(payload.response) : undefined;
+      if (hasRequest) this.payload.request = request;
+      if (hasResponse) this.payload.response = response;
+    } catch (error) {
+      // Error messages can quote the caller's payload. Only a fixed class
+      // label reaches the stub, including for hostile thrown values.
+      this.projectionFailure ??= `external payload could not be captured: ${captureFailureClass(error)}`;
+    }
+  }
+
+  end(outcome: {
+    error?: unknown;
+    failed: boolean;
+    cost?: number;
+    usage?: Partial<AccountingUsage>;
+  }): void {
+    if (this.ended) return;
+    this.ended = true;
+    const endedAtMs = Date.now();
+    const common = {
+      phase: 'end' as const,
+      startedAt: new Date(this.startedAtMs).toISOString(),
+      endedAt: new Date(endedAtMs).toISOString(),
+      durationMs: Math.max(0, endedAtMs - this.startedAtMs),
+      outcomeStatus: outcome.failed ? ('error' as const) : ('ok' as const),
+      ...(outcome.cost !== undefined
+        ? { cost: outcome.cost, costProvenance: 'caller_reported' }
+        : {}),
+    };
+    let projectedUsage: Partial<AccountingUsage> | undefined;
+    let projectedError: ReturnType<typeof snapshotError> | undefined;
+    try {
+      projectedUsage =
+        outcome.usage !== undefined
+          ? (snapshotCapturedJson(outcome.usage) as Partial<AccountingUsage>)
+          : undefined;
+      projectedError = outcome.failed ? snapshotError(outcome.error) : undefined;
+      if (this.projectionFailure) throw new TypeError(this.projectionFailure);
+      this.write({
+        ...common,
+        ...(projectedUsage !== undefined ? { usage: projectedUsage } : {}),
+        ...(Object.keys(this.payload).length > 0 ? { external: this.payload } : {}),
+        ...(projectedError !== undefined ? { error: projectedError } : {}),
+      });
+      this.channel.noteOperation({
+        operationId: this.identity.operationId,
+        kind: 'external',
+        status: 'recorded',
+      });
+    } catch (error) {
+      const reason =
+        this.projectionFailure ??
+        `external record could not be captured: ${captureFailureClass(error)}`;
+      // Preserve actual settlement and structural identity; only the payload
+      // is omitted. A projection failure is one-record loss, not a run failure.
+      try {
+        this.write({
+          ...common,
+          ...(projectedUsage !== undefined ? { usage: projectedUsage } : {}),
+          ...(projectedError !== undefined
+            ? { error: { ...projectedError, message: '[truncated]' } }
+            : {}),
+          captured: {
+            fidelity: 'runtime_request',
+            redacted: this.channel.redact,
+            truncated: true,
+            omitted: ['record'],
+            reason,
+          },
+        });
+        this.channel.noteOperation({
+          operationId: this.identity.operationId,
+          kind: 'external',
+          status: 'omitted',
+        });
+      } catch {
+        // Even a broken fallback projection cannot replace the operation's
+        // result or original thrown value.
+      }
+    }
+  }
+
+  private write(
+    fields: Pick<CapturedExternalRequestRecord, 'phase'> & Partial<CapturedExternalRequestRecord>,
+  ): void {
+    const record: CapturedExternalRequestRecord = {
+      ...this.identity,
+      captured: { fidelity: 'runtime_request', redacted: false, truncated: false, omitted: [] },
+      ...fields,
+    };
+    this.channel.write(this.channel.redact ? redactCapturedRequest(record) : record);
+  }
+}
+
+function captureFailureClass(error: unknown): string {
+  try {
+    if (error instanceof TypeError) return 'TypeError';
+    if (error instanceof RangeError) return 'RangeError';
+    return error instanceof Error ? 'Error' : 'ThrownValue';
+  } catch {
+    // `instanceof` invokes getPrototypeOf on object RHS values. A revoked
+    // Proxy thrown from a caller getter makes even classification throw.
+    return 'ThrownValue';
+  }
+}
+
+function beginExternalJournal(operationId: string, name: string): ExternalJournal | undefined {
+  const channel = currentCaptureChannel();
+  if (!channel) return undefined;
+  try {
+    const journal = new ExternalJournal(channel, operationId, name);
+    journal.start();
+    return journal;
+  } catch {
+    return undefined;
+  }
+}
+
 function validateReportedCost(amountUsd: number): void {
   if (typeof amountUsd !== 'number' || !Number.isFinite(amountUsd) || amountUsd < 0) {
     throw new AxlError(
@@ -985,12 +1187,16 @@ export async function externalOperation<T>(
         validateReportedCost(amountUsd);
         reportedOutside = true;
       },
+      capture(): void {},
     });
   }
 
+  const journal = beginExternalJournal(handle.id, descriptor.name);
   let reported = false;
   let cost = 0;
   let usage: Partial<AccountingUsage> | undefined;
+  let failed = false;
+  let thrown: unknown;
   const report: ExternalOperationReport = {
     setCost(amountUsd: number, reportedUsage?: Partial<AccountingUsage>): void {
       if (reported) {
@@ -1004,12 +1210,33 @@ export async function externalOperation<T>(
       cost = amountUsd;
       usage = reportedUsage;
     },
+    capture(payload): void {
+      try {
+        journal?.capture(payload);
+      } catch {
+        // Capture is subordinate to the external operation.
+      }
+    },
   };
 
   try {
     return await handle.run(() => fn(report));
+  } catch (error) {
+    failed = true;
+    thrown = error;
+    throw error;
   } finally {
     if (reported) handle.settle({ cost, provenance: 'caller_reported', usage });
     else handle.settleUnknown('external_unreported');
+    try {
+      journal?.end({
+        failed,
+        ...(failed ? { error: thrown } : {}),
+        ...(reported ? { cost, ...(usage !== undefined ? { usage } : {}) } : {}),
+      });
+    } catch {
+      // A diagnostic finalizer must never replace a successful return or the
+      // original exception after the authoritative charge has settled.
+    }
   }
 }

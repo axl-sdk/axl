@@ -53,6 +53,10 @@ describe('HandleSupport workflow', () => {
 | `MockProvider.replay(file)` | Recorded sessions | Replays a recorded session from a JSON file. See snapshot testing below. |
 | `MockProvider.fn(handler)` | Custom logic | Custom response function receiving `(messages, callIndex)`. Returns `{ content, tool_calls? }`. |
 
+`MockProvider.sequence()` also accepts `finishReason`, `rawFinishReason`,
+`responseId`, and `responseModel` on each scripted response. The same fields
+appear on its streamed terminal `done` chunk, so tests can assert both paths.
+
 MockProvider also supports tool call simulation:
 
 ```typescript
@@ -460,7 +464,9 @@ const graded = scorer({
   description: 'Grades with a hosted vendor grader',
   async score(output) {
     return externalOperation({ name: 'vendor-grade' }, async (report) => {
+      report.capture({ request: { answer: output } }); // optional diagnostic JSON
       const res = await callVendor(output);
+      report.capture({ response: { score: res.score } });
       report.setCost(res.usd); // counted, and lands in accounting.breakdown.external
       return res.score;
     });
@@ -472,6 +478,11 @@ An external operation that never calls `report.setCost` is counted as
 `reasons.external_unreported`, so the run reports "incomplete" rather than quietly
 under-reporting. Inside a workflow the `ctx.withExternalOperation` form is equivalent — see
 [`externalOperation`](./api-reference.md#externaloperationdescriptor-fn--ctxwithexternaloperationdescriptor-fn).
+With `captureRequests` on, the operation is also journaled as `kind: 'external'`
+and linked from the item or scorer diagnostics. `report.capture()` is optional
+and never affects accounting. When testing, assert unreported cost separately
+from a reported `$0`, and put a sentinel string in captured payloads to check
+redaction.
 
 To stop a run at a spend threshold, set `EvalConfig.budget` (or pass `--budget`). It is a
 threshold, not a reservation: cases already in flight are allowed to settle, so
@@ -554,6 +565,40 @@ for await (const line of opened!.lines) {
 
 From the CLI, `axl-eval --capture-requests --output result.json` writes the same
 records to `result.requests.jsonl`.
+
+To rescore captured model outputs, load the journal, turn its model calls into
+a dataset, then use the normal eval runner:
+
+```ts
+import { defineEval, loadModelCalls, modelCallDataset, recordedModelCall, replayModelCall, runEval, scorer, type ModelCallInput, type ModelCallOutput } from '@axlsdk/eval';
+
+const records = await loadModelCalls('result.requests.jsonl');
+const captured = modelCallDataset(records, {
+  filter: (record) => record.kind !== 'external',
+});
+const scorers = [
+  scorer<ModelCallOutput, ModelCallInput>({
+    name: 'answered',
+    description: 'model returned text or chose a tool',
+    score: (output) => (output.content.length > 0 || output.tool_calls ? 1 : 0),
+  }),
+];
+const config = defineEval({ workflow: 'captured', dataset: captured, scorers });
+const rescored = await runEval(config, recordedModelCall(), runtime);
+const replayed = await runEval(config, replayModelCall({ model: 'openai:gpt-4o' }), runtime);
+```
+
+Both executors return a `ModelCallOutput`: `content`, parsed `json` when the
+request asked for JSON, and any `tool_calls`, `thinking`, finish reason and
+response id/model. A tool-call turn is scored on the tool it chose. This is one
+model response, not an agent result: tools are never run.
+
+- **Recorded** makes no generation calls; only LLM judges you configure spend.
+- **Replay** makes one new provider call per item, charged as new spend. A
+  record with omitted or missing request data is refused before anything is
+  sent.
+- **Cancellation.** The runner's `signal` stops between cases and scorers, but
+  does not cancel a replay call already in flight.
 
 Three things to know before asserting on capture in a test:
 

@@ -475,6 +475,10 @@ describe('S1 tripwire — eval panels route cost through a completeness helper',
     // `CostPoint.cost` cannot be read without its `completeness` — the type
     // carries both, and the component's whole job is to draw the difference.
     'CostSparkLine.tsx': ['p.cost'],
+    // One external operation's caller-reported charge from its journal `end`
+    // line, printed under a "Reported cost" label beside its operation. It is
+    // diagnostic evidence for that single call, never summed into run spend.
+    'RunDiagnosticsPanel.tsx': ['{end?.cost !== undefined ? <span>{end.cost} USD</span>'],
   };
 
   it('reads no eval compat spend field outside the reader module', () => {

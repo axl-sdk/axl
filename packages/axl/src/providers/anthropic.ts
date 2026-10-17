@@ -24,6 +24,7 @@ import { assertSafeProviderBaseUrl } from '../http-transport.js';
 import type { InputContentPart, InputMediaSource } from '../input.js';
 import { UnsupportedModelInputError, UnsupportedModelOptionError } from '../errors.js';
 import { firstRichPart, type RichModality } from './rich-input.js';
+import { anthropicFinishReason, reportedString } from './response-metadata.js';
 
 function anthropicBase64(source: Extract<InputMediaSource, { type: 'bytes' | 'base64' }>): string {
   return source.type === 'base64'
@@ -1736,9 +1737,18 @@ export class AnthropicProvider implements Provider {
       !refused
         ? estimateAnthropicCost(effectiveModel, normalized.pricingUsage)
         : undefined;
+    const rawFinishReason = reportedString(json.stop_reason);
 
     return {
       content,
+      ...(rawFinishReason !== undefined
+        ? {
+            rawFinishReason,
+            finishReason: anthropicFinishReason(rawFinishReason),
+          }
+        : {}),
+      ...(reportedString(json.id) !== undefined ? { responseId: json.id } : {}),
+      ...(reportedString(json.model) !== undefined ? { responseModel: json.model } : {}),
       thinking_content: thinkingContent || undefined,
       tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
       usage: normalized?.usage,
@@ -1780,6 +1790,9 @@ export class AnthropicProvider implements Provider {
     let hasFallbackIterationSignal = false;
     let refused = false;
     let reasoningContextReset: ReasoningContextReset | undefined;
+    let responseId: string | undefined;
+    let responseModel: string | undefined;
+    let rawFinishReason: string | undefined;
 
     const finalizeUsage = () => {
       const normalized = rawUsage ? normalizeAnthropicUsage(rawUsage) : undefined;
@@ -1798,6 +1811,11 @@ export class AnthropicProvider implements Provider {
           : undefined;
       return {
         type: 'done',
+        ...(rawFinishReason !== undefined
+          ? { rawFinishReason, finishReason: anthropicFinishReason(rawFinishReason) }
+          : {}),
+        ...(responseId !== undefined ? { responseId } : {}),
+        ...(responseModel !== undefined ? { responseModel } : {}),
         usage,
         cost,
         costProvenance: tableEstimate(cost),
@@ -1909,6 +1927,9 @@ export class AnthropicProvider implements Provider {
 
             case 'message_start': {
               // message_start arrives first in the SSE stream with input token counts
+              responseId = reportedString(event.message?.id) ?? responseId;
+              responseModel = reportedString(event.message?.model) ?? responseModel;
+              rawFinishReason = reportedString(event.message?.stop_reason) ?? rawFinishReason;
               if (event.message?.usage) {
                 rawUsage = mergeAnthropicUsage(rawUsage, event.message.usage);
               }
@@ -1938,6 +1959,7 @@ export class AnthropicProvider implements Provider {
             }
 
             case 'message_delta': {
+              rawFinishReason = reportedString(event.delta?.stop_reason) ?? rawFinishReason;
               // A serving-model fallback can replace the initial transformations.
               const finalTransformations =
                 event.input_transformations ?? event.delta?.input_transformations;
@@ -2093,7 +2115,9 @@ type AnthropicStreamEvent = {
     | 'error';
   error?: { type?: string; message?: string };
   message?: {
+    id?: string;
     model?: string;
+    stop_reason?: string | null;
     speed?: string;
     inference_geo?: string;
     usage?: AnthropicUsage;

@@ -423,7 +423,9 @@ Declare paid work Axl cannot observe — a third-party API called from a tool, a
 
 ```typescript
 const rows = await ctx.withExternalOperation({ name: 'vendor-search' }, async (report) => {
+  report.capture({ request: { query } }); // optional caller JSON evidence
   const res = await vendor.search(query);
+  report.capture({ response: { count: res.rows.length } });
   report.setCost(res.billedUsd);       // finite, >= 0; explicit 0 means known-free
   return res.rows;
 });
@@ -433,7 +435,18 @@ Admission is checked **before** `fn` runs. The operation finalizes on return, th
 
 The amount must be **disjoint**: nested `ctx.ask` and other Axl operations account for themselves, and including them double-charges. `setCost(amount, usage?)` also accepts a partial `AccountingUsage`.
 
-`externalOperation` is the module-level equivalent for code without a `ctx`. Outside any accounting scope both still run `fn`, with a report that validates its argument but records nothing.
+When an opt-in request-capture channel and accounting scope are active,
+`report.capture({ request?, response? })` adds caller-supplied JSON evidence to
+the external operation's `end` journal line. Repeated calls update only the
+fields supplied, snapshotting each by value at the call. A cyclic, non-JSON or
+throwing-getter payload degrades that record to a stub; it never changes the
+operation result, error or charge. The same record bounds and `trace.redact`
+policy apply. The `external` record variant has `name`, timing, `outcomeStatus`,
+reported `cost`/`usage` and optional projected error; it has no `provider` or
+`model`. Cost is absent when unreported, including on a successful return.
+Outside a capturing accounting scope `capture()` is a safe no-op.
+
+`externalOperation` is the module-level equivalent for code without a `ctx`. Outside any accounting scope both still run `fn`; `setCost()` validates its argument but records nothing, and `capture()` is a no-op.
 
 ### `runtime.trackExecution(fn, options?)`
 
@@ -1918,6 +1931,45 @@ call without importing the optional `@axlsdk/eval` peer dependency.
 
 Storage for [captured requests](observability.md#captured-requests-opt-in), configured by `config.diagnostics.artifacts`:
 
+`CapturedRequestRecord` remains JSONL codec `v: 1`. Its additive fields include
+`workflow`, `agent`, `depth`, `sessionId`, `purpose`, `rejectedCallId`, optional
+dispatch/settlement timestamps and duration, response finish/identity metadata,
+and `partial` stream output on interrupted calls. Captured request messages
+retain runtime `origin`, and tool definitions retain explicit `strict` values.
+New start lines mark
+`captured.continuityCaptured: true` after a continuity-aware request snapshot;
+older v1 lines without it have unknown replay fidelity. Oversized end stubs
+retain `outcomeStatus`, usage, cost and structural finish/error/timing data while
+omitting the response payload. See [record fidelity and redaction](observability.md#what-a-record-contains).
+The discriminated `kind: 'external'` variant records a caller-declared operation
+by `name` without inventing a provider or model. Eval operation references and
+Studio diagnostics retain mixed model/external artifacts.
+
+`foldJournal(lines)` accepts decoded v1 journal lines and returns one validated
+`FoldedOperationRecord` per operation id. The union distinguishes
+`ModelCallRecord` (`kind: 'chat' | 'stream'`, with provider/model) from
+`ExternalOperationRecord` (`kind: 'external'`, with name). Each is `v: 2`;
+`modelCallRecordSchema`, `externalOperationRecordSchema`, and
+`foldedOperationRecordSchema` validate their respective forms. The exported
+`capturedJournalLineSchema` validates a decoded v1 line. An invalid line or
+contradictory identity/phase throws `AxlError('INVALID_CAPTURE_JOURNAL')`.
+Interleaved operation ids are supported; exact duplicate lines are ignored.
+Validation snapshots strict JSON by value, including unknown additive v1
+fields, so later mutations to an input line cannot change the folded record.
+
+The model record has `id`, `kind`, `provider`, `model`, optional `purpose`,
+`startedAt`/`endedAt`, `ids`, `attributes`, optional `gate`, `request`, `usage`,
+`cost`, `costProvenance`, `timing`, `captured`, and a closed `outcome`. Outcome
+statuses are `ok`, `error`, `aborted`, `stalled`, `consumer_closed`, and
+`unfinished`. A settled stub keeps its known status with `payloadOmitted: true`;
+`unfinished` means no end line was captured. Legacy timestamps and purpose are
+absent when the journal did not report them. `captured.replayable` is true only
+for an unredacted, untruncated request with the continuity marker and no
+omissions or provider option values. `redactModelCallRecord(record)` returns a
+redacted copy and clears replayability while retaining ids, attributes,
+timing, usage, and cost. The folded form is a consumption format; artifacts
+continue to store v1 phase lines.
+
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `root` | `string?` | — | Directory for the built-in `FileDiagnosticArtifactStore`. One of `root` or `store` is required for capture |
@@ -1972,7 +2024,29 @@ Lifecycle, retention and reclamation rules: [integration.md](integration.md#diag
 |--------|---------|-------------|
 | `initializeTelemetry()` | `Promise<void>` | Enable OpenTelemetry span emission. Call before executing workflows |
 | `initializeMcp()` | `Promise<void>` | Connect to configured MCP servers |
-| `shutdown()` | `Promise<void>` | Abort all in-flight executions, close MCP connections, memory manager, state store, and span manager |
+| `shutdown()` | `Promise<void>` | Abort all in-flight executions and close runtime-owned resources, including the span manager. It does not flush or shut down a supplied or global OpenTelemetry tracer provider; the application owns that provider's lifecycle |
+
+### OpenTelemetry configuration
+
+`AxlConfig.telemetry` accepts `TelemetryConfig`:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | `boolean?` | `false` | Enable OTel spans after `runtime.initializeTelemetry()`. `@opentelemetry/api` is an optional peer dependency |
+| `tracerProvider` | `unknown?` | Global OTel provider | Application-supplied tracer provider. Axl never flushes or shuts it down |
+| `serviceName` | `string?` | `'axl'` | Tracer name passed to `getTracer()` |
+| `captureContent` | `boolean?` | `false` | Opt in to GenAI system instructions, input/output messages, and tool-definition attributes. If omitted, `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true` (case-insensitive) enables it; any other defined value leaves it off. An explicit `true` or `false` always wins over the environment. `trace.redact: true` suppresses content regardless of this setting. Each content attribute is bounded by `maxContentAttributeBytes` and omitted whole when larger; omitted keys are listed in the span's `axl.gen_ai.content_omitted` string array |
+| `maxContentAttributeBytes` | `number?` | `65536` (64 KiB) | UTF-8 bound for each opted-in content attribute (and the stop-sequence array). Must be a positive integer; an invalid value throws `RangeError` when the runtime is constructed. Raise it only if your exporter, collector and backend accept attributes that large |
+
+Inference spans use the optional `SpanManager.startSpan?(name, attributes,
+options?)` method, where `options` is `{ kind?: 'client'; startTime?: number }`.
+`startTime` is epoch milliseconds at logical call initiation. The returned
+`SpanHandle` supports `setAttribute`, `addEvent`, `setStatus`, and `end`;
+attributes accept strings, numbers, booleans, and native arrays of each type.
+Existing custom managers that implement only `withSpanAsync`,
+`addEventToActiveSpan`, and `shutdown` remain valid; Axl skips inference spans
+when `startSpan` is absent. See [OpenTelemetry integration](observability.md#opentelemetry-integration)
+for span lifetime and content rules.
 
 ### Ad-hoc Context and Cost Tracking
 
@@ -2122,6 +2196,19 @@ Anthropic cache creation is included in
 `cache_write_tokens`; when the response provides 5-minute and 1-hour TTL buckets, Axl prices
 each bucket at its actual multiplier. Aggregate-only cache-write usage remains observable but
 is deliberately unpriced.
+
+**Provider response metadata** — `ProviderResponse` and terminal `StreamChunk`
+(`type: 'done'`) can carry four optional fields:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `finishReason` | `'stop' \| 'length' \| 'tool_calls' \| 'content_filter' \| 'refusal' \| 'other'` | Provider-neutral terminal reason; an unrecognized reported reason maps to `'other'` |
+| `rawFinishReason` | `string` | The vendor's reported finish reason or terminal status used for normalization |
+| `responseId` | `string` | Provider-reported response identifier |
+| `responseModel` | `string` | Provider-reported serving model |
+
+Missing wire fields remain absent. In particular, `responseModel` is never
+filled from the requested model. See [provider mappings](providers.md#response-metadata).
 
 `ProviderResponse.diagnostics?.reasoningContextReset` and the terminal stream
 `done.diagnostics` carry the same `ReasoningContextReset`: `droppedBlocks` plus
@@ -2630,6 +2717,70 @@ timeout check.
 ---
 
 ## Evaluation Types
+
+### Captured model-call eval helpers
+
+`@axlsdk/eval` exports `loadModelCalls(source)`, `modelCallDataset(records,
+{ filter?, annotate? })`, `recordedModelCall()`, and
+`replayModelCall({ model? })`. `source` is a file path to v1 journal JSONL, v2
+record JSONL, or a JSON array, or an in-memory record array. The asynchronous
+loader returns `FoldedOperationRecord[]`, preserving both model and external
+operations. A source cannot mix v1 phase lines with v2 records. Blank JSONL
+separator lines are allowed; malformed lines report their physical line number.
+Every entry is validated, including entries passed in memory.
+
+`modelCallDataset` returns an ordinary `Dataset<ModelCallInput, TAnnotations>`
+named `model-calls`. Each input has `{ request?, ids, attributes, recorded }`;
+`recorded` is the validated `ModelCallRecord`. `filter` runs on each validated
+folded operation. An external operation that remains after filtering throws
+`AxlError('MODEL_CALL_EXPECTED')`; it is never silently dropped. `annotate`
+attaches typed ground truth for scorers.
+
+Both executor factories return an ordinary `executeWorkflow` callback accepted
+by `runEval` and core's `EvalExecuteWorkflow` type. They return `{ output }`
+with no historical cost claim. Both outputs are a `ModelCallOutput`:
+
+```ts
+type ModelCallOutput = {
+  content: string;            // model text ('' for a tool-call-only turn)
+  json?: unknown;             // parsed content when the request asked for JSON
+  thinking?: string;
+  tool_calls?: ToolCallMessage[];
+  finishReason?: FinishReason;
+  rawFinishReason?: string;
+  responseId?: string;
+  responseModel?: string;
+};
+```
+
+Field names match a recorded `ok` outcome's `response`, so a scorer can compare
+a replay against `input.recorded` directly; opaque `providerMetadata` is not
+part of the output. Type a scorer as `scorer<ModelCallOutput, ModelCallInput>`.
+`recordedModelCall` reads a complete, unredacted successful response without a
+model call. `json` is set for a captured `json_object`/`json_schema` request;
+unparseable text throws `AxlError('INVALID_MODEL_CALL_JSON')`, except that a
+tool-call turn with empty text has no `json`. JSON parsing does not
+reconstruct the original Zod refinements or transforms. A request stub can
+still supply scorable text when its outcome has a complete response; without
+the request, its response format is unknown. Missing, redacted, omitted, or
+non-successful output throws a typed error.
+
+`replayModelCall` sends one captured request through
+`runtime.resolveProvider(...).provider`, preserving chat versus stream mode,
+message history (including reasoning continuity, agent provenance, runtime origin and ordered
+text parts), tool definitions, response format and allowlisted options. It
+refuses a missing, redacted, truncated, omitted or otherwise non-replayable
+request before dispatch. A full `provider:model` override selects a different
+model; a bare captured model is resolved with its captured provider. Custom
+registry aliases that cannot be resolved safely require an explicit override.
+Replay executes no tool calls from the response; the calls the new model
+chose are returned in `tool_calls`, with its finish reason and response
+identity. Only the **new** call is measured as spend by `runEval`.
+A replayed stream stops at its terminal `done`; EOF before `done` raises a
+typed incomplete-stream error instead of returning partial text.
+`RunEvalOptions.signal` is checked between cases and scorers; the existing
+`executeWorkflow(input, runtime)` callback does not receive that signal, so
+it does not cancel an already dispatched replay call.
 
 Types from `@axlsdk/eval` used by `runEval()`, `runtime.eval()`, and the CLI.
 

@@ -47,6 +47,12 @@ lifecycle-organized `.internal/plans/`; durable decision inputs belong under
 `.internal/research/`. Follow `.internal/README.md`. The subsystem → doc map is in
 `.claude/rules/documentation.md`.
 
+**Write public docs for users, not reviewers.** Lead with what the reader can do, use
+plain words instead of internal design vocabulary, keep each fact in one place, and
+put exhaustive guarantees in `docs/api-reference.md` or `.internal/spec/`. When you
+touch a section that breaks these rules, fix it in the same change. The full style
+rules are in `.claude/rules/documentation.md` ("Writing style").
+
 ## Commands
 ```bash
 pnpm test            # all tests (unit + e2e + studio) — MockProvider, no API keys

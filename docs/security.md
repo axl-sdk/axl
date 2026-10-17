@@ -319,7 +319,11 @@ See [docs/migration/state-store-durability.md](./migration/state-store-durabilit
 
 ## Observability-Boundary Redaction
 
-`config.trace.redact: true` enables a three-layer filter that scrubs user/LLM content everywhere it would otherwise flow to observability consumers, while preserving structural metadata (IDs, keys, agent/tool/workflow names, roles, cost/token metrics, durations, timestamps, `askId`/`parentAskId`/`depth`) so observability stays useful under compliance mode.
+`config.trace.redact: true` enables a three-layer event/Studio filter and
+suppresses optional GenAI span content. It preserves structural metadata (IDs,
+keys, agent/tool/workflow names, roles, cost/token metrics, durations,
+timestamps, `askId`/`parentAskId`/`depth`) so observability stays useful under
+compliance mode.
 
 ```typescript
 const runtime = new AxlRuntime({
@@ -344,6 +348,23 @@ Studio consumers should check the flag via `runtime.isRedactEnabled(): boolean` 
 
 See [observability.md](./observability.md#pii-and-redaction) for the complete per-route scrubbed/preserved field table.
 
+### OpenTelemetry span content
+
+With telemetry enabled, inference spans export structural GenAI attributes
+only. Prompts, responses, reasoning and tool definitions are added only when
+you set `telemetry.captureContent: true` (or the
+`OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` fallback), and
+`trace.redact: true` always removes them. See
+[content capture](./observability.md#genai-content-capture) for what is
+included and the size limit.
+
+Two things export without content capture:
+
+- **Stop sequences**, as a request parameter. Keep secrets out of them, or
+  enable `trace.redact`, which removes them too.
+- **`error.type`**, a short error class or code. Span status never carries the
+  error message.
+
 ### `ProviderError.body` is intentionally off the event stream
 
 When a provider returns a non-2xx response, the adapter throws a `ProviderError`
@@ -362,18 +383,38 @@ programmatically. See [providers.md](./providers.md#typed-provider-errors).
 and responses of a run to disk. That is exactly the material redaction exists to
 contain, so the same policy applies, twice:
 
-- **Before the write.** When `trace.redact` is on, every record passes through
+- **Before the write.** When `trace.redact` is on, every full record passes through
   `redactCapturedRequest()` before it reaches the sink. Message content, tool-call
-  arguments, response content, error messages and gate `reason` /
-  `feedbackMessage` become `'[redacted]'`; structure (roles, counts, model,
-  provider, timings, ids) survives, and the record is stamped
+  arguments, tool descriptions and schemas, output schemas, stop strings,
+  tool choice, response content and thinking, partial stream output, error
+  messages and gate `reason` / `feedbackMessage` become `'[redacted]'`.
+  Opaque `providerMetadata` is removed from both request and response, with
+  the omission recorded; structure (roles, counts, model, provider, timings,
+  ids, usage and cost) survives, and the record is stamped
   `captured.redacted: true`.
 - **Again at delivery.** Studio re-applies redaction when streaming records out,
   because an artifact may have been written before the flag was switched on.
+  Imported legacy lines without an `options` block are redacted the same way.
 
-Rich media never lands in an artifact: image, audio and file parts are replaced
-by descriptors. `providerOptions` contributes **keys only** — a credential
-passed through it cannot reach the file even unredacted.
+If a request or response can't be projected, capture writes a stub whose
+reason is a fixed label, never the error's own name, code or message.
+
+`redactModelCallRecord()` applies the same scrub to a folded `v: 2` record and
+returns a copy marked `captured.replayable: false`. Ids, timing, usage and cost
+survive; the original is unchanged.
+
+What an unredacted artifact can contain:
+
+- **Model calls.** Media parts become descriptors and `providerOptions` keeps
+  **keys only**, so a credential passed there never reaches the file. Message
+  content and opaque `providerMetadata` remain, so treat the artifact as
+  sensitive model content.
+- **External operations.** Whatever JSON your code passes to
+  `report.capture()`, including any credentials or media you put there. Pass
+  only the fields you need. With `trace.redact`, `external.request` and
+  `external.response` become `'[redacted]'` before storage and again at Studio
+  delivery; the name, outcome, timing, usage and cost remain. Studio also drops
+  unexpected fields from imported external lines.
 
 Capture is off unless a run asks for it, and asking requires a configured
 artifact root or store; there is no implicit location and no ambient default.

@@ -1,7 +1,8 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { NoopSpanManager } from '../telemetry/noop.js';
 import { createSpanManager } from '../telemetry/index.js';
 import { OTelSpanManager } from '../telemetry/span-manager.js';
+import type { SpanManager } from '../telemetry/types.js';
 
 // OTel SDK imports for testing
 import {
@@ -15,12 +16,17 @@ import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { agent } from '../agent.js';
 import { WorkflowContext } from '../context.js';
+import { AxlRuntime } from '../runtime.js';
 import { ProviderRegistry } from '../providers/registry.js';
 import { tool } from '../tool.js';
 import { createSequenceProvider } from './helpers.js';
 
 describe('telemetry', () => {
   describe('NoopSpanManager', () => {
+    it('has no explicit inference-span API', () => {
+      const manager: SpanManager = new NoopSpanManager();
+      expect(manager.startSpan).toBeUndefined();
+    });
     it('executes fn and returns result', async () => {
       const mgr = new NoopSpanManager();
       const result = await mgr.withSpanAsync('test', {}, async () => 42);
@@ -108,6 +114,32 @@ describe('OTelSpanManager', () => {
     expect(spans[0].name).toBe('test.span');
     expect(spans[0].attributes['test.key']).toBe('value');
     expect(spans[0].attributes['test.num']).toBe(42);
+  });
+
+  it('starts one CLIENT span under the active parent and ends it only once', async () => {
+    await manager.withSpanAsync('ask', {}, async () => {
+      const span = manager.startSpan(
+        'chat test-model',
+        {
+          'gen_ai.operation.name': 'chat',
+          'gen_ai.request.stop_sequences': ['one', 'two'],
+        },
+        { kind: 'client' },
+      );
+      span.setAttribute('gen_ai.response.finish_reasons', ['stop']);
+      span.setStatus('ok');
+      span.end();
+      span.end();
+    });
+    const spans = exporter.getFinishedSpans();
+    expect(spans).toHaveLength(2);
+    const parent = spans.find((span) => span.name === 'ask')!;
+    const inference = spans.find((span) => span.name === 'chat test-model')!;
+    expect(inference.kind).toBe(2); // OTel SpanKind.CLIENT
+    expect(inference.parentSpanContext?.spanId).toBe(parent.spanContext().spanId);
+    expect(inference.attributes['gen_ai.request.stop_sequences']).toEqual(['one', 'two']);
+    expect(inference.attributes['gen_ai.response.finish_reasons']).toEqual(['stop']);
+    expect(inference.status.code).toBe(1);
   });
 
   it('returns the function result', async () => {
@@ -210,6 +242,11 @@ describe('OTelSpanManager', () => {
     );
     expect(toolSpan?.parentSpanContext?.spanId).toBe(outerAsk?.spanContext().spanId);
     expect(innerAsk?.parentSpanContext?.spanId).toBe(toolSpan?.spanContext().spanId);
+    expect(outerAsk?.attributes['gen_ai.operation.name']).toBe('invoke_agent');
+    expect(outerAsk?.attributes['gen_ai.agent.name']).toBe('otel-outer');
+    expect(toolSpan?.attributes['gen_ai.operation.name']).toBe('execute_tool');
+    expect(toolSpan?.attributes['gen_ai.tool.name']).toBe('ask_otel_inner');
+    expect(toolSpan?.attributes['gen_ai.tool.call.id']).toBe('otel-tool-call');
   });
 
   it('setAttribute adds attributes after creation', async () => {
@@ -247,14 +284,39 @@ describe('OTelSpanManager', () => {
     expect(spans[0].events[0].name).toBe('active.event');
   });
 
-  it('shutdown flushes provider', async () => {
-    await manager.withSpanAsync('test.shutdown', {}, async () => 'done');
-    // Spans are recorded before shutdown
-    const spansBefore = exporter.getFinishedSpans();
-    expect(spansBefore.length).toBeGreaterThanOrEqual(1);
-    // shutdown should resolve without error
-    await manager.shutdown();
-  });
+  it.each(['supplied', 'global'] as const)(
+    'runtime shutdown leaves the %s tracer provider running',
+    async (selection) => {
+      const shutdown = vi.spyOn(provider, 'shutdown');
+      const forceFlush = vi.spyOn(provider, 'forceFlush');
+      // The OTel API normally returns a proxy for the global provider. Return
+      // the registered provider itself so this path exercises ownership too.
+      const globalProvider =
+        selection === 'global'
+          ? vi.spyOn(trace, 'getTracerProvider').mockReturnValue(provider)
+          : undefined;
+      const runtime = new AxlRuntime({
+        telemetry: {
+          enabled: true,
+          ...(selection === 'supplied' ? { tracerProvider: provider } : {}),
+        },
+      });
+
+      try {
+        await runtime.initializeTelemetry();
+        await runtime.shutdown();
+
+        expect(shutdown).not.toHaveBeenCalled();
+        expect(forceFlush).not.toHaveBeenCalled();
+        provider.getTracer('after-axl-shutdown').startSpan('still-running').end();
+        expect(exporter.getFinishedSpans().some((span) => span.name === 'still-running')).toBe(
+          true,
+        );
+      } finally {
+        globalProvider?.mockRestore();
+      }
+    },
+  );
 
   it('emits axl.agent.handoff span with source and target attributes', async () => {
     // Use the OTelSpanManager directly to verify handoff span creation

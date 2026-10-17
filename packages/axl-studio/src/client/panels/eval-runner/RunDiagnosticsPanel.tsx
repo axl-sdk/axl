@@ -166,7 +166,8 @@ function OperationRow({ operation, index }: { operation: CapturedOperation; inde
   const responseStub = stubCause(end);
   // A response is missing either because the operation has no `end` line at
   // all, or because its `end` carries neither response nor error.
-  const noResponse = !end || (end.response === undefined && end.error === undefined);
+  const noResponse =
+    head?.kind !== 'external' && (!end || (end.response === undefined && end.error === undefined));
 
   return (
     <li className="border-b border-[hsl(var(--border))] last:border-b-0">
@@ -177,7 +178,9 @@ function OperationRow({ operation, index }: { operation: CapturedOperation; inde
         className="w-full text-left px-3 py-2 hover:bg-[hsl(var(--muted))]/60 focus:outline-none focus-visible:ring-1 focus-visible:ring-[hsl(var(--ring))]"
       >
         <span className="flex items-baseline gap-2 flex-wrap text-[11px]">
-          <span className="font-mono text-[hsl(var(--foreground))]">{head?.model}</span>
+          <span className="font-mono text-[hsl(var(--foreground))]">
+            {head?.kind === 'external' ? head.name : head?.model}
+          </span>
           <span className="font-mono text-[hsl(var(--muted-foreground))]">{head?.kind}</span>
           {correlation && (
             <span className="text-[hsl(var(--muted-foreground))]">{correlation}</span>
@@ -185,15 +188,23 @@ function OperationRow({ operation, index }: { operation: CapturedOperation; inde
           {head?.turn !== undefined && (
             <span className="text-[hsl(var(--muted-foreground))]">turn {head.turn}</span>
           )}
-          <span className="text-[hsl(var(--muted-foreground))]">
-            {attempts !== undefined ? (
-              <>attempt {attempts}</>
-            ) : (
-              <>
-                attempt <Unknown what="Transport attempt" />
-              </>
-            )}
-          </span>
+          {head?.kind !== 'external' && (
+            <span className="text-[hsl(var(--muted-foreground))]">
+              {attempts !== undefined ? (
+                <>attempt {attempts}</>
+              ) : (
+                <>
+                  attempt <Unknown what="Transport attempt" />
+                </>
+              )}
+            </span>
+          )}
+          {head?.kind === 'external' && end?.outcomeStatus && (
+            <span className="text-[hsl(var(--muted-foreground))]">{end.outcomeStatus}</span>
+          )}
+          {head?.kind === 'external' && !end && (
+            <span className="text-amber-700 dark:text-amber-300">no end record</span>
+          )}
           {end?.termination !== undefined && (
             <span
               className="text-amber-700 dark:text-amber-300"
@@ -270,6 +281,26 @@ function Pre({ label, value }: { label: string; value: unknown }) {
 function OperationDetail({ operation, index }: { operation: CapturedOperation; index: number }) {
   const start = operation.start;
   const end = operation.end;
+  if (start?.kind === 'external' || end?.kind === 'external') {
+    const payload = end?.external;
+    const omitted = omittedAcross(operation.records);
+    return (
+      <div className="space-y-2" data-testid={`operation-detail-${index}`}>
+        {!end && <Row label="Outcome">no end record — settlement is unknown</Row>}
+        {payload?.request !== undefined && <Pre label="Caller request" value={payload.request} />}
+        {payload?.response !== undefined && (
+          <Pre label="Caller response" value={payload.response} />
+        )}
+        {end?.error && <Pre label="Error" value={end.error} />}
+        <Row label="Reported cost">
+          {end?.cost !== undefined ? <span>{end.cost} USD</span> : <Unknown what="Cost" />}
+        </Row>
+        {end?.usage !== undefined && <Pre label="Reported usage" value={end.usage} />}
+        {stubCause(end) && <Row label="Payload">record stub — {stubCause(end)}</Row>}
+        {omitted.length > 0 && <Row label="Omitted">{omitted.join(', ')}</Row>}
+      </div>
+    );
+  }
   const request = start?.request;
   const response = end?.response;
   const correction = operation.records.find((r) => r.correction)?.correction;

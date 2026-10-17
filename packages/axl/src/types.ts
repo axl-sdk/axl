@@ -1571,11 +1571,28 @@ export type CallTiming = {
   wireMs: number;
 };
 
+/** Provider-neutral reason a model call ended. Unrecognized wire reasons map to `other`. */
+export type FinishReason =
+  | 'stop'
+  | 'length'
+  | 'tool_calls'
+  | 'content_filter'
+  | 'refusal'
+  | 'other';
+
 /** Provider response */
 export type ProviderResponse = {
   content: string;
   thinking_content?: string;
   tool_calls?: ToolCallMessage[];
+  /** Provider-neutral finish reason, when the wire reports a terminal reason or status. */
+  finishReason?: FinishReason;
+  /** Exact vendor finish reason or status used to derive `finishReason`. */
+  rawFinishReason?: string;
+  /** Response identifier reported by the provider. Never inferred from the request. */
+  responseId?: string;
+  /** Model reported in the response. Never inferred from the requested model. */
+  responseModel?: string;
   usage?: {
     prompt_tokens: number;
     completion_tokens: number;

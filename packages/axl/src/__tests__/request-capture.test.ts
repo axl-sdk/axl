@@ -16,6 +16,9 @@ import { z } from 'zod';
 import { agent } from '../agent.js';
 import { workflow } from '../workflow.js';
 import { AxlRuntime } from '../runtime.js';
+import { AdmissionController } from '../accounting.js';
+import { ProviderError } from '../providers/errors.js';
+import { StallTimeoutError } from '../errors.js';
 import type { CapturedRequestRecord } from '../diagnostics/capture.js';
 import type { ChatMessage, ChatOptions, Provider, StreamChunk } from '../providers/types.js';
 import type { ProviderResponse } from '../types.js';
@@ -77,6 +80,7 @@ describe('A10 — captured request reflects the submitted conversation', () => {
     // `messages`, leaving a "retry" record that explains nothing.
     expect(starts[0].request!.messages.length).toBeGreaterThan(0);
     expect(starts[1].request!.messages.length).toBeGreaterThan(starts[0].request!.messages.length);
+    expect(starts[1].rejectedCallId).toBe(starts[0].operationId);
     // Turn 2 submitted the rejected attempt AND the correction, in that order.
     const turn2 = starts[1].request!.messages;
     expect(turn2.at(-2)).toMatchObject({ role: 'assistant', content: 'not json at all' });
@@ -108,6 +112,7 @@ describe('A10 — captured request reflects the submitted conversation', () => {
     const starts = phase(records, 'start');
 
     expect(starts[1].retryReason).toBe('validate');
+    expect(starts[1].rejectedCallId).toBe(starts[0].operationId);
     expect(starts[1].correction).toMatchObject({ stage: 'validate', reason: 'too small' });
     // A single generic "retry" label for every rejection kind is the bug.
     expect(starts[1].correction!.stage).not.toBe('schema');
@@ -138,6 +143,7 @@ describe('A10 — captured request reflects the submitted conversation', () => {
 
     expect(starts).toHaveLength(2);
     expect(starts[1].retryReason).toBe('guardrail');
+    expect(starts[1].rejectedCallId).toBe(starts[0].operationId);
     expect(starts[1].correction).toMatchObject({ stage: 'guardrail', reason: 'contains bad' });
     expect(starts[1].request!.messages.at(-2)).toMatchObject({ content: 'bad words' });
   });
@@ -254,6 +260,7 @@ describe('A10 — captured request reflects the submitted conversation', () => {
     // A tool continuation is an agent-loop iteration; calling it a repair is
     // the narrative bug this kills.
     expect(starts[1].retryReason).toBeUndefined();
+    expect(starts[1].rejectedCallId).toBeUndefined();
     expect(starts[1].correction).toBeUndefined();
   });
 
@@ -304,6 +311,592 @@ describe('A10 — captured request reflects the submitted conversation', () => {
     expect(starts[2].correction!.stage).toBe('schema');
     // Accounting is untouched by any of this.
     expect(outcome.accounting.operations.total).toBe(3);
+  });
+});
+
+describe('P2 — journal fidelity at the provider boundary', () => {
+  it('labels runtime summaries and eval judge calls without inventing ask identity', async () => {
+    const { runtime } = scriptedRuntime([{ content: 'summary' }, { content: 'judge' }]);
+    const sink = new CollectingSink();
+    const channel = channelWith(sink);
+    const outcome = await runtime.trackOutcome(
+      async () => {
+        await runtime.summarizeMessages([{ role: 'user', content: 'old history' }], 'scripted:m');
+        await runtime.trackOutcome(
+          () =>
+            runtime
+              .resolveProvider('scripted:m')
+              .provider.chat([{ role: 'user', content: 'score this' }], { model: 'm' }),
+          { purpose: 'judging', captureCorrelation: { caseIndex: 2, scorer: 'quality' } },
+        );
+      },
+      { capture: channel },
+    );
+    await channel.close();
+    expect(outcome.status).toBe('fulfilled');
+    const starts = phase(sink.records(), 'start');
+    expect(starts).toHaveLength(2);
+    expect(starts[0]).toMatchObject({ purpose: 'summary', turn: 0 });
+    expect(starts[0].askId).toBeUndefined();
+    expect(starts[1]).toMatchObject({ purpose: 'judge', caseIndex: 2, scorer: 'quality' });
+    expect(starts[1].askId).toBeUndefined();
+    expect(starts[1].turn).toBeUndefined();
+  });
+
+  it('keeps a context summary in its nested ask branch without inheriting repair state', async () => {
+    const { runtime } = scriptedRuntime([
+      {
+        content: '',
+        tool_calls: [{ id: 'c1', type: 'function', function: { name: 'nested', arguments: '{}' } }],
+      },
+      { content: 'summary' },
+      { content: 'inner answer' },
+      { content: 'outer answer' },
+    ]);
+    const { tool } = await import('../tool.js');
+    const inner = agent({ name: 'inner', model: 'scripted:m', maxContext: 500 });
+    const nested = tool({
+      name: 'nested',
+      description: 'nested ask',
+      input: z.object({}),
+      handler: async () => ctx.ask(inner, 'inner'),
+    } as never);
+    const outer = agent({ name: 'outer', model: 'scripted:m', tools: [nested] });
+    const ctx = runtime.createContext({
+      sessionHistory: Array.from({ length: 20 }, (_, i) => ({
+        role: (i % 2 ? 'assistant' : 'user') as 'assistant' | 'user',
+        content: `history ${i} ${'x'.repeat(200)}`,
+      })),
+    });
+    const { records } = await capture(runtime, () => ctx.ask(outer, 'outer'));
+    const starts = phase(records, 'start');
+    const summary = starts.find((r) => r.purpose === 'summary')!;
+    const nestedAsk = starts.find((r) => r.purpose === 'ask' && r.agent === 'inner')!;
+    const outerAsk = starts.find((r) => r.purpose === 'ask' && r.agent === 'outer')!;
+    expect(summary).toBeDefined();
+    expect(nestedAsk).toBeDefined();
+    expect(summary.askId).toBe(nestedAsk.askId);
+    expect(summary.parentAskId).toBe(outerAsk.askId);
+    expect(nestedAsk.parentAskId).toBe(outerAsk.askId);
+    expect(summary).toMatchObject({ purpose: 'summary', turn: 0 });
+    expect(summary.retryReason).toBeUndefined();
+    expect(summary.rejectedCallId).toBeUndefined();
+    expect(summary.correction).toBeUndefined();
+  });
+
+  it('links repair calls within concurrent ask branches only', async () => {
+    const attempts = new Map<string, number>();
+    const provider: Provider = {
+      name: 'branch',
+      async chat(messages) {
+        const branch = messages.some(
+          (message) => typeof message.content === 'string' && message.content.includes('branch-A'),
+        )
+          ? 'A'
+          : 'B';
+        const attempt = (attempts.get(branch) ?? 0) + 1;
+        attempts.set(branch, attempt);
+        await Promise.resolve(); // Both asks can be in flight before either settles.
+        return { content: attempt === 1 ? 'invalid' : '{"value":1}' };
+      },
+      async *stream() {
+        yield { type: 'done' };
+      },
+    };
+    const runtime = new AxlRuntime({ defaultProvider: 'branch' });
+    runtime.registerProvider('branch', provider);
+    const asker = agent({ name: 'branch-agent', model: 'branch:m', system: 'fixture' });
+    runtime.register(
+      workflow({
+        name: 'parallel-repairs',
+        input: z.any(),
+        handler: async (ctx) =>
+          Promise.all([
+            ctx.ask(asker, 'branch-A', { schema: Answer, retries: 1 }),
+            ctx.ask(asker, 'branch-B', { schema: Answer, retries: 1 }),
+          ]),
+      }),
+    );
+    const { records, outcome } = await capture(runtime, () =>
+      runtime.execute('parallel-repairs', {}),
+    );
+    expect(outcome.status).toBe('fulfilled');
+    const byAsk = new Map<string, CapturedRequestRecord[]>();
+    for (const record of phase(records, 'start')) {
+      const key = record.askId ?? 'missing';
+      byAsk.set(key, [...(byAsk.get(key) ?? []), record]);
+    }
+    expect(byAsk.size).toBe(2);
+    for (const starts of byAsk.values()) {
+      expect(starts).toHaveLength(2);
+      expect(starts![1].rejectedCallId).toBe(starts![0].operationId);
+      expect(starts![1].retryReason).toBe('schema');
+      expect(starts![0].workflow).toBe('parallel-repairs');
+      expect(starts![0].agent).toBe('branch-agent');
+      expect(starts![0].depth).toBe(0);
+      expect(starts![0].purpose).toBe('ask');
+    }
+  });
+
+  it('emits no journal lines when admission closes after open but before built-in dispatch', async () => {
+    const entered = deferred();
+    const release = deferred();
+    class AdmissionAwareProvider implements Provider {
+      readonly name = 'admission-aware';
+      readonly reportsRequestLifecycle = true as const;
+      async chat(messages: ChatMessage[], options: ChatOptions): Promise<ProviderResponse> {
+        if (messages[0]?.content === 'slow') {
+          entered.resolve();
+          await release.promise;
+        }
+        options.dispatchAdmission?.beforeDispatch(1);
+        options.requestLifecycle?.onDispatch?.();
+        return { content: 'ok', cost: 1 };
+      }
+      async *stream(): AsyncGenerator<StreamChunk> {
+        yield { type: 'done' };
+      }
+    }
+    const runtime = new AxlRuntime({ defaultProvider: 'admission-aware' });
+    runtime.registerProvider('admission-aware', new AdmissionAwareProvider());
+    const facade = runtime.resolveProvider('admission-aware:m').provider;
+    const sink = new CollectingSink();
+    const channel = channelWith(sink);
+    const admission = new AdmissionController({ limit: 1 });
+    const outcome = await runtime.trackOutcome(
+      async () => {
+        const slow = facade.chat([{ role: 'user', content: 'slow' }], { model: 'm' });
+        await entered.promise;
+        await facade.chat([{ role: 'user', content: 'fast' }], { model: 'm' });
+        release.resolve();
+        await expect(slow).rejects.toMatchObject({ name: 'AdmissionDeniedError' });
+      },
+      { admission, capture: channel },
+    );
+    await channel.close();
+
+    expect(outcome.status).toBe('fulfilled');
+    expect(outcome.accounting.operations.total).toBe(1);
+    expect(outcome.accounting.operations.denied).toBe(1);
+    expect(sink.records().map((record) => record.phase)).toEqual(['start', 'end']);
+    expect(phase(sink.records(), 'start')[0].request?.messages[0].content).toBe('fast');
+  });
+
+  it('snapshots nested continuity metadata, tool schemas and response metadata by value', async () => {
+    const continuity = {
+      anthropicThinkingBlocks: [
+        { type: 'thinking', thinking: 'reason', signature: 'sig-original' },
+      ],
+    };
+    const parameters = { type: 'object', properties: { city: { description: 'original' } } };
+    const responseMetadata = { geminiParts: [{ text: 'raw', thoughtSignature: 'sig-response' }] };
+    const provider: Provider = {
+      name: 'fixture',
+      async chat() {
+        return {
+          content: 'answer',
+          thinking_content: 'hidden reasoning',
+          finishReason: 'stop',
+          rawFinishReason: 'end_turn',
+          responseId: 'msg_1',
+          responseModel: 'served-model',
+          providerMetadata: responseMetadata,
+        };
+      },
+      async *stream() {
+        yield { type: 'done' };
+      },
+    };
+    const runtime = new AxlRuntime({ defaultProvider: 'fixture' });
+    runtime.registerProvider('fixture', provider);
+    const facade = runtime.resolveProvider('fixture:m').provider;
+    const sink = new CollectingSink();
+    const channel = channelWith(sink);
+    const messages: ChatMessage[] = [
+      {
+        role: 'assistant',
+        content: 'prior',
+        agent: 'writer',
+        origin: 'runtime',
+        providerMetadata: continuity,
+      },
+    ];
+    const tools = [
+      { type: 'function' as const, function: { name: 'lookup', parameters, strict: false } },
+    ];
+
+    await runtime.trackOutcome(() => facade.chat(messages, { model: 'm', tools }), {
+      capture: channel,
+    });
+    continuity.anthropicThinkingBlocks[0].signature = 'mutated';
+    parameters.properties.city.description = 'mutated';
+    responseMetadata.geminiParts[0].thoughtSignature = 'mutated';
+    await channel.close();
+
+    const start = phase(sink.records(), 'start')[0];
+    const end = phase(sink.records(), 'end')[0];
+    expect(start.captured.continuityCaptured).toBe(true);
+    expect(start.request?.messages[0].providerMetadata).toEqual({
+      anthropicThinkingBlocks: [
+        { type: 'thinking', thinking: 'reason', signature: 'sig-original' },
+      ],
+    });
+    expect(start.request?.messages[0].origin).toBe('runtime');
+    expect(start.request?.messages[0].agent).toBe('writer');
+    expect(start.request?.tools?.[0].strict).toBe(false);
+    expect(start.request?.tools?.[0].parameters).toMatchObject({
+      properties: { city: { description: 'original' } },
+    });
+    expect(end.response).toMatchObject({
+      content: 'answer',
+      thinking: 'hidden reasoning',
+      finishReason: 'stop',
+      rawFinishReason: 'end_turn',
+      responseId: 'msg_1',
+      responseModel: 'served-model',
+      providerMetadata: { geminiParts: [{ thoughtSignature: 'sig-response' }] },
+    });
+    expect(start.startedAt).toMatch(/^\d{4}-/);
+    expect(end.endedAt).toMatch(/^\d{4}-/);
+    expect(end.durationMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it('retains streamed text, thinking, tool calls and terminal metadata', async () => {
+    const provider: Provider = {
+      name: 'stream-fixture',
+      async chat() {
+        return { content: 'unused' };
+      },
+      async *stream() {
+        yield { type: 'text_delta', content: 'first ' };
+        yield { type: 'thinking_delta', content: 'plan' };
+        yield { type: 'tool_call_delta', id: 'call_1', name: 'lookup', arguments: '{"q":' };
+        yield { type: 'text_delta', content: 'second' };
+        yield { type: 'tool_call_delta', id: 'call_1', arguments: '"x"}' };
+        yield {
+          type: 'done',
+          finishReason: 'tool_calls',
+          rawFinishReason: 'tool_use',
+          responseId: 'stream_1',
+          responseModel: 'served-model',
+          usage: { prompt_tokens: 2, completion_tokens: 3, total_tokens: 5 },
+          timing: { queuedMs: 0, attempts: 1, retryMs: 0, ttfbMs: 1, wireMs: 2 },
+        };
+      },
+    };
+    const runtime = new AxlRuntime({ defaultProvider: 'stream-fixture' });
+    runtime.registerProvider('stream-fixture', provider);
+    const facade = runtime.resolveProvider('stream-fixture:m').provider;
+    const sink = new CollectingSink();
+    const channel = channelWith(sink);
+    await runtime.trackOutcome(
+      async () => {
+        for await (const _chunk of facade.stream([], { model: 'm' })) void _chunk;
+      },
+      { capture: channel },
+    );
+    await channel.close();
+
+    const end = phase(sink.records(), 'end')[0];
+    expect(end.response).toMatchObject({
+      content: 'first second',
+      thinking: 'plan',
+      tool_calls: [{ id: 'call_1', function: { name: 'lookup', arguments: '{"q":"x"}' } }],
+      finishReason: 'tool_calls',
+      rawFinishReason: 'tool_use',
+      responseId: 'stream_1',
+      responseModel: 'served-model',
+      usage: { total_tokens: 5 },
+      timing: { wireMs: 2 },
+    });
+  });
+
+  it('records partial output and consumer_closed on an early break', async () => {
+    const provider: Provider = {
+      name: 'partial',
+      async chat() {
+        return { content: 'unused' };
+      },
+      async *stream() {
+        yield { type: 'text_delta', content: 'visible' };
+        yield { type: 'thinking_delta', content: 'private' };
+        yield { type: 'text_delta', content: 'unseen' };
+      },
+    };
+    const runtime = new AxlRuntime({ defaultProvider: 'partial' });
+    runtime.registerProvider('partial', provider);
+    const sink = new CollectingSink();
+    const channel = channelWith(sink);
+    const facade = runtime.resolveProvider('partial:m').provider;
+    await runtime.trackOutcome(
+      async () => {
+        for await (const chunk of facade.stream([], { model: 'm' })) {
+          if (chunk.type === 'thinking_delta') break;
+        }
+      },
+      { capture: channel },
+    );
+    await channel.close();
+    const end = phase(sink.records(), 'end')[0];
+    expect(end.termination).toBe('consumer_closed');
+    expect(end.partial).toEqual({ content: 'visible', thinking: 'private' });
+    expect(end.response).toBeUndefined();
+  });
+
+  it('records partial output and aborted on a real abort signal', async () => {
+    const controller = new AbortController();
+    const provider: Provider = {
+      name: 'abortable',
+      async chat() {
+        return { content: 'unused' };
+      },
+      async *stream(_messages, options) {
+        yield { type: 'text_delta', content: 'partial' };
+        options.signal?.throwIfAborted();
+        yield { type: 'done' };
+      },
+    };
+    const runtime = new AxlRuntime({ defaultProvider: 'abortable' });
+    runtime.registerProvider('abortable', provider);
+    const sink = new CollectingSink();
+    const channel = channelWith(sink);
+    const facade = runtime.resolveProvider('abortable:m').provider;
+    await runtime.trackOutcome(
+      async () => {
+        const iterator = facade.stream([], { model: 'm', signal: controller.signal });
+        expect((await iterator.next()).value).toMatchObject({ type: 'text_delta' });
+        controller.abort(new DOMException('cancelled', 'AbortError'));
+        await expect(iterator.next()).rejects.toMatchObject({ name: 'AbortError' });
+      },
+      { capture: channel },
+    );
+    await channel.close();
+    const end = phase(sink.records(), 'end')[0];
+    expect(end.termination).toBe('aborted');
+    expect(end.partial).toEqual({ content: 'partial' });
+    expect(end.response).toBeUndefined();
+  });
+
+  it('records partial output and stalled on a real context stall timeout', async () => {
+    const provider: Provider = {
+      name: 'staller',
+      async chat() {
+        return { content: 'unused' };
+      },
+      async *stream(_messages, options) {
+        yield { type: 'text_delta', content: 'partial' };
+        await new Promise<never>((_resolve, reject) => {
+          const signal = options.signal;
+          if (signal?.aborted) return reject(signal.reason);
+          signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+        });
+      },
+    };
+    const runtime = new AxlRuntime({ defaultProvider: 'staller' });
+    runtime.registerProvider('staller', provider);
+    const asker = agent({ name: 'staller', model: 'staller:m', system: 'fixture' });
+    runtime.register(
+      workflow({
+        name: 'stalled-workflow',
+        input: z.any(),
+        handler: async (ctx) => {
+          void ctx.events; // Real provider streaming path.
+          return ctx.ask(asker, 'go', { stallTimeout: '20ms' });
+        },
+      }),
+    );
+    const sink = new CollectingSink();
+    const channel = channelWith(sink);
+    const outcome = await runtime.trackOutcome(() => runtime.execute('stalled-workflow', {}), {
+      capture: channel,
+    });
+    await channel.close();
+    expect(outcome.status).toBe('rejected');
+    if (outcome.status === 'rejected') expect(outcome.error).toBeInstanceOf(StallTimeoutError);
+    const end = phase(sink.records(), 'end')[0];
+    expect(end.termination).toBe('stalled');
+    expect(end.partial).toEqual({ content: 'partial' });
+    expect(end.response).toBeUndefined();
+  });
+
+  it('projects ProviderError retry hints and request id without its raw body', async () => {
+    const provider: Provider = {
+      name: 'error-fixture',
+      async chat() {
+        throw new ProviderError({
+          provider: 'error-fixture',
+          status: 429,
+          retryable: true,
+          requestId: 'req_123',
+          retryAfterMs: 250,
+          message: 'throttled',
+          body: 'secret raw body',
+        });
+      },
+      async *stream() {
+        yield { type: 'done' };
+      },
+    };
+    const runtime = new AxlRuntime({ defaultProvider: 'error-fixture' });
+    runtime.registerProvider('error-fixture', provider);
+    const facade = runtime.resolveProvider('error-fixture:m').provider;
+    const sink = new CollectingSink();
+    const channel = channelWith(sink);
+    await runtime.trackOutcome(() => facade.chat([], { model: 'm' }), { capture: channel });
+    await channel.close();
+    expect(phase(sink.records(), 'end')[0].error).toMatchObject({
+      name: 'ProviderError',
+      code: 'PROVIDER_ERROR',
+      status: 429,
+      retryable: true,
+      requestId: 'req_123',
+      retryAfterMs: 250,
+    });
+    expect(JSON.stringify(sink.records())).not.toContain('secret raw body');
+  });
+
+  it('redacts continuity metadata, thinking and tool arguments while retaining structure', async () => {
+    const secret = 'SECRET-CONTINUITY-4242';
+    const provider: Provider = {
+      name: 'redacted',
+      async chat() {
+        return {
+          content: secret,
+          thinking_content: secret,
+          tool_calls: [
+            { id: 'call_1', type: 'function', function: { name: 'lookup', arguments: secret } },
+          ],
+          providerMetadata: { geminiParts: [{ thoughtSignature: secret }] },
+          responseId: 'resp_1',
+          usage: { prompt_tokens: 1, completion_tokens: 2, total_tokens: 3 },
+          cost: 0.01,
+        };
+      },
+      async *stream() {
+        yield { type: 'done' };
+      },
+    };
+    const runtime = new AxlRuntime({ defaultProvider: 'redacted' });
+    runtime.registerProvider('redacted', provider);
+    const sink = new CollectingSink();
+    const channel = channelWith(sink, { redact: true });
+    await runtime.trackOutcome(
+      () =>
+        runtime.resolveProvider('redacted:m').provider.chat(
+          [
+            {
+              role: 'assistant',
+              content: secret,
+              providerMetadata: { anthropicThinkingBlocks: [{ signature: secret }] },
+              tool_calls: [
+                { id: 'prior', type: 'function', function: { name: 'lookup', arguments: secret } },
+              ],
+            },
+          ],
+          { model: 'm' },
+        ),
+      { capture: channel },
+    );
+    await channel.close();
+    expect(sink.lines.join('\n')).not.toContain(secret);
+    const start = phase(sink.records(), 'start')[0];
+    const end = phase(sink.records(), 'end')[0];
+    expect(start.request?.messages[0]).not.toHaveProperty('providerMetadata');
+    expect(end.response).not.toHaveProperty('providerMetadata');
+    expect(start.captured.omitted).toContain('providerMetadata');
+    expect(end.captured.omitted).toContain('providerMetadata');
+    expect(end.response).toMatchObject({
+      responseId: 'resp_1',
+      usage: { total_tokens: 3 },
+      cost: 0.01,
+    });
+  });
+
+  it('redacts partial stream output and provider error payload', async () => {
+    const secret = 'SECRET-PARTIAL-4242';
+    const provider: Provider = {
+      name: 'redacted-stream',
+      async chat() {
+        return { content: 'unused' };
+      },
+      async *stream() {
+        yield { type: 'text_delta', content: secret };
+        yield { type: 'thinking_delta', content: secret };
+        yield { type: 'tool_call_delta', id: 'call_1', name: 'lookup', arguments: secret };
+        throw new ProviderError({
+          provider: 'redacted-stream',
+          status: 429,
+          retryable: true,
+          requestId: 'req_1',
+          message: secret,
+          body: secret,
+        });
+      },
+    };
+    const runtime = new AxlRuntime({ defaultProvider: 'redacted-stream' });
+    runtime.registerProvider('redacted-stream', provider);
+    const facade = runtime.resolveProvider('redacted-stream:m').provider;
+    const sink = new CollectingSink();
+    const channel = channelWith(sink, { redact: true });
+    await runtime.trackOutcome(
+      async () => {
+        await expect(async () => {
+          for await (const _chunk of facade.stream([], { model: 'm' })) void _chunk;
+        }).rejects.toBeInstanceOf(ProviderError);
+      },
+      { capture: channel },
+    );
+    await channel.close();
+    expect(sink.lines.join('\n')).not.toContain(secret);
+    const end = phase(sink.records(), 'end')[0];
+    expect(end.partial).toMatchObject({ content: '[redacted]', thinking: '[redacted]' });
+    expect(end.error).toMatchObject({ status: 429, retryable: true, requestId: 'req_1' });
+  });
+
+  it('keeps settlement evidence when an oversized end response is stubbed', async () => {
+    const provider: Provider = {
+      name: 'oversized',
+      async chat() {
+        return {
+          content: 'x'.repeat(2_000),
+          cost: 0.25,
+          usage: { prompt_tokens: 2, completion_tokens: 3, total_tokens: 5 },
+          finishReason: 'length',
+          rawFinishReason: 'max_tokens',
+          responseId: 'resp_large',
+          responseModel: 'served-model',
+          timing: { queuedMs: 0, attempts: 1, retryMs: 0, ttfbMs: 1, wireMs: 2 },
+        } as ProviderResponse;
+      },
+      async *stream() {
+        yield { type: 'done' };
+      },
+    };
+    const runtime = new AxlRuntime({ defaultProvider: 'oversized' });
+    runtime.registerProvider('oversized', provider);
+    const sink = new CollectingSink();
+    const channel = channelWith(sink, { maxRecordBytes: 1_024 });
+    await runtime.trackOutcome(
+      () => runtime.resolveProvider('oversized:m').provider.chat([], { model: 'm' }),
+      { capture: channel },
+    );
+    await channel.close();
+    const end = phase(sink.records(), 'end')[0];
+    expect(end.response).toBeUndefined();
+    expect(end).toMatchObject({
+      outcomeStatus: 'ok',
+      cost: 0.25,
+      usage: { total_tokens: 5 },
+      finishReason: 'length',
+      rawFinishReason: 'max_tokens',
+      responseId: 'resp_large',
+      responseModel: 'served-model',
+      timing: { wireMs: 2 },
+      captured: { truncated: true },
+    });
+    expect(end.captured.omitted).toContain('record');
+    expect(sink.lines.every((line) => Buffer.byteLength(line, 'utf-8') <= 1_024)).toBe(true);
+    expect(channel.operations()[0].status).toBe('truncated');
   });
 });
 
@@ -555,6 +1148,9 @@ describe('A12 — bounded, private, failure-tolerant capture', () => {
     // The stub records how big the thing it replaced actually was.
     expect(start.bytes).toBeGreaterThan(1024);
     expect(status.status).toBe('complete');
+    expect(channel.operations()).toMatchObject([
+      { operationId: start.operationId, status: 'truncated' },
+    ]);
   });
 
   it('A12.2 stops at the run byte limit with an identical accounting result', async () => {
@@ -828,10 +1424,103 @@ describe('capture failures never reach the run', () => {
     expect(stub.captured.reason).toMatch(/DataCloneError/);
   });
 
-  it('a retry record that could not be projected still lets the response be captured', async () => {
-    // The failure is aimed at the ATTEMPT record only: the provider raises the
-    // flag immediately before the second dispatch, and the getter lowers it as
-    // soon as it has thrown once, so the start and end records project normally.
+  it('a revoked-proxy projection error cannot escape capture or replace the model error', async () => {
+    const { proxy, revoke } = Proxy.revocable({}, {});
+    revoke();
+    const options = { model: 'm' } as ChatOptions;
+    Object.defineProperty(options, 'responseFormat', {
+      get() {
+        throw proxy;
+      },
+    });
+    const off = providerRuntime();
+    const baseline = await off.runtime.trackOutcome(() =>
+      off.runtime
+        .resolveProvider('scripted:m')
+        .provider.chat([{ role: 'user', content: 'go' }], options),
+    );
+    const on = providerRuntime();
+    const sink = new CollectingSink();
+    const channel = channelWith(sink, { redact: true });
+    const outcome = await on.runtime.trackOutcome(
+      () =>
+        on.runtime
+          .resolveProvider('scripted:m')
+          .provider.chat([{ role: 'user', content: 'go' }], options),
+      { capture: channel },
+    );
+    await channel.close();
+    expect(outcome.status).toBe('fulfilled');
+    expect(on.provider.calls).toHaveLength(1);
+    expect(outcome.accounting).toEqual(baseline.accounting);
+    expect(sink.records()[0].captured.reason).toBe(
+      'the request could not be captured: capture failure',
+    );
+
+    const original = new Error('original provider error');
+    const failing: Provider = {
+      name: 'scripted',
+      async chat() {
+        throw original;
+      },
+      async *stream() {
+        yield { type: 'done' };
+      },
+    };
+    const runtime = new AxlRuntime({ defaultProvider: 'scripted', trace: { enabled: false } });
+    runtime.registerProvider('scripted', failing);
+    const failingSink = new CollectingSink();
+    const failingChannel = channelWith(failingSink);
+    const failure = await runtime.trackOutcome(
+      () =>
+        runtime
+          .resolveProvider('scripted:m')
+          .provider.chat([{ role: 'user', content: 'go' }], options),
+      { capture: failingChannel },
+    );
+    await failingChannel.close();
+    expect(failure.status).toBe('rejected');
+    if (failure.status === 'rejected') expect(failure.error).toBe(original);
+    expect(failure.accounting.operations.total).toBe(1);
+  });
+
+  it('redacted capture stubs never serialize attacker-controlled error names, codes or tags', async () => {
+    const secret = 'SECRET_CAPTURE_PAYLOAD_42';
+    const named = new Error('ordinary message');
+    Object.defineProperties(named, {
+      name: { get: () => secret },
+      code: { get: () => secret },
+      [Symbol.toStringTag]: { get: () => secret },
+    });
+    const tagged = { [Symbol.toStringTag]: secret };
+    for (const thrown of [named, tagged]) {
+      const options = { model: 'm' } as ChatOptions;
+      Object.defineProperty(options, 'responseFormat', {
+        get() {
+          throw thrown;
+        },
+      });
+      const { runtime, provider } = providerRuntime();
+      const sink = new CollectingSink();
+      const channel = channelWith(sink, { redact: true });
+      const outcome = await runtime.trackOutcome(
+        () =>
+          runtime
+            .resolveProvider('scripted:m')
+            .provider.chat([{ role: 'user', content: 'go' }], options),
+        { capture: channel },
+      );
+      await channel.close();
+      expect(outcome.status).toBe('fulfilled');
+      expect(provider.calls).toHaveLength(1);
+      expect(sink.lines.join('\n')).not.toContain(secret);
+      expect(sink.records()[0].captured.reason).toMatch(/could not be captured/);
+    }
+  });
+
+  it('a mutable options getter cannot rewrite or break a later retry record', async () => {
+    // The model is snapshotted before provider invocation. Reading a hostile
+    // getter again on retry would let provider-side mutation corrupt capture.
     let hostile = false;
     const options = {
       get model(): string {
@@ -874,10 +1563,11 @@ describe('capture failures never reach the run', () => {
 
     expect(outcome.status).toBe('fulfilled');
     expect(status.status).toBe('complete');
-    // The attempt record is the one that degraded.
+    // The retry retains the original request identity without re-reading the
+    // caller's mutable options.
     const attempt = phase(sink.records(), 'attempt')[0];
-    expect(attempt.captured.truncated).toBe(true);
-    expect(attempt.captured.reason).toBeTruthy();
+    expect(attempt.captured.truncated).toBe(false);
+    expect(attempt.model).toBe('m');
     // And the RESPONSE still lands. A retry record nobody could project says
     // nothing about the response that follows: the call ran and returned. Only
     // `end()` seals an operation, so a failed attempt must not stand in for it —
@@ -885,11 +1575,7 @@ describe('capture failures never reach the run', () => {
     const end = phase(sink.records(), 'end');
     expect(end).toHaveLength(1);
     expect(end[0].response).toBeDefined();
-    // But the operation does NOT read back as fully recorded. A loss verdict is
-    // sticky in both directions: a reader following this ref to look at the
-    // retry would find nothing there, with the ref itself the only thing that
-    // could have warned them.
-    expect(channel.operations()[0].status).toBe('omitted');
+    expect(channel.operations()[0].status).toBe('recorded');
   });
 
   it('keeps capturing the rest of the run after one un-projectable call', async () => {
@@ -915,7 +1601,15 @@ describe('capture failures never reach the run', () => {
     const starts = phase(sink.records(), 'start');
     const usable = starts.filter((r) => r.request !== undefined);
     expect(usable).toHaveLength(1);
-    expect(phase(sink.records(), 'end')).toHaveLength(1);
+    // A request-projection stub is incomplete evidence, but the dispatched
+    // call's actual successful settlement is still an end line with usage.
+    const ends = phase(sink.records(), 'end');
+    expect(ends).toHaveLength(2);
+    const stub = starts.find((r) => r.captured.truncated)!;
+    expect(ends.find((r) => r.operationId === stub.operationId)?.response).toBeDefined();
+    expect(channel.operations().find((r) => r.operationId === stub.operationId)?.status).toBe(
+      'omitted',
+    );
   });
 
   it('an unrecognized content part does not fail the call or move the numbers', async () => {
@@ -979,6 +1673,90 @@ describe('capture failures never reach the run', () => {
     // bug: the charge is real either way.
     expect(outcome.status).toBe('fulfilled');
     expect(outcome.accounting.knownCost).toBeCloseTo(0.1, 10);
+  });
+
+  it('a hostile stream delta cannot change the returned chunks or masquerade as complete capture', async () => {
+    const bad = { type: 'tool_call_delta', id: 'tool-1', name: 'search' } as StreamChunk;
+    Object.defineProperty(bad, 'arguments', {
+      get() {
+        throw new Error('secret model output');
+      },
+    });
+    const provider = {
+      name: 'scripted',
+      async *stream(): AsyncGenerator<StreamChunk> {
+        yield bad;
+        yield { type: 'done', usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } };
+      },
+    } as Provider;
+    const runtime = new AxlRuntime({ defaultProvider: 'scripted', trace: { enabled: false } });
+    runtime.registerProvider('scripted', provider);
+    const sink = new CollectingSink();
+    const channel = channelWith(sink);
+    const outcome = await runtime.trackOutcome(
+      async () => {
+        const chunks: StreamChunk[] = [];
+        for await (const chunk of runtime.resolveProvider('scripted:m').provider.stream!(
+          [{ role: 'user', content: 'go' }],
+          { model: 'scripted:m' },
+        ))
+          chunks.push(chunk);
+        return chunks;
+      },
+      { capture: channel },
+    );
+    await channel.close();
+    expect(outcome.status).toBe('fulfilled');
+    expect(Object.is(outcome.status === 'fulfilled' ? outcome.value[0] : undefined, bad)).toBe(
+      true,
+    );
+    expect(outcome.accounting.usage.inputTokens).toBe(1);
+    const end = phase(sink.records(), 'end')[0];
+    expect(end.captured.omitted).toContain('streamChunk');
+    expect(JSON.stringify(sink.records())).not.toContain('secret model output');
+  });
+
+  it('a terminal metadata projection failure records successful settlement without changing the done chunk', async () => {
+    const done = { type: 'done', cost: 0.03 } as StreamChunk;
+    Object.defineProperty(done, 'providerMetadata', {
+      get() {
+        throw new Error('secret native response');
+      },
+    });
+    const runtime = new AxlRuntime({ defaultProvider: 'scripted', trace: { enabled: false } });
+    runtime.registerProvider('scripted', {
+      name: 'scripted',
+      async *stream(): AsyncGenerator<StreamChunk> {
+        yield done;
+      },
+    } as Provider);
+    const sink = new CollectingSink();
+    const channel = channelWith(sink);
+    const outcome = await runtime.trackOutcome(
+      async () => {
+        const seen: StreamChunk[] = [];
+        for await (const chunk of runtime.resolveProvider('scripted:m').provider.stream!(
+          [{ role: 'user', content: 'go' }],
+          { model: 'scripted:m' },
+        ))
+          seen.push(chunk);
+        return seen;
+      },
+      { capture: channel },
+    );
+    await channel.close();
+    expect(outcome.status).toBe('fulfilled');
+    expect(Object.is(outcome.status === 'fulfilled' ? outcome.value[0] : undefined, done)).toBe(
+      true,
+    );
+    expect(outcome.accounting.knownCost).toBeCloseTo(0.03, 10);
+    const end = phase(sink.records(), 'end')[0];
+    expect(end).toMatchObject({
+      outcomeStatus: 'ok',
+      captured: { truncated: true, omitted: ['record'] },
+    });
+    expect(end.endedAt).toBeDefined();
+    expect(JSON.stringify(sink.records())).not.toContain('secret native response');
   });
 
   it('M4 a stream closed early is sealed with a termination reason, not left start_only', async () => {

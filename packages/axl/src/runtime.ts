@@ -73,6 +73,7 @@ import {
 import { NoopSpanManager } from './telemetry/noop.js';
 import { createSpanManager } from './telemetry/index.js';
 import type { SpanManager, SpanHandle } from './telemetry/types.js';
+import { resolveContentAttributeMaxBytes } from './telemetry/gen-ai.js';
 
 /**
  * Function exported from an eval module that overrides the default
@@ -793,6 +794,8 @@ export class AxlRuntime extends EventEmitter {
   /** Raw adapter → its scoped facade. Keyed weakly so a registry that drops an
    *  adapter does not pin it here. */
   private scopedProviders = new WeakMap<Provider, Provider>();
+  /** Validated at construction so a bad bound fails loudly before any call. */
+  private readonly contentAttributeMaxBytes: number;
   private transcriptionProviderRegistry: TranscriptionProviderRegistry;
   private stateStore: StateStore;
   private executions = new Map<string, ExecutionInfo>();
@@ -876,6 +879,9 @@ export class AxlRuntime extends EventEmitter {
   constructor(config?: AxlConfig) {
     super();
     this.config = resolveConfig(config ?? {});
+    this.contentAttributeMaxBytes = resolveContentAttributeMaxBytes(
+      this.config.telemetry?.maxContentAttributeBytes,
+    );
     this.providerRegistry = new ProviderRegistry();
     this.transcriptionProviderRegistry = new TranscriptionProviderRegistry();
     this.stateStore = this.createStateStore();
@@ -1972,8 +1978,8 @@ export class AxlRuntime extends EventEmitter {
    * It forwards everything to the adapter — custom properties and accessors,
    * class private-field methods, property writes, capability methods, ordinary
    * `instanceof` — while routing `chat`/`stream` through accounting and budget
-   * admission whenever a `trackOutcome` scope is active. Outside a scope it
-   * delegates verbatim.
+   * admission whenever a `trackOutcome` scope is active. Optional runtime
+   * telemetry also observes calls outside an accounting scope.
    *
    * Identity is stable per runtime per adapter (repeated calls return the same
    * facade), but `resolveProvider(uri).provider === registeredInstance` is now
@@ -1988,7 +1994,12 @@ export class AxlRuntime extends EventEmitter {
   private scopedProvider(raw: Provider): Provider {
     const existing = this.scopedProviders.get(raw);
     if (existing) return existing;
-    const facade = createScopedProvider(raw);
+    const facade = createScopedProvider(raw, {
+      getSpanManager: () => this.spanManager,
+      captureContent: this.config.telemetry?.captureContent === true,
+      maxContentBytes: this.contentAttributeMaxBytes,
+      redact: this.config.trace?.redact === true,
+    });
     this.scopedProviders.set(raw, facade);
     return facade;
   }

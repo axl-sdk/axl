@@ -1,18 +1,28 @@
-import type { SpanHandle, SpanManager, TelemetryConfig } from './types.js';
+import type {
+  SpanAttributeValue,
+  SpanAttributes,
+  SpanHandle,
+  SpanManager,
+  TelemetryConfig,
+} from './types.js';
 
 /** Minimal interface for an OTel span. */
 interface OTelSpan {
-  setAttribute(key: string, value: string | number | boolean): void;
-  addEvent(name: string, attributes?: Record<string, string | number | boolean>): void;
+  setAttribute(key: string, value: SpanAttributeValue): void;
+  addEvent(name: string, attributes?: SpanAttributes): void;
   setStatus(status: { code: unknown; message?: string }): void;
   end(): void;
 }
 
 /** Minimal interface for an OTel tracer. */
 interface OTelTracer {
+  startSpan(
+    name: string,
+    options: { attributes: SpanAttributes; kind?: number; startTime?: number },
+  ): OTelSpan;
   startActiveSpan<T>(
     name: string,
-    options: { attributes: Record<string, string | number | boolean> },
+    options: { attributes: SpanAttributes },
     fn: (span: OTelSpan) => Promise<T>,
   ): Promise<T>;
 }
@@ -20,11 +30,11 @@ interface OTelTracer {
 /** Minimal interface for an OTel tracer provider. */
 interface OTelTracerProvider {
   getTracer(name: string): OTelTracer;
-  shutdown?(): Promise<void>;
 }
 
 /** Minimal interface for the @opentelemetry/api module. */
 interface OTelApi {
+  SpanKind: { CLIENT: number };
   SpanStatusCode: { UNSET: unknown; OK: unknown; ERROR: unknown };
   trace: {
     getTracerProvider(): OTelTracerProvider;
@@ -39,12 +49,10 @@ interface OTelApi {
 export class OTelSpanManager implements SpanManager {
   private tracer: OTelTracer;
   private otelApi: OTelApi;
-  private tracerProvider: OTelTracerProvider;
 
-  private constructor(otelApi: OTelApi, tracer: OTelTracer, tracerProvider: OTelTracerProvider) {
+  private constructor(otelApi: OTelApi, tracer: OTelTracer) {
     this.otelApi = otelApi;
     this.tracer = tracer;
-    this.tracerProvider = tracerProvider;
   }
 
   static async create(config: TelemetryConfig): Promise<OTelSpanManager> {
@@ -63,39 +71,19 @@ export class OTelSpanManager implements SpanManager {
     const serviceName = config.serviceName ?? 'axl';
     const tracer = tracerProvider.getTracer(serviceName);
 
-    return new OTelSpanManager(otelApi, tracer, tracerProvider);
+    return new OTelSpanManager(otelApi, tracer);
   }
 
   async withSpanAsync<T>(
     name: string,
-    attributes: Record<string, string | number | boolean>,
+    attributes: SpanAttributes,
     fn: (span: SpanHandle) => Promise<T>,
   ): Promise<T> {
-    const otelApi = this.otelApi;
-
     return this.tracer.startActiveSpan(name, { attributes }, async (otelSpan: OTelSpan) => {
       let statusWasSet = false;
-      const handle: SpanHandle = {
-        setAttribute(key: string, value: string | number | boolean) {
-          otelSpan.setAttribute(key, value);
-        },
-        addEvent(eventName: string, attrs?: Record<string, string | number | boolean>) {
-          otelSpan.addEvent(eventName, attrs);
-        },
-        setStatus(code: 'unset' | 'ok' | 'error', message?: string) {
-          statusWasSet = true;
-          const statusCode =
-            code === 'ok'
-              ? otelApi.SpanStatusCode.OK
-              : code === 'error'
-                ? otelApi.SpanStatusCode.ERROR
-                : otelApi.SpanStatusCode.UNSET;
-          otelSpan.setStatus({ code: statusCode, message });
-        },
-        end() {
-          otelSpan.end();
-        },
-      };
+      const handle = this.handle(otelSpan, () => {
+        statusWasSet = true;
+      });
 
       try {
         const result = await fn(handle);
@@ -113,16 +101,57 @@ export class OTelSpanManager implements SpanManager {
     });
   }
 
-  addEventToActiveSpan(name: string, attributes?: Record<string, string | number | boolean>): void {
+  /** Start a CLIENT inference span under the current OTel context. The caller ends it. */
+  startSpan(
+    name: string,
+    attributes: SpanAttributes,
+    options?: { kind?: 'client'; startTime?: number },
+  ): SpanHandle {
+    const span = this.tracer.startSpan(name, {
+      attributes,
+      ...(options?.kind === 'client' ? { kind: this.otelApi.SpanKind.CLIENT } : {}),
+      ...(options?.startTime !== undefined ? { startTime: options.startTime } : {}),
+    });
+    return this.handle(span);
+  }
+
+  private handle(span: OTelSpan, onStatus?: () => void): SpanHandle {
+    const otelApi = this.otelApi;
+    let ended = false;
+    return {
+      setAttribute(key, value) {
+        if (!ended) span.setAttribute(key, value);
+      },
+      addEvent(name, attributes) {
+        if (!ended) span.addEvent(name, attributes);
+      },
+      setStatus(code, message) {
+        if (ended) return;
+        onStatus?.();
+        const statusCode =
+          code === 'ok'
+            ? otelApi.SpanStatusCode.OK
+            : code === 'error'
+              ? otelApi.SpanStatusCode.ERROR
+              : otelApi.SpanStatusCode.UNSET;
+        span.setStatus({ code: statusCode, message });
+      },
+      end() {
+        if (ended) return;
+        ended = true;
+        span.end();
+      },
+    };
+  }
+
+  addEventToActiveSpan(name: string, attributes?: SpanAttributes): void {
     const activeSpan = this.otelApi.trace.getActiveSpan?.();
     if (activeSpan) {
       activeSpan.addEvent(name, attributes);
     }
   }
 
-  async shutdown(): Promise<void> {
-    if (this.tracerProvider && typeof this.tracerProvider.shutdown === 'function') {
-      await this.tracerProvider.shutdown();
-    }
-  }
+  // Axl uses an application-owned provider, whether supplied or global.
+  // Its lifecycle, including flush and shutdown, belongs to the application.
+  async shutdown(): Promise<void> {}
 }

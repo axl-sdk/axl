@@ -25,6 +25,11 @@ import type { RecordedAudioSource } from '../transcription.js';
 import { InvalidModelInputError, UnsupportedModelInputError } from '../errors.js';
 import { firstRichPart, type RichModality } from './rich-input.js';
 import { GEMINI_DEFAULT_BASE_URL } from './default-endpoints.js';
+import {
+  geminiFinishReason,
+  geminiInteractionFinishReason,
+  reportedString,
+} from './response-metadata.js';
 
 function hasRichGeminiMessages(messages: readonly ChatMessage[]): boolean {
   return messages.some((message) => Array.isArray(message.content));
@@ -1413,6 +1418,16 @@ export class GeminiProvider implements Provider {
     });
     return {
       content,
+      ...(reportedString(json.status) !== undefined
+        ? {
+            rawFinishReason: json.status,
+            finishReason: geminiInteractionFinishReason(json.status, toolCalls.length > 0),
+          }
+        : toolCalls.length > 0
+          ? { finishReason: geminiInteractionFinishReason(undefined, true) }
+          : {}),
+      ...(reportedString(json.id) !== undefined ? { responseId: json.id } : {}),
+      ...(reportedString(json.model) !== undefined ? { responseModel: json.model } : {}),
       thinking_content: thinkingContent || undefined,
       tool_calls: toolCalls.length ? toolCalls : undefined,
       usage: normalized?.usage,
@@ -1490,6 +1505,8 @@ export class GeminiProvider implements Provider {
     const argumentBuffers = new Map<number, string>();
     const stopped = new Set<number>();
     let completed = false;
+    let responseId: string | undefined;
+    let responseModel: string | undefined;
     const responseTierEvidence = geminiResponseTierEvidence(responseHeaders);
     // True once a frame carried model output this parser could not put on a
     // step. Non-text `step.start` parts ARE preserved (the step is cloned
@@ -1518,6 +1535,8 @@ export class GeminiProvider implements Provider {
           // conflicting or unknown evidence latches the call unpriced.
           recordGeminiResponseTier(responseTierEvidence, event.interaction?.service_tier);
           recordGeminiResponseTier(responseTierEvidence, event.interaction?.usage?.service_tier);
+          responseId = reportedString(event.interaction?.id) ?? responseId;
+          responseModel = reportedString(event.interaction?.model) ?? responseModel;
           if (event.event_type === 'error') {
             const status = geminiInteractionErrorStatus(event.error?.code);
             const message = event.error?.message ?? 'Gemini Interactions stream failed';
@@ -1650,7 +1669,10 @@ export class GeminiProvider implements Provider {
               }
             }
             stopped.add(index!);
-          } else if (event.event_type === 'interaction.completed') {
+          } else if (
+            event.event_type === 'interaction.completed' ||
+            event.event_type === 'interaction.requires_action'
+          ) {
             if (steps.size !== stopped.size) {
               throw new Error('Gemini Interactions stream completed before all steps stopped');
             }
@@ -1658,6 +1680,7 @@ export class GeminiProvider implements Provider {
               (step) => step.type === 'function_call' && !!step.id && !!step.name,
             ).length;
             this.assertInteractionTerminalStatus(event.interaction?.status, toolCallCount);
+            const rawFinishReason = reportedString(event.interaction?.status);
             completed = true;
             const orderedSteps = [...steps.entries()]
               .sort(([a], [b]) => a - b)
@@ -1676,6 +1699,16 @@ export class GeminiProvider implements Provider {
             });
             yield {
               type: 'done',
+              ...(rawFinishReason !== undefined
+                ? {
+                    rawFinishReason,
+                    finishReason: geminiInteractionFinishReason(rawFinishReason, toolCallCount > 0),
+                  }
+                : toolCallCount > 0
+                  ? { finishReason: geminiInteractionFinishReason(undefined, true) }
+                  : {}),
+              ...(responseId !== undefined ? { responseId } : {}),
+              ...(responseModel !== undefined ? { responseModel } : {}),
               usage: normalized?.usage,
               cost: streamInteractionCost,
               costProvenance: tableEstimate(streamInteractionCost),
@@ -1686,7 +1719,9 @@ export class GeminiProvider implements Provider {
         }
       }
       if (!completed)
-        throw new Error('Gemini Interactions stream ended before interaction.completed');
+        throw new Error(
+          'Gemini Interactions stream ended before interaction.completed or interaction.requires_action',
+        );
     } finally {
       reader.releaseLock();
     }
@@ -2275,6 +2310,18 @@ export class GeminiProvider implements Provider {
 
     return {
       content,
+      ...(reportedString(candidate.finishReason) !== undefined
+        ? {
+            rawFinishReason: candidate.finishReason,
+            finishReason: geminiFinishReason(candidate.finishReason, toolCalls.length > 0),
+          }
+        : toolCalls.length > 0
+          ? { finishReason: geminiFinishReason(undefined, true) }
+          : {}),
+      ...(reportedString(json.responseId) !== undefined ? { responseId: json.responseId } : {}),
+      ...(reportedString(json.modelVersion) !== undefined
+        ? { responseModel: json.modelVersion }
+        : {}),
       thinking_content: thinkingContent || undefined,
       tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
       usage: normalized?.usage,
@@ -2306,6 +2353,10 @@ export class GeminiProvider implements Provider {
     let hasInvalidResponseTier = false;
     let responseIsTextOnly = true;
     let terminalFailure: string | undefined;
+    let responseId: string | undefined;
+    let responseModel: string | undefined;
+    let rawFinishReason: string | undefined;
+    let hasFunctionCall = false;
     // Accumulate raw parts across stream chunks for providerMetadata round-tripping
     const accumulatedParts: Array<Record<string, unknown>> = [];
 
@@ -2333,6 +2384,8 @@ export class GeminiProvider implements Provider {
           }
 
           if (typeof chunk.modelVersion === 'string') effectiveModel = chunk.modelVersion;
+          responseId = reportedString(chunk.responseId) ?? responseId;
+          responseModel = reportedString(chunk.modelVersion) ?? responseModel;
 
           // Extract usage from this chunk. A malformed or incomplete usage
           // report remains unpriced rather than manufacturing token counts.
@@ -2359,6 +2412,7 @@ export class GeminiProvider implements Provider {
               } else if (part.text) {
                 yield { type: 'text_delta', content: part.text };
               } else if (part.functionCall) {
+                hasFunctionCall = true;
                 // Gemini sends complete functionCall objects (not incremental deltas).
                 // Preserve Gemini 3.x's native `id` so mapMessages can echo it back
                 // in the matching functionResponse on the next turn.
@@ -2374,6 +2428,7 @@ export class GeminiProvider implements Provider {
           if (candidate?.finishReason && !['STOP', 'MAX_TOKENS'].includes(candidate.finishReason)) {
             terminalFailure = candidate.finishReason;
           }
+          rawFinishReason = reportedString(candidate?.finishReason) ?? rawFinishReason;
         }
       }
 
@@ -2396,6 +2451,13 @@ export class GeminiProvider implements Provider {
           : undefined;
       yield {
         type: 'done',
+        ...(rawFinishReason !== undefined
+          ? { rawFinishReason, finishReason: geminiFinishReason(rawFinishReason, hasFunctionCall) }
+          : hasFunctionCall
+            ? { finishReason: geminiFinishReason(undefined, true) }
+            : {}),
+        ...(responseId !== undefined ? { responseId } : {}),
+        ...(responseModel !== undefined ? { responseModel } : {}),
         usage: normalizedUsage?.usage,
         cost: streamCost,
         costProvenance: tableEstimate(streamCost),
@@ -2445,6 +2507,7 @@ type GeminiInteractionUsage = {
 };
 
 type GeminiInteractionResponse = {
+  id?: string;
   model?: string;
   status?: string;
   service_tier?: unknown;
@@ -2683,6 +2746,7 @@ type GeminiContent = {
 };
 
 type GeminiResponse = {
+  responseId?: string;
   modelVersion?: string;
   candidates?: GeminiCandidate[];
   usageMetadata?: GeminiUsageMetadata;

@@ -2,6 +2,7 @@ import type {
   CallTiming,
   ChatMessage,
   ProviderResponse,
+  FinishReason,
   ToolCallMessage,
   ReasoningContextReset,
 } from '../types.js';
@@ -12,7 +13,7 @@ import type { DispatchAdmission } from '../accounting.js';
 // Re-export for convenience. `CallTiming` is defined in `../types.js` beside
 // `ProviderResponse` (which also carries it) — defining it here would make
 // `types.ts` import from this module, reversing the existing dependency edge.
-export type { CallTiming, ChatMessage, ProviderResponse, ToolCallMessage };
+export type { CallTiming, ChatMessage, ProviderResponse, FinishReason, ToolCallMessage };
 
 export type InputModalitySupport = {
   image?: { sources: readonly InputMediaSource['type'][] };
@@ -151,6 +152,14 @@ export type StreamChunk =
   | { type: 'tool_call_delta'; id: string; name?: string; arguments?: string }
   | {
       type: 'done';
+      /** Provider-neutral finish reason, when the wire reports one. */
+      finishReason?: FinishReason;
+      /** Exact vendor finish reason or status used to derive `finishReason`. */
+      rawFinishReason?: string;
+      /** Response identifier reported by the provider. Never inferred from the request. */
+      responseId?: string;
+      /** Model reported in the response. Never inferred from the requested model. */
+      responseModel?: string;
       usage?: {
         prompt_tokens: number;
         completion_tokens: number;

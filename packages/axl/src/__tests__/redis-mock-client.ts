@@ -5,6 +5,56 @@
 import { vi } from 'vitest';
 import { RedisStore } from '../state/redis.js';
 
+type ZRangeOptions = {
+  BY?: 'SCORE' | 'LEX';
+  REV?: boolean;
+  LIMIT?: { offset: number; count: number };
+};
+
+/** Redis orders members that share a score by their bytes. */
+function compareMemberBytes(a: string, b: string): number {
+  return Buffer.compare(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8'));
+}
+
+function scoreBound(bound: number | string, infinite: '+inf' | '-inf'): number {
+  if (bound === infinite) return infinite === '+inf' ? Infinity : -Infinity;
+  if (bound === '+inf') return Infinity;
+  if (bound === '-inf') return -Infinity;
+  if (typeof bound === 'string') {
+    throw new Error(`redis mock: unsupported ZRANGE score bound ${bound}`);
+  }
+  return bound;
+}
+
+/**
+ * ZRANGE over the mock's member → score map, in Redis order: score, then
+ * member bytes (both reversed with REV). BY:'SCORE' takes inclusive numeric
+ * bounds or '+inf' / '-inf'; with REV, start is the maximum.
+ */
+function rangeZset(
+  zsetData: Map<string, Map<string, number>>,
+  key: string,
+  start: number | string,
+  stop: number | string,
+  options?: ZRangeOptions,
+): Array<[string, number]> {
+  const set = zsetData.get(key);
+  if (!set) return [];
+  let entries = [...set.entries()].sort((a, b) => a[1] - b[1] || compareMemberBytes(a[0], b[0]));
+  if (options?.REV) entries.reverse();
+  if (options?.BY === 'SCORE') {
+    const max = scoreBound(options.REV ? start : stop, '+inf');
+    const min = scoreBound(options.REV ? stop : start, '-inf');
+    entries = entries.filter(([, score]) => score >= min && score <= max);
+  } else if (options?.BY === 'LEX') {
+    throw new Error('redis mock: ZRANGE BY LEX is not supported');
+  }
+  if (options?.LIMIT) {
+    entries = entries.slice(options.LIMIT.offset, options.LIMIT.offset + options.LIMIT.count);
+  }
+  return entries;
+}
+
 /**
  * Build a chainable mock RedisMulti that queues commands and applies them
  * on `.exec()`. Mirrors node-redis v5's RedisMulti shape (set/del/sAdd/
@@ -164,19 +214,46 @@ export function createMockMulti(
  * @param keyPrefix - Override the default `'axl:'` prefix to exercise
  * the keyPrefix option without hitting a real Redis.
  */
-export function createRedisStoreWithMockClient(
+export type MockTtlConfig = Partial<{
+  session: number | null;
+  sessionMeta: number | null;
+  checkpoint: number | null;
+  executionState: number | null;
+  executionHistory: number | null;
+  evalHistory: number | null;
+  memory: number | null;
+  streamingEvents: number | null;
+}>;
+
+/**
+ * Build a RedisStore over an existing client (the mock's, or a wrapper around
+ * it), bypassing the private constructor. Two stores built over one client
+ * behave like two processes sharing one Redis.
+ */
+export function createRedisStoreOverClient(
+  client: unknown,
   keyPrefix = 'axl:',
-  ttlConfig?: Partial<{
-    session: number | null;
-    sessionMeta: number | null;
-    checkpoint: number | null;
-    executionState: number | null;
-    executionHistory: number | null;
-    evalHistory: number | null;
-    memory: number | null;
-    streamingEvents: number | null;
-  }>,
-) {
+  ttlConfig?: MockTtlConfig,
+): RedisStore {
+  // Resolve TTLs the same way the factory does: per-category override
+  // beats default beats null (no TTL).
+  const store = Object.create(RedisStore.prototype) as RedisStore;
+  (store as any).client = client;
+  (store as any).keyPrefix = keyPrefix;
+  (store as any).ttls = {
+    session: ttlConfig?.session ?? null,
+    sessionMeta: ttlConfig?.sessionMeta ?? null,
+    checkpoint: ttlConfig?.checkpoint ?? null,
+    executionState: ttlConfig?.executionState ?? null,
+    executionHistory: ttlConfig?.executionHistory ?? null,
+    evalHistory: ttlConfig?.evalHistory ?? null,
+    memory: ttlConfig?.memory ?? null,
+    streamingEvents: ttlConfig?.streamingEvents ?? null,
+  };
+  return store;
+}
+
+export function createRedisStoreWithMockClient(keyPrefix = 'axl:', ttlConfig?: MockTtlConfig) {
   const data = new Map<string, string>();
   const hashData = new Map<string, Map<string, string>>();
 
@@ -345,57 +422,20 @@ export function createRedisStoreWithMockClient(
     }),
     // ZRANGE: the node-redis v5 parameterized form. With
     // BY:'SCORE' + REV:true this is the "ZREVRANGEBYSCORE" semantic.
-    // Production accepts any bounds; this mock only handles the
-    // '+inf' / '-inf' pair that our store uses, plus optional LIMIT.
     // (The dedicated `zRevRangeByScore` method exists in node-redis v4
     // but was removed in v5 — caught by the REDIS_URL-gated integration
     // test suite.)
     zRange: vi.fn(
-      async (
-        key: string,
-        start: number | string,
-        stop: number | string,
-        options?: {
-          BY?: 'SCORE' | 'LEX';
-          REV?: boolean;
-          LIMIT?: { offset: number; count: number };
-        },
-      ) => {
-        const set = zsetData.get(key);
-        if (!set) return [];
-        let entries = [...set.entries()];
-        // BY:SCORE filters by score; REV reverses (start/stop swap meaning).
-        // For our usage (start: '+inf', stop: '-inf', BY: 'SCORE', REV: true),
-        // we want everything in descending score order. Numeric bounds are
-        // also supported for completeness, mirroring real Redis.
-        if (options?.BY === 'SCORE') {
-          if (options.REV) {
-            const max = start;
-            const min = stop;
-            if (max !== '+inf' && typeof max !== 'string')
-              entries = entries.filter(([, score]) => score <= (max as number));
-            if (min !== '-inf' && typeof min !== 'string')
-              entries = entries.filter(([, score]) => score >= (min as number));
-            entries.sort((a, b) => b[1] - a[1]);
-          } else {
-            const min = start;
-            const max = stop;
-            if (min !== '-inf' && typeof min !== 'string')
-              entries = entries.filter(([, score]) => score >= (min as number));
-            if (max !== '+inf' && typeof max !== 'string')
-              entries = entries.filter(([, score]) => score <= (max as number));
-            entries.sort((a, b) => a[1] - b[1]);
-          }
-        } else {
-          // BY undefined → index-based (we don't use this path in production)
-          entries.sort((a, b) => a[1] - b[1]);
-          if (options?.REV) entries.reverse();
-        }
-        if (options?.LIMIT) {
-          entries = entries.slice(options.LIMIT.offset, options.LIMIT.offset + options.LIMIT.count);
-        }
-        return entries.map(([value]) => value);
-      },
+      async (key: string, start: number | string, stop: number | string, options?: ZRangeOptions) =>
+        rangeZset(zsetData, key, start, stop, options).map(([value]) => value),
+    ),
+    // ZRANGE ... WITHSCORES, node-redis v5 `zRangeWithScores` reply shape.
+    zRangeWithScores: vi.fn(
+      async (key: string, start: number | string, stop: number | string, options?: ZRangeOptions) =>
+        rangeZset(zsetData, key, start, stop, options).map(([value, score]) => ({
+          value,
+          score,
+        })),
     ),
     // multi() returns a chain object. Queue commands; on .exec(), apply
     // them all atomically against the same backing Maps. Real Redis
@@ -419,21 +459,7 @@ export function createRedisStoreWithMockClient(
   };
 
   // Bypass the private constructor and inject the mock client.
-  // Resolve TTLs the same way the factory does: per-category override
-  // beats default beats null (no TTL).
-  const store = Object.create(RedisStore.prototype) as RedisStore;
-  (store as any).client = mockClient;
-  (store as any).keyPrefix = keyPrefix;
-  (store as any).ttls = {
-    session: ttlConfig?.session ?? null,
-    sessionMeta: ttlConfig?.sessionMeta ?? null,
-    checkpoint: ttlConfig?.checkpoint ?? null,
-    executionState: ttlConfig?.executionState ?? null,
-    executionHistory: ttlConfig?.executionHistory ?? null,
-    evalHistory: ttlConfig?.evalHistory ?? null,
-    memory: ttlConfig?.memory ?? null,
-    streamingEvents: ttlConfig?.streamingEvents ?? null,
-  };
+  const store = createRedisStoreOverClient(mockClient, keyPrefix, ttlConfig);
 
   return { store, mockClient, data, hashData, setData, zsetData, ttls, listData };
 }

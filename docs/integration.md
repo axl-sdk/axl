@@ -354,7 +354,7 @@ the store:
 
 | Store | How | Note |
 |---|---|---|
-| `RedisStore` | `SET key value XX KEEPTTL` | **Requires Redis ≥ 6.0** for `KEEPTTL`. Nothing else in `RedisStore` does |
+| `RedisStore` | `SET key value XX KEEPTTL` | Covered by `RedisStore`'s Redis 7.0 requirement (see [RedisStore options](./api-reference.md#redisstore-options)) |
 | `SQLiteStore` | `UPDATE … WHERE id = ?` and not expired | a resurrected row would start a new retention window, or none at all without `ttls.evalHistory` |
 | `MemoryStore` | live-row check, then set | as above |
 | a custom store | omit it | corrections are then **not persisted at all**; the in-process cache is still corrected |

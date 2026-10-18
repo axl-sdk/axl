@@ -101,7 +101,7 @@ To read further back, pass `nextCursor` as `cursor` on the next request. `nextCu
 
 An invalid `limit` or `cursor` returns `400` with `error.code: 'INVALID_PARAM'` and `error.param` naming the parameter. Runs that started in the same millisecond each appear on exactly one page. With `trace.redact` on, summaries have `result`, `error` and `metadata` scrubbed like the detail route. Paging is allowed in `readOnly` mode.
 
-The cost, workflow-stats and trace-stats aggregates read at most their window cap of recent runs (2 000 by default) from the store when they rebuild.
+The cost, workflow-stats and trace-stats aggregates read at most their window cap of recent runs (2 000 by default) from the store when they rebuild. Deleting a run also triggers a rebuild; rebuilds never overlap, and deletes that arrive during one share a single follow-up rebuild, so deleting many runs at once costs at most two store reads per aggregate.
 
 ### Versioned execution history and tool aggregates
 

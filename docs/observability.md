@@ -1354,7 +1354,7 @@ Each aggregate panel is backed by a typed aggregator that:
 
 1. **Rebuilds from history** on server start — replays persisted executions (up to 2000) or eval entries (up to 500) through a pure reducer function
 2. **Folds live events** as they arrive via the runtime's event emitter
-3. **Periodically rebuilds** every 5 minutes to evict events that fall outside time windows
+3. **Periodically rebuilds** every 5 minutes to evict events that fall outside time windows. A run delete also triggers a rebuild; rebuilds never overlap, and requests that arrive during one share a single follow-up rebuild
 
 Aggregate state is compute-on-read from the existing `ExecutionInfo.events` and `EvalHistoryEntry` data — no new persisted schema or materialized tables.
 

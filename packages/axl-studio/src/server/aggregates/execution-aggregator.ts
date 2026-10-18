@@ -1,5 +1,6 @@
 import type { AxlRuntime, AxlEvent, HistoricalExecutionInfo } from '@axlsdk/axl';
 import type { ConnectionManager } from '../ws/connection-manager.js';
+import { CoalescedRunner } from './coalesced-runner.js';
 import { AggregateSnapshots, REBUILD_INTERVAL_MS, withinWindow } from './aggregate-snapshots.js';
 import type { WindowId } from './aggregate-snapshots.js';
 
@@ -77,7 +78,17 @@ export class ExecutionAggregator<State> {
     );
   }
 
-  async rebuild(): Promise<void> {
+  /**
+   * Rebuild from the store. Requests that arrive during a rebuild (a burst of
+   * deletes, the timer) coalesce into one trailing rebuild.
+   */
+  rebuild(): Promise<void> {
+    return this.rebuilds.run();
+  }
+
+  private readonly rebuilds = new CoalescedRunner(() => this.rebuildFromStore());
+
+  private async rebuildFromStore(): Promise<void> {
     this.generation++;
     const cap = this.options.executionCap ?? 2000;
     const capped: HistoricalExecutionInfo[] = await this.options.runtime.getExecutions({

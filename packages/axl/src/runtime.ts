@@ -118,6 +118,8 @@ const DEFAULT_MAX_EVENTS_PER_EXECUTION = 50_000;
 const DEFAULT_STREAMING_BATCH_SIZE = 100;
 /** Default bound on the recent-runs cache. See `config.state.recentExecutionsCacheSize`. */
 const DEFAULT_RECENT_EXECUTIONS_CACHE_SIZE = 1_000;
+/** Page size `getExecution(id)` uses to scan a paging store that cannot fetch by id. */
+const EXECUTION_SCAN_PAGE_SIZE = 100;
 const DEFAULT_STREAMING_BATCH_INTERVAL = 1_000; // ms
 /** How often orphaned/expired diagnostic artifacts are reclaimed. */
 const DEFAULT_ARTIFACT_SWEEP_MS = 60_000;
@@ -1031,10 +1033,10 @@ export class AxlRuntime extends EventEmitter {
     const recentRunsSize = resolveRecentExecutionsCacheSize(
       this.config.state?.recentExecutionsCacheSize,
     );
+    // A store that saves and lists keeps history itself; by-id reads on one
+    // without `getExecution` scan its listing.
     const storeKeepsHistory = Boolean(
-      this.stateStore.saveExecution &&
-      this.stateStore.listExecutions &&
-      this.stateStore.getExecution,
+      this.stateStore.saveExecution && this.stateStore.listExecutions,
     );
     this.recentRuns =
       !storeKeepsHistory && recentRunsSize > 0 ? new RecentRunsCache(recentRunsSize) : undefined;
@@ -2927,10 +2929,12 @@ export class AxlRuntime extends EventEmitter {
 
   /**
    * Get execution details by ID. Looks in order at running runs, runs whose
-   * save is still in flight, the state store, and (only for a store that
-   * cannot fetch or keep history) the recent-runs cache. Nothing read from
-   * the store is cached, so a run deleted or expired elsewhere is gone on
-   * the next call.
+   * save is still in flight, the state store (its `getExecution`, or a scan
+   * of its listing when it has `listExecutions` but no `getExecution`), and
+   * (only for a store that cannot list or save history) the recent-runs
+   * cache. Nothing read from the store is cached, so a run deleted or
+   * expired elsewhere is gone on the next call, and every run
+   * `getExecutions()` lists can be fetched here.
    */
   async getExecution(executionId: string): Promise<HistoricalExecutionInfo | undefined> {
     const active = this.executions.get(executionId);
@@ -2939,12 +2943,38 @@ export class AxlRuntime extends EventEmitter {
     const pending = this.pendingSaves.get(executionId);
     if (pending) return pending.snapshot;
 
-    if (this.stateStore.getExecution) {
-      const stored = await this.stateStore.getExecution(executionId);
-      if (stored) return this.normalizeStoredExecution(stored);
-    }
+    const stored = this.stateStore.getExecution
+      ? await this.stateStore.getExecution(executionId)
+      : await this.findInStoreListing(executionId);
+    if (stored) return this.normalizeStoredExecution(stored);
 
     return this.recentRunsServeReads() ? this.recentRuns!.get(executionId) : undefined;
+  }
+
+  /**
+   * By-id read for a store that lists but cannot fetch by id. A paging store
+   * is scanned page by page with the cursor, stopping at the match; any
+   * other store is listed once in full. Returns `null` when the store cannot
+   * list or does not hold the run.
+   */
+  private async findInStoreListing(executionId: string): Promise<HistoricalExecutionInfo | null> {
+    const store = this.stateStore;
+    if (!store.listExecutions) return null;
+    if (store.historyPaging !== true) {
+      return (await store.listExecutions()).find((e) => e.executionId === executionId) ?? null;
+    }
+    let cursor: ExecutionCursor | undefined;
+    for (;;) {
+      const page = await store.listExecutions(EXECUTION_SCAN_PAGE_SIZE, { cursor });
+      const found = page.find((e) => e.executionId === executionId);
+      if (found) return found;
+      if (page.length === 0) return null;
+      // Advance from the furthest row in listing order, whatever order the
+      // page came back in, so the scan always moves forward.
+      const last = [...page].sort(compareExecutionsNewestFirst)[page.length - 1];
+      if (cursor && compareExecutionsNewestFirst(last, cursor) <= 0) return null;
+      cursor = { startedAt: last.startedAt, executionId: last.executionId };
+    }
   }
 
   /** The recent-runs cache stands in for listing when the store cannot list
@@ -2957,7 +2987,8 @@ export class AxlRuntime extends EventEmitter {
   }
 
   /** The recent-runs cache stands in for by-id reads when the store cannot
-   *  fetch runs, or never receives them because it cannot save. */
+   *  fetch or list runs (it exists only then), or never receives them because
+   *  it cannot save. */
   private recentRunsServeReads(): boolean {
     return (
       this.recentRuns !== undefined &&

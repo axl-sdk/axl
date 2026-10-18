@@ -782,8 +782,7 @@ const runtime = new AxlRuntime({
   },
 });
 
-// Boot sequence: lazy-load THEN recover THEN accept new work
-await runtime.getExecutions();
+// Boot sequence: recover THEN accept new work
 const recovered = await runtime.recoverIncompleteStreams();
 console.log(`Recovered ${recovered.length} crashed executions`);
 app.listen(3000);

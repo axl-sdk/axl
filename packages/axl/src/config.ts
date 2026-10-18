@@ -82,6 +82,20 @@ export type StateConfig = {
    */
   maxEventsPerExecution?: number;
   /**
+   * How many recently finished runs the runtime keeps in process when the
+   * state store cannot keep execution history itself, that is, when it lacks
+   * `saveExecution`, `listExecutions` or `getExecution`. The cache stands in
+   * for the missing methods: `getExecutions()` lists from it when the store
+   * cannot list, and `getExecution(id)` falls back to it when the store
+   * cannot fetch. The least recently used run is dropped first.
+   *
+   * The built-in stores have all three methods, so the runtime never keeps
+   * this cache for them: history is read through the store on every call.
+   *
+   * Default: 1_000. `0` turns the cache off. Must be a non-negative integer.
+   */
+  recentExecutionsCacheSize?: number;
+  /**
    * When to persist execution events to the state store.
    *
    * - `'terminal'` (default, back-compat) — events are buffered in memory

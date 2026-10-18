@@ -21,7 +21,8 @@ paths:
   and `RedisStore` but **not** `SQLiteStore` (it warns once — use `'terminal'`). High-volume
   `token`/`partial_object`/`string_delta` are never flushed (reconstructable from
   `agent_call_end`).
-- History (executions, eval results) auto-persists and lazy-loads. RedisStore TTLs, window
+- History auto-persists. The runtime reads execution history through the store on every
+  call (no in-process history cache); eval history still lazy-loads once. RedisStore TTLs, window
   semantics, and crash recovery are the per-category contract in
   `docs/migration/state-store-durability.md` + `docs/integration.md` — read those rather
   than restating them here.

@@ -13,7 +13,13 @@ import { buildSummaryPrompt, requestSummary } from './compaction.js';
 import { ProviderRegistry } from './providers/registry.js';
 import { TranscriptionProviderRegistry } from './providers/transcription-registry.js';
 import type { TranscriptionProvider } from './providers/transcription-types.js';
-import type { StateStore, PendingDecision, EvalHistoryEntry } from './state/types.js';
+import type {
+  StateStore,
+  PendingDecision,
+  EvalHistoryEntry,
+  ExecutionCursor,
+} from './state/types.js';
+import { compareExecutionsNewestFirst } from './state/retention.js';
 import { MemoryStore } from './state/memory.js';
 import { SQLiteStore } from './state/sqlite.js';
 import {
@@ -110,6 +116,8 @@ function hashInput(input: unknown): string {
  *  overridden via `config.state.maxEventsPerExecution`. */
 const DEFAULT_MAX_EVENTS_PER_EXECUTION = 50_000;
 const DEFAULT_STREAMING_BATCH_SIZE = 100;
+/** Default bound on the recent-runs cache. See `config.state.recentExecutionsCacheSize`. */
+const DEFAULT_RECENT_EXECUTIONS_CACHE_SIZE = 1_000;
 const DEFAULT_STREAMING_BATCH_INTERVAL = 1_000; // ms
 /** How often orphaned/expired diagnostic artifacts are reclaimed. */
 const DEFAULT_ARTIFACT_SWEEP_MS = 60_000;
@@ -580,6 +588,121 @@ function assertNoRemovedObservationCallbacks(options: unknown): void {
   );
 }
 
+/**
+ * Bounded least-recently-used set of finished runs, keyed by execution id.
+ *
+ * The runtime keeps one only for a store that cannot save, list, or fetch
+ * execution history by itself; for such a store this is the only place a
+ * finished run stays visible. `Map` iteration order is insertion order, so
+ * re-inserting on every touch keeps the least recently used entry first.
+ */
+class RecentRunsCache {
+  private readonly entries = new Map<string, HistoricalExecutionInfo>();
+
+  constructor(private readonly capacity: number) {}
+
+  get size(): number {
+    return this.entries.size;
+  }
+
+  get(executionId: string): HistoricalExecutionInfo | undefined {
+    const entry = this.entries.get(executionId);
+    if (entry) {
+      this.entries.delete(executionId);
+      this.entries.set(executionId, entry);
+    }
+    return entry;
+  }
+
+  set(executionId: string, execution: HistoricalExecutionInfo): void {
+    this.entries.delete(executionId);
+    this.entries.set(executionId, execution);
+    while (this.entries.size > this.capacity) {
+      const oldest = this.entries.keys().next().value as string;
+      this.entries.delete(oldest);
+    }
+  }
+
+  delete(executionId: string): boolean {
+    return this.entries.delete(executionId);
+  }
+
+  values(): HistoricalExecutionInfo[] {
+    return [...this.entries.values()];
+  }
+}
+
+/** A finished run whose history save has not settled yet. */
+type PendingSave = {
+  /** The record being saved, served to reads until the save settles. */
+  snapshot: HistoricalExecutionInfo;
+  /** Settles (never rejects) once the save, and any follow-up, is done. */
+  settled: Promise<void>;
+};
+
+function resolveRecentExecutionsCacheSize(requested: unknown): number {
+  if (requested === undefined) return DEFAULT_RECENT_EXECUTIONS_CACHE_SIZE;
+  if (typeof requested !== 'number' || !Number.isInteger(requested) || requested < 0) {
+    throw new AxlError(
+      'INVALID_CONFIG',
+      `config.state.recentExecutionsCacheSize must be a non-negative integer; got ${String(requested)}`,
+    );
+  }
+  return requested;
+}
+
+/**
+ * Validate `getExecutions()` options. A bad page size or cursor is a caller
+ * bug, so it throws instead of returning an empty or unbounded list. The
+ * cursor is copied to its two fields, so passing the last item of a page as
+ * the cursor works and nothing else reaches the store.
+ */
+function parseGetExecutionsOptions(options: unknown): {
+  limit?: number;
+  cursor?: ExecutionCursor;
+} {
+  if (options === undefined) return {};
+  if (options === null || typeof options !== 'object') {
+    throw new AxlError(
+      'INVALID_ARGUMENT',
+      `getExecutions() options must be an object; got ${options === null ? 'null' : typeof options}`,
+    );
+  }
+  const { limit, cursor } = options as { limit?: unknown; cursor?: unknown };
+  if (
+    limit !== undefined &&
+    limit !== Infinity &&
+    !(typeof limit === 'number' && Number.isInteger(limit) && limit > 0)
+  ) {
+    throw new AxlError(
+      'INVALID_ARGUMENT',
+      `getExecutions() limit must be a positive integer; got ${String(limit)}`,
+    );
+  }
+  let parsedCursor: ExecutionCursor | undefined;
+  if (cursor !== undefined) {
+    const candidate = cursor as Partial<ExecutionCursor> | null;
+    if (
+      candidate === null ||
+      typeof candidate !== 'object' ||
+      typeof candidate.startedAt !== 'number' ||
+      !Number.isFinite(candidate.startedAt) ||
+      typeof candidate.executionId !== 'string'
+    ) {
+      throw new AxlError(
+        'INVALID_ARGUMENT',
+        'getExecutions() cursor must be { startedAt: number; executionId: string }, ' +
+          'built from the last item of the previous page',
+      );
+    }
+    parsedCursor = { startedAt: candidate.startedAt, executionId: candidate.executionId };
+  }
+  return {
+    ...(limit === undefined || limit === Infinity ? {} : { limit: limit as number }),
+    ...(parsedCursor ? { cursor: parsedCursor } : {}),
+  };
+}
+
 /** Cost scope for tracking cost across async boundaries via AsyncLocalStorage. */
 type CostScope = {
   totalCost: number;
@@ -808,8 +931,6 @@ export class AxlRuntime extends EventEmitter {
   private mcpManager?: McpManager;
   private memoryManager?: MemoryManager;
   private spanManager: SpanManager = new NoopSpanManager();
-  private historicalExecutions = new Map<string, HistoricalExecutionInfo>();
-  private historicalExecutionsLoadPromise: Promise<void> | null = null;
   /** Per-session in-process serialization. Each entry is a chain of pending
    *  work for that session id — `Session.send` / `Session.stream` await the
    *  prior entry before reading history, so concurrent calls produce a
@@ -851,12 +972,28 @@ export class AxlRuntime extends EventEmitter {
    *  The Set is mutated by the chain's own `.finally` so entries clear as
    *  soon as the work settles. */
   private persistInflight = new Set<Promise<void>>();
-  /** In-flight execution saves (save → finalize chain), keyed by execution
-   *  id. `deleteExecution()` awaits the entry for its id before deleting from
-   *  the store, so a save that lands late cannot re-create a deleted run.
-   *  Each entry removes itself when its chain settles (success or failure),
-   *  but only if it is still the current entry for that id. */
-  private pendingSaves = new Map<string, Promise<void>>();
+  /** Finished runs whose history save has not settled, keyed by execution
+   *  id. Reads serve the snapshot until the save lands, so a run is visible
+   *  the moment it finishes (read-your-writes). `deleteExecution()` awaits
+   *  the entry before deleting from the store, so a save that lands late
+   *  cannot re-create a deleted run. Each entry removes itself when its save
+   *  settles (success or failure), but only if it is still the current entry
+   *  for that id, so the map holds only in-flight saves. */
+  private pendingSaves = new Map<string, PendingSave>();
+  /** Recently finished runs, kept only when the store cannot save, list, or
+   *  fetch execution history itself (and the cache size is not `0`).
+   *  `undefined` for every built-in store: execution history is read through
+   *  the store on every call and never cached here. */
+  private readonly recentRuns: RecentRunsCache | undefined;
+  /** Execution ids `recoverIncompleteStreams()` is working on, each with a
+   *  promise that settles when recovery is done with that id.
+   *  `deleteExecution()` awaits it, so a recovered record cannot land after
+   *  the delete. */
+  private recoveringExecutions = new Map<string, Promise<void>>();
+  /** Execution ids with a `deleteExecution()` in progress, with a count of
+   *  concurrent deletes. Recovery skips them: their store sweep removes the
+   *  streaming buffer it would otherwise turn back into a record. */
+  private deletingExecutions = new Map<string, number>();
   /** Resolved diagnostic artifact backend, when `diagnostics.artifacts` is set. */
   private artifactStore?: DiagnosticArtifactStore;
   private artifactLeaseMs = DEFAULT_ARTIFACT_LEASE_MS;
@@ -891,6 +1028,16 @@ export class AxlRuntime extends EventEmitter {
     this.providerRegistry = new ProviderRegistry();
     this.transcriptionProviderRegistry = new TranscriptionProviderRegistry();
     this.stateStore = this.createStateStore();
+    const recentRunsSize = resolveRecentExecutionsCacheSize(
+      this.config.state?.recentExecutionsCacheSize,
+    );
+    const storeKeepsHistory = Boolean(
+      this.stateStore.saveExecution &&
+      this.stateStore.listExecutions &&
+      this.stateStore.getExecution,
+    );
+    this.recentRuns =
+      !storeKeepsHistory && recentRunsSize > 0 ? new RecentRunsCache(recentRunsSize) : undefined;
     // Resolve + validate the events cap once at construction. Reject
     // 0 / negatives / fractions / NaN early; allow Infinity for the
     // legacy "unbounded" opt-out.
@@ -1557,13 +1704,15 @@ export class AxlRuntime extends EventEmitter {
 
   /**
    * Persist a completed/failed execution to the state store (fire-and-forget)
-   * and move it from the active executions map to the historical cache.
+   * and remove it from the active executions map. Until the save settles the
+   * run is served from `pendingSaves`; afterwards from the store (or, for a
+   * store that cannot keep history, from `recentRuns`).
    *
    * Resurrection guard: if `runtime.deleteExecution(id)` was called while
    * this execution was still running, the id will be in
-   * `pendingDeletedExecutions`. In that case we skip the save AND the
-   * historical-cache write, and finalize the streaming buffer (if any) so
-   * the buffer doesn't outlive the delete.
+   * `pendingDeletedExecutions`. In that case we skip the save AND every
+   * in-process record of the run, and finalize the streaming buffer (if any)
+   * so the buffer doesn't outlive the delete.
    */
   private persistExecution(execInfo: ExecutionInfo): void {
     const id = execInfo.executionId;
@@ -1574,7 +1723,7 @@ export class AxlRuntime extends EventEmitter {
 
     if (this.pendingDeletedExecutions.has(id)) {
       // The user deleted this execution while it was still running. Honor
-      // that intent: skip save, skip cache write, finalize the streaming
+      // that intent: skip save, keep no record, finalize the streaming
       // buffer so it doesn't outlive the delete.
       this.pendingDeletedExecutions.delete(id);
       this.executions.delete(id);
@@ -1635,10 +1784,11 @@ export class AxlRuntime extends EventEmitter {
         })
         .then(() => undefined);
       this.persistInflight.add(chain);
-      this.pendingSaves.set(id, chain);
+      const pending: PendingSave = { snapshot, settled: chain };
+      this.pendingSaves.set(id, pending);
       chain.finally(() => {
         this.persistInflight.delete(chain);
-        if (this.pendingSaves.get(id) === chain) this.pendingSaves.delete(id);
+        if (this.pendingSaves.get(id) === pending) this.pendingSaves.delete(id);
       });
     } else if (this.streamingFlusher) {
       // No saveExecution but streaming is enabled (custom store). Drop
@@ -1650,9 +1800,10 @@ export class AxlRuntime extends EventEmitter {
       chain.finally(() => this.persistInflight.delete(chain));
     }
 
-    // Move from active to historical cache to bound active map growth.
-    // Use the snapshot so the cached entry is not mutated by lingering closures.
-    this.historicalExecutions.set(id, snapshot);
+    // A store that cannot keep history leaves this cache as the only place
+    // the run stays visible. Use the snapshot so the cached entry is not
+    // mutated by lingering closures.
+    this.recentRuns?.set(id, snapshot);
     this.executions.delete(id);
   }
 
@@ -1867,7 +2018,6 @@ export class AxlRuntime extends EventEmitter {
     return result;
   }
 
-  /** Get all execution info (running + completed + historical). */
   /** Normalize an execution loaded from a `StateStore` so the
    *  historical event union holds for downstream consumers
    *  (Studio aggregators, REST routes, redaction). Custom or legacy stores
@@ -1889,37 +2039,96 @@ export class AxlRuntime extends EventEmitter {
     return normalizeHistoricalExecution(exec);
   }
 
-  async getExecutions(): Promise<HistoricalExecutionInfo[]> {
-    // Lazy-load historical executions from store on first access (once-guard)
-    if (!this.historicalExecutionsLoadPromise && this.stateStore.listExecutions) {
-      this.historicalExecutionsLoadPromise = this.stateStore
-        .listExecutions()
-        .then((stored) => {
-          for (const exec of stored) {
-            if (
-              !this.executions.has(exec.executionId) &&
-              !this.historicalExecutions.has(exec.executionId)
-            ) {
-              this.historicalExecutions.set(exec.executionId, this.normalizeStoredExecution(exec));
-            }
-          }
-        })
-        .catch((error) => {
-          // Failed to load — reset so next call retries
-          this.historicalExecutionsLoadPromise = null;
-          throw error;
-        });
+  /**
+   * List executions, newest first: running runs, runs whose save is still in
+   * flight, and the history the state store holds. Ordered by `startedAt`,
+   * then `executionId`, both descending.
+   *
+   * With no options, returns every retained run. Pass `limit` for one page,
+   * and `cursor` (built from the last item of the previous page) for the
+   * page after it. Each call reads through the store, so runs finished or
+   * deleted by other runtimes sharing the store are reflected immediately.
+   *
+   * @throws {AxlError} `INVALID_ARGUMENT` for a `limit` that is not a positive
+   *   integer (`Infinity` means no limit) or a malformed `cursor`.
+   */
+  async getExecutions(options?: {
+    limit?: number;
+    cursor?: ExecutionCursor;
+  }): Promise<HistoricalExecutionInfo[]> {
+    const { limit, cursor } = parseGetExecutionsOptions(options);
+    const isAfterCursor = (exec: HistoricalExecutionInfo): boolean =>
+      cursor === undefined || compareExecutionsNewestFirst(exec, cursor) > 0;
+
+    // Capture in-process runs BEFORE reading the store. A save that settles
+    // while the store read is in flight is then in this snapshot, in the
+    // store page, or in both (de-duplicated below), never in neither.
+    // Precedence when an id appears twice: active > pending save > store >
+    // recent-runs cache, so live data wins.
+    const live = new Map<string, HistoricalExecutionInfo>(this.executions);
+    for (const [id, { snapshot }] of this.pendingSaves) {
+      if (!live.has(id)) live.set(id, snapshot);
     }
-    if (this.historicalExecutionsLoadPromise) {
-      await this.historicalExecutionsLoadPromise;
+    const recent = this.recentRunsServeListing() ? this.recentRuns!.values() : [];
+
+    // Each in-process run can hide at most one store row (its own, older
+    // copy). Over-fetch by that many so the page is still full after those
+    // rows are dropped.
+    const stored = await this.listStoredExecutions({
+      limit,
+      cursor,
+      overlap: live.size + recent.length,
+    });
+
+    const merged = new Map<string, HistoricalExecutionInfo>();
+    for (const [id, exec] of live) {
+      if (isAfterCursor(exec)) merged.set(id, exec);
+    }
+    for (const exec of stored) {
+      const id = exec.executionId;
+      if (!live.has(id) && !merged.has(id)) merged.set(id, exec);
+    }
+    for (const exec of recent) {
+      const id = exec.executionId;
+      if (!live.has(id) && !merged.has(id) && isAfterCursor(exec)) merged.set(id, exec);
     }
 
-    // Merge: in-memory takes precedence (has live data)
-    const merged = new Map(this.historicalExecutions);
-    for (const [id, exec] of this.executions) {
-      merged.set(id, exec);
-    }
-    return [...merged.values()].sort((a, b) => b.startedAt - a.startedAt);
+    const sorted = [...merged.values()].sort(compareExecutionsNewestFirst);
+    return limit === undefined ? sorted : sorted.slice(0, limit);
+  }
+
+  /**
+   * Read one page of execution history from the store: the records strictly
+   * after `cursor`, newest first, at least `limit + overlap` of them when the
+   * store holds that many (all of them when `limit` is unset).
+   *
+   * Only a store that declares `historyPaging` is handed the cursor. Any
+   * other store is listed in full and paged here: filtering the output of a
+   * store that ignored the cursor would return its first page again, and an
+   * empty page after that.
+   */
+  private async listStoredExecutions(page: {
+    limit: number | undefined;
+    cursor: ExecutionCursor | undefined;
+    overlap: number;
+  }): Promise<HistoricalExecutionInfo[]> {
+    const store = this.stateStore;
+    if (!store.listExecutions) return [];
+    const wanted = page.limit === undefined ? undefined : page.limit + page.overlap;
+    const rows =
+      store.historyPaging === true
+        ? await store.listExecutions(wanted, { cursor: page.cursor })
+        : await store.listExecutions();
+    // The same bound applies to a paging store's rows, so one that returns
+    // more than asked, or rows at the cursor, cannot repeat an item.
+    const cursor = page.cursor;
+    const after =
+      cursor === undefined
+        ? rows
+        : rows.filter((row) => compareExecutionsNewestFirst(row, cursor) > 0);
+    const window =
+      wanted === undefined ? after : [...after].sort(compareExecutionsNewestFirst).slice(0, wanted);
+    return window.map((row) => this.normalizeStoredExecution(row));
   }
 
   /**
@@ -2524,20 +2733,25 @@ export class AxlRuntime extends EventEmitter {
    * Recover executions whose process died mid-run when `state.persist:
    * 'streaming'` was configured. Synthesizes a partial `ExecutionInfo`
    * from the streaming buffer for each — `status: 'failed'`, error
-   * `'process terminated'` — registers them in the historical cache so
-   * they show up in `getExecutions()`, persists them via the store's
-   * `saveExecution`, and finalizes the streaming buffer.
+   * `'process terminated'` — persists them via the store's
+   * `saveExecution` (so they show up in `getExecutions()`), and finalizes
+   * the streaming buffer.
    *
    * Idempotent — if the streaming buffer is already gone (or
    * `listStreamingExecutions` is empty), this is a no-op. Returns the
    * list of recovered `ExecutionInfo`s for caller introspection.
    *
-   * Wire this into your process startup AFTER `runtime.getExecutions()`
-   * has lazy-loaded the historical cache. Order matters: completed
-   * executions already in the store should not be overwritten by a
-   * stale streaming buffer that the previous process didn't get to
-   * finalize. The implementation checks the historical store before
-   * synthesizing, so a re-run is safe.
+   * A run whose final record already exists is never recovered: for each
+   * buffered id this asks the store's `getExecution(id)` and, when a record
+   * is there, only drops the leftover buffer. It does not list history, so
+   * its cost does not grow with the size of the store. A store without
+   * `getExecution` cannot be checked, and every buffered run is recovered.
+   *
+   * Wire this into process startup, before the process accepts new work:
+   * a run live in another process looks the same as a crashed one.
+   * `deleteExecution(id)` called while recovery is working on that id waits
+   * for recovery to finish with it, so the recovered record cannot outlive
+   * the delete.
    */
   async recoverIncompleteStreams(): Promise<HistoricalExecutionInfo[]> {
     if (!this.stateStore.listStreamingExecutions || !this.stateStore.getStreamingEvents) {
@@ -2547,13 +2761,6 @@ export class AxlRuntime extends EventEmitter {
 
     const ids = await this.stateStore.listStreamingExecutions();
     if (ids.length === 0) return [];
-
-    // Ensure historicalExecutions is populated so we don't double-recover
-    // an execution that already has a complete `executionHistory` blob.
-    // (Race: a previous process might have finalized after writing
-    // saveExecution, but our streaming list still has the entry. Defensive
-    // check.)
-    await this.getExecutions();
 
     const recovered: HistoricalExecutionInfo[] = [];
     for (const id of ids) {
@@ -2569,100 +2776,144 @@ export class AxlRuntime extends EventEmitter {
       if (this.executions.has(id) || this.streamableExecutionIds.has(id)) {
         continue;
       }
+      // A delete in progress sweeps this buffer itself; recovering it would
+      // re-create the record the caller is deleting. A concurrent recovery
+      // call already working on the id finishes it.
+      if (this.deletingExecutions.has(id) || this.recoveringExecutions.has(id)) continue;
 
-      // If a canonical execution already exists, just drop the orphan buffer.
-      const existing = this.historicalExecutions.get(id);
-      if (existing) {
-        await this.stateStore.finalizeStreamingEvents?.(id);
-        continue;
+      // Registered before the first store read for this id, so a delete
+      // that starts from here on waits until recovery is done with it.
+      let finishRecovery!: () => void;
+      this.recoveringExecutions.set(
+        id,
+        new Promise<void>((resolve) => {
+          finishRecovery = resolve;
+        }),
+      );
+      try {
+        const result = await this.recoverStreamingExecution(id);
+        if (result) recovered.push(result);
+      } finally {
+        this.recoveringExecutions.delete(id);
+        finishRecovery();
       }
-
-      const events = await this.stateStore.getStreamingEvents(id);
-      if (events.length === 0) {
-        // Empty buffer — drop the orphan index entry.
-        await this.stateStore.finalizeStreamingEvents?.(id);
-        continue;
-      }
-
-      const eventSchemaVersion = getEventSchemaVersion(events[0]);
-      for (const event of events) {
-        if (getEventSchemaVersion(event) !== eventSchemaVersion) {
-          throw new Error(`Streaming buffer ${id} contains mixed event schema versions`);
-        }
-      }
-
-      // Bound the synthesized events array to the configured cap so a
-      // crashed run with hundreds of thousands of buffered events can't
-      // resurrect as an unbounded ExecutionInfo. Mirrors `pushEventBounded`'s
-      // sentinel behavior — truncation marker as the last entry.
-      const boundedEvents = boundRecoveredEvents(events, this.maxEventsPerExecution);
-
-      // Synthesize a partial ExecutionInfo. We don't have the original
-      // input or workflow name on hand, but we can pull them off events
-      // when available — `workflow_start` is the only event type the
-      // emitter auto-stamps with the workflow name, so prefer it. Falling
-      // back to events[0] is fragile because the first ASK-scoped event
-      // (ask_start) may precede workflow_start in unusual scenarios.
-      const workflowStartEvent = boundedEvents.find((e) => e.type === 'workflow_start');
-      const lastEvent = boundedEvents[boundedEvents.length - 1];
-      const startedAt = workflowStartEvent?.timestamp ?? boundedEvents[0]?.timestamp ?? Date.now();
-      const completedAt = lastEvent.timestamp ?? startedAt;
-      const workflowName = workflowStartEvent?.workflow ?? RECOVERED_UNKNOWN_WORKFLOW;
-
-      // Sum cost from cost-bearing leaf events; flag if any was unpriced so the
-      // recovered `totalCost` carries the same lower-bound signal as a live run.
-      const totalCost = boundedEvents.reduce((sum, e) => sum + eventCostContribution(e), 0);
-      const unpriced = boundedEvents.some(isUnpricedLeaf);
-
-      const executionBase = {
-        executionId: id,
-        workflow: workflowName,
-        status: 'failed' as const,
-        events: boundedEvents,
-        totalCost,
-        unpriced,
-        startedAt,
-        completedAt,
-        duration: completedAt - startedAt,
-        error: 'process terminated (recovered from streaming buffer)',
-      };
-      const synthesized: HistoricalExecutionInfo =
-        eventSchemaVersion === 2
-          ? {
-              ...executionBase,
-              eventSchemaVersion: 2,
-              events: boundedEvents as AxlEventV2[],
-              observation: { complete: false, reason: 'process_interrupted' },
-            }
-          : {
-              ...executionBase,
-              eventSchemaVersion: 1,
-              events: boundedEvents as LegacyAxlEventV1[],
-            };
-
-      // Persist + register. CRITICAL: only delete the streaming buffer
-      // AFTER saveExecution succeeds. If saveExecution throws (Redis flaky
-      // during recovery), we'd otherwise lose the only on-disk record by
-      // deleting the buffer in the next finalize call. Mirrors the live-
-      // workflow `persistExecution` save→finalize chain.
-      if (this.stateStore.saveExecution) {
-        try {
-          await this.stateStore.saveExecution(synthesized);
-        } catch (err) {
-          console.error(
-            `[axl] recoverIncompleteStreams: failed to save synthesized execution ` +
-              `${id}: ${err instanceof Error ? err.message : String(err)}. ` +
-              `Streaming buffer left in place for next recovery attempt.`,
-          );
-          continue;
-        }
-      }
-      this.historicalExecutions.set(id, synthesized);
-      await this.stateStore.finalizeStreamingEvents?.(id);
-      recovered.push(synthesized);
     }
 
     return recovered;
+  }
+
+  /** Recover one buffered execution. Returns the synthesized record, or
+   *  `undefined` when there was nothing to recover. */
+  private async recoverStreamingExecution(
+    id: string,
+  ): Promise<HistoricalExecutionInfo | undefined> {
+    if (!this.stateStore.getStreamingEvents) return undefined;
+
+    // If a canonical execution already exists, just drop the orphan buffer.
+    // (A previous process may have saved it but died before finalizing.)
+    const existing = await this.stateStore.getExecution?.(id);
+    if (existing) {
+      await this.stateStore.finalizeStreamingEvents?.(id);
+      return undefined;
+    }
+
+    const events = await this.stateStore.getStreamingEvents(id);
+    if (events.length === 0) {
+      // Empty buffer — drop the orphan index entry.
+      await this.stateStore.finalizeStreamingEvents?.(id);
+      return undefined;
+    }
+
+    const eventSchemaVersion = getEventSchemaVersion(events[0]);
+    for (const event of events) {
+      if (getEventSchemaVersion(event) !== eventSchemaVersion) {
+        throw new Error(`Streaming buffer ${id} contains mixed event schema versions`);
+      }
+    }
+
+    // Bound the synthesized events array to the configured cap so a
+    // crashed run with hundreds of thousands of buffered events can't
+    // resurrect as an unbounded ExecutionInfo. Mirrors `pushEventBounded`'s
+    // sentinel behavior — truncation marker as the last entry.
+    const boundedEvents = boundRecoveredEvents(events, this.maxEventsPerExecution);
+
+    // Synthesize a partial ExecutionInfo. We don't have the original
+    // input or workflow name on hand, but we can pull them off events
+    // when available — `workflow_start` is the only event type the
+    // emitter auto-stamps with the workflow name, so prefer it. Falling
+    // back to events[0] is fragile because the first ASK-scoped event
+    // (ask_start) may precede workflow_start in unusual scenarios.
+    const workflowStartEvent = boundedEvents.find((e) => e.type === 'workflow_start');
+    const lastEvent = boundedEvents[boundedEvents.length - 1];
+    const startedAt = workflowStartEvent?.timestamp ?? boundedEvents[0]?.timestamp ?? Date.now();
+    const completedAt = lastEvent.timestamp ?? startedAt;
+    const workflowName = workflowStartEvent?.workflow ?? RECOVERED_UNKNOWN_WORKFLOW;
+
+    // Sum cost from cost-bearing leaf events; flag if any was unpriced so the
+    // recovered `totalCost` carries the same lower-bound signal as a live run.
+    const totalCost = boundedEvents.reduce((sum, e) => sum + eventCostContribution(e), 0);
+    const unpriced = boundedEvents.some(isUnpricedLeaf);
+
+    const executionBase = {
+      executionId: id,
+      workflow: workflowName,
+      status: 'failed' as const,
+      events: boundedEvents,
+      totalCost,
+      unpriced,
+      startedAt,
+      completedAt,
+      duration: completedAt - startedAt,
+      error: 'process terminated (recovered from streaming buffer)',
+    };
+    const synthesized: HistoricalExecutionInfo =
+      eventSchemaVersion === 2
+        ? {
+            ...executionBase,
+            eventSchemaVersion: 2,
+            events: boundedEvents as AxlEventV2[],
+            observation: { complete: false, reason: 'process_interrupted' },
+          }
+        : {
+            ...executionBase,
+            eventSchemaVersion: 1,
+            events: boundedEvents as LegacyAxlEventV1[],
+          };
+
+    // Persist. CRITICAL: only delete the streaming buffer AFTER
+    // saveExecution succeeds. If saveExecution throws (Redis flaky during
+    // recovery), we'd otherwise lose the only on-disk record by deleting
+    // the buffer in the next finalize call. Mirrors the live-workflow
+    // `persistExecution` save→finalize chain, including its `pendingSaves`
+    // entry: reads see the record while it is being saved, and a delete
+    // waits for the save.
+    const saveExecution = this.stateStore.saveExecution;
+    if (saveExecution) {
+      const save = (async () => saveExecution.call(this.stateStore, synthesized))();
+      const pending: PendingSave = {
+        snapshot: synthesized,
+        settled: save.then(
+          () => undefined,
+          () => undefined,
+        ),
+      };
+      this.pendingSaves.set(id, pending);
+      try {
+        await save;
+      } catch (err) {
+        console.error(
+          `[axl] recoverIncompleteStreams: failed to save synthesized execution ` +
+            `${id}: ${err instanceof Error ? err.message : String(err)}. ` +
+            `Streaming buffer left in place for next recovery attempt.`,
+        );
+        return undefined;
+      } finally {
+        if (this.pendingSaves.get(id) === pending) this.pendingSaves.delete(id);
+      }
+    }
+    this.recentRuns?.set(id, synthesized);
+    await this.stateStore.finalizeStreamingEvents?.(id);
+    return synthesized;
   }
 
   /** Abort a running execution by its ID. */
@@ -2674,27 +2925,44 @@ export class AxlRuntime extends EventEmitter {
     }
   }
 
-  /** Get execution details by ID. */
+  /**
+   * Get execution details by ID. Looks in order at running runs, runs whose
+   * save is still in flight, the state store, and (only for a store that
+   * cannot fetch or keep history) the recent-runs cache. Nothing read from
+   * the store is cached, so a run deleted or expired elsewhere is gone on
+   * the next call.
+   */
   async getExecution(executionId: string): Promise<HistoricalExecutionInfo | undefined> {
-    // Check active in-memory executions first
-    const inMemory = this.executions.get(executionId);
-    if (inMemory) return inMemory;
+    const active = this.executions.get(executionId);
+    if (active) return active;
 
-    // Check historical cache
-    const cached = this.historicalExecutions.get(executionId);
-    if (cached) return cached;
+    const pending = this.pendingSaves.get(executionId);
+    if (pending) return pending.snapshot;
 
-    // Fall through to store
     if (this.stateStore.getExecution) {
       const stored = await this.stateStore.getExecution(executionId);
-      if (stored) {
-        const normalized = this.normalizeStoredExecution(stored);
-        this.historicalExecutions.set(executionId, normalized);
-        return normalized;
-      }
+      if (stored) return this.normalizeStoredExecution(stored);
     }
 
-    return undefined;
+    return this.recentRunsServeReads() ? this.recentRuns!.get(executionId) : undefined;
+  }
+
+  /** The recent-runs cache stands in for listing when the store cannot list
+   *  runs, or never receives them because it cannot save. */
+  private recentRunsServeListing(): boolean {
+    return (
+      this.recentRuns !== undefined &&
+      (!this.stateStore.saveExecution || !this.stateStore.listExecutions)
+    );
+  }
+
+  /** The recent-runs cache stands in for by-id reads when the store cannot
+   *  fetch runs, or never receives them because it cannot save. */
+  private recentRunsServeReads(): boolean {
+    return (
+      this.recentRuns !== undefined &&
+      (!this.stateStore.saveExecution || !this.stateStore.getExecution)
+    );
   }
 
   /** Save an eval result to history. */
@@ -2758,15 +3026,16 @@ export class AxlRuntime extends EventEmitter {
 
   /**
    * Delete an execution from history by id. Removes from the active map (if
-   * still running), the historical cache, the configured StateStore, AND
+   * still running), the recent-runs cache, the configured StateStore, AND
    * any execution-scoped side state — pending awaitHuman decisions,
    * resolver maps, streaming buffer registration, in-flight abort controller.
-   * Returns true if an entry was actually removed from any of the three
-   * primary surfaces (active map, historical cache, store).
+   * Returns true if the run was running, had a save in flight, or was
+   * removed from the recent-runs cache or the store.
    *
    * If the run has already finished but its history save has not landed
    * yet, this method waits for that save (whether it succeeds or fails)
-   * before deleting, so the save cannot re-create the deleted record.
+   * before deleting, so the save cannot re-create the deleted record. It
+   * likewise waits for `recoverIncompleteStreams()` to finish with the id.
    *
    * In-flight handling: if the execution is still running, this method
    * **aborts** it (via the registered abort controller) AND marks the id for
@@ -2791,7 +3060,21 @@ export class AxlRuntime extends EventEmitter {
    * (`defaultTtl` / `ttls.executionHistory`).
    */
   async deleteExecution(id: string): Promise<boolean> {
+    // Marked before the first await, so recovery started from here on
+    // leaves this id alone.
+    this.deletingExecutions.set(id, (this.deletingExecutions.get(id) ?? 0) + 1);
+    try {
+      return await this.deleteExecutionWhileMarked(id);
+    } finally {
+      const remaining = (this.deletingExecutions.get(id) ?? 1) - 1;
+      if (remaining > 0) this.deletingExecutions.set(id, remaining);
+      else this.deletingExecutions.delete(id);
+    }
+  }
+
+  private async deleteExecutionWhileMarked(id: string): Promise<boolean> {
     const wasActive = this.executions.has(id);
+    const hadPendingSave = this.pendingSaves.has(id);
     const pendingDecisionResolver = this.pendingDecisionResolvers.get(id);
     const hadPendingDecision = pendingDecisionResolver !== undefined;
 
@@ -2830,26 +3113,29 @@ export class AxlRuntime extends EventEmitter {
       }
     }
 
-    // A save scheduled when this run finished may still be in flight. Let it
-    // land (or fail) first, otherwise it would re-create the record right
-    // after the store delete below. The chain never rejects.
-    await this.pendingSaves.get(id);
+    // A save scheduled when this run finished, or by crash recovery, may
+    // still be in flight. Let it land (or fail) first, otherwise it would
+    // re-create the record right after the store delete below. Neither
+    // promise rejects.
+    await this.pendingSaves.get(id)?.settled;
+    await this.recoveringExecutions.get(id);
 
-    // Lazy-load just THIS id from the store (cheaper than the full list).
-    // Without this, a "delete" on something only-in-store leaves a
-    // duplicate in memory on the next list call after lazy-load fires.
-    // Also captures the workflow name BEFORE delete so the audit event
-    // can carry it — compliance pipelines categorize by workflow.
+    // Capture the workflow name BEFORE delete so the audit event can carry
+    // it — compliance pipelines categorize by workflow.
     const existing = await this.getExecution(id);
     const workflow = existing?.workflow;
 
     const removedFromActive = this.executions.delete(id);
-    const removedFromHistorical = this.historicalExecutions.delete(id);
+    const removedFromRecent = this.recentRuns?.delete(id) ?? false;
 
     let removedFromStore = false;
     if (this.stateStore.deleteExecution) {
       removedFromStore = await this.stateStore.deleteExecution(id);
     }
+    // A run whose save was in flight was visible through this runtime when
+    // the delete was called, even if the save then failed and the store had
+    // nothing to remove.
+    const removed = removedFromActive || hadPendingSave || removedFromRecent || removedFromStore;
 
     // Audit signal. Emit regardless of whether anything was removed so
     // compliance consumers see attempted deletes too (useful for "user
@@ -2862,10 +3148,10 @@ export class AxlRuntime extends EventEmitter {
       workflow,
       wasActive,
       hadPendingDecision,
-      removed: removedFromActive || removedFromHistorical || removedFromStore,
+      removed,
     });
 
-    return removedFromActive || removedFromHistorical || removedFromStore;
+    return removed;
   }
 
   /**

@@ -1307,8 +1307,7 @@ const runtime = new AxlRuntime({
   },
 });
 
-// On the NEXT process, after a crash:
-await runtime.getExecutions();              // hydrate historical cache first
+// On the NEXT process, after a crash, before accepting requests:
 const recovered = await runtime.recoverIncompleteStreams();
 console.log(`Recovered ${recovered.length} crashed executions`);
 // Now safe to accept new requests
@@ -1334,6 +1333,8 @@ recovered runs from dashboards.
 - Recovery skips ids actively running in the current process (prevents corrupting a live workflow).
 - `saveExecution` failure during recovery preserves the streaming buffer for the next attempt (no data loss on intermittent Redis failures).
 - Recovery is idempotent — re-running it is safe; "canonical exists" branch drops orphan buffers without writing.
+- Recovery asks the store for each buffered run by id (`getExecution`) and skips any run that already has a final record. It does not list history, so startup cost tracks the number of crashed runs, not the size of the store.
+- A `deleteExecution(id)` issued while recovery works on that run waits for recovery to finish, so the recovered record does not outlive the delete.
 
 **Store coverage:** `RedisStore` implements the streaming methods atomically via MULTI. `MemoryStore` implements them in-process (good for tests; lost on crash by design). `SQLiteStore` does NOT — single-process file storage gets less value from crash-survival, and the runtime emits a one-shot warning when `persist: 'streaming'` is configured against it.
 

@@ -110,17 +110,43 @@ Expired records stop appearing in reads immediately and are removed from storage
 
 `keyPrefix` is the storage-layer isolation primitive for shared Redis clusters. Avoid Redis glob metacharacters (`*`, `?`, `[`, `]`) in the prefix; operators running `redis-cli SCAN MATCH` would otherwise have to escape them.
 
+### Listing history across instances
+
+Every `runtime.getExecutions()` and `runtime.getExecution(id)` call reads the store, so app instances sharing one store see the same history: runs finished on any instance appear everywhere, and a run deleted on one instance, or expired by the store, is gone from all of them on the next call. The runtime keeps only running runs and runs whose save has not landed yet, so its memory does not grow with history.
+
+Page through large histories with `limit` and a cursor built from the last item:
+
+```ts
+const page1 = await runtime.getExecutions({ limit: 100 });
+const last = page1.at(-1);
+const page2 = last
+  ? await runtime.getExecutions({
+      limit: 100,
+      cursor: { startedAt: last.startedAt, executionId: last.executionId },
+    })
+  : [];
+```
+
+How a page is read depends on the store:
+
+| Store | How `getExecutions()` reads it |
+|---|---|
+| Built-in stores, or a custom store with `historyPaging: true` | The store returns one page for the cursor |
+| Custom store with `listExecutions` but no `historyPaging` | The runtime lists the whole history and pages in process. Correct, but each page reads everything |
+| Custom store without `saveExecution`, `listExecutions` or `getExecution` | The runtime keeps up to `state.recentExecutionsCacheSize` recent runs (default 1 000) in process and serves the missing reads from them. History is limited to running runs plus those recent runs, and is per instance |
+
+See [`getExecutions`](./api-reference.md#execution-history) for the exact ordering and the cursor type.
+
 ### Boot wiring: recovery before accepting new work
 
 ```ts
-// 1. Hydrate the historical cache so recovery's "canonical exists" branch can fire
-await runtime.getExecutions();
-
-// 2. Reconstruct partial ExecutionInfos for crashed runs (if persist: 'streaming')
+// 1. Reconstruct partial ExecutionInfos for crashed runs (if persist: 'streaming').
+//    Each buffered run is checked against the store by id, so a run that
+//    already has a final record is skipped.
 const recovered = await runtime.recoverIncompleteStreams();
 console.log(`[boot] recovered ${recovered.length} crashed executions`);
 
-// 3. NOW accept new requests
+// 2. NOW accept new requests
 app.listen(3000);
 ```
 

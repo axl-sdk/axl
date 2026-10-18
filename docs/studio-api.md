@@ -23,8 +23,8 @@ Studio exposes a REST API that the SPA consumes. You can also call these directl
 | `GET /api/sessions/:id` | Read session history and handoff history. Rich user turns are projected to a bounded descriptor whose parts are `{ type: 'text', characters }`, `{ type: 'image', source, mediaType?, bytes? }`, or `{ type: 'audio', source, mediaType?, bytes? }`. The Studio payload deliberately carries **no** `locator` or `label` for either modality — it is a Studio-safe descriptor, not a replay payload — and never inline bytes or base64 |
 | `POST /api/sessions/:id/send` | Send one session message. Body: `{ workflow: string, message: string }`. Returns the workflow result |
 | `POST /api/sessions/:id/stream` | Start a session message. Body: `{ workflow: string, message: string }`. Broadcasts `AxlEvent`s on the returned `execution:{executionId}` channel |
-| `GET /api/executions` | List executions |
-| `GET /api/executions/:id` | Execution detail. `?since={step}` filters `events` to those with `step > since` (polling tail) |
+| `GET /api/executions` | One page of executions, newest first, as summaries without `events`. Query: `limit` (1 to 500, default 100), `cursor`. See [Paging executions](#paging-executions) |
+| `GET /api/executions/:id` | Full execution including `events`. `?since={step}` filters `events` to those with `step > since` (polling tail) |
 | `POST /api/executions/:id/abort` | Abort a running execution (signal-driven; wakes paused `ctx.awaitHuman`) |
 | `DELETE /api/executions/:id` | Delete an execution from history (GDPR scrub). Calls `runtime.deleteExecution` AND scrubs the WS replay buffer for `execution:{id}`. Returns `{ id, deleted: true }` or 404. Blocked in readOnly |
 | `GET /api/costs?window=24h\|7d\|30d\|all` | Aggregated cost data for a time window (default `7d`). `?windows=all` returns all four windows at once for debugging |
@@ -48,7 +48,7 @@ Studio exposes a REST API that the SPA consumes. You can also call these directl
 | `GET /api/decisions` | List pending decisions |
 | `POST /api/decisions/:id/resolve` | Resolve a pending decision in its owning runtime. Returns 400 for an invalid exact decision union, 404 for an unknown/already-resolved ID, and 409 for a persisted request whose process-local owner is gone |
 
-All endpoints return `{ ok: true, data: {...} }` on success or `{ ok: false, error: { code, message } }` on error.
+All endpoints return `{ ok: true, data: {...} }` on success (`GET /api/executions` also returns `nextCursor` beside `data`) or `{ ok: false, error: { code, message } }` on error.
 
 **How the Studio client reads the two diagnostics routes.** A run whose result
 carries a `diagnostics` block renders a "Captured requests" panel on the run
@@ -83,6 +83,25 @@ not mistaken for scrubbed bytes on disk. And the History-row marker reads only
 the embedded manifest: a sweep downgrades the owning history row, so the marker
 goes stale only between that sweep and the next history fetch — the panel's
 route confirmation closes that window when the run is opened.
+
+### Paging executions
+
+`GET /api/executions` returns the newest runs first, one page at a time, so Studio stays fast when the store holds a lot of history. Each item is a summary: the execution without `events`, plus `eventCount`. Fetch `GET /api/executions/:id` for a run's events.
+
+```json
+{ "ok": true, "data": [{ "executionId": "…", "workflow": "…", "status": "completed", "eventCount": 12, "…": "…" }], "nextCursor": "eyJzdGFydGVkQXQiOjE3…" }
+```
+
+To read further back, pass `nextCursor` as `cursor` on the next request. `nextCursor` is `null` on the last page. The Trace Explorer does this with its **Load more** button.
+
+| Query | Meaning |
+|-------|---------|
+| `limit` | Items per page: an integer from 1 to 500. Default 100 |
+| `cursor` | The `nextCursor` of the previous page. Treat it as an opaque string (it is base64url-encoded JSON of the last item's `startedAt` and `executionId`) |
+
+An invalid `limit` or `cursor` returns `400` with `error.code: 'INVALID_PARAM'` and `error.param` naming the parameter. Runs that started in the same millisecond each appear on exactly one page. With `trace.redact` on, summaries have `result`, `error` and `metadata` scrubbed like the detail route. Paging is allowed in `readOnly` mode.
+
+The cost, workflow-stats and trace-stats aggregates read at most their window cap of recent runs (2 000 by default) from the store when they rebuild. Deleting a run also triggers a rebuild; rebuilds never overlap, and deletes that arrive during one share a single follow-up rebuild, so deleting many runs at once costs at most two store reads per aggregate.
 
 ### Versioned execution history and tool aggregates
 

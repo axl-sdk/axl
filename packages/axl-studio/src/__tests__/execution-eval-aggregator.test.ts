@@ -53,7 +53,9 @@ function makeEvalEntry(overrides: Partial<EvalHistoryEntry> = {}): EvalHistoryEn
 function createMockRuntime(executions: ExecutionInfo[] = [], evalHistory: EvalHistoryEntry[] = []) {
   const emitter = new EventEmitter();
   return Object.assign(emitter, {
-    getExecutions: vi.fn().mockResolvedValue(executions),
+    getExecutions: vi
+      .fn()
+      .mockImplementation(async (opts?: { limit?: number }) => executions.slice(0, opts?.limit)),
     getExecution: vi
       .fn()
       .mockImplementation(async (id: string) => executions.find((e) => e.executionId === id)),
@@ -303,6 +305,31 @@ describe('ExecutionAggregator', () => {
     expect(agg.getSnapshot('all').count).toBe(0);
   });
 
+  it('matches the pre-paging result for a store within the cap', async () => {
+    const now = Date.now();
+    const executions = Array.from({ length: 6 }, (_, i) =>
+      makeExecution({ executionId: `exec-${i}`, startedAt: now - i * 1000, totalCost: 0.01 * i }),
+    );
+    const runtime = createMockRuntime(executions);
+    const agg = new ExecutionAggregator({
+      runtime: runtime as any,
+      connMgr,
+      channel: 'test',
+      reducer: executionReducer,
+      emptyState,
+      windows,
+      executionCap: 10,
+    });
+
+    await agg.start();
+
+    // What the aggregator produced before it asked for a limit.
+    const expected = executions.slice(0, 10).reduce(executionReducer, emptyState());
+    expect(agg.getSnapshot('all')).toEqual(expected);
+    expect(runtime.getExecutions).toHaveBeenCalledExactlyOnceWith({ limit: 10 });
+    agg.close();
+  });
+
   it('caps replay at executionCap', async () => {
     const now = Date.now();
     const executions = Array.from({ length: 10 }, (_, i) =>
@@ -325,6 +352,7 @@ describe('ExecutionAggregator', () => {
 
     await agg.start();
 
+    expect(runtime.getExecutions).toHaveBeenCalledExactlyOnceWith({ limit: 4 });
     expect(agg.getSnapshot('all').count).toBe(4);
     expect(agg.getSnapshot('all').totalCost).toBeCloseTo(0.04);
     agg.close();

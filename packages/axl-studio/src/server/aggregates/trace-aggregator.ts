@@ -5,6 +5,7 @@ import type {
   HistoricalExecutionInfo,
 } from '@axlsdk/axl';
 import type { ConnectionManager } from '../ws/connection-manager.js';
+import { CoalescedRunner } from './coalesced-runner.js';
 import { AggregateSnapshots, REBUILD_INTERVAL_MS, withinWindow } from './aggregate-snapshots.js';
 import type { WindowId } from './aggregate-snapshots.js';
 
@@ -70,10 +71,21 @@ export class TraceAggregator<State> {
     );
   }
 
-  async rebuild(): Promise<void> {
-    const executions: HistoricalExecutionInfo[] = await this.options.runtime.getExecutions();
+  /**
+   * Rebuild from the store. Requests that arrive during a rebuild (a burst of
+   * deletes, the timer) coalesce into one trailing rebuild.
+   */
+  rebuild(): Promise<void> {
+    return this.rebuilds.run();
+  }
+
+  private readonly rebuilds = new CoalescedRunner(() => this.rebuildFromStore());
+
+  private async rebuildFromStore(): Promise<void> {
     const cap = this.options.executionCap ?? 2000;
-    const capped = executions.slice(0, cap);
+    const capped: HistoricalExecutionInfo[] = await this.options.runtime.getExecutions({
+      limit: cap,
+    });
     const now = Date.now();
     const fresh = new Map<WindowId, State>(
       this.options.windows.map((w) => [w, this.options.emptyState()]),

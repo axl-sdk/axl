@@ -11,7 +11,9 @@ import type {
 } from './types';
 
 /** Select the trace reducer/renderer without scanning or reinterpreting events. */
-export function executionEventSchemaVersion(execution: ExecutionInfo): 1 | 2 {
+export function executionEventSchemaVersion(
+  execution: Pick<ExecutionInfo, 'eventSchemaVersion'>,
+): 1 | 2 {
   return execution.eventSchemaVersion ?? 1;
 }
 

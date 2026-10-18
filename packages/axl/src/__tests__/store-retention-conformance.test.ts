@@ -16,7 +16,7 @@ import { createRequire } from 'node:module';
 import { z } from 'zod';
 import { MemoryStore } from '../state/memory.js';
 import { SQLiteStore } from '../state/sqlite.js';
-import { PRUNE_BATCH } from '../state/retention.js';
+import { PRUNE_BATCH, compareExecutionsNewestFirst } from '../state/retention.js';
 import type { HistoryTtls, StateStore } from '../state/types.js';
 import type { HistoricalExecutionInfo } from '../types.js';
 import { AxlError } from '../errors.js';
@@ -378,6 +378,22 @@ describe.each([memoryHarness, sqliteHarness, redisHarness])(
       // Page boundaries that fall mid-group at other offsets.
       expect((await pageAll(h.store, 2)).flat()).toEqual(TIE_FIXTURE_ORDER);
       expect((await pageAll(h.store, 4)).flat()).toEqual(TIE_FIXTURE_ORDER);
+    });
+
+    it('orders tie members by code point (store byte order), including astral ids', async () => {
+      const h = factory.make();
+      // UTF-16 code-unit order puts the surrogate pair (\u{1F600}) before \uFFFD;
+      // code-point / UTF-8 byte order (Redis, SQLite BINARY) puts it after.
+      const ids = ['x-a', 'x-\uFFFD', 'x-\u{1F600}'];
+      for (const id of ids) await h.store.saveExecution(makeExec(id, 7000));
+      const expected = ['x-\u{1F600}', 'x-\uFFFD', 'x-a'];
+      expect((await h.store.listExecutions()).map((e) => e.executionId)).toEqual(expected);
+      expect((await pageAll(h.store, 1)).flat()).toEqual(expected);
+      const sorted = ids
+        .map((id) => ({ startedAt: 7000, executionId: id }))
+        .sort(compareExecutionsNewestFirst)
+        .map((e) => e.executionId);
+      expect(sorted).toEqual(expected);
     });
 
     it('a cursor at the very last item returns an empty page', async () => {

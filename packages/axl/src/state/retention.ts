@@ -80,5 +80,29 @@ export function compareExecutionsNewestFirst(
   b: Pick<HistoricalExecutionInfo, 'startedAt' | 'executionId'>,
 ): number {
   if (a.startedAt !== b.startedAt) return b.startedAt - a.startedAt;
-  return a.executionId < b.executionId ? 1 : a.executionId > b.executionId ? -1 : 0;
+  return compareCodePoints(b.executionId, a.executionId);
+}
+
+/**
+ * Compare strings by Unicode code point, which is the byte order Redis (sorted-set
+ * members with equal scores) and SQLite (BINARY collation over UTF-8) use. Plain
+ * `<` compares UTF-16 code units and disagrees with them when a surrogate pair is
+ * compared against a character in U+E000–U+FFFF, which would make in-process
+ * cursor filtering disagree with the store's tie order.
+ */
+function compareCodePoints(a: string, b: string): number {
+  const len = Math.min(a.length, b.length);
+  for (let i = 0; i < len; i++) {
+    const x = a.charCodeAt(i);
+    const y = b.charCodeAt(i);
+    if (x !== y) return codePointRank(x) - codePointRank(y);
+  }
+  return a.length - b.length;
+}
+
+/** Map a UTF-16 code unit so that surrogates sort above U+E000–U+FFFF. */
+function codePointRank(unit: number): number {
+  if (unit >= 0xe000) return unit - 0x800;
+  if (unit >= 0xd800) return unit + 0x2000;
+  return unit;
 }

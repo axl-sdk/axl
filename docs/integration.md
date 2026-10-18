@@ -133,7 +133,8 @@ How a page is read depends on the store:
 |---|---|
 | Built-in stores, or a custom store with `historyPaging: true` | The store returns one page for the cursor |
 | Custom store with `listExecutions` but no `historyPaging` | The runtime lists the whole history and pages in process. Correct, but each page reads everything |
-| Custom store without `saveExecution`, `listExecutions` or `getExecution` | The runtime keeps up to `state.recentExecutionsCacheSize` recent runs (default 1 000) in process and serves the missing reads from them. History is limited to running runs plus those recent runs, and is per instance |
+| Custom store with `listExecutions` but no `getExecution` | `getExecution(id)` scans the listing (by page with `historyPaging`, otherwise in full), so every listed run can be fetched. Add `getExecution` for cheap by-id reads |
+| Custom store without `saveExecution` or `listExecutions` | The runtime keeps up to `state.recentExecutionsCacheSize` recent runs (default 1 000) in process and serves the missing reads from them. History is limited to running runs plus those recent runs, and is per instance |
 
 See [`getExecutions`](./api-reference.md#execution-history) for the exact ordering and the cursor type.
 

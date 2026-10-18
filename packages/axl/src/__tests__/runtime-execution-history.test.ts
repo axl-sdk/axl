@@ -149,14 +149,16 @@ type ListCall = { limit: number | undefined; cursor: ExecutionCursor | undefined
  * A custom store that declares `historyPaging` and honors the cursor.
  * `extra` makes it return that many rows beyond the requested limit.
  */
-function makePagingStore(options?: { extra?: number }) {
+function makePagingStore(options?: { extra?: number; canFetch?: boolean }) {
   const inner = new MemoryStore();
   const listCalls: ListCall[] = [];
   const store: StateStore = {
     ...baseStore(inner),
     historyPaging: true,
     saveExecution: (e) => inner.saveExecution(e),
-    getExecution: (id) => inner.getExecution(id),
+    ...(options?.canFetch === false
+      ? {}
+      : { getExecution: (id: string) => inner.getExecution(id) }),
     deleteExecution: (id) => inner.deleteExecution(id),
     async listExecutions(limit?: number, opts?: { cursor?: ExecutionCursor }) {
       listCalls.push({ limit, cursor: opts?.cursor, args: arguments.length });
@@ -171,13 +173,15 @@ function makePagingStore(options?: { extra?: number }) {
 }
 
 /** A custom store whose `listExecutions` ignores the cursor and does not say so. */
-function makeCursorIgnoringStore() {
+function makeCursorIgnoringStore(options?: { canFetch?: boolean }) {
   const inner = new MemoryStore();
   const listCalls: ListCall[] = [];
   const store: StateStore = {
     ...baseStore(inner),
     saveExecution: (e) => inner.saveExecution(e),
-    getExecution: (id) => inner.getExecution(id),
+    ...(options?.canFetch === false
+      ? {}
+      : { getExecution: (id: string) => inner.getExecution(id) }),
     deleteExecution: (id) => inner.deleteExecution(id),
     async listExecutions(limit?: number, opts?: { cursor?: ExecutionCursor }) {
       listCalls.push({ limit, cursor: opts?.cursor, args: arguments.length });
@@ -325,6 +329,31 @@ describe.each(listingHarnesses)('$name — tie-safe paging through the runtime',
     const [, , third] = await runtime.getExecutions({ limit: 3 });
     // The previous page's last item itself is accepted as the cursor.
     expect(ids(await runtime.getExecutions({ cursor: third }))).toEqual(TIE_PAGES.flat().slice(3));
+  });
+});
+
+describe('expiry between pages (E3)', () => {
+  it('P3-05 a record that expires after page 1 is skipped and the cursor still advances', async () => {
+    let now = 1_000_000;
+    const store = new MemoryStore({ ttls: { executionHistory: 60 }, now: () => now });
+    // t-e is saved 30 s before the rest, so it alone expires at +61 s.
+    await store.saveExecution(TIE_FIXTURE.find((e) => e.executionId === 't-e')!);
+    now += 30_000;
+    for (const exec of TIE_FIXTURE) {
+      if (exec.executionId !== 't-e') await store.saveExecution(exec);
+    }
+    const runtime = new AxlRuntime({ state: { store } });
+
+    const first = await runtime.getExecutions({ limit: 3 });
+    expect(ids(first)).toEqual(TIE_PAGES[0]);
+    now = 1_000_000 + 61_000;
+
+    const second = await runtime.getExecutions({ limit: 3, cursor: cursorAfter(first) });
+    expect(ids(second)).toEqual(['t-d', 't-c', 't-b']);
+    expect(second.every((e) => e && typeof e.executionId === 'string')).toBe(true);
+    const third = await runtime.getExecutions({ limit: 3, cursor: cursorAfter(second) });
+    expect(ids(third)).toEqual(['t-a', 'lo']);
+    expect(await runtime.getExecutions({ limit: 3, cursor: cursorAfter(third) })).toEqual([]);
   });
 });
 
@@ -540,6 +569,75 @@ describe('merging running runs and in-flight saves with the store page', () => {
 // ═════════════════════════════════════════════════════════════════════════
 // Read-through across instances (AC3.1, E2, FR4)
 // ═════════════════════════════════════════════════════════════════════════
+
+describe('by-id reads on a store that lists but cannot fetch (MQ1 revised)', () => {
+  it('fetches any listed run, including one finished on another instance', async () => {
+    const { store, inner } = makeCursorIgnoringStore({ canFetch: false });
+    const a = new AxlRuntime({ state: { store, recentExecutionsCacheSize: 1 } });
+    const b = new AxlRuntime({ state: { store, recentExecutionsCacheSize: 1 } });
+    registerQuickWorkflow(a);
+    const runIds: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      runIds.push(await runOnce(a));
+      await settleSaves(a);
+    }
+
+    // No recent-runs cache for a store that saves and lists.
+    expect(internals(a).recentRuns).toBeUndefined();
+    for (const id of runIds) {
+      // Beyond any LRU bound on A, and never seen by B.
+      expect((await a.getExecution(id))?.executionId).toBe(id);
+      expect((await b.getExecution(id))?.executionId).toBe(id);
+    }
+    expect(ids(await b.getExecutions()).sort()).toEqual([...runIds].sort());
+
+    // A delete on either instance is seen by the other's next read.
+    await inner.deleteExecution(runIds[0]);
+    expect(await a.getExecution(runIds[0])).toBeUndefined();
+    expect(await b.deleteExecution(runIds[1])).toBe(true);
+    expect(await a.getExecution(runIds[1])).toBeUndefined();
+  });
+
+  it('scans a paging store page by page with the cursor', async () => {
+    const { store, inner, listCalls } = makePagingStore({ canFetch: false });
+    for (let i = 0; i < 250; i++) {
+      await inner.saveExecution(makeExec(`r-${String(i).padStart(3, '0')}`, 10_000 + i));
+    }
+    const runtime = new AxlRuntime({ state: { store } });
+
+    // The oldest run is on the third page.
+    expect((await runtime.getExecution('r-000'))?.executionId).toBe('r-000');
+    expect(listCalls).toHaveLength(3);
+    expect(listCalls.map((c) => c.limit)).toEqual([100, 100, 100]);
+    expect(listCalls[0].cursor).toBeUndefined();
+    expect(listCalls[1].cursor).toEqual({ startedAt: 10_150, executionId: 'r-150' });
+    expect(listCalls[2].cursor).toEqual({ startedAt: 10_050, executionId: 'r-050' });
+
+    // A newer run stops at the first page; an unknown id ends at an empty page.
+    listCalls.length = 0;
+    expect((await runtime.getExecution('r-249'))?.executionId).toBe('r-249');
+    expect(listCalls).toHaveLength(1);
+    listCalls.length = 0;
+    expect(await runtime.getExecution('missing')).toBeUndefined();
+    expect(listCalls).toHaveLength(4);
+  });
+
+  it('normalizes a legacy row found by the scan', async () => {
+    const { store, inner } = makeCursorIgnoringStore({ canFetch: false });
+    await inner.saveExecution({
+      executionId: 'legacy',
+      workflow: 'wf',
+      status: 'completed',
+      events: [{ executionId: 'legacy', step: 0, type: 'log', timestamp: 1, data: {} }],
+      totalCost: 0,
+      startedAt: 1,
+      completedAt: 1,
+      duration: 0,
+    } as unknown as HistoricalExecutionInfo);
+    const runtime = new AxlRuntime({ state: { store } });
+    expect((await runtime.getExecution('legacy'))?.eventSchemaVersion).toBe(1);
+  });
+});
 
 describe('runtimes sharing one store (AC3.1)', () => {
   it('P3-13 lists runs finished on the other instance and drops runs deleted on either', async () => {
@@ -825,6 +923,29 @@ describe('recoverIncompleteStreams() checks each run against the store', () => {
     expect(await deletion).toBe(true);
     expect(await store.getExecution('s1')).toBeNull();
     expect(await runtime.getExecutions()).toEqual([]);
+  });
+
+  it('shutdown() waits for a recovery save in flight (m4)', async () => {
+    const store = new HeldSaveStore();
+    await store.appendStreamingEvents('s1', bufferEvents('s1', 1_000));
+    const closeSpy = vi.spyOn(store, 'close');
+    const runtime = new AxlRuntime({ state: { store, persist: 'streaming' } });
+
+    const recovery = runtime.recoverIncompleteStreams();
+    await vi.waitFor(() => expect(store.heldSaves).toBe(1));
+    let shutDown = false;
+    const shutdown = runtime.shutdown().then(() => {
+      shutDown = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(shutDown).toBe(false);
+    expect(closeSpy).not.toHaveBeenCalled();
+
+    store.releaseSaves();
+    await shutdown;
+    expect(closeSpy).toHaveBeenCalled();
+    expect((await store.getExecution('s1'))?.status).toBe('failed');
+    expect(ids(await recovery)).toEqual(['s1']);
   });
 
   it('skips a run whose delete is already in progress', async () => {

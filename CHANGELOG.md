@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Studio `GET /api/executions` is paged.** The route returns one page of summaries, newest first: `{ ok, data, nextCursor }`, with up to 100 items by default (`?limit=` up to 500, `?cursor=` for the next page). Items no longer include `events`, and each has an `eventCount`. The Trace Explorer loads a run's events when you select it and adds a **Load more** button. **Migration:** if you call the REST route directly, follow `nextCursor` until it is `null` and fetch events from `GET /api/executions/:id`. See [Paging executions](docs/studio-api.md#paging-executions).
 - **Stable listing order.** `MemoryStore` and `SQLiteStore` list executions that started in the same millisecond by `executionId`, descending, so the order no longer changes between calls.
 
 ### Fixed

@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   redactExecutionInfo,
-  redactExecutionList,
+  summarizeExecution,
   redactMemoryValue,
   redactMemoryList,
   redactSessionHistory,
@@ -218,22 +218,23 @@ describe('redactExecutionInfo', () => {
   });
 });
 
-describe('redactExecutionList', () => {
-  it('returns the original array reference when redact is false', () => {
-    const list = [makeExecution(), makeExecution({ executionId: 'exec-2' })];
-    expect(redactExecutionList(list, false)).toBe(list);
+describe('summarizeExecution', () => {
+  it('drops events and reports their count', () => {
+    const out = summarizeExecution(makeExecution({ result: 'a' }), false);
+    expect(out).not.toHaveProperty('events');
+    expect(out.eventCount).toBe(makeExecution().events.length);
+    expect(out.result).toBe('a');
   });
 
-  it('scrubs each entry when redact is true', () => {
-    const list = [
-      makeExecution({ result: 'a' }),
-      makeExecution({ executionId: 'exec-2', result: { foo: 'b' } }),
-    ];
-    const out = redactExecutionList(list, true);
-    expect(out).toHaveLength(2);
-    for (const entry of out) {
-      expect(entry.result).toBe('[redacted]');
-    }
+  it('scrubs result, error and metadata when redact is true', () => {
+    const out = summarizeExecution(
+      makeExecution({ result: { foo: 'b' }, error: 'boom', metadata: { userId: 'u1' } } as never),
+      true,
+    );
+    expect(out).not.toHaveProperty('events');
+    expect(out.result).toBe('[redacted]');
+    expect(out.error).toBe('[redacted]');
+    expect(out.metadata).toEqual({ redacted: true });
   });
 });
 

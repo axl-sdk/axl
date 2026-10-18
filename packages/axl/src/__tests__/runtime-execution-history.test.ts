@@ -925,6 +925,29 @@ describe('recoverIncompleteStreams() checks each run against the store', () => {
     expect(await runtime.getExecutions()).toEqual([]);
   });
 
+  it('shutdown() waits for a recovery save in flight (m4)', async () => {
+    const store = new HeldSaveStore();
+    await store.appendStreamingEvents('s1', bufferEvents('s1', 1_000));
+    const closeSpy = vi.spyOn(store, 'close');
+    const runtime = new AxlRuntime({ state: { store, persist: 'streaming' } });
+
+    const recovery = runtime.recoverIncompleteStreams();
+    await vi.waitFor(() => expect(store.heldSaves).toBe(1));
+    let shutDown = false;
+    const shutdown = runtime.shutdown().then(() => {
+      shutDown = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(shutDown).toBe(false);
+    expect(closeSpy).not.toHaveBeenCalled();
+
+    store.releaseSaves();
+    await shutdown;
+    expect(closeSpy).toHaveBeenCalled();
+    expect((await store.getExecution('s1'))?.status).toBe('failed');
+    expect(ids(await recovery)).toEqual(['s1']);
+  });
+
   it('skips a run whose delete is already in progress', async () => {
     const store = new MemoryStore();
     await store.appendStreamingEvents('s1', bufferEvents('s1', 1_000));

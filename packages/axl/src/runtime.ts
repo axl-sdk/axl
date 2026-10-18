@@ -968,8 +968,8 @@ export class AxlRuntime extends EventEmitter {
    *  a delete from resurrecting the (intentionally-removed) row. Entries are
    *  removed once the would-be persist has been short-circuited. */
   private pendingDeletedExecutions = new Set<string>();
-  /** In-flight `persistExecution` chains (save → finalize). `shutdown()`
-   *  awaits these before closing the StateStore so a workflow whose abort
+  /** In-flight `persistExecution` chains (save → finalize) and crash-
+   *  recovery saves. `shutdown()` awaits these before closing the StateStore so a workflow whose abort
    *  triggers a persist-during-shutdown isn't racing a closed connection.
    *  The Set is mutated by the chain's own `.finally` so entries clear as
    *  soon as the work settles. */
@@ -2900,6 +2900,8 @@ export class AxlRuntime extends EventEmitter {
         ),
       };
       this.pendingSaves.set(id, pending);
+      // `shutdown()` waits for it before closing the store.
+      this.persistInflight.add(pending.settled);
       try {
         await save;
       } catch (err) {
@@ -2910,6 +2912,7 @@ export class AxlRuntime extends EventEmitter {
         );
         return undefined;
       } finally {
+        this.persistInflight.delete(pending.settled);
         if (this.pendingSaves.get(id) === pending) this.pendingSaves.delete(id);
       }
     }

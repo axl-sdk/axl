@@ -94,7 +94,7 @@ const runtime = new AxlRuntime({
 
 ### SQLiteStore and MemoryStore: history retention
 
-Both stores keep execution and eval history forever unless you set a retention. They take the same `ttls.executionHistory` / `ttls.evalHistory` (seconds, `null` = keep forever) as `RedisStore`, with the same windows:
+`SQLiteStore` keeps execution and eval history forever unless you set a retention, and warns once per process until `ttls.executionHistory` is set (`null` to keep forever). `MemoryStore` keeps the newest 1 000 runs by default (`maxExecutions`) and no time limit. Both take the same `ttls.executionHistory` / `ttls.evalHistory` (seconds, `null` = keep forever) as `RedisStore`, with the same windows:
 
 ```ts
 const runtime = new AxlRuntime({
@@ -104,8 +104,8 @@ const runtime = new AxlRuntime({
   },
 });
 
-// In-memory: cap the number of runs kept, optionally with a retention too
-const dev = new AxlRuntime({ state: { memory: { maxExecutions: 1_000 } } });
+// In-memory: raise the run cap (default 1 000; Infinity keeps all), optionally with a retention too
+const dev = new AxlRuntime({ state: { memory: { maxExecutions: 10_000 } } });
 ```
 
 Expired records stop appearing in reads immediately and are removed from storage on later saves, along with the run's leftover checkpoints and saved state. Records written before you set a retention keep no expiry until you apply it to them (next section). Details: [History retention](./api-reference.md#history-retention-historyttls).

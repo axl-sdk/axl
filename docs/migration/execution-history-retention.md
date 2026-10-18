@@ -66,7 +66,7 @@ new MemoryStore({ maxExecutions: 10_000 });
 | Set `defaultTtl` (Redis only) | History expires with your other Redis keys |
 | Set `AXL_DIAGNOSTICS_SILENT=true` | Silences every Axl diagnostic warning in the process |
 
-The runtime's `diagnostics.silent` option does not reach a store you construct yourself, because the store is created, and warns, before the runtime exists. Use one of the options above instead.
+The runtime's `diagnostics.silent` option silences the SQLite store the runtime creates for `state.store: 'sqlite'`. It does not reach a store you construct yourself, because that store is created, and warns, before the runtime exists; use one of the options above for those.
 
 ## Apply retention to records you already have
 
@@ -126,6 +126,8 @@ do {
 ```
 
 Every run appears on exactly one page, even when many started in the same millisecond, and a cursor keeps working if the run it names is deleted.
+
+A call without `limit` that returns more than 1 000 runs prints one warning per process suggesting `limit` and `cursor`. It still returns every run. Pass `limit: Infinity` when you do want everything, or set the runtime's `diagnostics.silent` (or `AXL_DIAGNOSTICS_SILENT=true`) to silence it.
 
 The same loop filters by tenant or user without holding the whole history in memory. For example, deleting a user's runs for a right-to-be-forgotten request:
 

@@ -30,6 +30,7 @@ import {
   isExpired,
   resolveHistoryRetentionOptions,
   resolveHistoryTtls,
+  DEFAULT_MEMORY_MAX_EXECUTIONS,
   retentionForUntimedRecord,
   type ResolvedHistoryTtls,
 } from './retention.js';
@@ -45,8 +46,8 @@ export type MemoryStoreOptions = {
   /**
    * Maximum number of execution-history records kept. When a save goes over
    * the limit, the oldest records in listing order (earliest `startedAt`,
-   * then lowest `executionId`) are removed. A positive integer or `Infinity`;
-   * unset means no limit.
+   * then lowest `executionId`) are removed. A positive integer or `Infinity`
+   * (no limit). Default: 1 000.
    */
   maxExecutions?: number;
   /** Clock in epoch milliseconds, used for retention. Defaults to `Date.now`. */
@@ -63,7 +64,8 @@ function compareOldestFirst(a: ExecutionOrderKey, b: ExecutionOrderKey): number 
 }
 
 function resolveMaxExecutions(value: unknown): number {
-  if (value === undefined || value === Infinity) return Infinity;
+  if (value === undefined) return DEFAULT_MEMORY_MAX_EXECUTIONS;
+  if (value === Infinity) return Infinity;
   if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) {
     throw new AxlError(
       'INVALID_CONFIG',
@@ -100,7 +102,8 @@ type PersistedAwaitHumanState = {
  * This is the one exception to "memory means ephemeral" — because a human
  * could take hours to respond, and losing that state is unacceptable.
  *
- * History can be bounded by time (`ttls`) and by count (`maxExecutions`).
+ * History can be bounded by time (`ttls`) and by count (`maxExecutions`,
+ * which keeps the newest 1 000 runs by default).
  * Expired records are never returned and are physically removed, a bounded
  * batch at a time, on later saves of the same kind.
  */

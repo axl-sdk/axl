@@ -162,8 +162,11 @@ export type DiagnosticsConfig = {
   schemaOversizedTokens?: number;
   /**
    * Silence the one-time `console.warn` diagnostics (the structured
-   * `schema_diagnostic` events still fire). Also silenceable process-wide via
-   * `AXL_DIAGNOSTICS_SILENT=true`.
+   * `schema_diagnostic` events still fire). This includes the large-listing
+   * warning and the retention warning of a SQLite store the runtime creates
+   * from `state.store: 'sqlite'`; a store you construct yourself warns before
+   * the runtime exists, so use its `ttls` or the environment variable. Also
+   * silenceable process-wide via `AXL_DIAGNOSTICS_SILENT=true`.
    */
   silent?: boolean;
   /**

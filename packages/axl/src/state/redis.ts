@@ -25,6 +25,7 @@ import {
   executionLastSavedAt,
   resolveHistoryRetentionOptions,
   retentionForUntimedRecord,
+  warnExecutionRetentionUnset,
 } from './retention.js';
 
 // Minimal interface for the node-redis client methods we use.
@@ -233,6 +234,9 @@ export interface RedisStoreOptions {
    *
    * `executionHistory` and `evalHistory` have the same meaning as the
    * `ttls` option of `MemoryStore` and `SQLiteStore` (see `HistoryTtls`).
+   * With neither `executionHistory` (any value, `null` included) nor
+   * {@link defaultTtl} set, `create()` warns once per process that
+   * execution history is kept forever.
    */
   ttls?: {
     session?: number | null;
@@ -319,6 +323,19 @@ function compareMembers(a: string, b: string): number {
 function compareNewestFirst(a: HistoryPosition, b: HistoryPosition): number {
   if (a.score !== b.score) return b.score - a.score;
   return compareMembers(b.id, a.id);
+}
+
+/**
+ * Warn once per process when a `RedisStore` keeps execution history forever
+ * because neither `ttls.executionHistory` (any value, `null` included) nor
+ * `defaultTtl` was set. Called by `RedisStore.create()`.
+ *
+ * @internal Exported for tests; not on the public barrel.
+ */
+export function warnIfRedisExecutionRetentionUnset(opts: RedisStoreOptions): void {
+  if (opts.ttls?.executionHistory === undefined && typeof opts.defaultTtl !== 'number') {
+    warnExecutionRetentionUnset('RedisStore');
+  }
 }
 
 /**
@@ -450,6 +467,7 @@ export class RedisStore implements StateStore {
     };
 
     const store = new RedisStore(client, keyPrefix, effectiveTtls);
+    warnIfRedisExecutionRetentionUnset(opts);
 
     // Lazy backfill of the new sorted-set indexes for installs upgrading
     // from pre-ZSET versions. Cheap when there's nothing to do (two ZCARD

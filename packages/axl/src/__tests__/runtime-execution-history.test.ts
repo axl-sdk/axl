@@ -688,7 +688,11 @@ describe('runtimes sharing one store (AC3.1)', () => {
 
 describe('what the runtime holds in process', () => {
   it('P3-11 after 10 000 runs on a listing store, holds only running runs and in-flight saves (AC3.4)', async () => {
-    const runtime = new AxlRuntime({ state: { store: new MemoryStore() } });
+    // Unbounded store, so all 10 000 runs stay in the store and the runtime is
+    // the only place they could pile up.
+    const runtime = new AxlRuntime({
+      state: { store: new MemoryStore({ maxExecutions: Infinity }) },
+    });
     registerQuickWorkflow(runtime);
     for (let i = 0; i < 10_000; i++) await runtime.execute('wf', {});
     await settleSaves(runtime);
@@ -710,7 +714,7 @@ describe('what the runtime holds in process', () => {
       expect(size, `runtime.${key}`).toBeLessThan(100);
     }
     expect((await runtime.getExecutions({ limit: 5 })).length).toBe(5);
-    expect((await runtime.getExecutions()).length).toBe(10_000);
+    expect((await runtime.getExecutions({ limit: Infinity })).length).toBe(10_000);
   }, 60_000);
 
   it('P3-09 a run is readable while its save is held, with the cache off (E1, AC3.5)', async () => {

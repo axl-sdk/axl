@@ -23,6 +23,7 @@ import {
   expiryFrom,
   resolveHistoryRetentionOptions,
   resolveHistoryTtls,
+  warnExecutionRetentionUnset,
   retentionForUntimedRecord,
   type ResolvedHistoryTtls,
 } from './retention.js';
@@ -32,7 +33,9 @@ export type SQLiteStoreOptions = {
   /**
    * History retention in seconds. A positive number expires a record that
    * many seconds after it is saved; `null` or unset keeps it. See
-   * {@link HistoryTtls} for how each category's window is counted.
+   * {@link HistoryTtls} for how each category's window is counted. With
+   * `executionHistory` unset, the store warns once per process; set it (to
+   * `null` to keep history forever) to silence the warning.
    */
   ttls?: HistoryTtls;
   /** Clock in epoch milliseconds, used for retention. Defaults to `Date.now`. */
@@ -139,6 +142,7 @@ export class SQLiteStore implements StateStore {
     this.db.pragma('journal_mode = WAL');
     this.migrate();
     this.initTables();
+    if (options?.ttls?.executionHistory === undefined) warnExecutionRetentionUnset('SQLiteStore');
   }
 
   /**

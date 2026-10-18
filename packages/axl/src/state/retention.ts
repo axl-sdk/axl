@@ -6,6 +6,7 @@ import type {
   HistoryTtls,
 } from './types.js';
 import { AxlError } from '../errors.js';
+import { warnDiagnosticOnce } from '../schema-diagnostics.js';
 
 /**
  * Maximum number of expired history rows one save physically removes.
@@ -20,6 +21,31 @@ import { AxlError } from '../errors.js';
  * @internal Exported for tests.
  */
 export const PRUNE_BATCH = 100;
+
+/** Default `maxExecutions` for `MemoryStore`: the newest 1 000 runs are kept. */
+export const DEFAULT_MEMORY_MAX_EXECUTIONS = 1_000;
+
+/**
+ * Warn once per process per store kind that execution history on this store
+ * is kept forever because no retention was chosen.
+ *
+ * Persistent stores never apply a timed default (an expiry nobody chose
+ * deletes data after the fact), so the warning is how a deployment gets
+ * asked to decide. Any explicit `ttls.executionHistory`, including `null`,
+ * is a decision and silences it, as does `AXL_DIAGNOSTICS_SILENT=true`. The
+ * store warns at construction because the runtime cannot see a store's
+ * policy; custom stores never warn.
+ */
+export function warnExecutionRetentionUnset(storeName: 'SQLiteStore' | 'RedisStore'): void {
+  warnDiagnosticOnce(
+    `execution_retention_unset\0${storeName}`,
+    `${storeName} keeps execution history forever because no retention is set; ` +
+      `set ttls.executionHistory${storeName === 'RedisStore' ? ' (or defaultTtl)' : ''} ` +
+      'to a number of seconds, or ttls.executionHistory to null to keep it forever without this warning.',
+    undefined,
+    'docs/migration/execution-history-retention.md#silencing-the-retention-warning',
+  );
+}
 
 /** Per-category retention in seconds, or `null` for "never expires". */
 export type ResolvedHistoryTtls = {

@@ -20,6 +20,7 @@ import type {
   ExecutionCursor,
 } from './state/types.js';
 import { compareExecutionsNewestFirst } from './state/retention.js';
+import { warnDiagnosticOnce, withDiagnosticsSilenced } from './schema-diagnostics.js';
 import { MemoryStore } from './state/memory.js';
 import { SQLiteStore } from './state/sqlite.js';
 import {
@@ -118,6 +119,8 @@ const DEFAULT_MAX_EVENTS_PER_EXECUTION = 50_000;
 const DEFAULT_STREAMING_BATCH_SIZE = 100;
 /** Default bound on the recent-runs cache. See `config.state.recentExecutionsCacheSize`. */
 const DEFAULT_RECENT_EXECUTIONS_CACHE_SIZE = 1_000;
+/** An unpaged `getExecutions()` returning more runs than this warns once per process. */
+const LARGE_EXECUTION_LISTING = 1_000;
 /** Page size `getExecution(id)` uses to scan a paging store that cannot fetch by id. */
 const EXECUTION_SCAN_PAGE_SIZE = 100;
 const DEFAULT_STREAMING_BATCH_INTERVAL = 1_000; // ms
@@ -1583,10 +1586,15 @@ export class AxlRuntime extends EventEmitter {
     const storeOption = this.config.state?.store ?? 'memory';
     if (typeof storeOption !== 'string') return storeOption;
     switch (storeOption) {
-      case 'sqlite':
-        return new SQLiteStore(this.config.state?.sqlite?.path ?? './data/axl.db', {
-          ttls: this.config.state?.sqlite?.ttls,
-        });
+      case 'sqlite': {
+        // The store warns from its constructor when no retention is set, and
+        // cannot see `diagnostics.silent`; this store is ours, so apply it here.
+        const create = () =>
+          new SQLiteStore(this.config.state?.sqlite?.path ?? './data/axl.db', {
+            ttls: this.config.state?.sqlite?.ttls,
+          });
+        return this.config.diagnostics?.silent ? withDiagnosticsSilenced(create) : create();
+      }
       case 'memory':
       default:
         return new MemoryStore(this.config.state?.memory);
@@ -2050,6 +2058,9 @@ export class AxlRuntime extends EventEmitter {
    * and `cursor` (built from the last item of the previous page) for the
    * page after it. Each call reads through the store, so runs finished or
    * deleted by other runtimes sharing the store are reflected immediately.
+   * A call without `limit` that returns more than 1 000 runs warns once per
+   * process (silenced by `diagnostics.silent`); pass `limit: Infinity` to ask
+   * for everything without the warning.
    *
    * @throws {AxlError} `INVALID_ARGUMENT` for a `limit` that is not a positive
    *   integer (`Infinity` means no limit) or a malformed `cursor`.
@@ -2096,7 +2107,21 @@ export class AxlRuntime extends EventEmitter {
     }
 
     const sorted = [...merged.values()].sort(compareExecutionsNewestFirst);
-    return limit === undefined ? sorted : sorted.slice(0, limit);
+    if (limit !== undefined) return sorted.slice(0, limit);
+    // `limit: Infinity` is an explicit request for everything, so it is quiet.
+    if (options?.limit === undefined && sorted.length > LARGE_EXECUTION_LISTING) {
+      // Without a history cache, every unpaged call reads the whole store.
+      // Returning everything keeps the call non-breaking; the warning makes
+      // the cost visible instead of silently truncating.
+      warnDiagnosticOnce(
+        'large_execution_listing',
+        `runtime.getExecutions() without a limit returned ${sorted.length} runs and reads ` +
+          'the whole history on every call; pass { limit, cursor } to read it a page at a time.',
+        this.config.diagnostics?.silent,
+        'docs/migration/execution-history-retention.md#page-through-large-histories',
+      );
+    }
+    return sorted;
   }
 
   /**

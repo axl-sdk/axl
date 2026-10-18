@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -7,6 +7,7 @@ import { RedisStore } from '../state/redis.js';
 import { AxlRuntime } from '../runtime.js';
 import type { ExecutionInfo, AxlEvent } from '../types.js';
 import { gateRedisClient } from './redis-gated-client.js';
+import { __resetSchemaDiagnosticWarnings } from '../schema-diagnostics.js';
 
 /**
  * `REDIS_URL`-gated integration tests against a real Redis server.
@@ -996,5 +997,44 @@ describe.skipIf(!REDIS_URL)('RedisStore integration (real Redis)', () => {
         await maintainer.close();
       }
     });
+  });
+});
+
+describe.skipIf(!REDIS_URL)('RedisStore.create() retention warning (real Redis, AC1.6)', () => {
+  /** Connect with `options`, close again, and count retention warnings. */
+  async function warningsFor(...optionsList: Array<Record<string, unknown>>): Promise<number> {
+    __resetSchemaDiagnosticWarnings();
+    vi.stubEnv('AXL_DIAGNOSTICS_SILENT', '');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      for (const options of optionsList) {
+        // Nothing is written, so the throwaway prefix leaves no keys behind.
+        const store = await RedisStore.create({
+          url: REDIS_URL!,
+          keyPrefix: `axl-test-${randomUUID()}:`,
+          skipMigration: true,
+          ...options,
+        });
+        await store.close();
+      }
+      return warn.mock.calls.filter((args) =>
+        String(args[0]).includes('RedisStore keeps execution history forever'),
+      ).length;
+    } finally {
+      warn.mockRestore();
+      vi.unstubAllEnvs();
+      __resetSchemaDiagnosticWarnings();
+    }
+  }
+
+  it('warns once per process when neither ttls.executionHistory nor defaultTtl is set', async () => {
+    expect(await warningsFor({}, {})).toBe(1);
+    expect(await warningsFor({ ttls: { evalHistory: 60 } })).toBe(1);
+  });
+
+  it('is silenced by any explicit executionHistory value or a defaultTtl', async () => {
+    expect(await warningsFor({ ttls: { executionHistory: null } })).toBe(0);
+    expect(await warningsFor({ ttls: { executionHistory: 60 } })).toBe(0);
+    expect(await warningsFor({ defaultTtl: 60 })).toBe(0);
   });
 });

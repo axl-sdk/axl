@@ -16,7 +16,9 @@
 - **Execution history retention** — Every built-in store takes the same
   `ttls.executionHistory` / `ttls.evalHistory`, expired runs disappear from
   reads at once and are cleaned up as new history is saved (Redis listing
-  indexes included), and the in-memory store keeps a bounded number of runs.
+  indexes included), and the in-memory store keeps the newest 1 000 runs by
+  default. SQLite and Redis keep history forever until you choose a retention,
+  and warn once until you do.
   The runtime reads history through the store on every call, so instances
   sharing a store agree, and `getExecutions({ limit, cursor })` pages large
   histories. `store.applyHistoryRetention()` applies a retention to history

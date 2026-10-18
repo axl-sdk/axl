@@ -23,7 +23,8 @@ import { gateRedisClient, type PruneStep } from './redis-gated-client.js';
 const IDS = 'axl:exec-history-ids';
 const TIME = 'axl:exec-history-z';
 const EXPIRY = 'axl:exec-history-exp';
-const RECHECK = 'axl:exec-history-prune-recheck';
+const RECHECK_TOKENS = 'axl:exec-history-prune-recheck-tokens';
+const RECHECK_BATCH = 'axl:exec-history-prune-recheck:';
 const blobKey = (id: string) => `axl:exec-history:${id}`;
 
 function makeExec(id: string, startedAt: number): HistoricalExecutionInfo {
@@ -58,6 +59,16 @@ function setup(options?: { s1?: MockTtlConfig; s2?: MockTtlConfig }) {
   const members = (key: string) => [...(mock.setData.get(key) ?? [])].sort();
   const zmembers = (key: string) => [...(mock.zsetData.get(key)?.keys() ?? [])].sort();
   const score = (key: string, id: string) => mock.zsetData.get(key)?.get(id);
+  /**
+   * Ids waiting in registered recheck batches. Also checks the registry and
+   * the batch keys agree: every batch key is registered and vice versa.
+   */
+  const recheckIds = (prefix = 'axl:exec-history-prune-recheck') => {
+    const batchKeys = [...mock.setData.keys()].filter((k) => k.startsWith(`${prefix}:`));
+    const tokens = members(`${prefix}-tokens`);
+    expect(batchKeys.map((k) => k.slice(prefix.length + 1)).sort()).toEqual(tokens);
+    return [...new Set(batchKeys.flatMap((k) => members(k)))].sort();
+  };
 
   /** Index an execution whose record has already expired: no blob, past expiry. */
   function plantDead(id: string, startedAt = 1, expiryKey = EXPIRY, kind = 'exec') {
@@ -98,7 +109,19 @@ function setup(options?: { s1?: MockTtlConfig; s2?: MockTtlConfig }) {
     }
   }
 
-  return { mock, gate, s1, s2, members, zmembers, score, plantDead, expire, expectConsistent };
+  return {
+    mock,
+    gate,
+    s1,
+    s2,
+    members,
+    zmembers,
+    score,
+    recheckIds,
+    plantDead,
+    expire,
+    expectConsistent,
+  };
 }
 
 async function listed(store: RedisStore): Promise<string[]> {
@@ -175,20 +198,30 @@ describe('RedisStore expiry index', () => {
     expect(t.zmembers('axl:eval-history-exp')).toEqual([]);
   });
 
-  it('P2-12 delete removes the expiry and recheck entries in the same MULTI', async () => {
+  it('P2-12 delete removes the expiry entry in the same MULTI', async () => {
     const t = setup();
     await t.s1.saveExecution(makeExec('d1', 1000));
-    t.mock.setData.set(RECHECK, new Set(['d1']));
     await t.s1.saveEvalResult({ id: 'v1', eval: 'e', timestamp: 5, data: {} });
-    t.mock.setData.set('axl:eval-history-prune-recheck', new Set(['v1']));
     const multisBefore = t.mock.mockClient.multi.mock.calls.length;
     await t.s1.deleteExecution('d1');
     await t.s1.deleteEvalResult('v1');
     expect(t.mock.mockClient.multi.mock.calls.length).toBe(multisBefore + 2);
     expect(t.zmembers(EXPIRY)).toEqual([]);
-    expect(t.members(RECHECK)).toEqual([]);
     expect(t.zmembers('axl:eval-history-exp')).toEqual([]);
-    expect(t.members('axl:eval-history-prune-recheck')).toEqual([]);
+  });
+
+  it('a deleted id waiting in a leftover recheck batch is never re-indexed', async () => {
+    const t = setup();
+    await t.s1.saveExecution(makeExec('d1', 1000));
+    // A crashed prune left d1 in its batch (it had been re-saved meanwhile).
+    t.mock.setData.set(`${RECHECK_BATCH}tok`, new Set(['d1']));
+    t.mock.setData.set(RECHECK_TOKENS, new Set(['tok']));
+    await t.s1.deleteExecution('d1');
+    await t.s1.saveExecution(makeExec('z', 2000));
+    expect(t.members(IDS)).toEqual(['z']);
+    expect(t.zmembers(TIME)).toEqual(['z']);
+    expect(t.recheckIds()).toEqual([]);
+    expect(t.members(RECHECK_TOKENS)).toEqual([]);
   });
 });
 
@@ -220,7 +253,7 @@ describe('RedisStore prune on save', () => {
     await t.s1.saveExecution(makeExec('n3', 10_002));
     expect(t.members(IDS).filter((id) => id.startsWith('dead-'))).toEqual([]);
     expect(t.zmembers(EXPIRY).filter((id) => id.startsWith('dead-'))).toEqual([]);
-    expect(t.members(RECHECK)).toEqual([]);
+    expect(t.recheckIds()).toEqual([]);
     expect(await listed(t.s1)).toEqual(['n3', 'n2', 'n1', 're']);
     // …and not even transiently: no removal ever named it.
     const removals = t.gate.multis.filter((m) => m.step === 'remove-multi');
@@ -251,7 +284,7 @@ describe('RedisStore prune on save', () => {
     expect(t.members('axl:eval-history-ids')).toEqual(['live']);
     expect(t.zmembers('axl:eval-history-z')).toEqual(['live']);
     expect(t.zmembers('axl:eval-history-exp')).toEqual(['live']);
-    expect(t.members('axl:eval-history-prune-recheck')).toEqual([]);
+    expect(t.recheckIds('axl:eval-history-prune-recheck')).toEqual([]);
   });
 
   it('P2-16 one prune reads at most one batch of the expiry set and two batches of blobs', async () => {
@@ -306,7 +339,7 @@ describe('RedisStore prune on save', () => {
     await Promise.all([t.s1.saveExecution(makeExec('a', 1)), t.s2.saveExecution(makeExec('b', 2))]);
     await Promise.all([t.s1.saveExecution(makeExec('c', 3)), t.s2.saveExecution(makeExec('d', 4))]);
     expect(t.members(IDS)).toEqual(['a', 'b', 'c', 'd']);
-    expect(t.members(RECHECK)).toEqual([]);
+    expect(t.recheckIds()).toEqual([]);
     t.expectConsistent();
   });
 });
@@ -336,7 +369,7 @@ describe('RedisStore prune interleavings (AC2.3, AC2.4)', () => {
     const expiry = t.score(EXPIRY, 'x')!;
     expect(expiry).toBeGreaterThanOrEqual(beforeResave + 60_000 - 1000);
     expect(expiry).toBeLessThanOrEqual(after + 60_000);
-    expect(t.members(RECHECK)).toEqual([]);
+    expect(t.recheckIds()).toEqual([]);
     t.expectConsistent();
   });
 
@@ -351,7 +384,8 @@ describe('RedisStore prune interleavings (AC2.3, AC2.4)', () => {
     t.gate.release('mget-2');
     await save;
 
-    for (const key of [IDS, RECHECK]) expect(t.members(key)).not.toContain('x');
+    expect(t.members(IDS)).not.toContain('x');
+    expect(t.recheckIds()).not.toContain('x');
     for (const key of [TIME, EXPIRY]) expect(t.zmembers(key)).not.toContain('x');
     expect(t.mock.data.has(blobKey('x'))).toBe(false);
     expect(await listed(t.s1)).toEqual(['y']);
@@ -368,7 +402,8 @@ describe('RedisStore prune interleavings (AC2.3, AC2.4)', () => {
     t.gate.release('pttl');
     await save;
 
-    for (const key of [IDS, RECHECK]) expect(t.members(key)).not.toContain('x');
+    expect(t.members(IDS)).not.toContain('x');
+    expect(t.recheckIds()).not.toContain('x');
     for (const key of [TIME, EXPIRY]) expect(t.zmembers(key)).not.toContain('x');
     expect(await listed(t.s1)).toEqual(['y']);
     t.expectConsistent();
@@ -409,7 +444,7 @@ describe('RedisStore prune interleavings (AC2.3, AC2.4)', () => {
 
         await t.s1.saveExecution(makeExec('z', 20_000));
         expect(t.members(IDS)).toEqual(['live', 'y', 'z']);
-        expect(t.members(RECHECK)).toEqual([]);
+        expect(t.recheckIds()).toEqual([]);
         expect(await listed(t.s1)).toEqual(['z', 'y', 'live']);
         t.expectConsistent();
       });
@@ -423,10 +458,10 @@ describe('RedisStore prune interleavings (AC2.3, AC2.4)', () => {
       t.gate.release('remove-multi');
       await save;
       // The re-check failed; x is left for the next prune to re-check.
-      expect(t.members(RECHECK)).toEqual(['x']);
+      expect(t.recheckIds()).toEqual(['x']);
       await t.s1.saveExecution(makeExec('z', 20_000));
       expect(await listed(t.s1)).toEqual(['z', 'y', 'x']);
-      expect(t.members(RECHECK)).toEqual([]);
+      expect(t.recheckIds()).toEqual([]);
       t.expectConsistent();
     });
   });
@@ -443,15 +478,71 @@ describe('RedisStore prune interleavings (AC2.3, AC2.4)', () => {
     // until the next prune.
     expect(t.mock.data.has(blobKey('x'))).toBe(true);
     expect(t.members(IDS)).not.toContain('x');
-    expect(t.members(RECHECK)).toEqual(['x']);
+    expect(t.recheckIds()).toEqual(['x']);
 
     // Any later save of this kind, on any instance, re-checks it first.
     await t.s2.saveExecution(makeExec('z', 20_000));
     expect(await listed(t.s1)).toEqual(['z', 'y', 'x']);
     expect(t.score(TIME, 'x')).toBe(123);
     expect(t.zmembers(EXPIRY)).toContain('x');
-    expect(t.members(RECHECK)).toEqual([]);
+    expect(t.recheckIds()).toEqual([]);
     t.expectConsistent();
+  });
+
+  it('M1 two pruners + a re-save + a crash: the crashed batch survives the other pruner', async () => {
+    // Pruner A finishing its own re-check must not clear ids that pruner B
+    // removed after A read them; B then dies before its own re-check.
+    const t = setup();
+    const gB = gateRedisClient(t.mock.mockClient);
+    const sB = createRedisStoreOverClient(gB.client, 'axl:', { executionHistory: 60 });
+    // 1. Y expired: no blob, past expiry score, still indexed.
+    t.plantDead('Y', 7);
+    // 2. B reads Y as dead; paused before its removal MULTI.
+    const bAtRemove = gB.pauseAt('remove-multi');
+    const saveB = sB.saveExecution(makeExec('b', 10_000));
+    await bAtRemove;
+    // 3. A removes Y, its re-check still sees Y dead; paused before its re-index MULTI.
+    const aAtReindex = t.gate.pauseAt('reindex-multi');
+    const saveA = t.s1.saveExecution(makeExec('a', 10_001));
+    await aAtReindex;
+    // 4. Y is saved again (live and indexed).
+    await t.s2.saveExecution(makeExec('Y', 123));
+    expect(t.members(IDS)).toContain('Y');
+    // 5. B's stale removal lands, then B dies before its re-check.
+    gB.failAt('mget-2');
+    gB.release('remove-multi');
+    await saveB;
+    // 6. A's re-index lands.
+    t.gate.release('reindex-multi');
+    await saveA;
+
+    expect(t.mock.data.has(blobKey('Y'))).toBe(true);
+    expect(t.members(IDS)).not.toContain('Y');
+    expect(t.recheckIds()).toEqual(['Y']); // B's batch survived A's cleanup
+
+    // The next save on any instance re-checks B's batch and lists Y again.
+    await t.s2.saveExecution(makeExec('z', 20_000));
+    expect(await listed(t.s2)).toEqual(['z', 'a', 'b', 'Y']);
+    expect(t.score(TIME, 'Y')).toBe(123);
+    expect(t.recheckIds()).toEqual([]);
+    expect(t.members(RECHECK_TOKENS)).toEqual([]);
+    t.expectConsistent();
+  });
+
+  it('leftover batches are re-checked about one batch of ids per prune', async () => {
+    const t = setup();
+    const tokens = ['t1', 't2', 't3'];
+    for (const [i, tok] of tokens.entries()) {
+      const ids = Array.from({ length: PRUNE_BATCH }, (_, j) => `gone-${i}-${j}`);
+      t.mock.setData.set(`${RECHECK_BATCH}${tok}`, new Set(ids));
+    }
+    t.mock.setData.set(RECHECK_TOKENS, new Set(tokens));
+    await t.s1.saveExecution(makeExec('a', 1));
+    expect(t.members(RECHECK_TOKENS)).toHaveLength(2);
+    await t.s1.saveExecution(makeExec('b', 2));
+    await t.s1.saveExecution(makeExec('c', 3));
+    expect(t.members(RECHECK_TOKENS)).toEqual([]);
+    expect(t.recheckIds()).toEqual([]);
   });
 
   it('a re-checked id whose record expired again is simply dropped from the recheck set', async () => {
@@ -463,9 +554,92 @@ describe('RedisStore prune interleavings (AC2.3, AC2.4)', () => {
     await save;
     t.expire('x');
     await t.s1.saveExecution(makeExec('z', 20_000));
-    expect(t.members(RECHECK)).toEqual([]);
+    expect(t.recheckIds()).toEqual([]);
     expect(t.members(IDS)).not.toContain('x');
     t.expectConsistent();
+  });
+});
+
+describe('RedisStore listing walk over a large tie group (m1)', () => {
+  const G = 300; // several times any read window used below
+
+  function seedTieGroup() {
+    const { store, mockClient, data } = createRedisStoreWithMockClient();
+    return { store, mockClient, data };
+  }
+
+  /** Members transferred by every ZRANGE WITHSCORES call so far. */
+  async function transferred(mockClient: ReturnType<typeof seedTieGroup>['mockClient']) {
+    let total = 0;
+    for (const r of mockClient.zRangeWithScores.mock.results) {
+      total += ((await r.value) as unknown[]).length;
+    }
+    return total;
+  }
+
+  it('reads each member of a long dead tie group about once in one call', async () => {
+    const { store, mockClient, data } = seedTieGroup();
+    // G dead runs share one startedAt and sort ahead of three live ones.
+    for (let i = 0; i < G; i++) {
+      const id = `z-${String(i).padStart(4, '0')}`;
+      await store.saveExecution(makeExec(id, 1000));
+      data.delete(blobKey(id));
+    }
+    for (const id of ['a-1', 'a-2', 'a-3']) await store.saveExecution(makeExec(id, 1000));
+    mockClient.zRangeWithScores.mockClear();
+    expect((await store.listExecutions(2)).map((e) => e.executionId)).toEqual(['a-3', 'a-2']);
+    // Re-reading the window from the start of the score every time would
+    // transfer on the order of G² / window members.
+    expect(await transferred(mockClient)).toBeLessThanOrEqual(2 * G);
+  });
+
+  it('a walk whose anchor moved (entries removed mid-call) re-reads and skips nothing', async () => {
+    const { store, mockClient, data, zsetData, setData } = createRedisStoreWithMockClient();
+    // Exactly one read window (limit 3 reads 11) of dead entries ahead of the live ones.
+    for (let i = 0; i < 11; i++) {
+      const id = `z-${String(i).padStart(4, '0')}`;
+      await store.saveExecution(makeExec(id, 1000));
+      data.delete(blobKey(id));
+    }
+    for (const id of ['a-1', 'a-2', 'a-3']) await store.saveExecution(makeExec(id, 1000));
+    // After the first read, another instance's prune removes the dead
+    // entries already read: an offset-only walk would now skip live ones.
+    const real = mockClient.zRangeWithScores.getMockImplementation()!;
+    let calls = 0;
+    mockClient.zRangeWithScores.mockImplementation(async (...args) => {
+      const result = await real(...args);
+      if (++calls === 1) {
+        for (const m of result) {
+          zsetData.get(TIME)!.delete(m.value);
+          setData.get(IDS)!.delete(m.value);
+        }
+      }
+      return result;
+    });
+    expect((await store.listExecutions(3)).map((e) => e.executionId)).toEqual([
+      'a-3',
+      'a-2',
+      'a-1',
+    ]);
+  });
+
+  it('pages through a tie group several times the window, each run once', async () => {
+    const { store, mockClient } = seedTieGroup();
+    const ids = Array.from({ length: G }, (_, i) => `t-${String(i).padStart(4, '0')}`);
+    for (const id of ids) await store.saveExecution(makeExec(id, 1000));
+    await store.saveExecution(makeExec('older', 999));
+    mockClient.zRangeWithScores.mockClear();
+
+    const seen: string[] = [];
+    let cursor: { startedAt: number; executionId: string } | undefined;
+    for (let guard = 0; guard < 1000; guard++) {
+      const page = await store.listExecutions(25, cursor ? { cursor } : undefined);
+      if (page.length === 0) break;
+      seen.push(...page.map((e) => e.executionId));
+      const last = page[page.length - 1];
+      cursor = { startedAt: last.startedAt, executionId: last.executionId };
+    }
+    expect(seen).toEqual([...ids.reverse(), 'older']);
   });
 });
 

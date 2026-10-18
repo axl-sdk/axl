@@ -1435,10 +1435,12 @@ export class AxlRuntime extends EventEmitter {
     if (typeof storeOption !== 'string') return storeOption;
     switch (storeOption) {
       case 'sqlite':
-        return new SQLiteStore(this.config.state?.sqlite?.path ?? './data/axl.db');
+        return new SQLiteStore(this.config.state?.sqlite?.path ?? './data/axl.db', {
+          ttls: this.config.state?.sqlite?.ttls,
+        });
       case 'memory':
       default:
-        return new MemoryStore();
+        return new MemoryStore(this.config.state?.memory);
     }
   }
 

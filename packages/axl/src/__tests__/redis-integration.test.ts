@@ -213,6 +213,43 @@ describe.skipIf(!REDIS_URL)('RedisStore integration (real Redis)', () => {
       expect(await ttlStore.getEvalRetention(id)).toEqual({ exists: false });
     });
 
+    it('P1-19 executionHistory expires on the server while an untimed eval row stays', async () => {
+      const mixed = await RedisStore.create({
+        url: REDIS_URL!,
+        keyPrefix: `${TEST_PREFIX}mixed-`,
+        skipMigration: true,
+        defaultTtl: 3600,
+        ttls: { executionHistory: 1, evalHistory: null },
+      });
+      try {
+        const execId = `exec-exp-${randomUUID()}`;
+        const evalId = `ev-keep-${randomUUID()}`;
+        const now = Date.now();
+        await mixed.saveExecution({
+          executionId: execId,
+          workflow: 'wf',
+          status: 'completed',
+          events: [],
+          totalCost: 0,
+          startedAt: now,
+          completedAt: now,
+          duration: 0,
+        } as ExecutionInfo);
+        await mixed.saveEvalResult({ id: evalId, eval: 'suite', timestamp: now, data: {} });
+
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+
+        expect(await mixed.getExecution(execId)).toBeNull();
+        expect((await mixed.listExecutions()).some((e) => e.executionId === execId)).toBe(false);
+        expect(await mixed.getEvalRetention(evalId)).toEqual({ exists: true });
+        const client = (mixed as unknown as { client: { pTTL(key: string): Promise<number> } })
+          .client;
+        expect(await client.pTTL(`${TEST_PREFIX}mixed-eval-history:${evalId}`)).toBe(-1);
+      } finally {
+        await mixed.close?.();
+      }
+    });
+
     it('reports an absolute expiry for an eval row written under a TTL', async () => {
       const expiring = await RedisStore.create({
         url: REDIS_URL!,

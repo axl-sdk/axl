@@ -17,11 +17,13 @@ const require_ = createRequire(import.meta.url);
  * - v3 → v4: add `execution_history.event_schema_version` (INTEGER,
  *            nullable); missing remains the v1 sentinel.
  * - v4 → v5: add `execution_history.observation` (TEXT, nullable).
+ * - v5 → v6: add nullable `expires_at` to both history tables; existing
+ *            rows keep NULL (never expire).
  * The SQLiteStore constructor runs `migrate()` before `initTables()` and
  * tracks version via PRAGMA `user_version`. Idempotent, transactional,
  * rolls back on failure.
  */
-describe('SQLiteStore — schema migration v0 → v5', () => {
+describe('SQLiteStore — schema migration v0 → v6', () => {
   const tmps: string[] = [];
 
   afterEach(() => {
@@ -37,7 +39,7 @@ describe('SQLiteStore — schema migration v0 → v5', () => {
     return join(dir, 'state.sqlite');
   }
 
-  it('fresh install: creates versioned execution history and sets user_version=5', () => {
+  it('fresh install: creates versioned execution history and sets user_version=6', () => {
     const path = makeTmpFile();
     const store = new SQLiteStore(path);
     const Database = require_('better-sqlite3');
@@ -50,7 +52,10 @@ describe('SQLiteStore — schema migration v0 → v5', () => {
       expect(names).toContain('metadata');
       expect(names).toContain('event_schema_version');
       expect(names).toContain('observation');
-      expect(db.pragma('user_version', { simple: true })).toBe(5);
+      expect(names).toContain('expires_at');
+      const evalCols = db.pragma('table_info(eval_history)') as Array<{ name: string }>;
+      expect(evalCols.map((c) => c.name)).toContain('expires_at');
+      expect(db.pragma('user_version', { simple: true })).toBe(6);
     } finally {
       db.close();
       void store; // silence unused-locals
@@ -109,7 +114,7 @@ describe('SQLiteStore — schema migration v0 → v5', () => {
     new SQLiteStore(path);
     const db = new Database(path, { readonly: true });
     try {
-      expect(db.pragma('user_version', { simple: true })).toBe(5);
+      expect(db.pragma('user_version', { simple: true })).toBe(6);
       const cols = db.pragma('table_info(execution_history)') as Array<{ name: string }>;
       const names = cols.map((c) => c.name);
       expect(names).toContain('events');
@@ -152,7 +157,7 @@ describe('SQLiteStore — schema migration v0 → v5', () => {
 
     const db = new Database(path, { readonly: true });
     try {
-      expect(db.pragma('user_version', { simple: true })).toBe(5);
+      expect(db.pragma('user_version', { simple: true })).toBe(6);
       const cols = db.pragma('table_info(execution_history)') as Array<{ name: string }>;
       expect(cols.map((c) => c.name)).toContain('events');
     } finally {
@@ -198,7 +203,7 @@ describe('SQLiteStore — schema migration v0 → v5', () => {
     // Verify column rename + version bump.
     const db = new Database(path, { readonly: true });
     try {
-      expect(db.pragma('user_version', { simple: true })).toBe(5);
+      expect(db.pragma('user_version', { simple: true })).toBe(6);
       const cols = db.pragma('table_info(checkpoints)') as Array<{ name: string }>;
       const names = cols.map((c) => c.name);
       expect(names).toContain('name');
@@ -256,7 +261,7 @@ describe('SQLiteStore — schema migration v0 → v5', () => {
 
     const db = new Database(path, { readonly: true });
     try {
-      expect(db.pragma('user_version', { simple: true })).toBe(5);
+      expect(db.pragma('user_version', { simple: true })).toBe(6);
       const cols = db.pragma('table_info(execution_history)') as Array<{ name: string }>;
       expect(cols.map((c) => c.name)).toContain('metadata');
     } finally {
@@ -334,7 +339,7 @@ describe('SQLiteStore — schema migration v0 → v5', () => {
     const store = new SQLiteStore(path);
     const db = new Database(path, { readonly: true });
     try {
-      expect(db.pragma('user_version', { simple: true })).toBe(5);
+      expect(db.pragma('user_version', { simple: true })).toBe(6);
       const row = db
         .prepare(
           'SELECT events, event_schema_version FROM execution_history WHERE execution_id = ?',
@@ -379,7 +384,7 @@ describe('SQLiteStore — schema migration v0 → v5', () => {
     const store = new SQLiteStore(path);
     const db = new Database(path, { readonly: true });
     try {
-      expect(db.pragma('user_version', { simple: true })).toBe(5);
+      expect(db.pragma('user_version', { simple: true })).toBe(6);
       const cols = db.pragma('table_info(execution_history)') as Array<{ name: string }>;
       expect(cols.map((column) => column.name)).toContain('observation');
     } finally {
@@ -389,6 +394,126 @@ describe('SQLiteStore — schema migration v0 → v5', () => {
     const got = await store.getExecution!('exec-v4');
     expect(got?.eventSchemaVersion).toBe(2);
     expect(got?.observation).toBeUndefined();
+  });
+
+  /** A v5 database: both history tables without `expires_at`, three rows each. */
+  function seedV5(path: string): void {
+    const Database = require_('better-sqlite3');
+    const seed = new Database(path);
+    seed.exec(`
+      CREATE TABLE execution_history (
+        execution_id TEXT PRIMARY KEY,
+        workflow TEXT NOT NULL,
+        status TEXT NOT NULL,
+        total_cost REAL NOT NULL DEFAULT 0,
+        started_at INTEGER NOT NULL,
+        completed_at INTEGER,
+        duration INTEGER NOT NULL DEFAULT 0,
+        error TEXT,
+        events TEXT NOT NULL,
+        metadata TEXT,
+        event_schema_version INTEGER,
+        observation TEXT
+      );
+      CREATE TABLE eval_history (
+        id TEXT PRIMARY KEY,
+        eval_name TEXT NOT NULL,
+        timestamp INTEGER NOT NULL,
+        data TEXT NOT NULL
+      );
+      CREATE INDEX idx_exec_history_started ON execution_history (started_at DESC);
+      PRAGMA user_version = 5;
+    `);
+    const insertExec = seed.prepare(
+      'INSERT INTO execution_history VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    );
+    const insertEval = seed.prepare('INSERT INTO eval_history VALUES (?, ?, ?, ?)');
+    for (const n of [1, 2, 3]) {
+      insertExec.run(
+        `old-${n}`,
+        'wf',
+        'completed',
+        0,
+        n * 1000,
+        n * 1000,
+        0,
+        null,
+        '[]',
+        null,
+        2,
+        null,
+      );
+      insertEval.run(`eval-${n}`, 'e', n * 1000, '{}');
+    }
+    seed.close();
+  }
+
+  it('v5 → v6 (P1-14): adds expires_at to both history tables; old rows stay, untimed', async () => {
+    const path = makeTmpFile();
+    seedV5(path);
+    const Database = require_('better-sqlite3');
+
+    // Even with retention configured and the clock far in the future, rows
+    // written before the upgrade keep no expiry and stay visible.
+    const farFuture = () => Date.now() + 10 * 365 * 86_400_000;
+    const opens = [
+      new SQLiteStore(path, { ttls: { executionHistory: 60, evalHistory: 60 }, now: farFuture }),
+      new SQLiteStore(path, { ttls: { executionHistory: 60, evalHistory: 60 }, now: farFuture }),
+      new SQLiteStore(path, { ttls: { executionHistory: 60, evalHistory: 60 }, now: farFuture }),
+    ];
+    const store = opens[2];
+
+    const db = new Database(path, { readonly: true });
+    try {
+      expect(db.pragma('user_version', { simple: true })).toBe(6);
+      for (const table of ['execution_history', 'eval_history']) {
+        const cols = db.pragma(`table_info(${table})`) as Array<{ name: string }>;
+        expect(cols.filter((c) => c.name === 'expires_at')).toHaveLength(1);
+        const rows = db.prepare(`SELECT expires_at FROM ${table}`).all() as Array<{
+          expires_at: number | null;
+        }>;
+        expect(rows).toHaveLength(3);
+        expect(rows.every((r) => r.expires_at === null)).toBe(true);
+      }
+      const indexes = (
+        db.prepare("SELECT name FROM sqlite_master WHERE type = 'index'").all() as Array<{
+          name: string;
+        }>
+      ).map((r) => r.name);
+      expect(indexes).not.toContain('idx_exec_history_started');
+      expect(indexes).toEqual(
+        expect.arrayContaining([
+          'idx_exec_history_started_id',
+          'idx_exec_history_expires',
+          'idx_eval_history_expires',
+        ]),
+      );
+    } finally {
+      db.close();
+    }
+
+    expect((await store.listExecutions()).map((e) => e.executionId)).toEqual([
+      'old-3',
+      'old-2',
+      'old-1',
+    ]);
+    expect(await store.getExecution('old-1')).not.toBeNull();
+    expect((await store.listEvalResults()).map((e) => e.id)).toEqual([
+      'eval-3',
+      'eval-2',
+      'eval-1',
+    ]);
+    expect(await store.getEvalRetention('eval-1')).toEqual({ exists: true });
+    for (const s of opens) await s.close();
+  });
+
+  it('v5 → v6: a pre-upgrade eval row re-saved after the upgrade stays untimed', async () => {
+    const path = makeTmpFile();
+    seedV5(path);
+    const store = new SQLiteStore(path, { ttls: { evalHistory: 60 } });
+    await store.saveEvalResult({ id: 'eval-1', eval: 'e', timestamp: 1000, data: { v: 2 } });
+    expect(await store.getEvalRetention('eval-1')).toEqual({ exists: true });
+    await store.close();
   });
 
   it('round-trip: saveExecution writes via new column name; getExecution reads back', async () => {

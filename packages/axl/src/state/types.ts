@@ -75,7 +75,11 @@ export interface StateStore {
   saveExecution?(execution: HistoricalExecutionInfo): Promise<void>;
   /** Get a specific execution by ID from history. */
   getExecution?(executionId: string): Promise<HistoricalExecutionInfo | null>;
-  /** List recent executions (most recent first). */
+  /**
+   * List recent executions, most recent first. The built-in stores order by
+   * `startedAt` descending and break ties by `executionId` descending, so the
+   * order is total and stable across calls.
+   */
   listExecutions?(limit?: number): Promise<HistoricalExecutionInfo[]>;
   /**
    * Delete an execution from history by ID. Returns `true` if an entry was
@@ -140,8 +144,10 @@ export interface StateStore {
    * bytes on a timer and at startup. Physical deletion is therefore EVENTUAL,
    * not synchronous with the store's expiry.
    *
-   * Built-ins implement it: `MemoryStore` and `SqliteStore` never expire, so
-   * `expiresAt` is `undefined`; `RedisStore` reports existence and any live TTL.
+   * Built-ins implement it. `MemoryStore` and `SQLiteStore` report the
+   * absolute expiry they stored when `ttls.evalHistory` was configured at the
+   * row's first write, and no `expiresAt` otherwise; `RedisStore` reports
+   * existence and any live TTL. An expired row reports `{ exists: false }`.
    * A custom store WITHOUT this method cannot host managed artifact capture —
    * `AxlRuntime` rejects that configuration when it is constructed rather than
    * after a run has spent money.
@@ -206,6 +212,29 @@ export interface StateStore {
   close?(): Promise<void>;
   deleteCheckpoints?(executionId: string): Promise<void>;
 }
+
+/**
+ * History retention, in **seconds**, shared by the built-in stores
+ * (`MemoryStore`, `SQLiteStore`, and the matching categories of
+ * `RedisStore`'s `ttls`).
+ *
+ * - A positive number expires the record that many seconds after it is saved.
+ * - `null` or unset keeps it forever.
+ *
+ * Windows differ per category:
+ * - `executionHistory` counts from the record's **last** save; saving the same
+ *   execution again restarts the window.
+ * - `evalHistory` counts from the row's **first** write. Saving the same eval
+ *   id again keeps the expiry it already had, and `updateEvalResult` never
+ *   changes it.
+ *
+ * Retention applies to records saved while it is configured; rows written
+ * before keep whatever expiry they had. Custom stores own their retention.
+ */
+export type HistoryTtls = {
+  executionHistory?: number | null;
+  evalHistory?: number | null;
+};
 
 /** Persisted eval history entry. */
 export type EvalHistoryEntry = {

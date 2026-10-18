@@ -143,7 +143,10 @@ Without TTLs, every save accumulates forever and Redis eventually OOMs. Categori
 **Window semantics:**
 - **Sliding** (`memory`, `session`, `sessionMeta`): every write resets the TTL. Active users keep their data; inactive users forget. Reads do NOT refresh — pair with a no-op write per turn if you need read-as-activity.
 - **Fixed-creation** (`checkpoint`, `streamingEvents`): TTL set on first write via `EXPIRE NX`. Subsequent writes don't extend the window — the hash ages out together with the run it belongs to.
-- **Fixed-refresh** (`executionState`, `executionHistory`, `evalHistory`): TTL via `SET ... EX`, refreshes on overwrite. `executionState` is retained for application-managed state compatibility; Axl does not automatically resume it.
+- **Restarted on save** (`executionState`, `executionHistory`): TTL via `SET ... EX`, so every save restarts the window. `executionState` is retained for application-managed state compatibility; Axl does not automatically resume it.
+- **Fixed from first write** (`evalHistory`): a re-save keeps the remaining TTL and `updateEvalResult` keeps it too, so corrections never extend an eval row's life. A row that exists without a TTL stays untimed.
+
+`MemoryStore` and `SQLiteStore` accept the same `ttls.executionHistory` / `ttls.evalHistory` with the same windows; see [History retention](../api-reference.md#history-retention-historyttls).
 
 **`streamingEvents` is opt-in only.** It does NOT fall back to `defaultTtl`. The TTL is the safety net for operators who forget to wire `runtime.recoverIncompleteStreams()` into startup — auto-applying a generous default would silently TTL-evict crashed-run buffers before recovery had a chance to run. **Must be longer than your max process-restart-gap** or recovery misses.
 

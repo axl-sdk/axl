@@ -183,11 +183,16 @@ export interface RedisStoreOptions {
    *   new ones) eventually ages out. If you need read-activity to count
    *   as "active," issue a no-op `ctx.remember` against a sentinel key
    *   per session turn.
-   * - **Fixed window**: `checkpoint`, `executionState`, `executionHistory`,
-   *   `evalHistory`. The TTL is set on the first write and isn't extended
-   *   on subsequent writes (via `EXPIRE ... NX`). Designed for runtime-
-   *   controlled lifecycles like executions, where the data should age
-   *   out on a schedule from creation.
+   * - **Fixed from the first write**: `checkpoint`, `streamingEvents`
+   *   (`EXPIRE ... NX`) and `evalHistory` (a re-save re-applies the remaining
+   *   `PTTL`; `updateEvalResult` uses `KEEPTTL`). Later writes never extend
+   *   the window, and an eval row that exists without a TTL stays untimed.
+   * - **Restarted on every save**: `executionState`, `executionHistory`
+   *   (`SET ... EX`). An execution record is kept for the full window after
+   *   its last save, which is normally when the run finished.
+   *
+   * `executionHistory` and `evalHistory` have the same meaning as the
+   * `ttls` option of `MemoryStore` and `SQLiteStore` (see `HistoryTtls`).
    */
   ttls?: {
     session?: number | null;

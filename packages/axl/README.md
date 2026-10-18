@@ -755,7 +755,18 @@ const store = await RedisStore.create({
 
 The prefix is concatenated as-given — no normalization. Include a trailing colon if you want one. Empty string is rejected.
 
-**TTLs are strongly recommended in production** — without them every `save*` accumulates forever and Redis eventually OOMs. Sliding window: `memory`, `session`, `sessionMeta` (every write refreshes; reads do NOT). Fixed-creation: `checkpoint`, `streamingEvents`. Fixed-refresh: `executionState`, `executionHistory`, `evalHistory`. `streamingEvents` is opt-in only (does NOT fall back to `defaultTtl`). See [api-reference.md](../../docs/api-reference.md#redisstore-options) for the full table.
+**TTLs are strongly recommended in production** — without them every `save*` accumulates forever and Redis eventually OOMs. Sliding window: `memory`, `session`, `sessionMeta` (every write refreshes; reads do NOT). Fixed from the first write: `checkpoint`, `streamingEvents`, `evalHistory` (re-saves and corrections keep an eval row's expiry). Restarted on every save: `executionState`, `executionHistory`. `streamingEvents` is opt-in only (does NOT fall back to `defaultTtl`). See [api-reference.md](../../docs/api-reference.md#redisstore-options) for the full table.
+
+`MemoryStore` and `SQLiteStore` take the same history retention, and `MemoryStore` can also cap how many executions it keeps:
+
+```typescript
+new AxlRuntime({ state: { store: 'memory', memory: { maxExecutions: 1_000 } } });
+new AxlRuntime({
+  state: { store: 'sqlite', sqlite: { path: './data/axl.db', ttls: { executionHistory: 30 * 86_400 } } },
+});
+```
+
+See [History retention](../../docs/api-reference.md#history-retention-historyttls).
 
 #### Crash survival: `state.persist: 'streaming'`
 

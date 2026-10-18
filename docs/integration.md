@@ -88,7 +88,25 @@ const runtime = new AxlRuntime({
 });
 ```
 
-**Without TTLs, every save accumulates and Redis OOMs.** Pick `defaultTtl` based on your retention policy; override per category as needed. `streamingEvents` is opt-in only (does NOT fall back to `defaultTtl`) so a generous default doesn't TTL-evict crashed-run buffers before recovery runs. See [docs/migration/state-store-durability.md](./migration/state-store-durability.md#tldr) for the full TTL strategy + window semantics (sliding vs. fixed-creation vs. fixed-refresh).
+**Without TTLs, every save accumulates and Redis OOMs.** Pick `defaultTtl` based on your retention policy; override per category as needed. `streamingEvents` is opt-in only (does NOT fall back to `defaultTtl`) so a generous default doesn't TTL-evict crashed-run buffers before recovery runs. See [docs/migration/state-store-durability.md](./migration/state-store-durability.md#tldr) for the full TTL strategy and how each category's window is counted (sliding, fixed from the first write, or restarted on every save).
+
+### SQLiteStore and MemoryStore: history retention
+
+Both stores keep execution and eval history forever unless you set a retention. They take the same `ttls.executionHistory` / `ttls.evalHistory` (seconds, `null` = keep forever) as `RedisStore`, with the same windows:
+
+```ts
+const runtime = new AxlRuntime({
+  state: {
+    store: 'sqlite',
+    sqlite: { path: './data/axl.db', ttls: { executionHistory: 60 * 60 * 24 * 30 } },
+  },
+});
+
+// In-memory: cap the number of runs kept, optionally with a retention too
+const dev = new AxlRuntime({ state: { memory: { maxExecutions: 1_000 } } });
+```
+
+Expired records stop appearing in reads immediately and are removed from storage on later saves, along with the run's leftover checkpoints and saved state. Records written before you set a retention keep no expiry. Details: [History retention](./api-reference.md#history-retention-historyttls).
 
 `keyPrefix` is the storage-layer isolation primitive for shared Redis clusters. Avoid Redis glob metacharacters (`*`, `?`, `[`, `]`) in the prefix; operators running `redis-cli SCAN MATCH` would otherwise have to escape them.
 
@@ -263,9 +281,10 @@ expire server-side while this process is offline. Stores therefore expose:
 getEvalRetention?(id: string): Promise<{ exists: boolean; expiresAt?: number }>;
 ```
 
-`MemoryStore` and `SQLiteStore` report existence with no expiry; `RedisStore`
-derives both from `PTTL`, so a configured `ttls.evalHistory` is mirrored onto
-the artifact as an absolute `expiresAt`.
+On every built-in store a configured `ttls.evalHistory` is mirrored onto the
+artifact as an absolute `expiresAt`. `MemoryStore` and `SQLiteStore` report the
+expiry they stored when the row was first written; `RedisStore` derives it from
+`PTTL`. With no eval retention, the row and its artifact never expire.
 
 **Re-saving an existing eval result never extends its retention.** Only a
 genuinely new row gets the configured `ttls.evalHistory` window; an existing one
@@ -287,8 +306,8 @@ the store:
 | Store | How | Note |
 |---|---|---|
 | `RedisStore` | `SET key value XX KEEPTTL` | **Requires Redis ≥ 6.0** for `KEEPTTL`. Nothing else in `RedisStore` does |
-| `SQLiteStore` | `UPDATE … WHERE id = ?` | no expiry, so a resurrection here would be permanent |
-| `MemoryStore` | presence check, then set | as above |
+| `SQLiteStore` | `UPDATE … WHERE id = ?` and not expired | a resurrected row would start a new retention window, or none at all without `ttls.evalHistory` |
+| `MemoryStore` | live-row check, then set | as above |
 | a custom store | omit it | corrections are then **not persisted at all**; the in-process cache is still corrected |
 
 On a Redis older than 6.0 the server rejects `KEEPTTL`, and the store raises an

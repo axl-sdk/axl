@@ -44,12 +44,21 @@ export type TraceConfig = {
   redact?: boolean;
 };
 
-import type { StateStore } from './state/types.js';
+import type { StateStore, HistoryTtls } from './state/types.js';
 
 /** State store configuration */
 export type StateConfig = {
   store?: StateStore | 'memory' | 'sqlite';
-  sqlite?: { path: string };
+  /**
+   * Options for the store built by `store: 'sqlite'`: the database file and
+   * optional history retention (seconds; see `HistoryTtls`).
+   */
+  sqlite?: { path: string; ttls?: HistoryTtls };
+  /**
+   * Options for the store built by `store: 'memory'` (the default): history
+   * retention in seconds and a maximum number of execution records.
+   */
+  memory?: { ttls?: HistoryTtls; maxExecutions?: number };
   /**
    * Maximum number of events retained in `ExecutionInfo.events` per
    * execution. Token and partial_object events are already excluded

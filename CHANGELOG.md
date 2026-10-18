@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **History retention for MemoryStore and SQLiteStore.** Both stores now take `ttls: { executionHistory, evalHistory }` in seconds, with the same meaning as on `RedisStore`, and `MemoryStore` takes `maxExecutions` to cap how many runs it keeps. Set them from runtime config with `state.memory` and `state.sqlite.ttls`. Expired runs disappear from reads and are cleaned up on later saves, along with their leftover checkpoints and saved state. Nothing expires unless you set it, and existing SQLite rows are never given an expiry. See [History retention](docs/api-reference.md#history-retention-historyttls).
+
+### Changed
+
+- **Stable listing order.** `MemoryStore` and `SQLiteStore` list executions that started in the same millisecond by `executionId`, descending, so the order no longer changes between calls.
+
 ### Fixed
 
 - **Deleted runs stay deleted.** Deleting a run right after it finished could let its pending history save bring the run back. `runtime.deleteExecution()` now waits for that save before deleting.

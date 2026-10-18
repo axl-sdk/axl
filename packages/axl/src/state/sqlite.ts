@@ -5,8 +5,36 @@ import type {
   HumanDecision,
 } from '../types.js';
 import { getExecutionEventSchemaVersion, normalizeStoredExecution } from '../event-schema.js';
-import type { StateStore, PendingDecision, ExecutionState, EvalHistoryEntry } from './types.js';
+import type {
+  StateStore,
+  PendingDecision,
+  ExecutionState,
+  EvalHistoryEntry,
+  HistoryTtls,
+} from './types.js';
 import { normalizePersistedSessionHistory } from '../input.js';
+import { AxlError } from '../errors.js';
+import {
+  PRUNE_BATCH,
+  expiryFrom,
+  resolveHistoryTtls,
+  type ResolvedHistoryTtls,
+} from './retention.js';
+
+/** Options for {@link SQLiteStore}. */
+export type SQLiteStoreOptions = {
+  /**
+   * History retention in seconds. A positive number expires a record that
+   * many seconds after it is saved; `null` or unset keeps it. See
+   * {@link HistoryTtls} for how each category's window is counted.
+   */
+  ttls?: HistoryTtls;
+  /** Clock in epoch milliseconds, used for retention. Defaults to `Date.now`. */
+  now?: () => number;
+};
+
+/** SQL predicate for "this history row has not expired" (bind `now`). */
+const LIVE = '(expires_at IS NULL OR expires_at > ?)';
 
 // Lazy-loaded better-sqlite3 types
 type Database = import('better-sqlite3').Database;
@@ -78,8 +106,20 @@ function rowToExecutionInfo(row: ExecutionHistoryRow): HistoricalExecutionInfo {
  */
 export class SQLiteStore implements StateStore {
   private db: Database;
+  private readonly ttls: ResolvedHistoryTtls;
+  private readonly now: () => number;
 
-  constructor(filePath: string) {
+  constructor(filePath: string, options?: SQLiteStoreOptions) {
+    // Validate options before touching the file, so a bad config never
+    // migrates or creates a database.
+    this.ttls = resolveHistoryTtls('SQLiteStore', options?.ttls);
+    if (options?.now !== undefined && typeof options.now !== 'function') {
+      throw new AxlError(
+        'INVALID_CONFIG',
+        'SQLiteStore: now must be a function returning epoch milliseconds',
+      );
+    }
+    this.now = options?.now ?? (() => Date.now());
     let BetterSqlite3: DatabaseConstructor;
     try {
       BetterSqlite3 = require('better-sqlite3');
@@ -121,6 +161,11 @@ export class SQLiteStore implements StateStore {
    *   Existing rows remain `NULL`, the documented v1 sentinel.
    * - v5 (observation completeness): add `execution_history.observation`.
    *   Existing rows remain `NULL`, meaning they predate the contract.
+   * - v6 (history retention): add nullable `expires_at` (epoch ms) to
+   *   `execution_history` and `eval_history`. Existing rows remain `NULL`
+   *   (never expire), so an upgrade deletes nothing. The single-column
+   *   `started_at` index is replaced by `(started_at, execution_id)`, which
+   *   serves the tie-safe listing order.
    *
    * Applied BEFORE `initTables()` so the subsequent `CREATE TABLE
    * IF NOT EXISTS` runs against the post-migration column name. Fresh
@@ -138,7 +183,7 @@ export class SQLiteStore implements StateStore {
    * transactional re-read costs nothing.
    */
   private migrate(): void {
-    const TARGET_VERSION = 5;
+    const TARGET_VERSION = 6;
     const current = this.db.pragma('user_version', { simple: true }) as number;
     if (current >= TARGET_VERSION) return;
 
@@ -199,6 +244,15 @@ export class SQLiteStore implements StateStore {
         if (cols.length > 0 && !cols.some((c) => c.name === 'observation')) {
           this.db.exec('ALTER TABLE execution_history ADD COLUMN observation TEXT');
         }
+      }
+      if (committed < 6) {
+        for (const table of ['execution_history', 'eval_history']) {
+          const cols = this.db.pragma(`table_info(${table})`) as Array<{ name: string }>;
+          if (cols.length > 0 && !cols.some((c) => c.name === 'expires_at')) {
+            this.db.exec(`ALTER TABLE ${table} ADD COLUMN expires_at INTEGER`);
+          }
+        }
+        this.db.exec('DROP INDEX IF EXISTS idx_exec_history_started');
       }
       this.db.pragma(`user_version = ${TARGET_VERSION}`);
       this.db.exec('COMMIT');
@@ -266,18 +320,23 @@ export class SQLiteStore implements StateStore {
         events TEXT NOT NULL,
         metadata TEXT,
         event_schema_version INTEGER,
-        observation TEXT
+        observation TEXT,
+        expires_at INTEGER
       );
 
       CREATE TABLE IF NOT EXISTS eval_history (
         id TEXT PRIMARY KEY,
         eval_name TEXT NOT NULL,
         timestamp INTEGER NOT NULL,
-        data TEXT NOT NULL
+        data TEXT NOT NULL,
+        expires_at INTEGER
       );
 
-      CREATE INDEX IF NOT EXISTS idx_exec_history_started ON execution_history (started_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_exec_history_started_id
+        ON execution_history (started_at DESC, execution_id DESC);
+      CREATE INDEX IF NOT EXISTS idx_exec_history_expires ON execution_history (expires_at);
       CREATE INDEX IF NOT EXISTS idx_eval_history_timestamp ON eval_history (timestamp DESC);
+      CREATE INDEX IF NOT EXISTS idx_eval_history_expires ON eval_history (expires_at);
     `);
   }
 
@@ -428,39 +487,77 @@ export class SQLiteStore implements StateStore {
       ...execution,
       eventSchemaVersion: getExecutionEventSchemaVersion(execution),
     } as HistoricalExecutionInfo);
+    const now = this.now();
+    // The window counts from the last save: every save writes a fresh expiry.
+    this.db.transaction(() => {
+      this.db
+        .prepare(
+          'INSERT OR REPLACE INTO execution_history (execution_id, workflow, status, total_cost, started_at, completed_at, duration, error, events, metadata, event_schema_version, observation, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        )
+        .run(
+          normalized.executionId,
+          normalized.workflow,
+          normalized.status,
+          normalized.totalCost,
+          normalized.startedAt,
+          normalized.completedAt ?? null,
+          normalized.duration,
+          normalized.error ?? null,
+          JSON.stringify(normalized.events),
+          normalized.metadata !== undefined ? JSON.stringify(normalized.metadata) : null,
+          normalized.eventSchemaVersion,
+          normalized.observation !== undefined ? JSON.stringify(normalized.observation) : null,
+          expiryFrom(now, this.ttls.executionHistory),
+        );
+      this.pruneExpiredExecutions(now);
+    })();
+  }
+
+  /**
+   * Remove up to `PRUNE_BATCH` expired execution-history rows, together with
+   * each run's leftover checkpoints and saved execution state, inside the
+   * caller's transaction. Pending decisions are not touched. The runtime
+   * never writes execution state, and a run is only saved to history once it
+   * has finished, so nothing still running depends on what is removed here.
+   */
+  private pruneExpiredExecutions(now: number): void {
+    const ids = (
+      this.db
+        .prepare(
+          'SELECT execution_id FROM execution_history WHERE expires_at <= ? ORDER BY expires_at LIMIT ?',
+        )
+        .all(now, PRUNE_BATCH) as Array<{ execution_id: string }>
+    ).map((row) => row.execution_id);
+    if (ids.length === 0) return;
+    const idList = JSON.stringify(ids);
+    for (const table of ['execution_history', 'checkpoints', 'execution_state']) {
+      this.db
+        .prepare(`DELETE FROM ${table} WHERE execution_id IN (SELECT value FROM json_each(?))`)
+        .run(idList);
+    }
+  }
+
+  /** Remove up to `PRUNE_BATCH` expired eval-history rows (caller's transaction). */
+  private pruneExpiredEvals(now: number): void {
     this.db
       .prepare(
-        'INSERT OR REPLACE INTO execution_history (execution_id, workflow, status, total_cost, started_at, completed_at, duration, error, events, metadata, event_schema_version, observation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'DELETE FROM eval_history WHERE rowid IN (SELECT rowid FROM eval_history WHERE expires_at <= ? ORDER BY expires_at LIMIT ?)',
       )
-      .run(
-        normalized.executionId,
-        normalized.workflow,
-        normalized.status,
-        normalized.totalCost,
-        normalized.startedAt,
-        normalized.completedAt ?? null,
-        normalized.duration,
-        normalized.error ?? null,
-        JSON.stringify(normalized.events),
-        normalized.metadata !== undefined ? JSON.stringify(normalized.metadata) : null,
-        normalized.eventSchemaVersion,
-        normalized.observation !== undefined ? JSON.stringify(normalized.observation) : null,
-      );
+      .run(now, PRUNE_BATCH);
   }
 
   async getExecution(executionId: string): Promise<HistoricalExecutionInfo | null> {
     const row = this.db
-      .prepare('SELECT * FROM execution_history WHERE execution_id = ?')
-      .get(executionId) as ExecutionHistoryRow | undefined;
+      .prepare(`SELECT * FROM execution_history WHERE execution_id = ? AND ${LIVE}`)
+      .get(executionId, this.now()) as ExecutionHistoryRow | undefined;
     return row ? rowToExecutionInfo(row) : null;
   }
 
   async listExecutions(limit?: number): Promise<HistoricalExecutionInfo[]> {
-    const sql = limit
-      ? 'SELECT * FROM execution_history ORDER BY started_at DESC LIMIT ?'
-      : 'SELECT * FROM execution_history ORDER BY started_at DESC';
+    const base = `SELECT * FROM execution_history WHERE ${LIVE} ORDER BY started_at DESC, execution_id DESC`;
+    const now = this.now();
     const rows = (
-      limit ? this.db.prepare(sql).all(limit) : this.db.prepare(sql).all()
+      limit ? this.db.prepare(`${base} LIMIT ?`).all(now, limit) : this.db.prepare(base).all(now)
     ) as ExecutionHistoryRow[];
     return rows.map(rowToExecutionInfo);
   }
@@ -498,32 +595,48 @@ export class SQLiteStore implements StateStore {
 
   // ── Eval History ────────────────────────────────────────────────────────
 
+  /**
+   * Write an eval history row. Retention counts from the row's first write:
+   * re-saving a live row keeps its `expires_at` (including none, for a row
+   * written without retention). A row that has already expired is replaced
+   * as a new one.
+   */
   async saveEvalResult(entry: EvalHistoryEntry): Promise<void> {
-    this.db
-      .prepare(
-        'INSERT OR REPLACE INTO eval_history (id, eval_name, timestamp, data) VALUES (?, ?, ?, ?)',
-      )
-      .run(entry.id, entry.eval, entry.timestamp, JSON.stringify(entry.data));
+    const now = this.now();
+    this.db.transaction(() => {
+      const existing = this.db
+        .prepare(`SELECT expires_at FROM eval_history WHERE id = ? AND ${LIVE}`)
+        .get(entry.id, now) as { expires_at: number | null } | undefined;
+      const expiresAt = existing ? existing.expires_at : expiryFrom(now, this.ttls.evalHistory);
+      this.db
+        .prepare(
+          'INSERT OR REPLACE INTO eval_history (id, eval_name, timestamp, data, expires_at) VALUES (?, ?, ?, ?, ?)',
+        )
+        .run(entry.id, entry.eval, entry.timestamp, JSON.stringify(entry.data), expiresAt);
+      this.pruneExpiredEvals(now);
+    })();
   }
 
   /**
    * Update-only write: see `StateStore.updateEvalResult`. `UPDATE ... WHERE id`
-   * touches nothing when the row is gone, where `INSERT OR REPLACE` would
-   * resurrect it — and SQLite history has no expiry, so a resurrection here is
-   * permanent.
+   * touches nothing when the row is gone or expired, where `INSERT OR REPLACE`
+   * would resurrect it. `expires_at` is left as it was.
    */
   async updateEvalResult(entry: EvalHistoryEntry): Promise<boolean> {
     const result = this.db
-      .prepare('UPDATE eval_history SET eval_name = ?, timestamp = ?, data = ? WHERE id = ?')
-      .run(entry.eval, entry.timestamp, JSON.stringify(entry.data), entry.id);
+      .prepare(
+        `UPDATE eval_history SET eval_name = ?, timestamp = ?, data = ? WHERE id = ? AND ${LIVE}`,
+      )
+      .run(entry.eval, entry.timestamp, JSON.stringify(entry.data), entry.id, this.now());
     return result.changes > 0;
   }
 
   async listEvalResults(limit?: number): Promise<EvalHistoryEntry[]> {
-    const sql = limit
-      ? 'SELECT * FROM eval_history ORDER BY timestamp DESC LIMIT ?'
-      : 'SELECT * FROM eval_history ORDER BY timestamp DESC';
-    const rows = (limit ? this.db.prepare(sql).all(limit) : this.db.prepare(sql).all()) as Array<{
+    const base = `SELECT * FROM eval_history WHERE ${LIVE} ORDER BY timestamp DESC`;
+    const now = this.now();
+    const rows = (
+      limit ? this.db.prepare(`${base} LIMIT ?`).all(now, limit) : this.db.prepare(base).all(now)
+    ) as Array<{
       id: string;
       eval_name: string;
       timestamp: number;
@@ -542,10 +655,13 @@ export class SQLiteStore implements StateStore {
     return result.changes > 0;
   }
 
-  /** SQLite history has no automatic expiry — only existence is meaningful. */
+  /** Existence plus the expiry stored at the row's first write, if any. */
   async getEvalRetention(id: string): Promise<{ exists: boolean; expiresAt?: number }> {
-    const row = this.db.prepare('SELECT 1 FROM eval_history WHERE id = ?').get(id);
-    return { exists: row !== undefined };
+    const row = this.db
+      .prepare(`SELECT expires_at FROM eval_history WHERE id = ? AND ${LIVE}`)
+      .get(id, this.now()) as { expires_at: number | null } | undefined;
+    if (!row) return { exists: false };
+    return row.expires_at === null ? { exists: true } : { exists: true, expiresAt: row.expires_at };
   }
 
   // ── Sessions (Studio introspection) ────────────────────────────────────

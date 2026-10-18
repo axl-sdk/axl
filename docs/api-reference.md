@@ -2080,6 +2080,55 @@ const runtime3 = new AxlRuntime({
 });
 ```
 
+### History retention (`HistoryTtls`)
+
+Every built-in store accepts the same retention option for its history:
+
+```typescript
+type HistoryTtls = {
+  executionHistory?: number | null; // seconds
+  evalHistory?: number | null; // seconds
+};
+```
+
+| Value | Meaning |
+|-------|---------|
+| positive number | The record expires that many seconds after it is saved |
+| `null` | The record never expires (on `RedisStore`, this also opts out of `defaultTtl`) |
+| unset | The record never expires (on `RedisStore`, `defaultTtl` applies if set) |
+
+| Category | Window |
+|----------|--------|
+| `executionHistory` | Counted from the record's **last** save. Saving the same execution again restarts it |
+| `evalHistory` | Counted from the row's **first** write. Saving the same eval id again keeps its expiry, and so does `updateEvalResult`. A row written without retention stays untimed. Once a row has expired, a new save starts a new window |
+
+Retention applies to records saved while it is configured; existing records keep whatever expiry they had. Once a record has expired, no read returns it: `getExecution` returns `null`, listings skip it, and `getEvalRetention` reports `{ exists: false }`. With `evalHistory` set, `getEvalRetention` reports the row's `expiresAt`, which diagnostic artifacts follow. Custom stores own their own retention.
+
+### MemoryStore and SQLiteStore options
+
+```typescript
+import { MemoryStore, SQLiteStore } from '@axlsdk/axl';
+
+new MemoryStore({ ttls: { executionHistory: 86_400 }, maxExecutions: 1_000 });
+new SQLiteStore('./data/axl.db', { ttls: { executionHistory: 30 * 86_400, evalHistory: null } });
+
+// The same options from runtime config:
+new AxlRuntime({ state: { store: 'memory', memory: { maxExecutions: 1_000 } } });
+new AxlRuntime({ state: { store: 'sqlite', sqlite: { path: './data/axl.db', ttls: { executionHistory: 86_400 } } } });
+```
+
+| Field | Store | Type | Default | Description |
+|-------|-------|------|---------|-------------|
+| `ttls` | both | `HistoryTtls?` | — (keep forever) | History retention, see above. `0`, negative, `NaN`, `Infinity` and non-numbers throw an `AxlError` (`INVALID_CONFIG`) at construction |
+| `maxExecutions` | `MemoryStore` | `number?` | — (no limit) | Maximum execution records kept. A save that goes over the limit removes the oldest in listing order (earliest `startedAt`, then lowest `executionId`), which can be the record just saved. A positive integer or `Infinity`; anything else throws an `AxlError` (`INVALID_CONFIG`) |
+| `now` | both | `() => number` | `Date.now` | Clock in epoch milliseconds used for retention. Mainly for tests |
+
+Expired records are removed from storage a batch at a time (up to 100 per save) on later saves of the same kind; there are no background timers. When an execution record is removed this way, or by `maxExecutions`, its checkpoints and saved execution state are removed with it (and, on `MemoryStore`, its streaming buffer). Pending decisions are left alone.
+
+`SQLiteStore` stores the expiry in an `expires_at` column on both history tables, added by schema v6 on first open; rows written before the upgrade keep no expiry.
+
+`listExecutions` on both stores orders by `startedAt` descending, then `executionId` descending.
+
 ### RedisStore options
 
 `RedisStore.create()` accepts either a URL string (back-compat) or an options object:
@@ -2090,7 +2139,7 @@ const runtime3 = new AxlRuntime({
 | `keyPrefix` | `string?` | `'axl:'` | Prepended to every key written by this store. Concatenated as-given — no normalization (include the trailing colon if you want one). Empty string is rejected. Useful when two Axl deployments share a Redis cluster, or when coexisting with other applications' keys |
 | `skipMigration` | `boolean?` | `false` | Skip the one-time lazy backfill of the execution / eval-history sorted-set indexes on startup. Set to `true` for installs at six-figure execution counts where the startup cost is unacceptable, then call `store.backfillExecutionIndex()` / `store.backfillEvalIndex()` manually during a maintenance window. Until then, `listExecutions` / `listEvalResults` fall back to the legacy SET + N×GET + JS-sort read path — correct but slow at scale |
 | `defaultTtl` | `number?` | — | Default TTL in **seconds** applied to every TTL-capable storage category. Without a TTL, every `save*` accumulates forever — strongly recommended in production |
-| `ttls` | `object?` | — | Per-category TTL overrides in seconds (`session`, `sessionMeta`, `checkpoint`, `executionState`, `executionHistory`, `evalHistory`, `memory`, `streamingEvents`). Set a category to `null` to explicitly opt out even when `defaultTtl` is set. `pendingDecision` is intentionally NOT configurable — pending decisions share a hash, so a TTL would expire all of them at once. **Window semantics:** `memory`, `session`, and `sessionMeta` are sliding (every write refreshes TTL — active users keep their data, inactive users forget; reads do NOT refresh); `checkpoint` and `streamingEvents` are fixed-creation (TTL set on first write only); `executionState` / `executionHistory` / `evalHistory` are fixed-refresh (TTL via `SET ... EX`). **`streamingEvents` is opt-in only** — does NOT fall back to `defaultTtl`. Must be longer than your max time-between-restarts or `recoverIncompleteStreams()` will miss crashed-run buffers that aged out before the next process started. Non-positive and non-finite values (`0`, negative, `NaN`, `Infinity`) are defensively treated as no-TTL. Per-category TTLs are independent. Legacy memory entries (pre-`memory-methods` patch) migrate forward on first read with the configured TTL applied. `listPendingExecutions` self-prunes stale ids when their `executionState` blob has TTL-evicted |
+| `ttls` | `object?` | — | Per-category TTL overrides in seconds (`session`, `sessionMeta`, `checkpoint`, `executionState`, `executionHistory`, `evalHistory`, `memory`, `streamingEvents`). Set a category to `null` to explicitly opt out even when `defaultTtl` is set. `pendingDecision` is intentionally NOT configurable — pending decisions share a hash, so a TTL would expire all of them at once. **Window semantics:** `memory`, `session`, and `sessionMeta` are sliding (every write refreshes TTL — active users keep their data, inactive users forget; reads do NOT refresh); `checkpoint` and `streamingEvents` are fixed from the first write (TTL set once); `executionState` and `executionHistory` restart their window on every save; `evalHistory` is fixed from the row's first write, as described in [History retention](#history-retention-historyttls). **`streamingEvents` is opt-in only** — does NOT fall back to `defaultTtl`. Must be longer than your max time-between-restarts or `recoverIncompleteStreams()` will miss crashed-run buffers that aged out before the next process started. Non-positive and non-finite values (`0`, negative, `NaN`, `Infinity`) are defensively treated as no-TTL. Per-category TTLs are independent. Legacy memory entries (pre-`memory-methods` patch) migrate forward on first read with the configured TTL applied. `listPendingExecutions` self-prunes stale ids when their `executionState` blob has TTL-evicted |
 
 ### Provider configuration
 
@@ -2250,7 +2299,8 @@ third-party profile cannot declare one.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `store` | `'memory' \| 'sqlite' \| StateStore` | `'memory'` | Backend implementation. Pass an instance for `RedisStore` (use `await RedisStore.create(url)`) or a custom store |
-| `sqlite` | `{ path: string }` | — | Path for the `'sqlite'` store. Required when `store === 'sqlite'` |
+| `sqlite` | `{ path: string; ttls?: HistoryTtls }` | — | Options for the store built by `store: 'sqlite'`. `path` is the database file (`./data/axl.db` when `sqlite` is omitted); `ttls` is passed to the store as its history retention (see [SQLiteStore options](#memorystore-and-sqlitestore-options)) |
+| `memory` | `{ ttls?: HistoryTtls; maxExecutions?: number }` | — | Options for the store built by `store: 'memory'` (the default): history retention and a cap on execution records (see [MemoryStore options](#memorystore-and-sqlitestore-options)). Invalid values throw when the runtime is constructed |
 | `maxEventsPerExecution` | `number` | `50_000` | Maximum number of events retained in `ExecutionInfo.events` per execution. When the cap is hit, subsequent events are dropped from the array (with a sentinel `log` event recording the truncation) — but the trace channel (`runtime.on('trace')`) and WS broadcast continue to receive every event, so live observability isn't degraded. Must be a positive integer or `Infinity` (explicit unbounded opt-out — only safe for short-lived executions). Pathological values (`0`, negative, fractional, `NaN`) are rejected at construction with a `RangeError` |
 | `persist` | `'terminal' \| 'streaming'` | `'terminal'` | When to write events to the state store. `'terminal'` (default, back-compat): events buffered in memory, written at the terminal `done`/`error` event. Fastest path; if the process crashes mid-run, events are lost. `'streaming'`: events batched and written throughout the run via `StateStore.appendStreamingEvents`; on a process crash, call `runtime.recoverIncompleteStreams()` from the next process to reconstruct a partial `ExecutionInfo` from the surviving buffer. Excluded from streaming flush: `token`, `partial_object`, `string_delta` (high-volume stream-only, reconstructable from persisted `agent_call_end.data`) |
 | `streamingBatchSize` | `number` | `100` | Number of events buffered before flushing to the streaming store. Set to `1` for per-event flush (highest durability, one Redis round-trip per emit — adds latency proportional to RTT). Only meaningful when `persist === 'streaming'` |

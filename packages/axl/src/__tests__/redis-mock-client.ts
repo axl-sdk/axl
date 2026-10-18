@@ -112,6 +112,8 @@ export function createMockMulti(
           if (data.delete(k)) count++;
           if (hashData.delete(k)) count++;
           if (listData.delete(k)) count++;
+          if (setData.delete(k)) count++;
+          if (zsetData.delete(k)) count++;
         }
         return count;
       });
@@ -350,6 +352,8 @@ export function createRedisStoreWithMockClient(keyPrefix = 'axl:', ttlConfig?: M
         if (data.delete(k)) count++;
         if (hashData.delete(k)) count++;
         if (listData.delete(k)) count++;
+        if (setData.delete(k)) count++;
+        if (zsetData.delete(k)) count++;
       }
       return count;
     }),

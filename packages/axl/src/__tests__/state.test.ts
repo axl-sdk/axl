@@ -1503,13 +1503,13 @@ describe('RedisStore', () => {
       await store.deleteExecution('e1');
       expect(captured).toHaveLength(1);
       // Per-execution surfaces deleted together: history-set sRem + history
-      // blob del + history zRem + expiry zRem + prune-recheck sRem +
-      // checkpoint del + exec-state del + pending-exec-set sRem +
-      // streaming-events del + streaming-ids sRem + decisions hash hDel = 11.
+      // blob del + history zRem + expiry zRem + checkpoint del +
+      // exec-state del + pending-exec-set sRem + streaming-events del +
+      // streaming-ids sRem + decisions hash hDel = 10.
       // Full sweep prevents resurrection via the streaming buffer and closes
       // the GDPR right-to-be-forgotten leak path (no pending decision left
       // behind for awaitHuman runs).
-      expect(captured[0]._queueLength()).toBe(11);
+      expect(captured[0]._queueLength()).toBe(10);
 
       // No single-op delete commands escaped the MULTI
       expect(mockClient.sRem).not.toHaveBeenCalled();
@@ -2853,8 +2853,8 @@ describe('RedisStore', () => {
       const chains = instrumentMulti(mockClient);
       const result = await store.deleteEvalResult('ev1');
 
-      // sRem + del + zRem + expiry zRem + prune-recheck sRem
-      expect(chains[0]._queueLength()).toBe(5);
+      // sRem + del + zRem + expiry zRem
+      expect(chains[0]._queueLength()).toBe(4);
       expect(result).toBe(true);
     });
 
@@ -2863,7 +2863,7 @@ describe('RedisStore', () => {
       const chains = instrumentMulti(mockClient);
       const result = await store.deleteEvalResult('does-not-exist');
 
-      expect(chains[0]._queueLength()).toBe(5);
+      expect(chains[0]._queueLength()).toBe(4);
       expect(result).toBe(false);
     });
 

@@ -15,6 +15,7 @@ import type {
 import { AxlError } from '../errors.js';
 import { normalizePersistedSessionHistory } from '../input.js';
 import { getExecutionEventSchemaVersion, normalizeStoredExecution } from '../event-schema.js';
+import { randomUUID } from 'node:crypto';
 import { warnDiagnosticOnce } from '../schema-diagnostics.js';
 import { PRUNE_BATCH } from './retention.js';
 
@@ -264,8 +265,10 @@ type HistoryKind = 'execution' | 'eval';
  * - `expiry`: sorted set scored by the record's expiry (epoch ms). Only timed
  *   records are in it. The prune reads it to find index entries whose record
  *   may have expired.
- * - `recheck`: ids a prune removed from the indexes and has not yet
- *   re-checked. Survives a crashed prune, so the next one re-checks them.
+ * - `recheckTokens` / `recheckBatch(token)`: each prune writes the ids it
+ *   removes to its own batch key and registers the batch's token. It deletes
+ *   only its own batch once re-checked, so a batch left by a prune that
+ *   crashed survives until a later prune re-checks it.
  */
 type HistoryIndex = {
   kind: HistoryKind;
@@ -273,7 +276,8 @@ type HistoryIndex = {
   ids: string;
   time: string;
   expiry: string;
-  recheck: string;
+  recheckTokens: string;
+  recheckBatch(token: string): string;
   dataKey(id: string): string;
   /** The listing score stored in a record's blob, or `null` if unreadable. */
   timeScoreOf(raw: string): number | null;
@@ -619,7 +623,8 @@ export class RedisStore implements StateStore {
         ids: this.execHistorySetKey(),
         time: this.execHistoryZsetKey(),
         expiry: `${this.keyPrefix}exec-history-exp`,
-        recheck: `${this.keyPrefix}exec-history-prune-recheck`,
+        recheckTokens: `${this.keyPrefix}exec-history-prune-recheck-tokens`,
+        recheckBatch: (token) => `${this.keyPrefix}exec-history-prune-recheck:${token}`,
         dataKey: (id) => this.execHistoryKey(id),
         timeScoreOf: (raw) => {
           const startedAt = (JSON.parse(raw) as HistoricalExecutionInfo).startedAt;
@@ -633,7 +638,8 @@ export class RedisStore implements StateStore {
       ids: this.evalHistorySetKey(),
       time: this.evalHistoryZsetKey(),
       expiry: `${this.keyPrefix}eval-history-exp`,
-      recheck: `${this.keyPrefix}eval-history-prune-recheck`,
+      recheckTokens: `${this.keyPrefix}eval-history-prune-recheck-tokens`,
+      recheckBatch: (token) => `${this.keyPrefix}eval-history-prune-recheck:${token}`,
       dataKey: (id) => this.evalHistoryKey(id),
       timeScoreOf: (raw) => {
         const timestamp = (JSON.parse(raw) as EvalHistoryEntry).timestamp;
@@ -1025,7 +1031,6 @@ export class RedisStore implements StateStore {
       .del(index.dataKey(executionId))
       .zRem(index.time, executionId)
       .zRem(index.expiry, executionId)
-      .sRem(index.recheck, executionId)
       .del(this.checkpointKey(executionId))
       .del(this.executionStateKey(executionId))
       .sRem(this.pendingExecSetKey(), executionId)
@@ -1158,7 +1163,6 @@ export class RedisStore implements StateStore {
       .del(index.dataKey(id))
       .zRem(index.time, id)
       .zRem(index.expiry, id)
-      .sRem(index.recheck, id)
       .exec();
     const deleted = typeof deletedCount === 'number' ? deletedCount : 0;
     return deleted > 0;
@@ -1235,27 +1239,47 @@ export class RedisStore implements StateStore {
 
     const results: T[] = [];
     const seen = new Set<string>();
+    // Results start strictly after `bound`: the cursor, then the last record
+    // returned.
     let bound = cursor;
-    // Members at the bound's score that sort at or before the bound's member.
-    // A read restarting at the bound's score returns them first; they are read
-    // again and dropped.
-    let boundTies = 0;
+    // Reads cover the members scored at most `rangeMax`, newest first.
+    let rangeMax: number | '+inf' = cursor !== undefined ? cursor.score : '+inf';
+    // The last member read and its position in that range. The next read
+    // starts at the anchor itself (`LIMIT offset`), so members already read
+    // are never transferred again, however many share one score. If the
+    // anchor is not where it was (entries removed or added meanwhile), the
+    // read is repeated from the start of the range.
+    let anchor: { id: string; score: number; pos: number } | undefined;
+    // Doubles while reads return nothing new (a long run of members at or
+    // before the cursor), so skipping them takes few round trips.
+    let grow = 1;
+    const read = (offset: number, count: number | undefined) =>
+      // ZRANGE BY SCORE REV: start is the highest score, stop the lowest.
+      this.client.zRangeWithScores(index.time, rangeMax, '-inf', {
+        BY: 'SCORE',
+        REV: true,
+        ...(count !== undefined ? { LIMIT: { offset, count } } : {}),
+      });
     for (;;) {
       const remaining = max !== undefined ? max - results.length : undefined;
       // Read a little more than needed: a few index entries may be dead.
-      const count =
-        remaining !== undefined ? boundTies + Math.max(remaining * 2, remaining + 5) : undefined;
-      // ZRANGE BY SCORE REV: start is the highest score, stop the lowest.
-      const members = await this.client.zRangeWithScores(
-        index.time,
-        bound !== undefined ? bound.score : '+inf',
-        '-inf',
-        {
-          BY: 'SCORE',
-          REV: true,
-          ...(count !== undefined ? { LIMIT: { offset: 0, count } } : {}),
-        },
-      );
+      const want =
+        remaining !== undefined ? Math.max(remaining * 2, remaining + 5) * grow : undefined;
+      let offset = 0;
+      let count = want;
+      let members: Array<{ value: string; score: number }>;
+      if (anchor !== undefined && want !== undefined) {
+        offset = anchor.pos;
+        count = want + 1;
+        members = await read(offset, count);
+        if (members[0]?.value !== anchor.id) {
+          offset = 0;
+          count = anchor.pos + 1 + want;
+          members = await read(offset, count);
+        }
+      } else {
+        members = await read(offset, count);
+      }
       const fresh = members.filter(
         (m) =>
           !seen.has(m.value) &&
@@ -1276,17 +1300,24 @@ export class RedisStore implements StateStore {
           }
           if (max !== undefined && results.length >= max) return results;
         }
-        const last = fresh[fresh.length - 1];
-        const next = { score: last.score, id: last.value };
-        bound = next;
-        boundTies = members.filter((m) => m.score === next.score).length;
+        const lastFresh = fresh[fresh.length - 1];
+        bound = { score: lastFresh.score, id: lastFresh.value };
+        grow = 1;
       } else {
-        // Nothing new in a full read (entries added at the bound's score
-        // meanwhile): read a larger window from the same bound.
-        boundTies = members.length;
+        grow *= 2;
       }
       // A short read means the set is exhausted.
       if (count === undefined || members.length < count) return results;
+      const last = members[members.length - 1];
+      if (last.score === rangeMax) {
+        anchor = { id: last.value, score: last.score, pos: offset + members.length - 1 };
+      } else {
+        // The range moves down to the last member's score. Every member at
+        // that score that sorts before it was in this read.
+        rangeMax = last.score;
+        const before = members.filter((m) => m.score === last.score).length - 1;
+        anchor = { id: last.value, score: last.score, pos: before };
+      }
     }
   }
 
@@ -1296,18 +1327,25 @@ export class RedisStore implements StateStore {
   // entries in the id set and the time sorted set stay behind. Every history
   // save runs one bounded prune of its kind:
   //
-  //   0. Re-check ids a previous prune removed but never re-checked (it
-  //      crashed in between). They are in the kind's recheck set.
+  //   0. Re-check batches other prunes registered and have not cleared:
+  //      they may have crashed between steps 3 and 4.
   //   1. Read up to PRUNE_BATCH ids from the expiry sorted set whose expiry
   //      has passed.
   //   2. MGET their blobs.
   //   3. For ids whose blob is gone, in one MULTI: remove them from the id
-  //      set, the time sorted set and the expiry sorted set, and add them to
-  //      the recheck set. A missing blob is the only reason an id is removed.
+  //      set, the time sorted set and the expiry sorted set, write them to
+  //      this prune's own batch key and register its token. A missing blob
+  //      is the only reason an id is removed.
   //   4. Re-check those ids: a save of the same id that landed between steps
   //      2 and 3 has a live blob whose index entries step 3 just removed.
   //      Re-index every id whose blob is live again (see recheckPrunedIds)
-  //      and take the checked ids out of the recheck set, in one MULTI.
+  //      and delete this prune's batch key and token, in one MULTI.
+  //
+  // Batches are per prune, not per kind: a prune deletes only its own batch,
+  // so it can never clear ids another prune removed after this one read
+  // them. Re-checking a batch whose prune is still running is harmless: a
+  // re-save that matters landed before that prune's removal MULTI, so it is
+  // visible to any re-check that can see the batch.
   //
   // The prune never writes a blob, so it cannot bring back deleted data, and
   // every step is idempotent, so several instances pruning at once is safe.
@@ -1340,8 +1378,7 @@ export class RedisStore implements StateStore {
   }
 
   private async pruneHistory(index: HistoryIndex): Promise<void> {
-    const leftovers = await this.client.sMembers(index.recheck);
-    if (leftovers.length > 0) await this.recheckPrunedIds(index, leftovers.slice(0, PRUNE_BATCH));
+    await this.recheckLeftoverBatches(index);
 
     const candidates = await this.client.zRange(index.expiry, '-inf', Date.now(), {
       BY: 'SCORE',
@@ -1353,21 +1390,40 @@ export class RedisStore implements StateStore {
     const live = candidates.filter((_, i) => raws[i] != null);
 
     if (dead.length > 0) {
+      const token = randomUUID();
       await this.client
         .multi()
         .sRem(index.ids, dead)
         .zRem(index.time, dead)
         .zRem(index.expiry, dead)
-        .sAdd(index.recheck, dead)
+        .sAdd(index.recheckBatch(token), dead)
+        .sAdd(index.recheckTokens, token)
         .exec();
-      await this.recheckPrunedIds(index, dead);
+      await this.recheckPrunedIds(index, dead, [token]);
     }
     if (live.length > 0) await this.rescoreLiveExpiryEntries(index, live);
   }
 
   /**
-   * Re-index the ids among `ids` whose blob is live, then take all of `ids`
-   * out of the recheck set. The blob's remaining TTL decides what is written:
+   * Re-check batches registered by earlier prunes, up to about one batch of
+   * ids per call. Any registered batch may belong to a prune that crashed.
+   */
+  private async recheckLeftoverBatches(index: HistoryIndex): Promise<void> {
+    const tokens = await this.client.sMembers(index.recheckTokens);
+    if (tokens.length === 0) return;
+    const taken: string[] = [];
+    const ids = new Set<string>();
+    for (const token of tokens) {
+      for (const id of await this.client.sMembers(index.recheckBatch(token))) ids.add(id);
+      taken.push(token);
+      if (ids.size >= PRUNE_BATCH) break;
+    }
+    await this.recheckPrunedIds(index, [...ids], taken);
+  }
+
+  /**
+   * Re-index the ids among `ids` whose blob is live, then delete the batches
+   * named by `tokens`. The blob's remaining TTL decides what is written:
    *
    * - `-2`: the record was deleted after the MGET. Nothing is re-indexed.
    * - `-1`: the record is untimed. It goes back in the id set and the time
@@ -1377,8 +1433,12 @@ export class RedisStore implements StateStore {
    * The time score comes from the blob (`startedAt` / `timestamp`), so a
    * re-indexed record keeps its place in the listing.
    */
-  private async recheckPrunedIds(index: HistoryIndex, ids: string[]): Promise<void> {
-    const raws = await this.client.mGet(ids.map((id) => index.dataKey(id)));
+  private async recheckPrunedIds(
+    index: HistoryIndex,
+    ids: string[],
+    tokens: string[],
+  ): Promise<void> {
+    const raws = ids.length > 0 ? await this.client.mGet(ids.map((id) => index.dataKey(id))) : [];
     const live: Array<{ id: string; timeScore: number }> = [];
     for (let i = 0; i < ids.length; i++) {
       const raw = raws[i];
@@ -1402,7 +1462,7 @@ export class RedisStore implements StateStore {
       tx.sAdd(index.ids, id).zAdd(index.time, { score: timeScore, value: id });
       if (pttl > 0) tx.zAdd(index.expiry, { score: now + pttl, value: id });
     }
-    tx.sRem(index.recheck, ids);
+    tx.del(tokens.map((token) => index.recheckBatch(token))).sRem(index.recheckTokens, tokens);
     await tx.exec();
   }
 

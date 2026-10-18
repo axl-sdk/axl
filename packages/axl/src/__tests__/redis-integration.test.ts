@@ -662,6 +662,19 @@ describe.skipIf(!REDIS_URL)('RedisStore integration (real Redis)', () => {
       });
     }
 
+    /** Ids waiting in registered recheck batches (registry + batch keys). */
+    async function recheckIds(s: RedisStore, prefix: string): Promise<string[]> {
+      const c = rawClient(s);
+      const tokens = await c.sMembers(`${prefix}exec-history-prune-recheck-tokens`);
+      const ids = new Set<string>();
+      for (const token of tokens) {
+        for (const id of await c.sMembers(`${prefix}exec-history-prune-recheck:${token}`)) {
+          ids.add(id);
+        }
+      }
+      return [...ids].sort();
+    }
+
     /** Index `id` as a record that has already expired: no blob, past expiry. */
     async function plantDead(s: RedisStore, prefix: string, id: string, startedAt: number) {
       await s.saveExecution(exec(id, startedAt));
@@ -717,7 +730,7 @@ describe.skipIf(!REDIS_URL)('RedisStore integration (real Redis)', () => {
         expect(await c.sMembers(`${prefix}exec-history-ids`)).toEqual(['d']);
         expect(await c.zRange(`${prefix}exec-history-z`, 0, -1)).toEqual(['d']);
         expect(await c.zRange(`${prefix}exec-history-exp`, 0, -1)).toEqual(['d']);
-        expect(await c.sMembers(`${prefix}exec-history-prune-recheck`)).toEqual([]);
+        expect(await recheckIds(s, prefix)).toEqual([]);
       } finally {
         await s.close();
       }
@@ -742,7 +755,7 @@ describe.skipIf(!REDIS_URL)('RedisStore integration (real Redis)', () => {
         const c = rawClient(s2);
         expect(await c.zScore(`${prefix}exec-history-z`, 'x')).toBe(123);
         expect(await c.zScore(`${prefix}exec-history-exp`, 'x')).toBeGreaterThan(Date.now());
-        expect(await c.sMembers(`${prefix}exec-history-prune-recheck`)).toEqual([]);
+        expect(await recheckIds(s2, prefix)).toEqual([]);
       } finally {
         await s1.close();
         await s2.close();
@@ -794,14 +807,52 @@ describe.skipIf(!REDIS_URL)('RedisStore integration (real Redis)', () => {
         gate.failAt('mget-2');
         gate.release('remove-multi');
         await save;
-        expect(await rawClient(s2).sMembers(`${prefix}exec-history-prune-recheck`)).toEqual(['x']);
+        expect(await recheckIds(s2, prefix)).toEqual(['x']);
 
         await s2.saveExecution(exec('z', 20_000));
         expect((await s2.listExecutions()).map((e) => e.executionId)).toEqual(['z', 'y', 'x']);
-        expect(await rawClient(s2).sMembers(`${prefix}exec-history-prune-recheck`)).toEqual([]);
+        expect(await recheckIds(s2, prefix)).toEqual([]);
+        expect(await rawClient(s2).sMembers(`${prefix}exec-history-prune-recheck-tokens`)).toEqual(
+          [],
+        );
       } finally {
         await s1.close();
         await s2.close();
+      }
+    });
+
+    it('M1 two pruners + a re-save + a crash: the crashed batch survives (real client)', async () => {
+      const prefix = `${TEST_PREFIX}race-two-pruners-`;
+      const sA = await open(prefix);
+      const sB = await open(prefix);
+      const s = await open(prefix);
+      const gA = gateRedisClient(rawClient(sA) as object);
+      (sA as unknown as { client: unknown }).client = gA.client;
+      const gB = gateRedisClient(rawClient(sB) as object);
+      (sB as unknown as { client: unknown }).client = gB.client;
+      try {
+        await plantDead(s, prefix, 'Y', 7);
+        const bAtRemove = gB.pauseAt('remove-multi');
+        const saveB = sB.saveExecution(exec('b', 10_000));
+        await bAtRemove;
+        const aAtReindex = gA.pauseAt('reindex-multi');
+        const saveA = sA.saveExecution(exec('a', 10_001));
+        await aAtReindex;
+        await s.saveExecution(exec('Y', 123));
+        gB.failAt('mget-2');
+        gB.release('remove-multi');
+        await saveB;
+        gA.release('reindex-multi');
+        await saveA;
+        expect(await recheckIds(s, prefix)).toEqual(['Y']);
+
+        await s.saveExecution(exec('z', 20_000));
+        expect((await s.listExecutions()).map((e) => e.executionId)).toEqual(['z', 'a', 'b', 'Y']);
+        expect(await recheckIds(s, prefix)).toEqual([]);
+      } finally {
+        await sA.close();
+        await sB.close();
+        await s.close();
       }
     });
   });

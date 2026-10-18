@@ -9,13 +9,13 @@
  *
  * | Step            | Command                                                 |
  * |-----------------|---------------------------------------------------------|
- * | `recheck-read`  | SMEMBERS on a `…-prune-recheck` set                     |
+ * | `recheck-read`  | SMEMBERS on a `…-prune-recheck…` key (registry or batch) |
  * | `zrange-expiry` | ZRANGE on a `…-exp` sorted set                          |
  * | `mget-1`        | the MGET right after `zrange-expiry`                    |
- * | `remove-multi`  | a MULTI that adds to a `…-prune-recheck` set            |
+ * | `remove-multi`  | a MULTI that adds to a `…-prune-recheck…` key            |
  * | `mget-2`        | the MGET right after `remove-multi` or `recheck-read`   |
  * | `pttl`          | a PTTL right after `mget-2`                             |
- * | `reindex-multi` | a MULTI that removes from a recheck set and deletes nothing |
+ * | `reindex-multi` | a MULTI that deletes or removes from a recheck key       |
  * | `rescore-multi` | a MULTI that only touches a `…-exp` sorted set          |
  *
  * A paused step waits before its command is sent; a failed step throws
@@ -57,7 +57,10 @@ export type GatedClient<C> = {
   failAt(step: PruneStep, error?: Error): void;
 };
 
-const isRecheck = (key: unknown) => typeof key === 'string' && key.endsWith('-prune-recheck');
+const isRecheck = (key: unknown) => {
+  const keys = Array.isArray(key) ? key : [key];
+  return keys.some((k) => typeof k === 'string' && k.includes('-prune-recheck'));
+};
 const isExpiry = (key: unknown) => typeof key === 'string' && key.endsWith('-history-exp');
 
 export function gateRedisClient<C extends object>(client: C): GatedClient<C> {
@@ -96,7 +99,7 @@ export function gateRedisClient<C extends object>(client: C): GatedClient<C> {
 
   function labelMulti(ops: Array<[string, unknown]>): PruneStep | undefined {
     if (ops.some(([m, key]) => m === 'sAdd' && isRecheck(key))) return 'remove-multi';
-    if (ops.some(([m, key]) => m === 'sRem' && isRecheck(key)) && !ops.some(([m]) => m === 'del')) {
+    if (ops.some(([m, key]) => (m === 'sRem' || m === 'del') && isRecheck(key))) {
       return 'reindex-multi';
     }
     if (

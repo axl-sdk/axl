@@ -554,23 +554,38 @@ app.post('/analyze', async (req, res) => {
   res.json(result);
 });
 
-// List a tenant's runs (queryable via runtime.getExecutions())
+// Read history a page at a time, so a large store is never loaded at once
+async function* allExecutions(pageSize = 500) {
+  let cursor: ExecutionCursor | undefined;
+  do {
+    const page = await runtime.getExecutions({ limit: pageSize, cursor });
+    yield* page;
+    const last = page.at(-1);
+    cursor = last && { startedAt: last.startedAt, executionId: last.executionId };
+  } while (cursor);
+}
+
+// List a tenant's runs
 app.get('/admin/runs', async (req, res) => {
-  const all = await runtime.getExecutions();
-  const tenant = all.filter((e) => e.metadata?.tenantId === req.user.tenantId);
+  const tenant = [];
+  for await (const e of allExecutions()) {
+    if (e.metadata?.tenantId === req.user.tenantId) tenant.push(e);
+  }
   res.json(tenant);
 });
 
 // GDPR right-to-be-forgotten — sweeps every per-execution surface
 app.delete('/users/:id/data', async (req, res) => {
-  const all = await runtime.getExecutions();
-  const userRuns = all.filter((e) => e.metadata?.userId === req.params.id);
-  const results = await Promise.all(
-    userRuns.map((e) => runtime.deleteExecution(e.executionId)),
-  );
-  res.json({ deleted: results.filter(Boolean).length });
+  let deleted = 0;
+  for await (const e of allExecutions()) {
+    if (e.metadata?.userId !== req.params.id) continue;
+    if (await runtime.deleteExecution(e.executionId)) deleted++;
+  }
+  res.json({ deleted });
 });
 ```
+
+Deleting runs as you go does not affect the pages still to come: the cursor is a position in the history, not an offset.
 
 **What `deleteExecution` actually removes** (one call, atomic per store):
 

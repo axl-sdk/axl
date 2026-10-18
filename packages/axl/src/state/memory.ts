@@ -13,6 +13,9 @@ import type {
   ExecutionState,
   EvalHistoryEntry,
   ExecutionCursor,
+  HistoryRetentionCursor,
+  HistoryRetentionOptions,
+  HistoryRetentionResult,
   HistoryTtls,
 } from './types.js';
 import { getExecutionEventSchemaVersion, normalizeStoredExecution } from '../event-schema.js';
@@ -21,9 +24,13 @@ import { AxlError } from '../errors.js';
 import {
   PRUNE_BATCH,
   compareExecutionsNewestFirst,
+  compareRetentionPositions,
+  executionLastSavedAt,
   expiryFrom,
   isExpired,
+  resolveHistoryRetentionOptions,
   resolveHistoryTtls,
+  retentionForUntimedRecord,
   type ResolvedHistoryTtls,
 } from './retention.js';
 
@@ -380,6 +387,81 @@ export class MemoryStore implements StateStore {
     return stored.expiresAt === null
       ? { exists: true }
       : { exists: true, expiresAt: stored.expiresAt };
+  }
+
+  // ── History maintenance ───────────────────────────────────────────
+
+  /**
+   * See `StateStore.applyHistoryRetention`. Every record this store holds was
+   * saved under the retention it was constructed with, so in practice a run
+   * finds nothing to expire or arm; the method exists so the same maintenance
+   * code works against every built-in store. There is no separate index, so
+   * `indexed` and `deadIndexEntries` are always `0`.
+   *
+   * An armed record keeps its place in last-save order, which is also where
+   * its expiry (last save + retention) belongs, so the prune-on-save order
+   * still holds.
+   */
+  async applyHistoryRetention(options: HistoryRetentionOptions): Promise<HistoryRetentionResult> {
+    const { kind, batchSize, cursor } = resolveHistoryRetentionOptions('MemoryStore', options);
+    const now = this.now();
+    let expired = 0;
+    let armed = 0;
+    let positions: HistoryRetentionCursor[];
+    if (kind === 'executions') {
+      let start = 0;
+      if (cursor !== undefined) {
+        const key = { startedAt: cursor.time, executionId: cursor.id };
+        start = this.executionOrderLowerBound(key);
+        const at = this.executionOrder[start];
+        if (at !== undefined && compareOldestFirst(at, key) === 0) start++;
+      }
+      positions = this.executionOrder
+        .slice(start, start + batchSize + 1)
+        .map((k) => ({ time: k.startedAt, id: k.executionId }));
+    } else {
+      positions = [...this.evalHistory.values()]
+        .map((stored) => ({ time: stored.entry.timestamp, id: stored.entry.id }))
+        .filter((p) => cursor === undefined || compareRetentionPositions(cursor, p) < 0)
+        .sort(compareRetentionPositions)
+        .slice(0, batchSize + 1);
+    }
+    const batch = positions.slice(0, batchSize);
+    const ttl = kind === 'executions' ? this.ttls.executionHistory : this.ttls.evalHistory;
+    if (ttl !== null) {
+      for (const { id } of batch) {
+        if (kind === 'executions') {
+          const stored = this.executionHistory.get(id);
+          if (!stored || stored.expiresAt !== null) continue;
+          const decision = retentionForUntimedRecord(executionLastSavedAt(stored.record), ttl, now);
+          if (decision.expired) {
+            this.expireExecutionRecord(id);
+            expired++;
+          } else {
+            stored.expiresAt = decision.expiresAt;
+            armed++;
+          }
+        } else {
+          const stored = this.evalHistory.get(id);
+          if (!stored || stored.expiresAt !== null) continue;
+          const decision = retentionForUntimedRecord(stored.entry.timestamp, ttl, now);
+          if (decision.expired) {
+            this.evalHistory.delete(id);
+            expired++;
+          } else {
+            stored.expiresAt = decision.expiresAt;
+            armed++;
+          }
+        }
+      }
+    }
+    return {
+      expired,
+      armed,
+      indexed: 0,
+      deadIndexEntries: 0,
+      cursor: positions.length > batchSize ? batch[batch.length - 1] : null,
+    };
   }
 
   // ── History retention internals ───────────────────────────────────

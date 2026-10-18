@@ -766,7 +766,7 @@ new AxlRuntime({
 });
 ```
 
-See [History retention](../../docs/api-reference.md#history-retention-historyttls).
+See [History retention](../../docs/api-reference.md#history-retention-historyttls). To apply a retention to history saved before you set it, run `store.applyHistoryRetention()` once: see [Execution history retention](../../docs/migration/execution-history-retention.md).
 
 #### Crash survival: `state.persist: 'streaming'`
 
@@ -813,7 +813,19 @@ runtime.on('decision_cleanup_failed', (e) => {
 
 If the execution is still running, the workflow is aborted (and a paused `ctx.awaitHuman()` correctly wakes with `AbortError` — fixed in 0.17.7). The resurrection guard ensures the workflow's eventual `workflow_end` doesn't re-create the row. Deletion waits for any in-process approval resolution or cancellation compensation before the store sweep. Custom stores must make `resolveDecision` idempotent and implement the complete execution-scoped sweep in `deleteExecution`.
 
-`ExecutionInfo.metadata` round-trips from `ExecuteOptions.metadata` (`userId`, `tenantId`, etc.) — queryable via `runtime.getExecutions().filter(...)`. Internal session control-plane keys (`sessionHistory`, `sessionId`) are stripped before persistence; they remain available via `ctx.metadata` for dynamic selectors.
+`ExecutionInfo.metadata` round-trips from `ExecuteOptions.metadata` (`userId`, `tenantId`, etc.). Filter on it as you read history; for large histories, read a page at a time:
+
+```typescript
+let cursor: ExecutionCursor | undefined;
+do {
+  const page = await runtime.getExecutions({ limit: 500, cursor });
+  for (const e of page) if (e.metadata?.tenantId === tenantId) handle(e);
+  const last = page.at(-1);
+  cursor = last && { startedAt: last.startedAt, executionId: last.executionId };
+} while (cursor);
+```
+
+Internal session control-plane keys (`sessionHistory`, `sessionId`) are stripped before persistence; they remain available via `ctx.metadata` for dynamic selectors.
 
 ### Session Options
 

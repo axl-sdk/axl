@@ -11,13 +11,21 @@ import type {
   ExecutionState,
   EvalHistoryEntry,
   ExecutionCursor,
+  HistoryRetentionCursor,
+  HistoryRetentionOptions,
+  HistoryRetentionResult,
 } from './types.js';
 import { AxlError } from '../errors.js';
 import { normalizePersistedSessionHistory } from '../input.js';
 import { getExecutionEventSchemaVersion, normalizeStoredExecution } from '../event-schema.js';
 import { randomUUID } from 'node:crypto';
 import { warnDiagnosticOnce } from '../schema-diagnostics.js';
-import { PRUNE_BATCH } from './retention.js';
+import {
+  PRUNE_BATCH,
+  executionLastSavedAt,
+  resolveHistoryRetentionOptions,
+  retentionForUntimedRecord,
+} from './retention.js';
 
 // Minimal interface for the node-redis client methods we use.
 // Avoids a hard compile-time dependency on the redis package.
@@ -118,8 +126,18 @@ interface RedisMulti {
   hSet(key: string, field: string, value: string): RedisMulti;
   hDel(key: string, field: string | string[]): RedisMulti;
   expire(key: string, seconds: number, mode?: 'NX' | 'XX' | 'GT' | 'LT'): RedisMulti;
-  zAdd(key: string, member: { score: number; value: string }): RedisMulti;
+  // `condition: 'NX'` only adds members that are not there yet (ZADD NX);
+  // the reply is the number of members added.
+  zAdd(
+    key: string,
+    member: { score: number; value: string },
+    options?: { condition?: 'NX' | 'XX' },
+  ): RedisMulti;
   zRem(key: string, member: string | string[]): RedisMulti;
+  // PEXPIREAT sets an absolute expiry in epoch ms. With `mode: 'NX'` it only
+  // applies to a key with no TTL; a timestamp in the past deletes the key
+  // (still subject to NX). Reply 1 if applied, 0 if not. Redis 7.0+ for NX.
+  pExpireAt(key: string, msTimestamp: number, mode?: 'NX' | 'XX' | 'GT' | 'LT'): RedisMulti;
   rPush(key: string, values: string | string[]): RedisMulti;
   // exec() returns the per-command results in queued order. We don't
   // type-narrow individual results because the callers that need a result
@@ -281,6 +299,8 @@ type HistoryIndex = {
   dataKey(id: string): string;
   /** The listing score stored in a record's blob, or `null` if unreadable. */
   timeScoreOf(raw: string): number | null;
+  /** When the record in a blob was last saved, as far as it shows, or `null`. */
+  lastSavedAtOf(raw: string): number | null;
 };
 
 /** A position in a history sorted set: score, then member. */
@@ -630,6 +650,10 @@ export class RedisStore implements StateStore {
           const startedAt = (JSON.parse(raw) as HistoricalExecutionInfo).startedAt;
           return typeof startedAt === 'number' ? startedAt : null;
         },
+        lastSavedAtOf: (raw) => {
+          const record = JSON.parse(raw) as HistoricalExecutionInfo;
+          return typeof record.startedAt === 'number' ? executionLastSavedAt(record) : null;
+        },
       };
     }
     return {
@@ -642,6 +666,11 @@ export class RedisStore implements StateStore {
       recheckBatch: (token) => `${this.keyPrefix}eval-history-prune-recheck:${token}`,
       dataKey: (id) => this.evalHistoryKey(id),
       timeScoreOf: (raw) => {
+        const timestamp = (JSON.parse(raw) as EvalHistoryEntry).timestamp;
+        return typeof timestamp === 'number' ? timestamp : null;
+      },
+      // Eval retention counts from the first write, which is the row's timestamp.
+      lastSavedAtOf: (raw) => {
         const timestamp = (JSON.parse(raw) as EvalHistoryEntry).timestamp;
         return typeof timestamp === 'number' ? timestamp : null;
       },
@@ -1378,7 +1407,7 @@ export class RedisStore implements StateStore {
   }
 
   private async pruneHistory(index: HistoryIndex): Promise<void> {
-    await this.recheckLeftoverBatches(index);
+    await this.recheckLeftoverBatches(index, PRUNE_BATCH);
 
     const candidates = await this.client.zRange(index.expiry, '-inf', Date.now(), {
       BY: 'SCORE',
@@ -1389,36 +1418,211 @@ export class RedisStore implements StateStore {
     const dead = candidates.filter((_, i) => raws[i] == null);
     const live = candidates.filter((_, i) => raws[i] != null);
 
-    if (dead.length > 0) {
-      const token = randomUUID();
-      await this.client
-        .multi()
-        .sRem(index.ids, dead)
-        .zRem(index.time, dead)
-        .zRem(index.expiry, dead)
-        .sAdd(index.recheckBatch(token), dead)
-        .sAdd(index.recheckTokens, token)
-        .exec();
-      await this.recheckPrunedIds(index, dead, [token]);
-    }
+    if (dead.length > 0) await this.removeDeadIndexEntries(index, dead);
     if (live.length > 0) await this.rescoreLiveExpiryEntries(index, live);
   }
 
   /**
-   * Re-check batches registered by earlier prunes, up to about one batch of
-   * ids per call. Any registered batch may belong to a prune that crashed.
+   * Steps 3 and 4 of the prune for `dead`, ids whose blob was found missing:
+   * remove them from all three index keys under a new recheck batch, then
+   * re-check them.
    */
-  private async recheckLeftoverBatches(index: HistoryIndex): Promise<void> {
+  private async removeDeadIndexEntries(index: HistoryIndex, dead: string[]): Promise<void> {
+    const token = randomUUID();
+    await this.client
+      .multi()
+      .sRem(index.ids, dead)
+      .zRem(index.time, dead)
+      .zRem(index.expiry, dead)
+      .sAdd(index.recheckBatch(token), dead)
+      .sAdd(index.recheckTokens, token)
+      .exec();
+    await this.recheckPrunedIds(index, dead, [token]);
+  }
+
+  /**
+   * Re-check batches registered by earlier prunes, about `maxIds` ids at
+   * most, in chunks of about one batch. Any registered batch may belong to a
+   * prune that crashed. Only the tokens registered when the call starts are
+   * considered.
+   */
+  private async recheckLeftoverBatches(index: HistoryIndex, maxIds: number): Promise<void> {
     const tokens = await this.client.sMembers(index.recheckTokens);
-    if (tokens.length === 0) return;
-    const taken: string[] = [];
-    const ids = new Set<string>();
+    let taken: string[] = [];
+    let ids = new Set<string>();
+    let checked = 0;
     for (const token of tokens) {
       for (const id of await this.client.sMembers(index.recheckBatch(token))) ids.add(id);
       taken.push(token);
-      if (ids.size >= PRUNE_BATCH) break;
+      if (ids.size >= PRUNE_BATCH) {
+        await this.recheckPrunedIds(index, [...ids], taken);
+        checked += ids.size;
+        taken = [];
+        ids = new Set();
+        if (checked >= maxIds) return;
+      }
     }
-    await this.recheckPrunedIds(index, [...ids], taken);
+    if (taken.length > 0) await this.recheckPrunedIds(index, [...ids], taken);
+  }
+
+  // ── History maintenance ────────────────────────────────────────────────
+
+  /**
+   * See `StateStore.applyHistoryRetention`. One call:
+   *
+   * 1. On the first call of a walk (no cursor), backfills the time sorted
+   *    set from the id set if it is behind (see `backfillExecutionIndex`).
+   *    Every call then re-checks the recheck batches registered so far, so
+   *    batches left by crashed prunes are cleared.
+   * 2. Reads the next `batchSize` ids from the time sorted set, oldest first
+   *    by `(score, member)`, strictly after the cursor. The read restarts at
+   *    the cursor's position by value, never by offset.
+   * 3. MGETs their blobs and reads each live blob's PTTL.
+   * 4. In one MULTI, for each live blob:
+   *    - a TTL (`PTTL > 0`): `ZADD NX` to the expiry set at now + PTTL. A
+   *      record already in the expiry set keeps its entry (`indexed` counts
+   *      only new entries).
+   *    - no TTL (`-1`), with a retention configured: `PEXPIREAT … NX` at last
+   *      save + retention. `NX` applies only to a key that still has no TTL,
+   *      so a record re-saved meanwhile keeps the fresh window its save gave
+   *      it. A window that has already passed uses a timestamp in the past,
+   *      which makes Redis delete the key, again only if it is still untimed.
+   * 5. Adds each newly armed record to the expiry set (`ZADD NX`).
+   * 6. Removes ids whose blob is gone, and ids just deleted in step 4, with
+   *    the prune's removal and re-check (`removeDeadIndexEntries`), so a
+   *    record re-saved at any point stays listed and a deleted one is never
+   *    re-indexed.
+   *
+   * Blobs are never written. A record deleted while the call runs can leave
+   * an entry in the expiry set only; the next prune removes it.
+   */
+  async applyHistoryRetention(options: HistoryRetentionOptions): Promise<HistoryRetentionResult> {
+    const { kind, batchSize, cursor } = resolveHistoryRetentionOptions('RedisStore', options);
+    const index = this.historyIndex(kind === 'executions' ? 'execution' : 'eval');
+    const ttl = this.ttlFor(kind === 'executions' ? 'executionHistory' : 'evalHistory');
+
+    if (cursor === undefined) {
+      if (kind === 'executions') await this.backfillExecutionIndex();
+      else await this.backfillEvalIndex();
+    }
+    await this.recheckLeftoverBatches(index, Infinity);
+
+    const positions = await this.readRetentionBatch(index, cursor, batchSize + 1);
+    const batch = positions.slice(0, batchSize);
+    const result: HistoryRetentionResult = {
+      expired: 0,
+      armed: 0,
+      indexed: 0,
+      deadIndexEntries: 0,
+      cursor:
+        positions.length > batchSize
+          ? { time: batch[batch.length - 1].score, id: batch[batch.length - 1].value }
+          : null,
+    };
+    if (batch.length === 0) return result;
+
+    const ids = batch.map((m) => m.value);
+    const raws = await this.client.mGet(ids.map((id) => index.dataKey(id)));
+    const dead = ids.filter((_, i) => raws[i] == null);
+    const present = ids.flatMap((id, i) => {
+      const raw = raws[i];
+      return raw == null ? [] : [{ id, raw }];
+    });
+    const pttls = await Promise.all(present.map((r) => this.client.pTTL(index.dataKey(r.id))));
+
+    const now = Date.now();
+    const tx = this.client.multi();
+    const queued: Array<
+      | { action: 'index'; id: string }
+      | { action: 'arm'; id: string; expiresAt: number }
+      | { action: 'expire'; id: string }
+    > = [];
+    for (let i = 0; i < present.length; i++) {
+      const { id, raw } = present[i];
+      const pttl = pttls[i];
+      if (pttl === -2) {
+        // Gone since the MGET: removed below like any other missing blob.
+        dead.push(id);
+      } else if (pttl > 0) {
+        tx.zAdd(index.expiry, { score: now + pttl, value: id }, { condition: 'NX' });
+        queued.push({ action: 'index', id });
+      } else if (pttl === -1 && ttl !== undefined) {
+        let lastSavedAt: number | null;
+        try {
+          lastSavedAt = index.lastSavedAtOf(raw);
+        } catch {
+          lastSavedAt = null;
+        }
+        // A blob without a usable time is left alone, as listing skips it.
+        if (lastSavedAt === null) continue;
+        const decision = retentionForUntimedRecord(lastSavedAt, ttl, now);
+        if (decision.expired) {
+          // Any timestamp in the past deletes the key; NX still requires
+          // that it has no TTL.
+          tx.pExpireAt(index.dataKey(id), 1, 'NX');
+          queued.push({ action: 'expire', id });
+        } else {
+          tx.pExpireAt(index.dataKey(id), decision.expiresAt, 'NX');
+          queued.push({ action: 'arm', id, expiresAt: decision.expiresAt });
+        }
+      }
+    }
+
+    const expiredIds: string[] = [];
+    const armed: Array<{ id: string; expiresAt: number }> = [];
+    if (queued.length > 0) {
+      const replies = await tx.exec();
+      for (let i = 0; i < queued.length; i++) {
+        if (Number(replies[i]) !== 1) continue;
+        const entry = queued[i];
+        if (entry.action === 'index') result.indexed++;
+        else if (entry.action === 'expire') expiredIds.push(entry.id);
+        else armed.push(entry);
+      }
+    }
+    if (armed.length > 0) {
+      const indexTx = this.client.multi();
+      for (const { id, expiresAt } of armed) {
+        indexTx.zAdd(index.expiry, { score: expiresAt, value: id }, { condition: 'NX' });
+      }
+      await indexTx.exec();
+    }
+    result.armed = armed.length;
+    result.expired = expiredIds.length;
+    result.deadIndexEntries = dead.length;
+    if (dead.length > 0 || expiredIds.length > 0) {
+      await this.removeDeadIndexEntries(index, [...dead, ...expiredIds]);
+    }
+    return result;
+  }
+
+  /**
+   * Up to `count` members of the time sorted set strictly after `cursor`,
+   * oldest first by `(score, member)`. The members sharing the cursor's score
+   * are read in full and filtered by member; the rest start just above that
+   * score. Neither read uses an offset, so entries removed or added
+   * meanwhile cannot shift the walk.
+   */
+  private async readRetentionBatch(
+    index: HistoryIndex,
+    cursor: HistoryRetentionCursor | undefined,
+    count: number,
+  ): Promise<Array<{ value: string; score: number }>> {
+    if (cursor === undefined) {
+      return this.client.zRangeWithScores(index.time, '-inf', '+inf', {
+        BY: 'SCORE',
+        LIMIT: { offset: 0, count },
+      });
+    }
+    const ties = (
+      await this.client.zRangeWithScores(index.time, cursor.time, cursor.time, { BY: 'SCORE' })
+    ).filter((m) => compareMembers(m.value, cursor.id) > 0);
+    if (ties.length >= count) return ties.slice(0, count);
+    const rest = await this.client.zRangeWithScores(index.time, `(${cursor.time}`, '+inf', {
+      BY: 'SCORE',
+      LIMIT: { offset: 0, count: count - ties.length },
+    });
+    return [...ties, ...rest];
   }
 
   /**

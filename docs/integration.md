@@ -88,7 +88,9 @@ const runtime = new AxlRuntime({
 });
 ```
 
-**Without TTLs, every save accumulates and Redis OOMs.** Pick `defaultTtl` based on your retention policy; override per category as needed. With `executionHistory` and `evalHistory` set, the history listing indexes shrink along with the records: history saves clean up expired entries a batch at a time. `streamingEvents` is opt-in only (does NOT fall back to `defaultTtl`) so a generous default doesn't TTL-evict crashed-run buffers before recovery runs. See [docs/migration/state-store-durability.md](./migration/state-store-durability.md#tldr) for the full TTL strategy and how each category's window is counted (sliding, fixed from the first write, or restarted on every save).
+**Without TTLs, every save accumulates and Redis OOMs.** Pick `defaultTtl` based on your retention policy; override per category as needed. Until execution history has a retention (`ttls.executionHistory`, `null` to keep forever, or `defaultTtl`), the store warns once per process. With `executionHistory` and `evalHistory` set, the history listing indexes shrink along with the records: history saves clean up expired entries a batch at a time. `streamingEvents` is opt-in only (does NOT fall back to `defaultTtl`) so a generous default doesn't TTL-evict crashed-run buffers before recovery runs. See [docs/migration/state-store-durability.md](./migration/state-store-durability.md#tldr) for the full TTL strategy and how each category's window is counted (sliding, fixed from the first write, or restarted on every save).
+
+`keyPrefix` is the storage-layer isolation primitive for shared Redis clusters. Avoid Redis glob metacharacters (`*`, `?`, `[`, `]`) in the prefix; operators running `redis-cli SCAN MATCH` would otherwise have to escape them.
 
 ### SQLiteStore and MemoryStore: history retention
 
@@ -106,9 +108,22 @@ const runtime = new AxlRuntime({
 const dev = new AxlRuntime({ state: { memory: { maxExecutions: 1_000 } } });
 ```
 
-Expired records stop appearing in reads immediately and are removed from storage on later saves, along with the run's leftover checkpoints and saved state. Records written before you set a retention keep no expiry. Details: [History retention](./api-reference.md#history-retention-historyttls).
+Expired records stop appearing in reads immediately and are removed from storage on later saves, along with the run's leftover checkpoints and saved state. Records written before you set a retention keep no expiry until you apply it to them (next section). Details: [History retention](./api-reference.md#history-retention-historyttls).
 
-`keyPrefix` is the storage-layer isolation primitive for shared Redis clusters. Avoid Redis glob metacharacters (`*`, `?`, `[`, `]`) in the prefix; operators running `redis-cli SCAN MATCH` would otherwise have to escape them.
+### Applying retention to history you already have
+
+A retention applies to runs saved from then on; an upgrade never deletes or changes existing history. To bring existing records under the retention, and to clean up Redis listing indexes left by older versions, run the maintenance call once, for example from a deploy script:
+
+```ts
+const store = runtime.getStateStore();
+let cursor: HistoryRetentionCursor | null = null;
+do {
+  const result = await store.applyHistoryRetention!({ kind: 'executions', cursor });
+  cursor = result.cursor;
+} while (cursor !== null);
+```
+
+It works one batch at a time, can be stopped and resumed from the returned `cursor`, and is safe to run while the app serves traffic. Axl never runs it automatically. See [Execution history retention](./migration/execution-history-retention.md#apply-retention-to-records-you-already-have).
 
 ### Listing history across instances
 
@@ -196,14 +211,21 @@ app.post('/run', async (req, res) => {
   res.json(result);
 });
 
-// GDPR delete handler
+// GDPR delete handler: walk history a page at a time
 app.delete('/users/:id/data', async (req, res) => {
-  const execs = await runtime.getExecutions();
-  const userRuns = execs.filter((e) => e.metadata?.userId === req.params.id);
-  for (const e of userRuns) {
-    await runtime.deleteExecution(e.executionId);
-  }
-  res.json({ deleted: userRuns.length });
+  let deleted = 0;
+  let cursor: ExecutionCursor | undefined;
+  do {
+    const page = await runtime.getExecutions({ limit: 500, cursor });
+    for (const e of page) {
+      if (e.metadata?.userId !== req.params.id) continue;
+      await runtime.deleteExecution(e.executionId);
+      deleted++;
+    }
+    const last = page.at(-1);
+    cursor = last && { startedAt: last.startedAt, executionId: last.executionId };
+  } while (cursor);
+  res.json({ deleted });
 });
 
 // Audit trail

@@ -6,6 +6,7 @@ import type {
   AgentSummary,
   AgentDetail,
   ExecutionInfo,
+  ExecutionSummary,
   SessionSummary,
   SessionDetail,
   CostData,
@@ -25,6 +26,14 @@ import type { PlaygroundImageAttachment } from '../../playground-image';
 const BASE = (window.__AXL_STUDIO_BASE__ ?? '') + '/api';
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  return (await requestEnvelope<T, object>(path, init)).data;
+}
+
+/** Like `request`, but keeps sibling fields of `data` (e.g. a page's `nextCursor`). */
+async function requestEnvelope<T, Extra extends object>(
+  path: string,
+  init?: RequestInit,
+): Promise<{ data: T } & Extra> {
   const res = await fetch(`${BASE}${path}`, {
     headers: { 'Content-Type': 'application/json', ...init?.headers },
     ...init,
@@ -61,9 +70,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     );
   }
 
-  let body: ApiResponse<T>;
+  let body: ApiResponse<T> | ({ ok: true; data: T } & Extra);
   try {
-    body = (await res.json()) as ApiResponse<T>;
+    body = (await res.json()) as ApiResponse<T> | ({ ok: true; data: T } & Extra);
   } catch (err) {
     throw new Error(
       `Failed to parse server response as JSON (HTTP ${res.status}): ${
@@ -74,7 +83,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   if (!body.ok) {
     throw new Error(body.error.message);
   }
-  return body.data;
+  return body as { data: T } & Extra;
 }
 
 // ── Health ─────────────────────────────────────────────────────────
@@ -93,7 +102,12 @@ export const executeWorkflow = (name: string, input: unknown, stream = false) =>
   );
 
 // ── Executions ─────────────────────────────────────────────────────
-export const fetchExecutions = () => request<ExecutionInfo[]>('/executions');
+/** One page of execution summaries; `nextCursor` is `null` on the last page. */
+export type ExecutionPage = { data: ExecutionSummary[]; nextCursor: string | null };
+export const fetchExecutions = (cursor?: string): Promise<ExecutionPage> =>
+  requestEnvelope<ExecutionSummary[], { nextCursor: string | null }>(
+    `/executions${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''}`,
+  );
 /**
  * Fetch an execution. When `since` is set, the server filters `events`
  * to those with `step > since` (spec/16 §5.4) — useful for panels that

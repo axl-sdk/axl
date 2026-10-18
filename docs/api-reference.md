@@ -1915,7 +1915,7 @@ A store that declares `historyPaging: true` is handed the cursor and returns one
 | `result` | `unknown \| undefined` | Workflow return value (when `status === 'completed'`) |
 | `error` | `string \| undefined` | Error message (when `status === 'failed'`) |
 | `observation` | `ObservationStatus \| undefined` | Machine-readable trace completeness. New executions write `{ complete: true }` or an incomplete reason: `branch_drain_timeout`, `persistence_truncated`, or `process_interrupted`. `undefined` means the historical row predates this field. All built-in stores persist it; SQLite adds the auto-migrated schema-v5 `observation` column |
-| `metadata` | `Record<string, unknown> \| undefined` | Caller-supplied metadata lifted from `ExecuteOptions.metadata` (or `runtime.stream()`'s `options.metadata`). Stable, queryable surface for tags like `userId`, `tenantId`, or correlation ids — filter via `runtime.getExecutions()` + an in-process `.filter()`. Persisted by all three built-in stores (`MemoryStore`/`SQLiteStore`/`RedisStore`); `SQLiteStore` adds a `metadata` column in schema v3 (auto-migrated on first open). The internal session control-plane keys `sessionHistory` and `sessionId` are stripped before persistence — they remain readable on `ctx.metadata` for dynamic selectors but don't bloat the queryable surface. The snapshot is `structuredClone`'d so caller mutations to the original `options.metadata` after `execute()`/`stream()` returns don't surface mid-run. Scrubbed to `{ redacted: true }` by Studio's REST endpoints when `config.trace.redact: true`. Secondary indexes are intentionally not provided — `StateStore` is a persistence boundary, not a query engine |
+| `metadata` | `Record<string, unknown> \| undefined` | Caller-supplied metadata lifted from `ExecuteOptions.metadata` (or `runtime.stream()`'s `options.metadata`). Stable, queryable surface for tags like `userId`, `tenantId`, or correlation ids — filter the results of `runtime.getExecutions()` in process, a page at a time (`limit` + `cursor`) for large histories ([example](migration/execution-history-retention.md#page-through-large-histories)). Persisted by all three built-in stores (`MemoryStore`/`SQLiteStore`/`RedisStore`); `SQLiteStore` adds a `metadata` column in schema v3 (auto-migrated on first open). The internal session control-plane keys `sessionHistory` and `sessionId` are stripped before persistence — they remain readable on `ctx.metadata` for dynamic selectors but don't bloat the queryable surface. The snapshot is `structuredClone`'d so caller mutations to the original `options.metadata` after `execute()`/`stream()` returns don't surface mid-run. Scrubbed to `{ redacted: true }` by Studio's REST endpoints when `config.trace.redact: true`. Secondary indexes are intentionally not provided — `StateStore` is a persistence boundary, not a query engine |
 
 History readers return `HistoricalExecutionInfo = LegacyExecutionInfoV1 |
 ExecutionInfoV2`. Missing `eventSchemaVersion` is the v1 sentinel. New writers
@@ -2118,7 +2118,7 @@ type HistoryTtls = {
 | `executionHistory` | Counted from the record's **last** save. Saving the same execution again restarts it |
 | `evalHistory` | Counted from the row's **first** write. Saving the same eval id again keeps its expiry, and so does `updateEvalResult`. A row written without retention stays untimed. Once a row has expired, a new save starts a new window |
 
-Retention applies to records saved while it is configured; existing records keep whatever expiry they had. Once a record has expired, no read returns it: `getExecution` returns `null`, listings skip it, and `getEvalRetention` reports `{ exists: false }`. With `evalHistory` set, `getEvalRetention` reports the row's `expiresAt`, which diagnostic artifacts follow. On `MemoryStore` and `SQLiteStore`, deleting an expired record that a later save has not cleaned up yet still returns `true`; `RedisStore` returns `false` once the key has expired. Custom stores own their own retention.
+Retention applies to records saved while it is configured; existing records keep whatever expiry they had until you run [`applyHistoryRetention`](#applying-retention-to-existing-history). Once a record has expired, no read returns it: `getExecution` returns `null`, listings skip it, and `getEvalRetention` reports `{ exists: false }`. With `evalHistory` set, `getEvalRetention` reports the row's `expiresAt`, which diagnostic artifacts follow. On `MemoryStore` and `SQLiteStore`, deleting an expired record that a later save has not cleaned up yet still returns `true`; `RedisStore` returns `false` once the key has expired. Custom stores own their own retention.
 
 ### MemoryStore and SQLiteStore options
 
@@ -2141,7 +2141,7 @@ new AxlRuntime({ state: { store: 'sqlite', sqlite: { path: './data/axl.db', ttls
 
 Expired records are removed from storage a batch at a time (up to 100 per save) on later saves of the same kind; there are no background timers. When an execution record is removed this way, or by `maxExecutions`, its checkpoints and saved execution state are removed with it (and, on `MemoryStore`, its streaming buffer). Pending decisions are left alone.
 
-`SQLiteStore` stores the expiry in an `expires_at` column on both history tables, added by schema v6 on first open; rows written before the upgrade keep no expiry.
+`SQLiteStore` stores the expiry in an `expires_at` column on both history tables, added by schema v6 on first open; rows written before the upgrade keep no expiry until you run [`applyHistoryRetention`](#applying-retention-to-existing-history).
 
 ### Listing and paging history
 
@@ -2159,6 +2159,59 @@ const next = await store.listExecutions(100, {
 
 The next page starts strictly after the cursor, so every run is visited once, including runs that share a `startedAt` across a page boundary. A cursor still works after the run it names is deleted or expires. Expired records are skipped before the limit is applied, so a page holds `limit` records whenever that many remain. Without a limit, the call returns everything after the cursor. The built-in stores set `historyPaging: true` to say they support the cursor.
 
+### Applying retention to existing history
+
+`store.applyHistoryRetention(options)` applies the store's configured retention to history that was saved without one, such as records written before an upgrade or before you set `ttls`, and repairs `RedisStore`'s listing indexes. Axl never calls it; run it when you choose. Guide and examples: [Execution history retention](migration/execution-history-retention.md#apply-retention-to-records-you-already-have).
+
+```typescript
+import type { HistoryRetentionCursor } from '@axlsdk/axl';
+
+let cursor: HistoryRetentionCursor | null = null;
+do {
+  const result = await store.applyHistoryRetention({ kind: 'executions', cursor });
+  cursor = result.cursor;
+} while (cursor !== null);
+```
+
+`HistoryRetentionOptions`:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `kind` | `'executions' \| 'evals'` | required | Which history to process |
+| `batchSize` | `number?` | `500` | Records examined per call. A positive integer |
+| `cursor` | `HistoryRetentionCursor \| null` | `null` | The `cursor` from the previous call; omit or `null` to start |
+
+Anything else (an unknown `kind`, a `batchSize` that is not a positive integer, a cursor that is not `{ time: number; id: string }`) throws an `AxlError` (`INVALID_ARGUMENT`) before anything is changed.
+
+`HistoryRetentionResult`:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `expired` | `number` | Records with no expiry whose window had already passed, deleted by this call |
+| `armed` | `number` | Records with no expiry that now have one |
+| `indexed` | `number` | `RedisStore`: records that already had a TTL, added to the expiry index so later saves clean up their listing entries. Always `0` on `MemoryStore` and `SQLiteStore` |
+| `deadIndexEntries` | `number` | `RedisStore`: listing entries whose record no longer exists, removed. Always `0` on `MemoryStore` and `SQLiteStore` |
+| `cursor` | `HistoryRetentionCursor \| null` | Pass it to the next call; `null` when the walk is finished |
+
+`HistoryRetentionCursor` is `{ time: number; id: string }`: the last record of the batch, where `time` is `startedAt` for executions and `timestamp` for eval results. It is plain JSON, so it can be stored and passed back later.
+
+What a call does:
+
+- **Walk order.** Oldest first, by `(startedAt, executionId)` for executions and `(timestamp, id)` for eval results, starting strictly after the cursor. The cursor is a position, not an offset, so records deleted or expired behind it never cause a record to be skipped or counted twice.
+- **Records with no expiry**, when a retention is set for `kind`: the window counts from the record's last save, which is `completedAt` for executions (or `startedAt` when a record has none) and `timestamp` for eval results. A record whose window has already passed (`now >= lastSave + retention`) is deleted, along with its checkpoints and saved execution state on `MemoryStore` and `SQLiteStore`. Any other record gets `expiresAt = lastSave + retention`.
+- **Records with an expiry** keep it.
+- **No retention set** for `kind` (unset or `null`): nothing is deleted or given an expiry. `RedisStore` still repairs its indexes.
+- **Concurrent use.** A record saved again during the call keeps the expiry that save gave it, and a record deleted during the call is never brought back or re-listed. `SQLiteStore` runs each batch in one immediate transaction; `RedisStore` uses `PEXPIREAT … NX`, so it only touches keys that still have no TTL.
+- **Idempotent.** Running it to completion a second time reports all zeros and changes nothing.
+
+Per store:
+
+| Store | Notes |
+|-------|-------|
+| `MemoryStore` | Every record is saved under the retention the store was built with, so a run finds nothing to change. The method exists so the same maintenance code works on every built-in store |
+| `SQLiteStore` | Acts on rows whose `expires_at` is `NULL` |
+| `RedisStore` | Also adds records already timed before 0.27.0 to its expiry index (`indexed`), removes listing entries whose record is gone (`deadIndexEntries`), re-checks cleanup batches a crashed cleanup left behind, and on the first call of a walk backfills the time index if it is behind (see `skipMigration`). The members that share the cursor's `startedAt` are read in full on each call. Requires Redis 7.0 or newer (`PEXPIREAT … NX`) |
+
 ### RedisStore options
 
 `RedisStore.create()` accepts either a URL string (back-compat) or an options object:
@@ -2171,7 +2224,7 @@ The next page starts strictly after the cursor, so every run is visited once, in
 | `defaultTtl` | `number?` | — | Default TTL in **seconds** applied to every TTL-capable storage category. Without a TTL, every `save*` accumulates forever — strongly recommended in production |
 | `ttls` | `object?` | — | Per-category TTL overrides in seconds (`session`, `sessionMeta`, `checkpoint`, `executionState`, `executionHistory`, `evalHistory`, `memory`, `streamingEvents`). Set a category to `null` to explicitly opt out even when `defaultTtl` is set. `pendingDecision` is intentionally NOT configurable — pending decisions share a hash, so a TTL would expire all of them at once. **Window semantics:** `memory`, `session`, and `sessionMeta` are sliding (every write refreshes TTL — active users keep their data, inactive users forget; reads do NOT refresh); `checkpoint` and `streamingEvents` are fixed from the first write (TTL set once); `executionState` and `executionHistory` restart their window on every save; `evalHistory` is fixed from the row's first write, as described in [History retention](#history-retention-historyttls). **`streamingEvents` is opt-in only** — does NOT fall back to `defaultTtl`. Must be longer than your max time-between-restarts or `recoverIncompleteStreams()` will miss crashed-run buffers that aged out before the next process started. Non-positive and non-finite values (`0`, negative, `NaN`, `Infinity`) are defensively treated as no-TTL. Per-category TTLs are independent. Legacy memory entries (pre-`memory-methods` patch) migrate forward on first read with the configured TTL applied. `listPendingExecutions` self-prunes stale ids when their `executionState` blob has TTL-evicted |
 
-**History listing indexes.** Redis cannot expire individual members of a set, so `RedisStore` tracks when each timed execution and eval record expires. A history save then removes up to 100 expired records' entries from the listing indexes, and a record saved again in the meantime stays listed. Saves made while this process is already cleaning up the same kind of history skip their own pass, so cleanup keeps pace with saves rather than running once per save. With `executionHistory` or `evalHistory` set, the indexes stay proportional to the history you keep. Records saved without a TTL never enter this cleanup. Records that were timed before this cleanup existed keep their index entries until a maintenance pass applies it to them.
+**History listing indexes.** Redis cannot expire individual members of a set, so `RedisStore` tracks when each timed execution and eval record expires. A history save then removes up to 100 expired records' entries from the listing indexes, and a record saved again in the meantime stays listed. Saves made while this process is already cleaning up the same kind of history skip their own pass, so cleanup keeps pace with saves rather than running once per save. With `executionHistory` or `evalHistory` set, the indexes stay proportional to the history you keep. Records saved without a TTL never enter this cleanup. Records that were timed before this cleanup existed keep their index entries until you run [`applyHistoryRetention`](#applying-retention-to-existing-history).
 
 ### Provider configuration
 
@@ -2417,6 +2470,7 @@ These methods are optional (`?` on the interface). The runtime checks for their 
 | `listSessions?()` | List all session IDs (used by Studio's session browser) |
 | `close?()` | Close the underlying connection (called by `runtime.shutdown()`) |
 | `deleteCheckpoints?(executionId)` | Delete all checkpoints for an execution (called on successful completion) |
+| `applyHistoryRetention?(options)` | Apply your store's retention to history saved without one, one batch per call, resuming from a cursor. Never called by the runtime; implement it if you want the same maintenance call as the built-ins. Contract: [Applying retention to existing history](#applying-retention-to-existing-history) |
 
 ### Implementing a Custom StateStore
 

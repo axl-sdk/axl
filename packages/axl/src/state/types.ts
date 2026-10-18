@@ -79,8 +79,24 @@ export interface StateStore {
    * List recent executions, most recent first. The built-in stores order by
    * `startedAt` descending and break ties by `executionId` descending, so the
    * order is total and stable across calls.
+   *
+   * `options.cursor` asks for the page that starts strictly after that
+   * position in the same order. The runtime passes it only when the store
+   * sets {@link StateStore.historyPaging}; other stores are listed in full and
+   * paged in process.
    */
-  listExecutions?(limit?: number): Promise<HistoricalExecutionInfo[]>;
+  listExecutions?(
+    limit?: number,
+    options?: { cursor?: ExecutionCursor },
+  ): Promise<HistoricalExecutionInfo[]>;
+  /**
+   * Set to `true` when `listExecutions` honors `options.cursor` with the
+   * `(startedAt DESC, executionId DESC)` order. The built-in stores set it.
+   * Leave it unset if your store ignores the cursor: the runtime then lists
+   * everything and pages in process, which is correct but reads the whole
+   * history on every page.
+   */
+  readonly historyPaging?: boolean;
   /**
    * Delete an execution from history by ID. Returns `true` if an entry was
    * deleted, `false` if the ID didn't exist. Used for GDPR right-to-be-
@@ -212,6 +228,16 @@ export interface StateStore {
   close?(): Promise<void>;
   deleteCheckpoints?(executionId: string): Promise<void>;
 }
+
+/**
+ * Position in execution history, used to fetch the next page. Pages are
+ * ordered by `startedAt` descending, then `executionId` descending; a cursor
+ * built from the last item of one page returns the items strictly after it.
+ */
+export type ExecutionCursor = {
+  startedAt: number;
+  executionId: string;
+};
 
 /**
  * History retention, in **seconds**, shared by the built-in stores

@@ -393,6 +393,7 @@ export type {
   PendingDecision,
   EvalHistoryEntry,
   HistoryTtls,
+  ExecutionCursor,
 } from './state/types.js';
 export { MemoryStore } from './state/memory.js';
 export type { MemoryStoreOptions } from './state/memory.js';

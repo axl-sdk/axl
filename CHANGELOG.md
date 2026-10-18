@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Deleted runs stay deleted.** Deleting a run right after it finished could let its pending history save bring the run back. `runtime.deleteExecution()` now waits for that save before deleting.
+
 ## [0.26.0] - 2026-10-16
 
 ### Changed

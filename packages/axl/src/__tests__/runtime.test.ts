@@ -7,7 +7,8 @@ import { tool } from '../tool.js';
 import { Session } from '../session.js';
 import { AxlStream } from '../stream.js';
 import { ProviderError } from '../providers/errors.js';
-import type { AxlEvent, CallTiming } from '../types.js';
+import type { AxlEvent, CallTiming, HistoricalExecutionInfo } from '../types.js';
+import { MemoryStore } from '../state/memory.js';
 
 // ── Mock Provider ────────────────────────────────────────────────────────
 
@@ -3352,6 +3353,96 @@ describe('deleteExecution()', () => {
 
     expect(await runtime.getExecution(activeId)).toBeUndefined();
     expect(await runtime.getExecutions()).toHaveLength(0);
+  });
+
+  describe('a delete issued while the finished run is still being saved (E11)', () => {
+    /** A MemoryStore whose execution saves wait until the test releases them. */
+    class HeldSaveStore extends MemoryStore {
+      saveCalls = 0;
+      /** Settles once the most recent save has written (or failed). */
+      lastSave: Promise<void> = Promise.resolve();
+      private gates: Array<{ resolve: () => void; reject: (err: Error) => void }> = [];
+
+      override saveExecution(execution: HistoricalExecutionInfo): Promise<void> {
+        this.saveCalls++;
+        const save = new Promise<void>((resolve, reject) =>
+          this.gates.push({ resolve, reject }),
+        ).then(() => super.saveExecution(execution));
+        this.lastSave = save.catch(() => undefined);
+        return save;
+      }
+
+      releaseSaves(): void {
+        for (const gate of this.gates.splice(0)) gate.resolve();
+      }
+
+      failSaves(): void {
+        for (const gate of this.gates.splice(0)) gate.reject(new Error('store unavailable'));
+      }
+    }
+
+    async function finishRunWithHeldSave() {
+      const store = new HeldSaveStore();
+      const runtime = new AxlRuntime({ state: { store } });
+      runtime.register(
+        workflow({
+          name: 'wf',
+          input: z.object({}).strict(),
+          handler: async () => 'done',
+        }),
+      );
+      await runtime.execute('wf', {});
+      const [run] = await runtime.getExecutions();
+      expect(store.saveCalls).toBe(1);
+      return { runtime, store, executionId: run.executionId };
+    }
+
+    it('keeps the run deleted when the save lands after the delete was requested', async () => {
+      const { runtime, store, executionId } = await finishRunWithHeldSave();
+
+      const deletion = runtime.deleteExecution(executionId);
+      store.releaseSaves();
+      expect(await deletion).toBe(true);
+      await store.lastSave;
+
+      expect(await store.getExecution(executionId)).toBeNull();
+      expect(await runtime.getExecution(executionId)).toBeUndefined();
+      expect(await runtime.getExecutions()).toEqual([]);
+    });
+
+    it('still completes the delete when the held save fails', async () => {
+      const { runtime, store, executionId } = await finishRunWithHeldSave();
+
+      const deletion = runtime.deleteExecution(executionId);
+      store.failSaves();
+      expect(await deletion).toBe(true);
+      await store.lastSave;
+
+      expect(await store.getExecution(executionId)).toBeNull();
+      expect(await runtime.getExecution(executionId)).toBeUndefined();
+      expect(await runtime.getExecutions()).toEqual([]);
+    });
+
+    it('deletes normally once the save has already landed', async () => {
+      const { runtime, store, executionId } = await finishRunWithHeldSave();
+      store.releaseSaves();
+      await store.lastSave;
+      expect(await store.getExecution(executionId)).not.toBeNull();
+
+      expect(await runtime.deleteExecution(executionId)).toBe(true);
+      expect(await store.getExecution(executionId)).toBeNull();
+      expect(await runtime.getExecutions()).toEqual([]);
+    });
+
+    it('does not wait on another run’s pending save', async () => {
+      const { runtime, store, executionId } = await finishRunWithHeldSave();
+
+      expect(await runtime.deleteExecution('some-other-run')).toBe(false);
+
+      store.releaseSaves();
+      await store.lastSave;
+      expect(await store.getExecution(executionId)).not.toBeNull();
+    });
   });
 
   it('ExecutionInfo.metadata strips session control-plane keys', async () => {

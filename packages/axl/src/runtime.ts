@@ -851,6 +851,12 @@ export class AxlRuntime extends EventEmitter {
    *  The Set is mutated by the chain's own `.finally` so entries clear as
    *  soon as the work settles. */
   private persistInflight = new Set<Promise<void>>();
+  /** In-flight execution saves (save → finalize chain), keyed by execution
+   *  id. `deleteExecution()` awaits the entry for its id before deleting from
+   *  the store, so a save that lands late cannot re-create a deleted run.
+   *  Each entry removes itself when its chain settles (success or failure),
+   *  but only if it is still the current entry for that id. */
+  private pendingSaves = new Map<string, Promise<void>>();
   /** Resolved diagnostic artifact backend, when `diagnostics.artifacts` is set. */
   private artifactStore?: DiagnosticArtifactStore;
   private artifactLeaseMs = DEFAULT_ARTIFACT_LEASE_MS;
@@ -1627,7 +1633,11 @@ export class AxlRuntime extends EventEmitter {
         })
         .then(() => undefined);
       this.persistInflight.add(chain);
-      chain.finally(() => this.persistInflight.delete(chain));
+      this.pendingSaves.set(id, chain);
+      chain.finally(() => {
+        this.persistInflight.delete(chain);
+        if (this.pendingSaves.get(id) === chain) this.pendingSaves.delete(id);
+      });
     } else if (this.streamingFlusher) {
       // No saveExecution but streaming is enabled (custom store). Drop
       // the streaming buffer anyway — the workflow has completed in this
@@ -2752,6 +2762,10 @@ export class AxlRuntime extends EventEmitter {
    * Returns true if an entry was actually removed from any of the three
    * primary surfaces (active map, historical cache, store).
    *
+   * If the run has already finished but its history save has not landed
+   * yet, this method waits for that save (whether it succeeds or fails)
+   * before deleting, so the save cannot re-create the deleted record.
+   *
    * In-flight handling: if the execution is still running, this method
    * **aborts** it (via the registered abort controller) AND marks the id for
    * skip-on-persist so the workflow's eventual `workflow_end` doesn't
@@ -2813,6 +2827,11 @@ export class AxlRuntime extends EventEmitter {
         this.pendingDecisionResolvers.delete(id);
       }
     }
+
+    // A save scheduled when this run finished may still be in flight. Let it
+    // land (or fail) first, otherwise it would re-create the record right
+    // after the store delete below. The chain never rejects.
+    await this.pendingSaves.get(id);
 
     // Lazy-load just THIS id from the store (cheaper than the full list).
     // Without this, a "delete" on something only-in-store leaves a

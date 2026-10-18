@@ -71,9 +71,10 @@ export class TraceAggregator<State> {
   }
 
   async rebuild(): Promise<void> {
-    const executions: HistoricalExecutionInfo[] = await this.options.runtime.getExecutions();
     const cap = this.options.executionCap ?? 2000;
-    const capped = executions.slice(0, cap);
+    const capped: HistoricalExecutionInfo[] = await this.options.runtime.getExecutions({
+      limit: cap,
+    });
     const now = Date.now();
     const fresh = new Map<WindowId, State>(
       this.options.windows.map((w) => [w, this.options.emptyState()]),

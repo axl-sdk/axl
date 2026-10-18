@@ -41,7 +41,9 @@ function makeExecution(events: AxlEvent[], overrides: Partial<ExecutionInfo> = {
 function createMockRuntime(executions: ExecutionInfo[] = []) {
   const emitter = new EventEmitter();
   return Object.assign(emitter, {
-    getExecutions: vi.fn().mockResolvedValue(executions),
+    getExecutions: vi
+      .fn()
+      .mockImplementation(async (opts?: { limit?: number }) => executions.slice(0, opts?.limit)),
     getExecution: vi
       .fn()
       .mockImplementation(async (id: string) => executions.find((e) => e.executionId === id)),
@@ -199,6 +201,42 @@ describe('TraceAggregator', () => {
   });
 
   describe('execution cap', () => {
+    it('matches the pre-paging result for a store within the cap', async () => {
+      const now = Date.now();
+      const executions = Array.from({ length: 4 }, (_, i) =>
+        makeExecution(
+          [
+            makeEvent({
+              timestamp: now - i * 1000,
+              cost: 0.01 * (i + 1),
+              executionId: `exec-${i}`,
+            }),
+          ],
+          { executionId: `exec-${i}` },
+        ),
+      );
+      const runtime = createMockRuntime(executions);
+      const agg = new TraceAggregator({
+        runtime: runtime as any,
+        connMgr,
+        channel: 'test',
+        reducer,
+        emptyState,
+        windows,
+        executionCap: 10,
+      });
+
+      await agg.start();
+
+      const expected = executions
+        .slice(0, 10)
+        .flatMap((e) => e.events)
+        .reduce(reducer, emptyState());
+      expect(agg.getSnapshot('all')).toEqual(expected);
+      expect(runtime.getExecutions).toHaveBeenCalledExactlyOnceWith({ limit: 10 });
+      agg.close();
+    });
+
     it('caps replay at executionCap (default 2000)', async () => {
       const now = Date.now();
       // Create 5 executions, each with 1 event
@@ -220,6 +258,7 @@ describe('TraceAggregator', () => {
       });
 
       await agg.start();
+      expect(runtime.getExecutions).toHaveBeenCalledExactlyOnceWith({ limit: 3 });
       // Only first 3 executions should be replayed
       expect(agg.getSnapshot('all').count).toBe(3);
       agg.close();

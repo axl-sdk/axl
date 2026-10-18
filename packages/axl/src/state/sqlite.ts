@@ -338,6 +338,11 @@ export class SQLiteStore implements StateStore {
       CREATE INDEX IF NOT EXISTS idx_exec_history_expires ON execution_history (expires_at);
       CREATE INDEX IF NOT EXISTS idx_eval_history_timestamp ON eval_history (timestamp DESC);
       CREATE INDEX IF NOT EXISTS idx_eval_history_expires ON eval_history (expires_at);
+
+      -- Superseded by idx_exec_history_started_id in v6. Dropped here as well as in
+      -- migrate(): a pre-v6 process reopening a v6 file re-creates it, and
+      -- migrate() never runs again once user_version is 6.
+      DROP INDEX IF EXISTS idx_exec_history_started;
     `);
   }
 

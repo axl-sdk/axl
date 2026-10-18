@@ -2118,7 +2118,7 @@ type HistoryTtls = {
 | `executionHistory` | Counted from the record's **last** save. Saving the same execution again restarts it |
 | `evalHistory` | Counted from the row's **first** write. Saving the same eval id again keeps its expiry, and so does `updateEvalResult`. A row written without retention stays untimed. Once a row has expired, a new save starts a new window |
 
-Retention applies to records saved while it is configured; existing records keep whatever expiry they had. Once a record has expired, no read returns it: `getExecution` returns `null`, listings skip it, and `getEvalRetention` reports `{ exists: false }`. With `evalHistory` set, `getEvalRetention` reports the row's `expiresAt`, which diagnostic artifacts follow. Custom stores own their own retention.
+Retention applies to records saved while it is configured; existing records keep whatever expiry they had. Once a record has expired, no read returns it: `getExecution` returns `null`, listings skip it, and `getEvalRetention` reports `{ exists: false }`. With `evalHistory` set, `getEvalRetention` reports the row's `expiresAt`, which diagnostic artifacts follow. On `MemoryStore` and `SQLiteStore`, deleting an expired record that a later save has not cleaned up yet still returns `true`; `RedisStore` returns `false` once the key has expired. Custom stores own their own retention.
 
 ### MemoryStore and SQLiteStore options
 

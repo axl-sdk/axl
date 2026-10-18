@@ -16,14 +16,21 @@ function compareMemberBytes(a: string, b: string): number {
   return Buffer.compare(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8'));
 }
 
-function scoreBound(bound: number | string, infinite: '+inf' | '-inf'): number {
-  if (bound === infinite) return infinite === '+inf' ? Infinity : -Infinity;
-  if (bound === '+inf') return Infinity;
-  if (bound === '-inf') return -Infinity;
+type ScoreBound = { value: number; exclusive: boolean };
+
+/** A ZRANGE BY SCORE bound: a number, '+inf' / '-inf', or '(n' (exclusive). */
+function scoreBound(bound: number | string): ScoreBound {
+  if (bound === '+inf') return { value: Infinity, exclusive: false };
+  if (bound === '-inf') return { value: -Infinity, exclusive: false };
   if (typeof bound === 'string') {
-    throw new Error(`redis mock: unsupported ZRANGE score bound ${bound}`);
+    const exclusive = bound.startsWith('(');
+    const value = Number(exclusive ? bound.slice(1) : bound);
+    if (bound === '' || Number.isNaN(value)) {
+      throw new Error(`redis mock: unsupported ZRANGE score bound ${bound}`);
+    }
+    return { value, exclusive };
   }
-  return bound;
+  return { value: bound, exclusive: false };
 }
 
 /**
@@ -43,9 +50,13 @@ function rangeZset(
   let entries = [...set.entries()].sort((a, b) => a[1] - b[1] || compareMemberBytes(a[0], b[0]));
   if (options?.REV) entries.reverse();
   if (options?.BY === 'SCORE') {
-    const max = scoreBound(options.REV ? start : stop, '+inf');
-    const min = scoreBound(options.REV ? stop : start, '-inf');
-    entries = entries.filter(([, score]) => score >= min && score <= max);
+    const max = scoreBound(options.REV ? start : stop);
+    const min = scoreBound(options.REV ? stop : start);
+    entries = entries.filter(
+      ([, score]) =>
+        (min.exclusive ? score > min.value : score >= min.value) &&
+        (max.exclusive ? score < max.value : score <= max.value),
+    );
   } else if (options?.BY === 'LEX') {
     throw new Error('redis mock: ZRANGE BY LEX is not supported');
   }
@@ -160,13 +171,44 @@ export function createMockMulti(
       });
       return chain;
     },
-    zAdd(key: string, member: { score: number; value: string }) {
+    zAdd(
+      key: string,
+      member: { score: number; value: string },
+      options?: { condition?: 'NX' | 'XX' },
+    ) {
       queue.push(() => {
         if (!zsetData.has(key)) zsetData.set(key, new Map());
         const set = zsetData.get(key)!;
         const isNew = !set.has(member.value);
+        if (options?.condition === 'NX' && !isNew) return 0;
+        if (options?.condition === 'XX' && isNew) return 0;
         set.set(member.value, member.score);
         return isNew ? 1 : 0;
+      });
+      return chain;
+    },
+    // PEXPIREAT against the mock's TTL side map (seconds remaining, measured
+    // from Date.now()). A timestamp at or before now deletes the key, as
+    // Redis does. NX: only a key with no TTL.
+    pExpireAt(key: string, msTimestamp: number, mode?: 'NX' | 'XX' | 'GT' | 'LT') {
+      queue.push(() => {
+        if (!data.has(key) && !hashData.has(key) && !listData.has(key)) return 0;
+        const existing = ttls.get(key);
+        if (mode === 'NX' && existing !== undefined) return 0;
+        if (mode === 'XX' && existing === undefined) return 0;
+        if (mode === 'GT' || mode === 'LT') {
+          throw new Error('redis mock: PEXPIREAT GT/LT is not supported');
+        }
+        const remainingMs = msTimestamp - Date.now();
+        if (remainingMs <= 0) {
+          data.delete(key);
+          hashData.delete(key);
+          listData.delete(key);
+          ttls.delete(key);
+        } else {
+          ttls.set(key, remainingMs / 1000);
+        }
+        return 1;
       });
       return chain;
     },
@@ -453,7 +495,8 @@ export function createRedisStoreWithMockClient(keyPrefix = 'axl:', ttlConfig?: M
       const exists = data.has(key) || hashData.has(key) || listData.has(key);
       if (!exists) return -2;
       const seconds = ttls.get(key);
-      return seconds === undefined ? -1 : seconds * 1000;
+      // Redis reports whole milliseconds.
+      return seconds === undefined ? -1 : Math.round(seconds * 1000);
     }),
     multi: vi.fn(() => createMockMulti(data, hashData, setData, zsetData, ttls, listData)),
     quit: vi.fn(async () => {

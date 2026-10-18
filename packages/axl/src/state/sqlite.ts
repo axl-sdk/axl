@@ -11,14 +11,19 @@ import type {
   ExecutionState,
   EvalHistoryEntry,
   ExecutionCursor,
+  HistoryRetentionOptions,
+  HistoryRetentionResult,
   HistoryTtls,
 } from './types.js';
 import { normalizePersistedSessionHistory } from '../input.js';
 import { AxlError } from '../errors.js';
 import {
   PRUNE_BATCH,
+  executionLastSavedAt,
   expiryFrom,
+  resolveHistoryRetentionOptions,
   resolveHistoryTtls,
+  retentionForUntimedRecord,
   type ResolvedHistoryTtls,
 } from './retention.js';
 
@@ -684,6 +689,94 @@ export class SQLiteStore implements StateStore {
       .get(id, this.now()) as { expires_at: number | null } | undefined;
     if (!row) return { exists: false };
     return row.expires_at === null ? { exists: true } : { exists: true, expiresAt: row.expires_at };
+  }
+
+  // ── History maintenance ─────────────────────────────────────────────────
+
+  /**
+   * See `StateStore.applyHistoryRetention`. One batch runs in one immediate
+   * transaction, so no other writer can change a row between this call
+   * reading it and acting on it. Only rows whose `expires_at` is `NULL` are
+   * touched. An expired execution takes its checkpoints and saved execution
+   * state with it, as a normal expiry does. There is no separate index, so
+   * `indexed` and `deadIndexEntries` are always `0`.
+   */
+  async applyHistoryRetention(options: HistoryRetentionOptions): Promise<HistoryRetentionResult> {
+    const { kind, batchSize, cursor } = resolveHistoryRetentionOptions('SQLiteStore', options);
+    const ttl = kind === 'executions' ? this.ttls.executionHistory : this.ttls.evalHistory;
+    const table =
+      kind === 'executions'
+        ? { name: 'execution_history', id: 'execution_id', time: 'started_at' }
+        : { name: 'eval_history', id: 'id', time: 'timestamp' };
+    const lastSaved = kind === 'executions' ? 'completed_at' : 'NULL';
+    const now = this.now();
+    return this.db
+      .transaction((): HistoryRetentionResult => {
+        // Strictly after the cursor in (time ASC, id ASC) order. Text ids
+        // compare with SQLite's BINARY collation, the same code-point order
+        // the other stores use.
+        const params: Array<number | string> = [];
+        let sql =
+          `SELECT ${table.id} AS id, ${table.time} AS time, ${lastSaved} AS last_saved, ` +
+          `expires_at FROM ${table.name}`;
+        if (cursor !== undefined) {
+          sql += ` WHERE ${table.time} > ? OR (${table.time} = ? AND ${table.id} > ?)`;
+          params.push(cursor.time, cursor.time, cursor.id);
+        }
+        sql += ` ORDER BY ${table.time}, ${table.id} LIMIT ?`;
+        params.push(batchSize + 1);
+        const rows = this.db.prepare(sql).all(...params) as Array<{
+          id: string;
+          time: number;
+          last_saved: number | null;
+          expires_at: number | null;
+        }>;
+        const batch = rows.slice(0, batchSize);
+        const toExpire: string[] = [];
+        let armed = 0;
+        if (ttl !== null) {
+          const arm = this.db.prepare(
+            `UPDATE ${table.name} SET expires_at = ? WHERE ${table.id} = ? AND expires_at IS NULL`,
+          );
+          for (const row of batch) {
+            if (row.expires_at !== null) continue;
+            const lastSavedAt =
+              kind === 'executions'
+                ? executionLastSavedAt({ startedAt: row.time, completedAt: row.last_saved })
+                : row.time;
+            const decision = retentionForUntimedRecord(lastSavedAt, ttl, now);
+            if (decision.expired) toExpire.push(row.id);
+            else armed += arm.run(decision.expiresAt, row.id).changes;
+          }
+        }
+        let expired = 0;
+        if (toExpire.length > 0) {
+          const idList = JSON.stringify(toExpire);
+          expired = this.db
+            .prepare(
+              `DELETE FROM ${table.name} WHERE expires_at IS NULL AND ${table.id} IN (SELECT value FROM json_each(?))`,
+            )
+            .run(idList).changes;
+          if (kind === 'executions') {
+            for (const side of ['checkpoints', 'execution_state']) {
+              this.db
+                .prepare(
+                  `DELETE FROM ${side} WHERE execution_id IN (SELECT value FROM json_each(?))`,
+                )
+                .run(idList);
+            }
+          }
+        }
+        const last = batch[batch.length - 1];
+        return {
+          expired,
+          armed,
+          indexed: 0,
+          deadIndexEntries: 0,
+          cursor: rows.length > batchSize ? { time: last.time, id: last.id } : null,
+        };
+      })
+      .immediate();
   }
 
   // ── Sessions (Studio introspection) ────────────────────────────────────

@@ -170,6 +170,41 @@ export interface StateStore {
    */
   getEvalRetention?(id: string): Promise<{ exists: boolean; expiresAt?: number }>;
 
+  // History maintenance
+  /**
+   * Apply the store's configured history retention to records that were
+   * saved without one (for example before an upgrade, or before a retention
+   * was set), and repair the store's listing indexes. Processes one batch and
+   * returns the cursor to continue from; call again with that cursor until it
+   * is `null`. Axl never calls this itself: run it when you choose to.
+   *
+   * For each record in the batch that has no expiry, and only when a
+   * retention is configured for `options.kind`:
+   * - a record whose window has already passed is deleted, with the same
+   *   per-run data a normal expiry removes;
+   * - any other record gets the expiry it would have had: the retention
+   *   counted from its last save (`completedAt` for executions, falling back
+   *   to `startedAt`; `timestamp` for eval rows).
+   *
+   * Records that already have an expiry keep it. With no retention
+   * configured for the kind (unset or `null`), nothing is expired or armed.
+   *
+   * The walk is oldest first, by `(startedAt, executionId)` for executions
+   * and `(timestamp, id)` for eval rows, and the cursor is a position in that
+   * order rather than an offset, so records removed behind it (by this call,
+   * a concurrent delete or an expiry) never cause a record to be skipped.
+   * Running it to completion twice changes nothing the second time.
+   *
+   * **Custom store implementors:** custom stores own their retention and may
+   * implement this with the same contract, or leave it out. Built-ins:
+   * - `MemoryStore` and `SQLiteStore` act on their rows directly; they keep
+   *   no separate index, so `indexed` and `deadIndexEntries` are always `0`.
+   * - `RedisStore` also adds records that already carry a TTL to its expiry
+   *   index (`indexed`) and removes index entries whose record is gone
+   *   (`deadIndexEntries`).
+   */
+  applyHistoryRetention?(options: HistoryRetentionOptions): Promise<HistoryRetentionResult>;
+
   // Sessions (Studio introspection)
   /** List all session IDs (used by Studio session browser). */
   listSessions?(): Promise<string[]>;
@@ -255,11 +290,49 @@ export type ExecutionCursor = {
  *   changes it.
  *
  * Retention applies to records saved while it is configured; rows written
- * before keep whatever expiry they had. Custom stores own their retention.
+ * before keep whatever expiry they had until you run
+ * {@link StateStore.applyHistoryRetention}. Custom stores own their retention.
  */
 export type HistoryTtls = {
   executionHistory?: number | null;
   evalHistory?: number | null;
+};
+
+/** Which history {@link StateStore.applyHistoryRetention} processes. */
+export type HistoryRetentionKind = 'executions' | 'evals';
+
+/**
+ * Where {@link StateStore.applyHistoryRetention} continues from: the last
+ * record of the previous batch, oldest-first. `time` is `startedAt` for
+ * executions and `timestamp` for eval rows. Pass it back unchanged; it is
+ * plain JSON, so it can be stored between runs.
+ */
+export type HistoryRetentionCursor = {
+  time: number;
+  id: string;
+};
+
+/** Options for {@link StateStore.applyHistoryRetention}. */
+export type HistoryRetentionOptions = {
+  kind: HistoryRetentionKind;
+  /** Records examined per call. A positive integer; defaults to 500. */
+  batchSize?: number;
+  /** The `cursor` returned by the previous call. Omit or pass `null` to start. */
+  cursor?: HistoryRetentionCursor | null;
+};
+
+/** What one {@link StateStore.applyHistoryRetention} call did. */
+export type HistoryRetentionResult = {
+  /** Records with no expiry whose window had already passed, now deleted. */
+  expired: number;
+  /** Records with no expiry that now have one. */
+  armed: number;
+  /** Records that already had an expiry, newly added to the store's expiry index (Redis). */
+  indexed: number;
+  /** Index entries whose record no longer exists, now removed (Redis). */
+  deadIndexEntries: number;
+  /** Pass to the next call, or `null` when the walk is finished. */
+  cursor: HistoryRetentionCursor | null;
 };
 
 /** Persisted eval history entry. */

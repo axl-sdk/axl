@@ -1,8 +1,8 @@
 /**
  * A wrapper around a Redis client (the shared mock, or a real node-redis
- * client) that can pause or fail RedisStore's history prune at named steps,
- * so tests can interleave a competing save or delete deterministically, with
- * no timers.
+ * client) that can pause or fail RedisStore's history prune (and
+ * `applyHistoryRetention`) at named steps, so tests can interleave a
+ * competing save or delete deterministically, with no timers.
  *
  * Steps are recognized from the command and the key it touches, never from
  * store internals:
@@ -17,6 +17,7 @@
  * | `pttl`          | a PTTL right after `mget-2`                             |
  * | `reindex-multi` | a MULTI that deletes or removes from a recheck key       |
  * | `rescore-multi` | a MULTI that only touches a `…-exp` sorted set          |
+ * | `retention-multi` | a MULTI with a PEXPIREAT (`applyHistoryRetention`)    |
  *
  * A paused step waits before its command is sent; a failed step throws
  * instead of sending it, like a connection that dropped at that point.
@@ -29,7 +30,8 @@ export type PruneStep =
   | 'mget-2'
   | 'pttl'
   | 'reindex-multi'
-  | 'rescore-multi';
+  | 'rescore-multi'
+  | 'retention-multi';
 
 type Deferred = { promise: Promise<void>; resolve: () => void };
 
@@ -98,6 +100,7 @@ export function gateRedisClient<C extends object>(client: C): GatedClient<C> {
   }
 
   function labelMulti(ops: Array<[string, unknown]>): PruneStep | undefined {
+    if (ops.some(([m]) => m === 'pExpireAt')) return 'retention-multi';
     if (ops.some(([m, key]) => m === 'sAdd' && isRecheck(key))) return 'remove-multi';
     if (ops.some(([m, key]) => (m === 'sRem' || m === 'del') && isRecheck(key))) {
       return 'reindex-multi';

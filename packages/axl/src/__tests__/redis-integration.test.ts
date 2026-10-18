@@ -637,8 +637,10 @@ describe.skipIf(!REDIS_URL)('RedisStore integration (real Redis)', () => {
       zRange(key: string, start: number | string, stop: number | string): Promise<string[]>;
       zScore(key: string, member: string): Promise<number | null>;
       zAdd(key: string, member: { score: number; value: string }): Promise<number>;
+      zRem(key: string, member: string | string[]): Promise<number>;
       del(keys: string | string[]): Promise<number>;
       get(key: string): Promise<string | null>;
+      pTTL(key: string): Promise<number>;
     };
     const rawClient = (s: RedisStore) => (s as unknown as { client: RawClient }).client;
 
@@ -853,6 +855,145 @@ describe.skipIf(!REDIS_URL)('RedisStore integration (real Redis)', () => {
         await sA.close();
         await sB.close();
         await s.close();
+      }
+    });
+  });
+
+  describe('history maintenance (applyHistoryRetention)', () => {
+    type RawClient = {
+      sMembers(key: string): Promise<string[]>;
+      zRange(key: string, start: number | string, stop: number | string): Promise<string[]>;
+      zScore(key: string, member: string): Promise<number | null>;
+      zRem(key: string, member: string | string[]): Promise<number>;
+      del(keys: string | string[]): Promise<number>;
+      exists(key: string): Promise<number>;
+      pTTL(key: string): Promise<number>;
+    };
+    const rawClient = (s: RedisStore) => (s as unknown as { client: RawClient }).client;
+
+    const exec = (id: string, startedAt: number, completedAt = startedAt): ExecutionInfo => ({
+      executionId: id,
+      workflow: 'wf',
+      status: 'completed',
+      events: [],
+      totalCost: 0,
+      startedAt,
+      completedAt,
+      duration: 0,
+    });
+
+    async function open(prefix: string, executionHistory: number | null) {
+      return RedisStore.create({
+        url: REDIS_URL!,
+        keyPrefix: prefix,
+        skipMigration: true,
+        ttls: { executionHistory },
+      });
+    }
+
+    async function runToCompletion(s: RedisStore, batchSize: number) {
+      const totals = { expired: 0, armed: 0, indexed: 0, deadIndexEntries: 0, calls: 0 };
+      let cursor: { time: number; id: string } | null = null;
+      do {
+        const r = await s.applyHistoryRetention({ kind: 'executions', batchSize, cursor });
+        totals.expired += r.expired;
+        totals.armed += r.armed;
+        totals.indexed += r.indexed;
+        totals.deadIndexEntries += r.deadIndexEntries;
+        totals.calls++;
+        cursor = r.cursor;
+      } while (cursor !== null);
+      return totals;
+    }
+
+    it('P5-02/03/04/06 arms, expires, indexes and repairs pre-upgrade history, then is a no-op', async () => {
+      const prefix = `${TEST_PREFIX}maintenance-`;
+      const legacy = await open(prefix, null);
+      const timed = await open(prefix, 30);
+      const now = Date.now();
+      // Untimed records from before the upgrade: L1 finished 30 s ago, L2
+      // 120 s ago, plus a startedAt tie group that crosses batch boundaries.
+      await legacy.saveExecution(exec('L1', now - 3_600_000, now - 30_000));
+      await legacy.saveExecution(exec('L2', now - 3_600_000, now - 120_000));
+      for (const id of ['tie-a', 'tie-b', 'tie-c']) {
+        await legacy.saveExecution(exec(id, now - 1_000_000, now - 1000));
+      }
+      // Timed before the upgrade: a TTL but no expiry-set entry.
+      await timed.saveExecution(exec('T1', now - 2_000_000));
+      await rawClient(timed).zRem(`${prefix}exec-history-exp`, 'T1');
+      // A dead index entry: indexed, no blob.
+      await legacy.saveExecution(exec('D', now - 500_000));
+      await rawClient(legacy).del(`${prefix}exec-history:D`);
+      const s = await open(prefix, 60);
+      try {
+        const totals = await runToCompletion(s, 2);
+        expect(totals).toMatchObject({ armed: 4, expired: 1, indexed: 1, deadIndexEntries: 1 });
+
+        const c = rawClient(s);
+        expect(await c.zScore(`${prefix}exec-history-exp`, 'L1')).toBe(now - 30_000 + 60_000);
+        const l1 = await c.pTTL(`${prefix}exec-history:L1`);
+        expect(Math.abs(now - 30_000 + 60_000 - (Date.now() + l1))).toBeLessThan(1000);
+        expect(await c.exists(`${prefix}exec-history:L2`)).toBe(0);
+        const t1 = await c.pTTL(`${prefix}exec-history:T1`);
+        expect(t1).toBeGreaterThan(25_000);
+        expect(t1).toBeLessThanOrEqual(30_000);
+        expect(await c.zScore(`${prefix}exec-history-exp`, 'T1')).toBeGreaterThan(Date.now());
+        for (const id of ['L2', 'D']) {
+          expect(await c.zScore(`${prefix}exec-history-z`, id)).toBeNull();
+          expect(await c.sMembers(`${prefix}exec-history-ids`)).not.toContain(id);
+        }
+        expect((await s.listExecutions()).map((e) => e.executionId)).toEqual([
+          'tie-c',
+          'tie-b',
+          'tie-a',
+          'T1',
+          'L1',
+        ]);
+
+        // P5-06: a second full run changes nothing.
+        const before = await c.zScore(`${prefix}exec-history-exp`, 'tie-b');
+        expect(await runToCompletion(s, 2)).toMatchObject({
+          armed: 0,
+          expired: 0,
+          indexed: 0,
+          deadIndexEntries: 0,
+        });
+        expect(await c.zScore(`${prefix}exec-history-exp`, 'tie-b')).toBe(before);
+      } finally {
+        await legacy.close();
+        await timed.close();
+        await s.close();
+      }
+    });
+
+    it('a record re-saved before it is armed or expired keeps its fresh window (real client)', async () => {
+      const prefix = `${TEST_PREFIX}maintenance-resave-`;
+      const legacy = await open(prefix, null);
+      const s = await open(prefix, 60);
+      const maintainer = await open(prefix, 60);
+      const gate = gateRedisClient(rawClient(maintainer) as object);
+      (maintainer as unknown as { client: unknown }).client = gate.client;
+      try {
+        const now = Date.now();
+        await legacy.saveExecution(exec('past', now - 3_600_000));
+        await legacy.saveExecution(exec('inside', now - 1000));
+        const paused = gate.pauseAt('retention-multi');
+        const run = maintainer.applyHistoryRetention({ kind: 'executions' });
+        await paused;
+        await s.saveExecution(exec('past', now - 3_600_000));
+        await s.saveExecution(exec('inside', now - 1000));
+        gate.release('retention-multi');
+        expect(await run).toMatchObject({ armed: 0, expired: 0 });
+
+        const c = rawClient(s);
+        for (const id of ['past', 'inside']) {
+          expect(await c.pTTL(`${prefix}exec-history:${id}`)).toBeGreaterThan(55_000);
+        }
+        expect((await s.listExecutions()).map((e) => e.executionId)).toEqual(['inside', 'past']);
+      } finally {
+        await legacy.close();
+        await s.close();
+        await maintainer.close();
       }
     });
   });

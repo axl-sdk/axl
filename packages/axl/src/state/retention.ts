@@ -1,5 +1,10 @@
 import type { HistoricalExecutionInfo } from '../types.js';
-import type { HistoryTtls } from './types.js';
+import type {
+  HistoryRetentionCursor,
+  HistoryRetentionKind,
+  HistoryRetentionOptions,
+  HistoryTtls,
+} from './types.js';
 import { AxlError } from '../errors.js';
 
 /**
@@ -70,6 +75,99 @@ export function isExpired(expiresAt: number | null, now: number): boolean {
   return expiresAt !== null && now >= expiresAt;
 }
 
+/** Records examined per `applyHistoryRetention` call when `batchSize` is omitted. */
+export const DEFAULT_RETENTION_BATCH_SIZE = 500;
+
+export type ResolvedHistoryRetentionOptions = {
+  kind: HistoryRetentionKind;
+  batchSize: number;
+  cursor: HistoryRetentionCursor | undefined;
+};
+
+/**
+ * Validate `applyHistoryRetention` options. This is a maintenance call that
+ * deletes records, so a malformed argument is rejected rather than guessed at.
+ */
+export function resolveHistoryRetentionOptions(
+  storeName: string,
+  options: HistoryRetentionOptions,
+): ResolvedHistoryRetentionOptions {
+  const method = `${storeName}.applyHistoryRetention()`;
+  if (options === null || typeof options !== 'object') {
+    throw new AxlError('INVALID_ARGUMENT', `${method} options must be an object`);
+  }
+  const { kind, batchSize, cursor } = options as {
+    kind?: unknown;
+    batchSize?: unknown;
+    cursor?: unknown;
+  };
+  if (kind !== 'executions' && kind !== 'evals') {
+    throw new AxlError(
+      'INVALID_ARGUMENT',
+      `${method} kind must be 'executions' or 'evals'; got ${String(kind)}`,
+    );
+  }
+  if (
+    batchSize !== undefined &&
+    !(typeof batchSize === 'number' && Number.isSafeInteger(batchSize) && batchSize > 0)
+  ) {
+    throw new AxlError(
+      'INVALID_ARGUMENT',
+      `${method} batchSize must be a positive integer; got ${String(batchSize)}`,
+    );
+  }
+  let parsedCursor: HistoryRetentionCursor | undefined;
+  if (cursor !== undefined && cursor !== null) {
+    const candidate = cursor as Partial<HistoryRetentionCursor>;
+    if (
+      typeof candidate !== 'object' ||
+      typeof candidate.time !== 'number' ||
+      !Number.isFinite(candidate.time) ||
+      typeof candidate.id !== 'string'
+    ) {
+      throw new AxlError(
+        'INVALID_ARGUMENT',
+        `${method} cursor must be the { time, id } cursor returned by the previous call`,
+      );
+    }
+    parsedCursor = { time: candidate.time, id: candidate.id };
+  }
+  return {
+    kind,
+    batchSize: (batchSize as number | undefined) ?? DEFAULT_RETENTION_BATCH_SIZE,
+    cursor: parsedCursor,
+  };
+}
+
+/**
+ * What `applyHistoryRetention` does with a record that has no expiry, under a
+ * retention of `ttlSeconds`: the record's window counts from its last save,
+ * exactly as if it had been saved with the retention configured. A window
+ * that has already passed means the record is deleted now.
+ */
+export function retentionForUntimedRecord(
+  lastSavedAt: number,
+  ttlSeconds: number,
+  now: number,
+): { expired: true } | { expired: false; expiresAt: number } {
+  const expiresAt = lastSavedAt + Math.round(ttlSeconds * 1000);
+  return isExpired(expiresAt, now) ? { expired: true } : { expired: false, expiresAt };
+}
+
+/**
+ * When an execution record was last saved, as far as the record shows. Runs
+ * are saved once, when they finish, so that is `completedAt`; records without
+ * one fall back to `startedAt`.
+ */
+export function executionLastSavedAt(record: {
+  startedAt: number;
+  completedAt?: number | null;
+}): number {
+  return typeof record.completedAt === 'number' && Number.isFinite(record.completedAt)
+    ? record.completedAt
+    : record.startedAt;
+}
+
 /**
  * Listing order for execution history: `startedAt` descending, then
  * `executionId` descending. The id tie-break makes the order total, so runs
@@ -81,6 +179,18 @@ export function compareExecutionsNewestFirst(
 ): number {
   if (a.startedAt !== b.startedAt) return b.startedAt - a.startedAt;
   return compareCodePoints(b.executionId, a.executionId);
+}
+
+/**
+ * The `applyHistoryRetention` walk order: `time` ascending, then `id` by code
+ * point ascending. The exact reverse of the listing order.
+ */
+export function compareRetentionPositions(
+  a: HistoryRetentionCursor,
+  b: HistoryRetentionCursor,
+): number {
+  if (a.time !== b.time) return a.time - b.time;
+  return compareCodePoints(a.id, b.id);
 }
 
 /**

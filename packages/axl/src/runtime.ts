@@ -2917,7 +2917,25 @@ export class AxlRuntime extends EventEmitter {
       }
     }
     this.recentRuns?.set(id, synthesized);
-    await this.stateStore.finalizeStreamingEvents?.(id);
+    // The record is saved, so a failed finalize only leaves an orphan buffer,
+    // which the next recovery drops through the "final record exists" branch.
+    // Track it so `shutdown()` does not close the store underneath it.
+    const finalize = Promise.resolve(this.stateStore.finalizeStreamingEvents?.(id)).then(
+      () => undefined,
+      (err: unknown) => {
+        console.error(
+          `[axl] recoverIncompleteStreams: saved execution ${id} but failed to drop its ` +
+            `streaming buffer: ${err instanceof Error ? err.message : String(err)}. ` +
+            `The next recovery removes it.`,
+        );
+      },
+    );
+    this.persistInflight.add(finalize);
+    try {
+      await finalize;
+    } finally {
+      this.persistInflight.delete(finalize);
+    }
     return synthesized;
   }
 

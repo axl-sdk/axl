@@ -948,6 +948,37 @@ describe('recoverIncompleteStreams() checks each run against the store', () => {
     expect(ids(await recovery)).toEqual(['s1']);
   });
 
+  it('shutdown() waits for the buffer cleanup after a recovery save, and a failed cleanup does not fail recovery', async () => {
+    const store = new MemoryStore();
+    await store.appendStreamingEvents('s1', bufferEvents('s1', 1_000));
+    let rejectFinalize!: (err: Error) => void;
+    vi.spyOn(store, 'finalizeStreamingEvents').mockImplementation(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectFinalize = reject;
+        }),
+    );
+    const closeSpy = vi.spyOn(store, 'close');
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const runtime = new AxlRuntime({ state: { store, persist: 'streaming' } });
+
+    const recovery = runtime.recoverIncompleteStreams();
+    await vi.waitFor(() => expect(store.finalizeStreamingEvents).toHaveBeenCalledWith('s1'));
+    const shutdown = runtime.shutdown();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(closeSpy).not.toHaveBeenCalled();
+
+    rejectFinalize(new Error('connection reset'));
+    await shutdown;
+    expect(closeSpy).toHaveBeenCalled();
+    expect(ids(await recovery)).toEqual(['s1']);
+    expect((await store.getExecution('s1'))?.status).toBe('failed');
+    expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining('failed to drop its streaming buffer'),
+    );
+    errorSpy.mockRestore();
+  });
+
   it('skips a run whose delete is already in progress', async () => {
     const store = new MemoryStore();
     await store.appendStreamingEvents('s1', bufferEvents('s1', 1_000));

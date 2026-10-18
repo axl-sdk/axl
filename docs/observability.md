@@ -799,7 +799,8 @@ The filter applies at three layers:
 
 | Route | Scrubbed fields | Preserved |
 |---|---|---|
-| `GET /api/executions` / `:id` | `result`, `error`, `metadata` (replaced with `{ redacted: true }` — caller-supplied `userId`/`tenantId`/correlation ids are PII surfaces) | `executionId`, `workflow`, `status`, `duration`, `totalCost`, `startedAt`, `completedAt`, `events` (already scrubbed at emit time) |
+| `GET /api/executions` | `result`, `error`, `metadata` (replaced with `{ redacted: true }` — caller-supplied `userId`/`tenantId`/correlation ids are PII surfaces) | `executionId`, `workflow`, `status`, `duration`, `totalCost`, `startedAt`, `completedAt`, `eventCount`. Items are summaries without `events`; see [Paging executions](./studio-api.md#paging-executions) |
+| `GET /api/executions/:id` | `result`, `error`, `metadata` (as above) | `executionId`, `workflow`, `status`, `duration`, `totalCost`, `startedAt`, `completedAt`, `events` (already scrubbed at emit time) |
 | `DELETE /api/executions/:id` | (no content) | (blocked in `readOnly`; also scrubs the WS replay buffer for `execution:{id}` via `ConnectionManager.clearChannelBuffer`) |
 | `GET /api/memory/:scope` / `:key` | `value` | `key` (programmer-chosen identifier, needed for navigation) |
 | `GET /api/sessions/:id` | `message.content`, `message.tool_calls[*].function.arguments`; `message.providerMetadata` is dropped entirely (opaque bag that may carry encoded reasoning / cache keys) | `role`, `name`, `tool_call_id`, `tool_calls[*].id`, `tool_calls[*].type`, `tool_calls[*].function.name`, `handoffHistory` (no content fields to scrub) |

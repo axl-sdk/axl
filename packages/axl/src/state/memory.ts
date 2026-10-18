@@ -12,6 +12,7 @@ import type {
   PendingDecision,
   ExecutionState,
   EvalHistoryEntry,
+  ExecutionCursor,
   HistoryTtls,
 } from './types.js';
 import { getExecutionEventSchemaVersion, normalizeStoredExecution } from '../event-schema.js';
@@ -274,13 +275,25 @@ export class MemoryStore implements StateStore {
     return normalizeStoredExecution(structuredClone(stored.record));
   }
 
-  async listExecutions(limit?: number): Promise<HistoricalExecutionInfo[]> {
+  /** Supports `listExecutions(limit, { cursor })`. */
+  readonly historyPaging = true;
+
+  async listExecutions(
+    limit?: number,
+    options?: { cursor?: ExecutionCursor },
+  ): Promise<HistoricalExecutionInfo[]> {
     const now = this.now();
     const max = limit ? limit : Infinity;
     const result: HistoricalExecutionInfo[] = [];
+    // `executionOrder` is oldest first, so the items strictly after the
+    // cursor in newest-first order are the ones below its lower bound.
+    const start =
+      options?.cursor !== undefined
+        ? this.executionOrderLowerBound(options.cursor) - 1
+        : this.executionOrder.length - 1;
     // Walk the sorted index newest first; expired records are skipped before
     // the limit is applied, so a page is filled with live records.
-    for (let i = this.executionOrder.length - 1; i >= 0 && result.length < max; i--) {
+    for (let i = start; i >= 0 && result.length < max; i--) {
       const stored = this.executionHistory.get(this.executionOrder[i].executionId)!;
       if (isExpired(stored.expiresAt, now)) continue;
       result.push(normalizeStoredExecution(structuredClone(stored.record)));

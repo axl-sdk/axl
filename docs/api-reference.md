@@ -2127,7 +2127,21 @@ Expired records are removed from storage a batch at a time (up to 100 per save) 
 
 `SQLiteStore` stores the expiry in an `expires_at` column on both history tables, added by schema v6 on first open; rows written before the upgrade keep no expiry.
 
-`listExecutions` on both stores orders by `startedAt` descending, then `executionId` descending.
+### Listing and paging history
+
+All three built-in stores list executions newest first: by `startedAt` descending, then `executionId` descending. The id tie-break keeps the order the same between calls, even for runs that started in the same millisecond.
+
+Pass a cursor built from the last item of a page to get the next page:
+
+```typescript
+const page = await store.listExecutions(100);
+const last = page[page.length - 1];
+const next = await store.listExecutions(100, {
+  cursor: { startedAt: last.startedAt, executionId: last.executionId },
+});
+```
+
+The next page starts strictly after the cursor, so every run is visited once, including runs that share a `startedAt` across a page boundary. A cursor still works after the run it names is deleted or expires. Expired records are skipped before the limit is applied, so a page holds `limit` records whenever that many remain. Without a limit, the call returns everything after the cursor. The built-in stores set `historyPaging: true` to say they support the cursor.
 
 ### RedisStore options
 
@@ -2140,6 +2154,8 @@ Expired records are removed from storage a batch at a time (up to 100 per save) 
 | `skipMigration` | `boolean?` | `false` | Skip the one-time lazy backfill of the execution / eval-history sorted-set indexes on startup. Set to `true` for installs at six-figure execution counts where the startup cost is unacceptable, then call `store.backfillExecutionIndex()` / `store.backfillEvalIndex()` manually during a maintenance window. Until then, `listExecutions` / `listEvalResults` fall back to the legacy SET + N×GET + JS-sort read path — correct but slow at scale |
 | `defaultTtl` | `number?` | — | Default TTL in **seconds** applied to every TTL-capable storage category. Without a TTL, every `save*` accumulates forever — strongly recommended in production |
 | `ttls` | `object?` | — | Per-category TTL overrides in seconds (`session`, `sessionMeta`, `checkpoint`, `executionState`, `executionHistory`, `evalHistory`, `memory`, `streamingEvents`). Set a category to `null` to explicitly opt out even when `defaultTtl` is set. `pendingDecision` is intentionally NOT configurable — pending decisions share a hash, so a TTL would expire all of them at once. **Window semantics:** `memory`, `session`, and `sessionMeta` are sliding (every write refreshes TTL — active users keep their data, inactive users forget; reads do NOT refresh); `checkpoint` and `streamingEvents` are fixed from the first write (TTL set once); `executionState` and `executionHistory` restart their window on every save; `evalHistory` is fixed from the row's first write, as described in [History retention](#history-retention-historyttls). **`streamingEvents` is opt-in only** — does NOT fall back to `defaultTtl`. Must be longer than your max time-between-restarts or `recoverIncompleteStreams()` will miss crashed-run buffers that aged out before the next process started. Non-positive and non-finite values (`0`, negative, `NaN`, `Infinity`) are defensively treated as no-TTL. Per-category TTLs are independent. Legacy memory entries (pre-`memory-methods` patch) migrate forward on first read with the configured TTL applied. `listPendingExecutions` self-prunes stale ids when their `executionState` blob has TTL-evicted |
+
+**History listing indexes.** Redis cannot expire individual members of a set, so `RedisStore` tracks when each timed execution and eval record expires. Every history save then removes up to 100 expired records' entries from the listing indexes, and a record saved again in the meantime stays listed. With `executionHistory` or `evalHistory` set, the indexes stay proportional to the history you keep. Records saved without a TTL never enter this cleanup. Records that were timed before this cleanup existed keep their index entries until a maintenance pass applies it to them.
 
 ### Provider configuration
 
@@ -2362,7 +2378,8 @@ These methods are optional (`?` on the interface). The runtime checks for their 
 |--------|-------------|
 | `saveExecution?(execution)` | Save a completed/failed `ExecutionInfo` to history |
 | `getExecution?(executionId)` | Get a specific execution from history |
-| `listExecutions?(limit?)` | List recent executions, most recent first. Pass `undefined` for no limit |
+| `listExecutions?(limit?, options?)` | List recent executions, most recent first. Pass `undefined` for no limit. `options.cursor` (`ExecutionCursor`: `{ startedAt, executionId }`) asks for the page strictly after that position, in `(startedAt DESC, executionId DESC)` order. Honor it only if you also set `historyPaging` |
+| `historyPaging?` | `true` when `listExecutions` honors `options.cursor`. Leave it unset otherwise: the runtime then lists your whole history and pages it in process, which is correct but reads everything for every page. See [Listing and paging history](#listing-and-paging-history) |
 | `deleteExecution?(executionId)` | Delete an execution from history. Returns `true` if an entry was removed. Symmetric to `deleteEvalResult` |
 | `appendStreamingEvents?(executionId, events)` | Append a batch of events to the streaming buffer. Called by the runtime when `state.persist: 'streaming'` is configured. Should register the executionId in an in-flight index on first call |
 | `finalizeStreamingEvents?(executionId)` | Delete the streaming buffer + un-register from the in-flight index. Called by the runtime after the canonical `executionHistory` blob has been written |

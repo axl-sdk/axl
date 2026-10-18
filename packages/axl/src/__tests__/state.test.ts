@@ -1503,12 +1503,13 @@ describe('RedisStore', () => {
       await store.deleteExecution('e1');
       expect(captured).toHaveLength(1);
       // Per-execution surfaces deleted together: history-set sRem + history
-      // blob del + history zRem + checkpoint del + exec-state del +
-      // pending-exec-set sRem + streaming-events del + streaming-ids sRem +
-      // decisions hash hDel = 9. Full sweep prevents resurrection via the
-      // streaming buffer and closes the GDPR right-to-be-forgotten leak
-      // path (no pending decision left behind for awaitHuman runs).
-      expect(captured[0]._queueLength()).toBe(9);
+      // blob del + history zRem + expiry zRem + prune-recheck sRem +
+      // checkpoint del + exec-state del + pending-exec-set sRem +
+      // streaming-events del + streaming-ids sRem + decisions hash hDel = 11.
+      // Full sweep prevents resurrection via the streaming buffer and closes
+      // the GDPR right-to-be-forgotten leak path (no pending decision left
+      // behind for awaitHuman runs).
+      expect(captured[0]._queueLength()).toBe(11);
 
       // No single-op delete commands escaped the MULTI
       expect(mockClient.sRem).not.toHaveBeenCalled();
@@ -1681,7 +1682,7 @@ describe('RedisStore', () => {
         const { store, mockClient } = createRedisStoreWithMockClient();
         for (let i = 0; i < 5; i++) await store.saveExecution(makeExec(`e${i}`, i * 100));
 
-        mockClient.zRange.mockClear();
+        mockClient.zRangeWithScores.mockClear();
         mockClient.mGet.mockClear();
         mockClient.get.mockClear();
 
@@ -1689,7 +1690,7 @@ describe('RedisStore', () => {
 
         expect(result.map((e) => e.executionId)).toEqual(['e4', 'e3', 'e2', 'e1', 'e0']);
         // Fast path: exactly ONE zRevRangeByScore + ONE mGet
-        expect(mockClient.zRange).toHaveBeenCalledTimes(1);
+        expect(mockClient.zRangeWithScores).toHaveBeenCalledTimes(1);
         expect(mockClient.mGet).toHaveBeenCalledTimes(1);
         // And NO per-ID get() — the legacy N+1 path
         expect(mockClient.get).not.toHaveBeenCalled();
@@ -1699,20 +1700,26 @@ describe('RedisStore', () => {
         const { store, mockClient } = createRedisStoreWithMockClient();
         for (let i = 0; i < 10; i++) await store.saveExecution(makeExec(`e${i}`, i * 100));
 
-        mockClient.zRange.mockClear();
+        mockClient.zRangeWithScores.mockClear();
         const result = await store.listExecutions(3);
 
         expect(result).toHaveLength(3);
         expect(result.map((e) => e.executionId)).toEqual(['e9', 'e8', 'e7']);
-        // Limit is pushed down to the ZSET with over-fetch (2x with +5 floor)
-        // so that TTL evictions between ZRANGE and MGET don't silently
-        // under-deliver. With limit=3 we fetch up to 8 candidates and stop
-        // at the first 3 non-null parsed rows.
-        expect(mockClient.zRange).toHaveBeenCalledWith('axl:exec-history-z', '+inf', '-inf', {
-          BY: 'SCORE',
-          REV: true,
-          LIMIT: { offset: 0, count: 8 },
-        });
+        // Limit is pushed down to the ZSET, reading a few extra (2x with a +5
+        // floor) so a handful of dead entries cost no extra round trip. With
+        // limit=3 the first read asks for 8 candidates; when all are live it
+        // stops at the first 3.
+        expect(mockClient.zRangeWithScores).toHaveBeenCalledTimes(1);
+        expect(mockClient.zRangeWithScores).toHaveBeenCalledWith(
+          'axl:exec-history-z',
+          '+inf',
+          '-inf',
+          {
+            BY: 'SCORE',
+            REV: true,
+            LIMIT: { offset: 0, count: 8 },
+          },
+        );
       });
 
       it('listExecutions delivers up to `limit` live entries even when some blobs are TTL-evicted', async () => {
@@ -1737,12 +1744,12 @@ describe('RedisStore', () => {
         await store.saveEvalResult({ id: 'ev1', eval: 't', timestamp: 1000, data: {} });
         await store.saveEvalResult({ id: 'ev2', eval: 't', timestamp: 2000, data: {} });
 
-        mockClient.zRange.mockClear();
+        mockClient.zRangeWithScores.mockClear();
         mockClient.mGet.mockClear();
         const result = await store.listEvalResults();
 
         expect(result.map((e) => e.id)).toEqual(['ev2', 'ev1']);
-        expect(mockClient.zRange).toHaveBeenCalledTimes(1);
+        expect(mockClient.zRangeWithScores).toHaveBeenCalledTimes(1);
         expect(mockClient.mGet).toHaveBeenCalledTimes(1);
       });
 
@@ -1763,7 +1770,7 @@ describe('RedisStore', () => {
         const result = await store.listExecutions();
         expect(result).toEqual([]);
         // Early-out at the SCARD probe — no need to hit the ZSET or mGet
-        expect(mockClient.zRange).not.toHaveBeenCalled();
+        expect(mockClient.zRangeWithScores).not.toHaveBeenCalled();
         expect(mockClient.mGet).not.toHaveBeenCalled();
       });
     });
@@ -2058,10 +2065,12 @@ describe('RedisStore', () => {
         });
         expect(ttls.get('axl:exec-history:e1')).toBe(60 * 60 * 24 * 30);
 
-        // Index keys (SET + ZSET) do NOT get TTLs — they age out lazily
-        // as data blobs expire and reads filter nulls.
+        // Index keys never carry a TTL themselves (a TTL would drop every
+        // entry at once). Their entries are removed by the prune that runs
+        // after each save, once the record they point at has expired.
         expect(ttls.has('axl:exec-history-ids')).toBe(false);
         expect(ttls.has('axl:exec-history-z')).toBe(false);
+        expect(ttls.has('axl:exec-history-exp')).toBe(false);
       });
 
       it('saveEvalResult applies TTL via SET ... EX', async () => {
@@ -2824,8 +2833,8 @@ describe('RedisStore', () => {
       });
 
       expect(mockClient.multi).toHaveBeenCalledTimes(1);
-      // sAdd + set + zAdd — three ops, all atomic
-      expect(chains[0]._queueLength()).toBe(3);
+      // sAdd + set + zAdd + expiry-set zRem (untimed) — four ops, all atomic
+      expect(chains[0]._queueLength()).toBe(4);
     });
 
     it('saveEvalResult queues set membership + data + zAdd in one MULTI', async () => {
@@ -2833,8 +2842,8 @@ describe('RedisStore', () => {
       const chains = instrumentMulti(mockClient);
       await store.saveEvalResult({ id: 'ev1', eval: 't', timestamp: 0, data: {} });
 
-      // sAdd + set + zAdd
-      expect(chains[0]._queueLength()).toBe(3);
+      // sAdd + set + zAdd + expiry-set zRem (untimed)
+      expect(chains[0]._queueLength()).toBe(4);
     });
 
     it('deleteEvalResult queues sRem + del + zRem in one MULTI and reads del() for the boolean', async () => {
@@ -2844,8 +2853,8 @@ describe('RedisStore', () => {
       const chains = instrumentMulti(mockClient);
       const result = await store.deleteEvalResult('ev1');
 
-      // sRem + del + zRem
-      expect(chains[0]._queueLength()).toBe(3);
+      // sRem + del + zRem + expiry zRem + prune-recheck sRem
+      expect(chains[0]._queueLength()).toBe(5);
       expect(result).toBe(true);
     });
 
@@ -2854,7 +2863,7 @@ describe('RedisStore', () => {
       const chains = instrumentMulti(mockClient);
       const result = await store.deleteEvalResult('does-not-exist');
 
-      expect(chains[0]._queueLength()).toBe(3);
+      expect(chains[0]._queueLength()).toBe(5);
       expect(result).toBe(false);
     });
 

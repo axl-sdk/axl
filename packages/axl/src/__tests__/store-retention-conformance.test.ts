@@ -330,6 +330,123 @@ describe.each([memoryHarness, sqliteHarness, redisHarness])(
   },
 );
 
+/** Tie fixture T: seven runs at one startedAt between a newer and an older one. */
+const TIE_FIXTURE_ORDER = ['hi', 't-g', 't-f', 't-e', 't-d', 't-c', 't-b', 't-a', 'lo'];
+
+async function saveTieFixture(store: HistoryStore): Promise<void> {
+  // Saved in a scrambled order, so neither insertion nor id order can pass for
+  // listing order.
+  for (const id of ['t-c', 'lo', 't-a', 't-g', 'hi', 't-e', 't-b', 't-f', 't-d']) {
+    const startedAt = id === 'hi' ? 2000 : id === 'lo' ? 500 : 1000;
+    await store.saveExecution(makeExec(id, startedAt));
+  }
+}
+
+function cursorOf(e: HistoricalExecutionInfo) {
+  return { startedAt: e.startedAt, executionId: e.executionId };
+}
+
+/** Page through the whole history with `limit`, returning each page's ids. */
+async function pageAll(store: HistoryStore, limit: number): Promise<string[][]> {
+  const pages: string[][] = [];
+  let cursor: { startedAt: number; executionId: string } | undefined;
+  for (let guard = 0; guard < 100; guard++) {
+    const page = await store.listExecutions(limit, cursor ? { cursor } : undefined);
+    pages.push(page.map((e) => e.executionId));
+    if (page.length === 0) return pages;
+    cursor = cursorOf(page[page.length - 1]);
+  }
+  throw new Error('paging did not terminate');
+}
+
+describe.each([memoryHarness, sqliteHarness, redisHarness])(
+  '$name — history paging by cursor (E12, AC2.2)',
+  (factory) => {
+    it('declares historyPaging', () => {
+      expect(factory.make().store.historyPaging).toBe(true);
+    });
+
+    it('P3-02 (store level) pages through a startedAt tie group, each run exactly once', async () => {
+      const h = factory.make();
+      await saveTieFixture(h.store);
+      expect(await pageAll(h.store, 3)).toEqual([
+        ['hi', 't-g', 't-f'],
+        ['t-e', 't-d', 't-c'],
+        ['t-b', 't-a', 'lo'],
+        [],
+      ]);
+      // Page boundaries that fall mid-group at other offsets.
+      expect((await pageAll(h.store, 2)).flat()).toEqual(TIE_FIXTURE_ORDER);
+      expect((await pageAll(h.store, 4)).flat()).toEqual(TIE_FIXTURE_ORDER);
+    });
+
+    it('a cursor at the very last item returns an empty page', async () => {
+      const h = factory.make();
+      await saveTieFixture(h.store);
+      const cursor = { startedAt: 500, executionId: 'lo' };
+      expect(await h.store.listExecutions(3, { cursor })).toEqual([]);
+      expect(await h.store.listExecutions(undefined, { cursor })).toEqual([]);
+    });
+
+    it('without a limit, returns everything strictly after the cursor', async () => {
+      const h = factory.make();
+      await saveTieFixture(h.store);
+      const page = await h.store.listExecutions(undefined, {
+        cursor: { startedAt: 1000, executionId: 't-d' },
+      });
+      expect(page.map((e) => e.executionId)).toEqual(['t-c', 't-b', 't-a', 'lo']);
+    });
+
+    it('P3-04 (store level) a cursor whose run was deleted still resumes in place', async () => {
+      const h = factory.make();
+      await saveTieFixture(h.store);
+      const [, , tf] = await h.store.listExecutions(3);
+      expect(tf.executionId).toBe('t-f');
+      await h.store.deleteExecution!('t-f');
+      const page = await h.store.listExecutions(3, { cursor: cursorOf(tf) });
+      expect(page.map((e) => e.executionId)).toEqual(['t-e', 't-d', 't-c']);
+    });
+
+    it('P2-14 returns exactly `limit` live records when expired ones are interleaved', async () => {
+      const h = factory.make({ executionHistory: 60 }, 0);
+      // live-i at startedAt 10i + 5, dead-i at 10i: interleaved in listing order.
+      for (let i = 0; i < 5; i++) await h.store.saveExecution(makeExec(`dead-${i}`, 10 * i));
+      if (h.setTime) h.setTime(30_000);
+      for (let i = 0; i < 5; i++) await h.store.saveExecution(makeExec(`live-${i}`, 10 * i + 5));
+      if (h.setTime) h.setTime(60_000);
+      else for (let i = 0; i < 5; i++) h.dropExecution(`dead-${i}`);
+
+      const page = await h.store.listExecutions(5);
+      expect(page.map((e) => e.executionId)).toEqual([
+        'live-4',
+        'live-3',
+        'live-2',
+        'live-1',
+        'live-0',
+      ]);
+      const after = await h.store.listExecutions(5, { cursor: cursorOf(page[2]) });
+      expect(after.map((e) => e.executionId)).toEqual(['live-1', 'live-0']);
+    });
+
+    it('fills a page past a long run of expired records and ties', async () => {
+      const h = factory.make({ executionHistory: 60 }, 0);
+      // 30 expired runs share one startedAt with 2 live ones, newest of all.
+      for (let i = 0; i < 30; i++) {
+        await h.store.saveExecution(makeExec(`d-${String(i).padStart(2, '0')}`, 1000));
+      }
+      if (h.setTime) h.setTime(30_000);
+      await h.store.saveExecution(makeExec('a-live', 1000)); // sorts after every d-*
+      await h.store.saveExecution(makeExec('older', 900));
+      await h.store.saveExecution(makeExec('oldest', 800));
+      if (h.setTime) h.setTime(60_000);
+      else for (let i = 0; i < 30; i++) h.dropExecution(`d-${String(i).padStart(2, '0')}`);
+
+      expect(await listedIds(h.store, 2)).toEqual(['a-live', 'older']);
+      expect((await pageAll(h.store, 1)).flat()).toEqual(['a-live', 'older', 'oldest']);
+    });
+  },
+);
+
 describe.each([memoryHarness, sqliteHarness])('$name — listing order and cleanup', (factory) => {
   it('lists newest first and breaks startedAt ties by executionId descending', async () => {
     const h = factory.make();

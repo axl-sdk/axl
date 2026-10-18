@@ -10,6 +10,7 @@ import type {
   PendingDecision,
   ExecutionState,
   EvalHistoryEntry,
+  ExecutionCursor,
   HistoryTtls,
 } from './types.js';
 import { normalizePersistedSessionHistory } from '../input.js';
@@ -553,12 +554,28 @@ export class SQLiteStore implements StateStore {
     return row ? rowToExecutionInfo(row) : null;
   }
 
-  async listExecutions(limit?: number): Promise<HistoricalExecutionInfo[]> {
-    const base = `SELECT * FROM execution_history WHERE ${LIVE} ORDER BY started_at DESC, execution_id DESC`;
-    const now = this.now();
-    const rows = (
-      limit ? this.db.prepare(`${base} LIMIT ?`).all(now, limit) : this.db.prepare(base).all(now)
-    ) as ExecutionHistoryRow[];
+  /** Supports `listExecutions(limit, { cursor })`. */
+  readonly historyPaging = true;
+
+  async listExecutions(
+    limit?: number,
+    options?: { cursor?: ExecutionCursor },
+  ): Promise<HistoricalExecutionInfo[]> {
+    const cursor = options?.cursor;
+    const params: Array<number | string> = [this.now()];
+    let sql = `SELECT * FROM execution_history WHERE ${LIVE}`;
+    if (cursor !== undefined) {
+      // Strictly after the cursor in (started_at DESC, execution_id DESC)
+      // order; served by the (started_at, execution_id) index.
+      sql += ' AND (started_at < ? OR (started_at = ? AND execution_id < ?))';
+      params.push(cursor.startedAt, cursor.startedAt, cursor.executionId);
+    }
+    sql += ' ORDER BY started_at DESC, execution_id DESC';
+    if (limit) {
+      sql += ' LIMIT ?';
+      params.push(limit);
+    }
+    const rows = this.db.prepare(sql).all(...params) as ExecutionHistoryRow[];
     return rows.map(rowToExecutionInfo);
   }
 

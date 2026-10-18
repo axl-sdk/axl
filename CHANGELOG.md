@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **History retention for MemoryStore and SQLiteStore.** Both stores now take `ttls: { executionHistory, evalHistory }` in seconds, with the same meaning as on `RedisStore`, and `MemoryStore` takes `maxExecutions` to cap how many runs it keeps. Set them from runtime config with `state.memory` and `state.sqlite.ttls`. Expired runs disappear from reads and are cleaned up on later saves, along with their leftover checkpoints and saved state. Nothing expires unless you set it, and existing SQLite rows are never given an expiry. See [History retention](docs/api-reference.md#history-retention-historyttls).
+- **Page execution history by cursor.** `MemoryStore`, `SQLiteStore` and `RedisStore` accept `listExecutions(limit, { cursor: { startedAt, executionId } })` and return the page after that run, visiting runs that started in the same millisecond exactly once. Custom stores can opt in with `historyPaging: true`. See [Listing and paging history](docs/api-reference.md#listing-and-paging-history).
 
 ### Changed
 
@@ -17,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Redis listing indexes no longer grow forever.** With `ttls.executionHistory` or `ttls.evalHistory` set, `RedisStore` now removes a record's listing-index entries after the record expires, a batch on each history save. This applies to records saved from now on; entries left by records that expired earlier are cleaned up by an upcoming maintenance call.
+- **Full pages from `RedisStore`.** `listExecutions(limit)` and `listEvalResults(limit)` returned fewer than `limit` records when many indexed records had expired. They now keep reading until the page is full or the history runs out.
 - **Deleted runs stay deleted.** Deleting a run right after it finished could let its pending history save bring the run back. `runtime.deleteExecution()` now waits for that save before deleting.
 
 ## [0.26.0] - 2026-10-16

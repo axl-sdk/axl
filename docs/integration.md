@@ -88,7 +88,7 @@ const runtime = new AxlRuntime({
 });
 ```
 
-**Without TTLs, every save accumulates and Redis OOMs.** Pick `defaultTtl` based on your retention policy; override per category as needed. `streamingEvents` is opt-in only (does NOT fall back to `defaultTtl`) so a generous default doesn't TTL-evict crashed-run buffers before recovery runs. See [docs/migration/state-store-durability.md](./migration/state-store-durability.md#tldr) for the full TTL strategy and how each category's window is counted (sliding, fixed from the first write, or restarted on every save).
+**Without TTLs, every save accumulates and Redis OOMs.** Pick `defaultTtl` based on your retention policy; override per category as needed. With `executionHistory` and `evalHistory` set, the history listing indexes shrink along with the records: each history save removes a batch of expired entries. `streamingEvents` is opt-in only (does NOT fall back to `defaultTtl`) so a generous default doesn't TTL-evict crashed-run buffers before recovery runs. See [docs/migration/state-store-durability.md](./migration/state-store-durability.md#tldr) for the full TTL strategy and how each category's window is counted (sliding, fixed from the first write, or restarted on every save).
 
 ### SQLiteStore and MemoryStore: history retention
 

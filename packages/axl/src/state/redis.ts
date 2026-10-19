@@ -18,7 +18,6 @@ import type {
 import { AxlError } from '../errors.js';
 import { normalizePersistedSessionHistory } from '../input.js';
 import { getExecutionEventSchemaVersion, normalizeStoredExecution } from '../event-schema.js';
-import { randomUUID } from 'node:crypto';
 import { warnDiagnosticOnce } from '../schema-diagnostics.js';
 import {
   PRUNE_BATCH,
@@ -107,6 +106,9 @@ interface RedisClient {
   // which is what we want for the multi-key writes (saveSession,
   // saveExecution, etc.) that previously could half-commit on failure.
   multi(): RedisMulti;
+  // EVAL runs a Lua script atomically. Only PRUNE_HISTORY_INDEX_SCRIPT uses
+  // it; every key the script touches is passed in `keys`.
+  eval(script: string, options: { keys: string[]; arguments: string[] }): Promise<unknown>;
   quit(): Promise<void>;
   // node-redis reports its socket state here and rejects a QUIT once the
   // client is closed. Optional because a caller may inject a minimal client
@@ -287,10 +289,6 @@ type HistoryKind = 'execution' | 'eval';
  * - `expiry`: sorted set scored by the record's expiry (epoch ms). Only timed
  *   records are in it. The prune reads it to find index entries whose record
  *   may have expired.
- * - `recheckTokens` / `recheckBatch(token)`: each prune writes the ids it
- *   removes to its own batch key and registers the batch's token. It deletes
- *   only its own batch once re-checked, so a batch left by a prune that
- *   crashed survives until a later prune re-checks it.
  */
 type HistoryIndex = {
   kind: HistoryKind;
@@ -298,14 +296,47 @@ type HistoryIndex = {
   ids: string;
   time: string;
   expiry: string;
-  recheckTokens: string;
-  recheckBatch(token: string): string;
   dataKey(id: string): string;
-  /** The listing score stored in a record's blob, or `null` if unreadable. */
-  timeScoreOf(raw: string): number | null;
   /** When the record in a blob was last saved, as far as it shows, or `null`. */
   lastSavedAtOf(raw: string): number | null;
 };
+
+/**
+ * Index cleanup for one kind of history, run with EVAL so each id is checked
+ * and updated atomically with respect to saves and deletes.
+ *
+ * KEYS: `[ids, time, expiry, dataKey(id_1), …, dataKey(id_n)]`.
+ * ARGV: `[nowMs, id_1, …, id_n]`. For each id, by its blob's PTTL:
+ *
+ * - `-2` (blob gone): remove the id from all three index keys.
+ * - `-1` (live, no TTL): remove it from the expiry set only.
+ * - otherwise (live, timed): re-score its expiry entry to now + PTTL.
+ *
+ * It never adds to the id set or the time sorted set and never writes a
+ * blob, so a missing blob is the only reason an id leaves the listing and a
+ * deleted record cannot be indexed again. Returns how many ids it removed.
+ *
+ * Exported for tests only; not part of the public API.
+ */
+export const PRUNE_HISTORY_INDEX_SCRIPT = `
+local now = tonumber(ARGV[1])
+local removed = 0
+for i = 2, #ARGV do
+  local id = ARGV[i]
+  local pttl = redis.call('PTTL', KEYS[i + 2])
+  if pttl == -2 then
+    redis.call('SREM', KEYS[1], id)
+    redis.call('ZREM', KEYS[2], id)
+    redis.call('ZREM', KEYS[3], id)
+    removed = removed + 1
+  elseif pttl == -1 then
+    redis.call('ZREM', KEYS[3], id)
+  else
+    redis.call('ZADD', KEYS[3], string.format('%d', now + pttl), id)
+  end
+end
+return removed
+`;
 
 /** A position in a history sorted set: score, then member. */
 type HistoryPosition = { score: number; id: string };
@@ -623,7 +654,7 @@ export class RedisStore implements StateStore {
   }
 
   // The legacy id set and the sorted set below always change together (save,
-  // delete, prune, re-index), so the slow-path guard `ZCARD >= SCARD` in
+  // delete, prune), so the slow-path guard `ZCARD >= SCARD` in
   // `listHistoryByZset` and backfill stays meaningful.
   private execHistorySetKey(): string {
     return `${this.keyPrefix}exec-history-ids`;
@@ -661,13 +692,7 @@ export class RedisStore implements StateStore {
         ids: this.execHistorySetKey(),
         time: this.execHistoryZsetKey(),
         expiry: `${this.keyPrefix}exec-history-exp`,
-        recheckTokens: `${this.keyPrefix}exec-history-prune-recheck-tokens`,
-        recheckBatch: (token) => `${this.keyPrefix}exec-history-prune-recheck:${token}`,
         dataKey: (id) => this.execHistoryKey(id),
-        timeScoreOf: (raw) => {
-          const startedAt = (JSON.parse(raw) as HistoricalExecutionInfo).startedAt;
-          return typeof startedAt === 'number' ? startedAt : null;
-        },
         lastSavedAtOf: (raw) => {
           const record = JSON.parse(raw) as HistoricalExecutionInfo;
           return typeof record.startedAt === 'number' ? executionLastSavedAt(record) : null;
@@ -680,13 +705,7 @@ export class RedisStore implements StateStore {
       ids: this.evalHistorySetKey(),
       time: this.evalHistoryZsetKey(),
       expiry: `${this.keyPrefix}eval-history-exp`,
-      recheckTokens: `${this.keyPrefix}eval-history-prune-recheck-tokens`,
-      recheckBatch: (token) => `${this.keyPrefix}eval-history-prune-recheck:${token}`,
       dataKey: (id) => this.evalHistoryKey(id),
-      timeScoreOf: (raw) => {
-        const timestamp = (JSON.parse(raw) as EvalHistoryEntry).timestamp;
-        return typeof timestamp === 'number' ? timestamp : null;
-      },
       // Eval retention counts from the first write, which is the row's timestamp.
       lastSavedAtOf: (raw) => {
         const timestamp = (JSON.parse(raw) as EvalHistoryEntry).timestamp;
@@ -1372,37 +1391,21 @@ export class RedisStore implements StateStore {
   //
   // Index members cannot carry a TTL, so when a history record expires its
   // entries in the id set and the time sorted set stay behind. Every history
-  // save runs one bounded prune of its kind:
-  //
-  //   0. Re-check batches other prunes registered and have not cleared:
-  //      they may have crashed between steps 3 and 4.
-  //   1. Read up to PRUNE_BATCH ids from the expiry sorted set whose expiry
-  //      has passed.
-  //   2. MGET their blobs.
-  //   3. For ids whose blob is gone, in one MULTI: remove them from the id
-  //      set, the time sorted set and the expiry sorted set, write them to
-  //      this prune's own batch key and register its token. A missing blob
-  //      is the only reason an id is removed.
-  //   4. Re-check those ids: a save of the same id that landed between steps
-  //      2 and 3 has a live blob whose index entries step 3 just removed.
-  //      Re-index every id whose blob is live again (see recheckPrunedIds)
-  //      and delete this prune's batch key and token, in one MULTI.
-  //
-  // Batches are per prune, not per kind: a prune deletes only its own batch,
-  // so it can never clear ids another prune removed after this one read
-  // them. Re-checking a batch whose prune is still running is harmless: a
-  // re-save that matters landed before that prune's removal MULTI, so it is
-  // visible to any re-check that can see the batch.
-  //
-  // The prune never writes a blob, so it cannot bring back deleted data, and
-  // every step is idempotent, so several instances pruning at once is safe.
-  // There is no Lua or WATCH in the client interface (WATCH would need a
-  // dedicated connection), which is why the re-check exists.
+  // save runs one bounded prune of its kind: it reads up to PRUNE_BATCH ids
+  // whose expiry has passed from the expiry sorted set, then runs
+  // PRUNE_HISTORY_INDEX_SCRIPT over them. The script checks each record's blob
+  // and updates the indexes in one atomic step, so a save or delete landing
+  // between the read and the script cannot be undone by it: a record saved
+  // again is seen live and stays listed, and a deleted one is already gone.
+  // The script only removes index entries and re-scores expiry entries; it
+  // never adds a listing entry or writes a blob, so it cannot bring back
+  // deleted data. Several instances pruning at once is safe.
 
   /**
    * Run one prune of `index`'s kind after a save. A prune failure does not
    * fail the save, whose MULTI already committed the record: it is reported
-   * once per process and the next save of that kind tries again.
+   * once per process and the next save of that kind tries again. That also
+   * covers a Redis user whose ACL denies `EVAL`.
    */
   private async pruneHistoryAfterSave(index: HistoryIndex): Promise<void> {
     const inFlight = (this.prunesInFlight ??= new Set());
@@ -1415,9 +1418,10 @@ export class RedisStore implements StateStore {
         `redis_history_prune_failed\0${index.kind}`,
         `RedisStore: removing expired ${index.label} index entries failed ` +
           `(${err instanceof Error ? err.message : String(err)}). The record was saved; ` +
-          'the next save retries the cleanup. Listings stay correct meanwhile.',
+          'the next save retries the cleanup. Listings stay correct meanwhile. The cleanup ' +
+          'runs a Lua script, so the Redis user needs permission to run EVAL.',
         undefined,
-        'docs/integration.md#redisstore-keyprefix-ttls-and-crash-recovery',
+        'docs/api-reference.md#redisstore-options',
       );
     } finally {
       inFlight.delete(index.kind);
@@ -1425,62 +1429,25 @@ export class RedisStore implements StateStore {
   }
 
   private async pruneHistory(index: HistoryIndex): Promise<void> {
-    await this.recheckLeftoverBatches(index, PRUNE_BATCH);
-
     const candidates = await this.client.zRange(index.expiry, '-inf', Date.now(), {
       BY: 'SCORE',
       LIMIT: { offset: 0, count: PRUNE_BATCH },
     });
-    if (candidates.length === 0) return;
-    const raws = await this.client.mGet(candidates.map((id) => index.dataKey(id)));
-    const dead = candidates.filter((_, i) => raws[i] == null);
-    const live = candidates.filter((_, i) => raws[i] != null);
-
-    if (dead.length > 0) await this.removeDeadIndexEntries(index, dead);
-    if (live.length > 0) await this.rescoreLiveExpiryEntries(index, live);
+    if (candidates.length > 0) await this.runPruneScript(index, candidates);
   }
 
   /**
-   * Steps 3 and 4 of the prune for `dead`, ids whose blob was found missing:
-   * remove them from all three index keys under a new recheck batch, then
-   * re-check them.
+   * Run {@link PRUNE_HISTORY_INDEX_SCRIPT} over `ids`, at most PRUNE_BATCH
+   * per call so one script never blocks the server for long.
    */
-  private async removeDeadIndexEntries(index: HistoryIndex, dead: string[]): Promise<void> {
-    const token = randomUUID();
-    await this.client
-      .multi()
-      .sRem(index.ids, dead)
-      .zRem(index.time, dead)
-      .zRem(index.expiry, dead)
-      .sAdd(index.recheckBatch(token), dead)
-      .sAdd(index.recheckTokens, token)
-      .exec();
-    await this.recheckPrunedIds(index, dead, [token]);
-  }
-
-  /**
-   * Re-check batches registered by earlier prunes, about `maxIds` ids at
-   * most, in chunks of about one batch. Any registered batch may belong to a
-   * prune that crashed. Only the tokens registered when the call starts are
-   * considered.
-   */
-  private async recheckLeftoverBatches(index: HistoryIndex, maxIds: number): Promise<void> {
-    const tokens = await this.client.sMembers(index.recheckTokens);
-    let taken: string[] = [];
-    let ids = new Set<string>();
-    let checked = 0;
-    for (const token of tokens) {
-      for (const id of await this.client.sMembers(index.recheckBatch(token))) ids.add(id);
-      taken.push(token);
-      if (ids.size >= PRUNE_BATCH) {
-        await this.recheckPrunedIds(index, [...ids], taken);
-        checked += ids.size;
-        taken = [];
-        ids = new Set();
-        if (checked >= maxIds) return;
-      }
+  private async runPruneScript(index: HistoryIndex, ids: string[]): Promise<void> {
+    for (let start = 0; start < ids.length; start += PRUNE_BATCH) {
+      const chunk = ids.slice(start, start + PRUNE_BATCH);
+      await this.client.eval(PRUNE_HISTORY_INDEX_SCRIPT, {
+        keys: [index.ids, index.time, index.expiry, ...chunk.map((id) => index.dataKey(id))],
+        arguments: [String(Date.now()), ...chunk],
+      });
     }
-    if (taken.length > 0) await this.recheckPrunedIds(index, [...ids], taken);
   }
 
   // ── History maintenance ────────────────────────────────────────────────
@@ -1490,8 +1457,6 @@ export class RedisStore implements StateStore {
    *
    * 1. On the first call of a walk (no cursor), backfills the time sorted
    *    set from the id set if it is behind (see `backfillExecutionIndex`).
-   *    Every call then re-checks the recheck batches registered so far, so
-   *    batches left by crashed prunes are cleared.
    * 2. Reads the next `batchSize` ids from the time sorted set, oldest first
    *    by `(score, member)`, strictly after the cursor. The read restarts at
    *    the cursor's position by value, never by offset.
@@ -1506,10 +1471,10 @@ export class RedisStore implements StateStore {
    *      it. A window that has already passed uses a timestamp in the past,
    *      which makes Redis delete the key, again only if it is still untimed.
    * 5. Adds each newly armed record to the expiry set (`ZADD NX`).
-   * 6. Removes ids whose blob is gone, and ids just deleted in step 4, with
-   *    the prune's removal and re-check (`removeDeadIndexEntries`), so a
-   *    record re-saved at any point stays listed and a deleted one is never
-   *    re-indexed.
+   * 6. Runs the prune script (`PRUNE_HISTORY_INDEX_SCRIPT`) over ids whose
+   *    blob is gone and ids just deleted in step 4. It checks each blob
+   *    atomically, so a record re-saved at any point stays listed and a
+   *    deleted one is never re-indexed.
    *
    * Blobs are never written. A record deleted while the call runs can leave
    * an entry in the expiry set only; the next prune removes it.
@@ -1523,7 +1488,6 @@ export class RedisStore implements StateStore {
       if (kind === 'executions') await this.backfillExecutionIndex();
       else await this.backfillEvalIndex();
     }
-    await this.recheckLeftoverBatches(index, Infinity);
 
     const positions = await this.readRetentionBatch(index, cursor, batchSize + 1);
     const batch = positions.slice(0, batchSize);
@@ -1609,7 +1573,7 @@ export class RedisStore implements StateStore {
     result.expired = expiredIds.length;
     result.deadIndexEntries = dead.length;
     if (dead.length > 0 || expiredIds.length > 0) {
-      await this.removeDeadIndexEntries(index, [...dead, ...expiredIds]);
+      await this.runPruneScript(index, [...dead, ...expiredIds]);
     }
     return result;
   }
@@ -1641,79 +1605,6 @@ export class RedisStore implements StateStore {
       LIMIT: { offset: 0, count: count - ties.length },
     });
     return [...ties, ...rest];
-  }
-
-  /**
-   * Re-index the ids among `ids` whose blob is live, then delete the batches
-   * named by `tokens`. The blob's remaining TTL decides what is written:
-   *
-   * - `-2`: the record was deleted after the MGET. Nothing is re-indexed.
-   * - `-1`: the record is untimed. It goes back in the id set and the time
-   *   sorted set, and stays out of the expiry set.
-   * - positive: it goes back in all three, with expiry `now + PTTL`.
-   *
-   * The time score comes from the blob (`startedAt` / `timestamp`), so a
-   * re-indexed record keeps its place in the listing.
-   */
-  private async recheckPrunedIds(
-    index: HistoryIndex,
-    ids: string[],
-    tokens: string[],
-  ): Promise<void> {
-    const raws = ids.length > 0 ? await this.client.mGet(ids.map((id) => index.dataKey(id))) : [];
-    const live: Array<{ id: string; timeScore: number }> = [];
-    for (let i = 0; i < ids.length; i++) {
-      const raw = raws[i];
-      if (raw == null) continue;
-      let timeScore: number | null;
-      try {
-        timeScore = index.timeScoreOf(raw);
-      } catch {
-        timeScore = null;
-      }
-      // A blob without a usable score cannot be listed anyway.
-      if (timeScore !== null) live.push({ id: ids[i], timeScore });
-    }
-    const pttls = await Promise.all(live.map((r) => this.client.pTTL(index.dataKey(r.id))));
-    const now = Date.now();
-    const tx = this.client.multi();
-    for (let i = 0; i < live.length; i++) {
-      const pttl = pttls[i];
-      if (pttl === -2) continue;
-      const { id, timeScore } = live[i];
-      tx.sAdd(index.ids, id).zAdd(index.time, { score: timeScore, value: id });
-      if (pttl > 0) tx.zAdd(index.expiry, { score: now + pttl, value: id });
-    }
-    tx.del(tokens.map((token) => index.recheckBatch(token))).sRem(index.recheckTokens, tokens);
-    await tx.exec();
-  }
-
-  /**
-   * Fix the expiry score of live records the expiry set says have expired.
-   * A normal re-save already moves the score, so this only matters when a
-   * blob's TTL changed without going through this store (an older Axl
-   * version re-saving it, an operator's PERSIST, or clock skew between this
-   * process and the server). Without it, such entries would sit at the head
-   * of the expiry set and fill every prune batch. Only the expiry set is
-   * touched, never the listing indexes.
-   */
-  private async rescoreLiveExpiryEntries(index: HistoryIndex, ids: string[]): Promise<void> {
-    const pttls = await Promise.all(ids.map((id) => this.client.pTTL(index.dataKey(id))));
-    const now = Date.now();
-    const tx = this.client.multi();
-    let queued = 0;
-    for (let i = 0; i < ids.length; i++) {
-      const pttl = pttls[i];
-      if (pttl === -1) {
-        tx.zRem(index.expiry, ids[i]);
-        queued++;
-      } else if (pttl > 0) {
-        tx.zAdd(index.expiry, { score: now + pttl, value: ids[i] });
-        queued++;
-      }
-      // -2: deleted or expired since the MGET; the next prune removes it.
-    }
-    if (queued > 0) await tx.exec();
   }
 
   // ── Sessions (Studio introspection) ────────────────────────────────────

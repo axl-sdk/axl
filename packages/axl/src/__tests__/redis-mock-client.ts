@@ -3,7 +3,7 @@
  * the store unit tests. Moved unchanged from `state.test.ts`.
  */
 import { vi } from 'vitest';
-import { RedisStore } from '../state/redis.js';
+import { PRUNE_HISTORY_INDEX_SCRIPT, RedisStore } from '../state/redis.js';
 
 type ZRangeOptions = {
   BY?: 'SCORE' | 'LEX';
@@ -499,6 +499,38 @@ export function createRedisStoreWithMockClient(keyPrefix = 'axl:', ttlConfig?: M
       return seconds === undefined ? -1 : Math.round(seconds * 1000);
     }),
     multi: vi.fn(() => createMockMulti(data, hashData, setData, zsetData, ttls, listData)),
+    // EVAL: the mock knows exactly one script, PRUNE_HISTORY_INDEX_SCRIPT,
+    // and runs a JS copy of it synchronously, so nothing interleaves with it
+    // (Redis runs a script atomically). Any other script is a test bug.
+    eval: vi.fn(async (script: string, options: { keys: string[]; arguments: string[] }) => {
+      if (script !== PRUNE_HISTORY_INDEX_SCRIPT) {
+        throw new Error('redis mock: EVAL supports only PRUNE_HISTORY_INDEX_SCRIPT');
+      }
+      const [idsKey, timeKey, expiryKey, ...dataKeys] = options.keys;
+      const [nowArg, ...ids] = options.arguments;
+      if (dataKeys.length !== ids.length) {
+        throw new Error('redis mock: prune script needs one data key per id');
+      }
+      const now = Number(nowArg);
+      let removed = 0;
+      for (const [i, id] of ids.entries()) {
+        const key = dataKeys[i];
+        const exists = data.has(key) || hashData.has(key) || listData.has(key);
+        const seconds = ttls.get(key);
+        if (!exists) {
+          setData.get(idsKey)?.delete(id);
+          zsetData.get(timeKey)?.delete(id);
+          zsetData.get(expiryKey)?.delete(id);
+          removed++;
+        } else if (seconds === undefined) {
+          zsetData.get(expiryKey)?.delete(id);
+        } else {
+          if (!zsetData.has(expiryKey)) zsetData.set(expiryKey, new Map());
+          zsetData.get(expiryKey)!.set(id, now + Math.round(seconds * 1000));
+        }
+      }
+      return removed;
+    }),
     quit: vi.fn(async () => {
       if (!clientOpen) throw new Error('The client is closed');
       clientOpen = false;

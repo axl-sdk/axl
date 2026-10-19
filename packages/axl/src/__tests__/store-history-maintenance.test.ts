@@ -577,21 +577,6 @@ describe('RedisStore applyHistoryRetention index repair', () => {
     for (const key of [IDS, TIME, EXPIRY]) expect(r.indexed(key, 'expired')).toBe(false);
   });
 
-  it('drains recheck batches left by crashed prunes', async () => {
-    const r = setup();
-    // A prune removed `Y` from the indexes, registered its batch and died
-    // before re-checking; `Y` is live.
-    r.data.set(blob('Y'), JSON.stringify(makeExec('Y', T0 - 1000)));
-    r.setData.set('axl:exec-history-prune-recheck-tokens', new Set(['crashed']));
-    r.setData.set('axl:exec-history-prune-recheck:crashed', new Set(['Y']));
-
-    await runToCompletion(r.store, 'executions');
-
-    expect(await listedIds(r.store)).toEqual(['Y']);
-    expect(r.setData.get('axl:exec-history-prune-recheck-tokens')?.size ?? 0).toBe(0);
-    expect(r.setData.has('axl:exec-history-prune-recheck:crashed')).toBe(false);
-  });
-
   it('backfills the time index on the first call when it is behind the id set', async () => {
     const r = setup();
     r.plant('a', T0 - HOUR);
@@ -612,11 +597,11 @@ describe('RedisStore applyHistoryRetention index repair', () => {
       executionHistory: TTL_S,
     }) as unknown as Store;
 
-    const atRemove = gated.pauseAt('remove-multi');
+    const atRemove = gated.pauseAt('eval-prune');
     const run = runToCompletion(maintainer, 'executions');
     await atRemove;
     await r.store.saveExecution(makeExec('Y', T0 - HOUR));
-    gated.release('remove-multi');
+    gated.release('eval-prune');
     expect(await run).toMatchObject({ deadIndexEntries: 1 });
 
     expect(await listedIds(r.store)).toEqual(['Y']);
@@ -693,7 +678,7 @@ describe('RedisStore applyHistoryRetention index repair', () => {
     const first = await maintainer.applyHistoryRetention({ kind: 'executions', batchSize: 4 });
     // The second batch arms its records, then the connection drops before
     // they are added to the expiry set.
-    gated.failAt('rescore-multi');
+    gated.failAt('expiry-index-multi');
     await expect(
       maintainer.applyHistoryRetention({ kind: 'executions', batchSize: 4, cursor: first.cursor }),
     ).rejects.toThrow(/ECONNRESET/);

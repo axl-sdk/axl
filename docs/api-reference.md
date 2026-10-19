@@ -2210,11 +2210,11 @@ Per store:
 |-------|-------|
 | `MemoryStore` | Every record is saved under the retention the store was built with, so a run finds nothing to change. The method exists so the same maintenance code works on every built-in store |
 | `SQLiteStore` | Acts on rows whose `expires_at` is `NULL` |
-| `RedisStore` | Also adds records already timed before 0.27.0 to its expiry index (`indexed`), removes listing entries whose record is gone (`deadIndexEntries`), re-checks cleanup batches a crashed cleanup left behind, and on the first call of a walk backfills the time index if it is behind (see `skipMigration`). The members that share the cursor's `startedAt` are read in full on each call. Needs the same Redis version as the rest of `RedisStore` (see [RedisStore options](#redisstore-options)) |
+| `RedisStore` | Also adds records already timed before 0.27.0 to its expiry index (`indexed`), removes listing entries whose record is gone (`deadIndexEntries`), and on the first call of a walk backfills the time index if it is behind (see `skipMigration`). The members that share the cursor's `startedAt` are read in full on each call. Needs the same Redis version and `EVAL` permission as the rest of `RedisStore` (see [RedisStore options](#redisstore-options)); without `EVAL` the call fails |
 
 ### RedisStore options
 
-`RedisStore` requires Redis 7.0 or newer.
+`RedisStore` requires Redis 7.0 or newer. It cleans up history listing indexes with a small Lua script, so the Redis user also needs permission to run `EVAL`. If your ACL denies scripting, saves still succeed, the indexes are not cleaned up, and the store prints a one-time warning per history kind saying the cleanup failed.
 
 `RedisStore.create()` accepts either a URL string (back-compat) or an options object:
 

@@ -757,16 +757,7 @@ The prefix is concatenated as-given — no normalization. Include a trailing col
 
 **TTLs are strongly recommended in production** — without them every `save*` accumulates forever and Redis eventually OOMs. Sliding window: `memory`, `session`, `sessionMeta` (every write refreshes; reads do NOT). Fixed from the first write: `checkpoint`, `streamingEvents`, `evalHistory` (re-saves and corrections keep an eval row's expiry). Restarted on every save: `executionState`, `executionHistory`. `streamingEvents` is opt-in only (does NOT fall back to `defaultTtl`). See [api-reference.md](../../docs/api-reference.md#redisstore-options) for the full table.
 
-`MemoryStore` and `SQLiteStore` take the same history retention. `MemoryStore` keeps the newest 1 000 executions by default; change it with `maxExecutions` (`Infinity` keeps all). `SQLiteStore` and `RedisStore` warn once until you choose an execution retention (`null` to keep forever):
-
-```typescript
-new AxlRuntime({ state: { store: 'memory', memory: { maxExecutions: 10_000 } } });
-new AxlRuntime({
-  state: { store: 'sqlite', sqlite: { path: './data/axl.db', ttls: { executionHistory: 30 * 86_400 } } },
-});
-```
-
-See [History retention](../../docs/api-reference.md#history-retention-historyttls). To apply a retention to history saved before you set it, run `store.applyHistoryRetention()` once: see [Execution history retention](../../docs/migration/execution-history-retention.md).
+`MemoryStore` and `SQLiteStore` take the same `ttls.executionHistory` / `ttls.evalHistory`; `MemoryStore` keeps the newest 1 000 runs by default (`maxExecutions`). See the [execution history retention guide](../../docs/migration/execution-history-retention.md).
 
 #### Crash survival: `state.persist: 'streaming'`
 

@@ -88,70 +88,29 @@ const runtime = new AxlRuntime({
 });
 ```
 
-**Without TTLs, every save accumulates and Redis OOMs.** Pick `defaultTtl` based on your retention policy; override per category as needed. Until execution history has a retention (`ttls.executionHistory`, `null` to keep forever, or `defaultTtl`), the store warns once per process. With `executionHistory` and `evalHistory` set, the history listing indexes shrink along with the records: history saves clean up expired entries a batch at a time. `streamingEvents` is opt-in only (does NOT fall back to `defaultTtl`) so a generous default doesn't TTL-evict crashed-run buffers before recovery runs. See [docs/migration/state-store-durability.md](./migration/state-store-durability.md#tldr) for the full TTL strategy and how each category's window is counted (sliding, fixed from the first write, or restarted on every save).
+**Without TTLs, every save accumulates and Redis OOMs.** Pick `defaultTtl` based on your retention policy and override per category as needed. `streamingEvents` is opt-in only (it does not fall back to `defaultTtl`), so a generous default can't expire crashed-run buffers before recovery runs. See [state store durability](./migration/state-store-durability.md#tldr) for how each category's window is counted.
 
 `keyPrefix` is the storage-layer isolation primitive for shared Redis clusters. Avoid Redis glob metacharacters (`*`, `?`, `[`, `]`) in the prefix; operators running `redis-cli SCAN MATCH` would otherwise have to escape them.
 
-### SQLiteStore and MemoryStore: history retention
+### Execution history: retention and paging
 
-`SQLiteStore` keeps execution and eval history forever unless you set a retention, and warns once per process until `ttls.executionHistory` is set (`null` to keep forever). `MemoryStore` keeps the newest 1 000 runs by default (`maxExecutions`) and no time limit. Both take the same `ttls.executionHistory` / `ttls.evalHistory` (seconds, `null` = keep forever) as `RedisStore`, with the same windows:
+Every built-in store takes the same history retention, so you can keep, say, 30 days of runs:
 
 ```ts
 const runtime = new AxlRuntime({
   state: {
     store: 'sqlite',
-    sqlite: { path: './data/axl.db', ttls: { executionHistory: 60 * 60 * 24 * 30 } },
+    sqlite: { path: './data/axl.db', ttls: { executionHistory: 30 * 24 * 60 * 60 } },
   },
 });
-
-// In-memory: raise the run cap (default 1 000; Infinity keeps all), optionally with a retention too
-const dev = new AxlRuntime({ state: { memory: { maxExecutions: 10_000 } } });
 ```
 
-Expired records stop appearing in reads immediately and are removed from storage on later saves, along with the run's leftover checkpoints and saved state. Records written before you set a retention keep no expiry until you apply it to them (next section). Details: [History retention](./api-reference.md#history-retention-historyttls).
+- **Defaults.** Nothing expires unless you set a retention. `SQLiteStore` and `RedisStore` warn once until you choose one (`null` keeps history forever on purpose). `MemoryStore` keeps the newest 1 000 runs (`state.memory.maxExecutions`).
+- **History you already have** keeps no expiry until you run `store.applyHistoryRetention()` once, for example from a deploy script.
+- **Shared stores.** `runtime.getExecutions()` and `getExecution(id)` read the store on every call, so app instances sharing a store see the same runs and deletes.
+- **Large histories.** Pass `{ limit, cursor }` to `getExecutions()` to read a page at a time.
 
-### Applying retention to history you already have
-
-A retention applies to runs saved from then on; an upgrade never deletes or changes existing history. To bring existing records under the retention, and to clean up Redis listing indexes left by older versions, run the maintenance call once, for example from a deploy script:
-
-```ts
-const store = runtime.getStateStore();
-let cursor: HistoryRetentionCursor | null = null;
-do {
-  const result = await store.applyHistoryRetention!({ kind: 'executions', cursor });
-  cursor = result.cursor;
-} while (cursor !== null);
-```
-
-It works one batch at a time, can be stopped and resumed from the returned `cursor`, and is safe to run while the app serves traffic. Axl never runs it automatically. See [Execution history retention](./migration/execution-history-retention.md#apply-retention-to-records-you-already-have).
-
-### Listing history across instances
-
-Every `runtime.getExecutions()` and `runtime.getExecution(id)` call reads the store, so app instances sharing one store see the same history: runs finished on any instance appear everywhere, and a run deleted on one instance, or expired by the store, is gone from all of them on the next call. The runtime keeps only running runs and runs whose save has not landed yet, so its memory does not grow with history.
-
-Page through large histories with `limit` and a cursor built from the last item:
-
-```ts
-const page1 = await runtime.getExecutions({ limit: 100 });
-const last = page1.at(-1);
-const page2 = last
-  ? await runtime.getExecutions({
-      limit: 100,
-      cursor: { startedAt: last.startedAt, executionId: last.executionId },
-    })
-  : [];
-```
-
-How a page is read depends on the store:
-
-| Store | How `getExecutions()` reads it |
-|---|---|
-| Built-in stores, or a custom store with `historyPaging: true` | The store returns one page for the cursor |
-| Custom store with `listExecutions` but no `historyPaging` | The runtime lists the whole history and pages in process. Correct, but each page reads everything |
-| Custom store with `listExecutions` but no `getExecution` | `getExecution(id)` scans the listing (by page with `historyPaging`, otherwise in full), so every listed run can be fetched. Add `getExecution` for cheap by-id reads |
-| Custom store without `saveExecution` or `listExecutions` | The runtime keeps up to `state.recentExecutionsCacheSize` recent runs (default 1 000) in process and serves the missing reads from them. History is limited to running runs plus those recent runs, and is per instance |
-
-See [`getExecutions`](./api-reference.md#execution-history) for the exact ordering and the cursor type.
+The [execution history retention guide](./migration/execution-history-retention.md) covers each of these with examples. Writing a custom store? Implement `getExecution` and set `historyPaging: true` with cursor support in `listExecutions` so reads stay cheap; see [optional StateStore methods](./api-reference.md#optional-methods).
 
 ### Boot wiring: recovery before accepting new work
 

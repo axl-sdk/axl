@@ -57,8 +57,7 @@ const runtime = new AxlRuntime({
   },
 });
 
-// Boot sequence: lazy-load THEN recover THEN accept new work
-await runtime.getExecutions(); // hydrate history cache
+// Boot sequence: recover THEN accept new work
 const recovered = await runtime.recoverIncompleteStreams();
 console.log(`Recovered ${recovered.length} crashed executions`);
 // Now safe to accept new requests
@@ -143,7 +142,10 @@ Without TTLs, every save accumulates forever and Redis eventually OOMs. Categori
 **Window semantics:**
 - **Sliding** (`memory`, `session`, `sessionMeta`): every write resets the TTL. Active users keep their data; inactive users forget. Reads do NOT refresh — pair with a no-op write per turn if you need read-as-activity.
 - **Fixed-creation** (`checkpoint`, `streamingEvents`): TTL set on first write via `EXPIRE NX`. Subsequent writes don't extend the window — the hash ages out together with the run it belongs to.
-- **Fixed-refresh** (`executionState`, `executionHistory`, `evalHistory`): TTL via `SET ... EX`, refreshes on overwrite. `executionState` is retained for application-managed state compatibility; Axl does not automatically resume it.
+- **Restarted on save** (`executionState`, `executionHistory`): TTL via `SET ... EX`, so every save restarts the window. `executionState` is retained for application-managed state compatibility; Axl does not automatically resume it.
+- **Fixed from first write** (`evalHistory`): a re-save keeps the remaining TTL and `updateEvalResult` keeps it too, so corrections never extend an eval row's life. A row that exists without a TTL stays untimed.
+
+`MemoryStore` and `SQLiteStore` accept the same `ttls.executionHistory` / `ttls.evalHistory` with the same windows; see [History retention](../api-reference.md#history-retention-historyttls).
 
 **`streamingEvents` is opt-in only.** It does NOT fall back to `defaultTtl`. The TTL is the safety net for operators who forget to wire `runtime.recoverIncompleteStreams()` into startup — auto-applying a generous default would silently TTL-evict crashed-run buffers before recovery had a chance to run. **Must be longer than your max process-restart-gap** or recovery misses.
 
@@ -151,7 +153,9 @@ Without TTLs, every save accumulates forever and Redis eventually OOMs. Categori
 
 #### Sorted-set perf
 
-`listExecutions(limit)` and `listEvalResults(limit)` now use `ZREVRANGEBYSCORE` + `MGET` — one indexed range lookup + one pipelined bulk fetch, regardless of total entry count. Over-fetches by 2× (with a +5 floor) when `limit` is set so TTL drift between the ZSET and data blobs doesn't silently under-deliver.
+`listExecutions(limit)` and `listEvalResults(limit)` now use `ZREVRANGEBYSCORE` + `MGET` — one indexed range lookup + one pipelined bulk fetch, regardless of total entry count. When `limit` is set, the store keeps reading until it has `limit` live records, so entries whose record has expired never shorten a page.
+
+**The indexes shrink with their records.** With a history retention set, each history save also removes listing entries for up to 100 expired records, so the indexes stay proportional to the history you keep. Records saved without a TTL are never touched. To clean up entries from before the upgrade, run `store.applyHistoryRetention()` once; see [Execution history retention](./execution-history-retention.md#apply-retention-to-records-you-already-have).
 
 **Upgrade path is automatic.** On `RedisStore.create()`, a one-time lazy backfill populates the sorted-set from the legacy ID set. Cheap when there's nothing to do (two ZCARD calls); a few seconds for installs with sub-10k entries. For six-figure deployments, pass `skipMigration: true` and run `await store.backfillExecutionIndex()` / `backfillEvalIndex()` during a maintenance window. While the ZSET is behind, reads fall back to the legacy slow path — correct but slower.
 

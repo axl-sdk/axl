@@ -1401,9 +1401,11 @@ export type ExecutionInfoV1 = {
    *  (or `runtime.stream()`'s `options.metadata`). Persisted as part of the
    *  `ExecutionInfo` snapshot so callers have a stable, queryable surface for
    *  tags like `userId`, `tenantId`, or correlation ids without parsing the
-   *  event timeline. Filter via `runtime.getExecutions()` + an in-process
-   *  `.filter()`; secondary indexes on this field are intentionally not
-   *  provided — `StateStore` is a persistence boundary, not a query engine. */
+   *  event timeline. Filter in process while paging with
+   *  `runtime.getExecutions({ limit, cursor })` (see
+   *  docs/migration/execution-history-retention.md); secondary indexes on this
+   *  field are intentionally not provided — `StateStore` is a persistence
+   *  boundary, not a query engine. */
   metadata?: Record<string, unknown>;
 };
 

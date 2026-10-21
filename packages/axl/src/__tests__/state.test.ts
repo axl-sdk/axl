@@ -7,6 +7,7 @@ import type { ChatMessage } from '../types.js';
 import { MemoryStore } from '../state/memory.js';
 import { SQLiteStore } from '../state/sqlite.js';
 import { RedisStore } from '../state/redis.js';
+import { createMockMulti, createRedisStoreWithMockClient } from './redis-mock-client.js';
 
 // Clean up the MemoryStore temp file between tests to prevent state leaking
 const AWAIT_HUMAN_TEMP_FILE = join(tmpdir(), 'axl-memory-store', 'await-human-state.json');
@@ -974,442 +975,6 @@ describe('SQLiteStore', () => {
 // ═════════════════════════════════════════════════════════════════════════
 
 describe('RedisStore', () => {
-  /**
-   * Build a chainable mock RedisMulti that queues commands and applies them
-   * on `.exec()`. Mirrors node-redis v5's RedisMulti shape (set/del/sAdd/
-   * sRem/hDel + exec) at the surface we use.
-   *
-   * Two callers reach this: the mock client's `multi()` builds one with
-   * the shared backing Maps; tests that want to inspect the queue can
-   * spy on the returned chain.
-   */
-  function createMockMulti(
-    data: Map<string, string>,
-    hashData: Map<string, Map<string, string>>,
-    setData: Map<string, Set<string>>,
-    zsetData: Map<string, Map<string, number>>,
-    ttls: Map<string, number>,
-    listData: Map<string, string[]>,
-  ) {
-    type QueuedOp = () => unknown;
-    const queue: QueuedOp[] = [];
-    const chain = {
-      set(key: string, value: string, options?: { EX?: number; PX?: number }) {
-        queue.push(() => {
-          data.set(key, value);
-          // The side map is in seconds; PX arrives in milliseconds.
-          if (options?.EX !== undefined) ttls.set(key, options.EX);
-          else if (options?.PX !== undefined) ttls.set(key, options.PX / 1000);
-          else ttls.delete(key);
-          return 'OK';
-        });
-        return chain;
-      },
-      hSet(key: string, field: string, value: string) {
-        queue.push(() => {
-          if (!hashData.has(key)) hashData.set(key, new Map());
-          hashData.get(key)!.set(field, value);
-          return 1;
-        });
-        return chain;
-      },
-      expire(key: string, seconds: number, mode?: 'NX' | 'XX' | 'GT' | 'LT') {
-        queue.push(() => {
-          const existing = ttls.get(key);
-          if (mode === 'NX' && existing !== undefined) return 0;
-          if (mode === 'XX' && existing === undefined) return 0;
-          ttls.set(key, seconds);
-          return 1;
-        });
-        return chain;
-      },
-      del(key: string | string[]) {
-        queue.push(() => {
-          const keys = Array.isArray(key) ? key : [key];
-          let count = 0;
-          for (const k of keys) {
-            if (data.delete(k)) count++;
-            if (hashData.delete(k)) count++;
-            if (listData.delete(k)) count++;
-          }
-          return count;
-        });
-        return chain;
-      },
-      sAdd(key: string, member: string | string[]) {
-        queue.push(() => {
-          if (!setData.has(key)) setData.set(key, new Set());
-          const members = Array.isArray(member) ? member : [member];
-          let count = 0;
-          for (const m of members) {
-            if (!setData.get(key)!.has(m)) {
-              setData.get(key)!.add(m);
-              count++;
-            }
-          }
-          return count;
-        });
-        return chain;
-      },
-      sRem(key: string, member: string | string[]) {
-        queue.push(() => {
-          const set = setData.get(key);
-          if (!set) return 0;
-          const members = Array.isArray(member) ? member : [member];
-          let count = 0;
-          for (const m of members) {
-            if (set.delete(m)) count++;
-          }
-          return count;
-        });
-        return chain;
-      },
-      hDel(key: string, field: string | string[]) {
-        queue.push(() => {
-          const map = hashData.get(key);
-          if (!map) return 0;
-          const fields = Array.isArray(field) ? field : [field];
-          let count = 0;
-          for (const f of fields) {
-            if (map.delete(f)) count++;
-          }
-          return count;
-        });
-        return chain;
-      },
-      zAdd(key: string, member: { score: number; value: string }) {
-        queue.push(() => {
-          if (!zsetData.has(key)) zsetData.set(key, new Map());
-          const set = zsetData.get(key)!;
-          const isNew = !set.has(member.value);
-          set.set(member.value, member.score);
-          return isNew ? 1 : 0;
-        });
-        return chain;
-      },
-      zRem(key: string, member: string | string[]) {
-        queue.push(() => {
-          const set = zsetData.get(key);
-          if (!set) return 0;
-          const members = Array.isArray(member) ? member : [member];
-          let count = 0;
-          for (const m of members) {
-            if (set.delete(m)) count++;
-          }
-          return count;
-        });
-        return chain;
-      },
-      rPush(key: string, values: string | string[]) {
-        queue.push(() => {
-          if (!listData.has(key)) listData.set(key, []);
-          const list = listData.get(key)!;
-          const arr = Array.isArray(values) ? values : [values];
-          for (const v of arr) list.push(v);
-          return list.length;
-        });
-        return chain;
-      },
-      async exec(): Promise<unknown[]> {
-        // Apply queued ops in order. A real Redis MULTI is atomic — we
-        // don't simulate failure scenarios here, but the per-op results
-        // match the node-redis return convention.
-        return queue.map((op) => op());
-      },
-    };
-    // Test-only inspection hook. Non-enumerable so it doesn't appear in
-    // Object.keys/JSON.stringify and can't be mistaken for production API.
-    Object.defineProperty(chain, '_queueLength', {
-      enumerable: false,
-      value: () => queue.length,
-    });
-    return chain as typeof chain & { _queueLength: () => number };
-  }
-
-  /**
-   * Create a RedisStore with a mock in-memory client, bypassing the
-   * private constructor via Object.create and injecting a mock client.
-   *
-   * @param keyPrefix - Override the default `'axl:'` prefix to exercise
-   * the keyPrefix option without hitting a real Redis.
-   */
-  function createRedisStoreWithMockClient(
-    keyPrefix = 'axl:',
-    ttlConfig?: Partial<{
-      session: number | null;
-      sessionMeta: number | null;
-      checkpoint: number | null;
-      executionState: number | null;
-      executionHistory: number | null;
-      evalHistory: number | null;
-      memory: number | null;
-      streamingEvents: number | null;
-    }>,
-  ) {
-    const data = new Map<string, string>();
-    const hashData = new Map<string, Map<string, string>>();
-
-    const setData = new Map<string, Set<string>>();
-    // Sorted set: member → score. We re-sort by score on read; production
-    // Redis maintains a skiplist for O(log N), but the mock just sorts on demand.
-    const zsetData = new Map<string, Map<string, number>>();
-    // Tracks the TTL last applied to each key (seconds, not absolute time).
-    // The mock doesn't simulate actual expiration — tests assert what was set.
-    const ttls = new Map<string, number>();
-    // Lists for streaming-event persistence (RPUSH / LRANGE).
-    const listData = new Map<string, string[]>();
-    // node-redis exposes an open socket as `isOpen` and rejects a QUIT on a
-    // closed client; a real Redis run proved it, so the mock reproduces it.
-    let clientOpen = true;
-
-    const mockClient = {
-      get isOpen() {
-        return clientOpen;
-      },
-      hSet: vi.fn(async (key: string, field: string, value: string) => {
-        if (!hashData.has(key)) hashData.set(key, new Map());
-        hashData.get(key)!.set(field, value);
-        return 1;
-      }),
-      // HSETNX semantics: set field only if it doesn't already exist.
-      // Returns 1 (set) or 0 (already existed). Mirrors node-redis v5 behavior.
-      hSetNX: vi.fn(async (key: string, field: string, value: string) => {
-        if (!hashData.has(key)) hashData.set(key, new Map());
-        const map = hashData.get(key)!;
-        if (map.has(field)) return 0;
-        map.set(field, value);
-        return 1;
-      }),
-      // node-redis returns undefined (not null) for missing hash fields
-      hGet: vi.fn(async (key: string, field: string): Promise<string | undefined> => {
-        return hashData.get(key)?.get(field);
-      }),
-      hGetAll: vi.fn(async (key: string) => {
-        const map = hashData.get(key);
-        if (!map || map.size === 0) return {};
-        return Object.fromEntries(map.entries());
-      }),
-      hDel: vi.fn(async (key: string, field: string | string[]) => {
-        const map = hashData.get(key);
-        if (!map) return 0;
-        const fields = Array.isArray(field) ? field : [field];
-        let count = 0;
-        for (const f of fields) {
-          if (map.delete(f)) count++;
-        }
-        return count;
-      }),
-      // SET with optional EX (TTL in seconds). The mock records the EX value
-      // on a side-map so tests can assert "TTL was set with the right value"
-      // without simulating real wall-clock expiration (which would make tests
-      // flaky and slow).
-      set: vi.fn(
-        async (
-          key: string,
-          value: string,
-          options?: { EX?: number; PX?: number; XX?: boolean; KEEPTTL?: boolean },
-        ) => {
-          // XX: only overwrite an existing key. Redis returns null and writes
-          // nothing when the key is absent.
-          if (options?.XX === true && !data.has(key)) return null;
-          data.set(key, value);
-          // KEEPTTL leaves whatever TTL the key already had.
-          if (options?.KEEPTTL === true) return 'OK';
-          if (options?.EX !== undefined) ttls.set(key, options.EX);
-          else if (options?.PX !== undefined) ttls.set(key, options.PX / 1000);
-          else ttls.delete(key); // SET without EX clears any existing TTL
-          return 'OK';
-        },
-      ),
-      // EXPIRE applies a TTL to an existing key. With `mode: 'NX'`, only
-      // sets if no TTL exists (used for fixed-window hash-backed data).
-      // Without mode, always (re)sets — used for sliding-window memory.
-      expire: vi.fn(async (key: string, seconds: number, mode?: 'NX' | 'XX' | 'GT' | 'LT') => {
-        const existing = ttls.get(key);
-        if (mode === 'NX' && existing !== undefined) return 0;
-        if (mode === 'XX' && existing === undefined) return 0;
-        // GT/LT not used by RedisStore today — fall through to set
-        ttls.set(key, seconds);
-        return 1;
-      }),
-      get: vi.fn(async (key: string) => {
-        return data.get(key) ?? null;
-      }),
-      del: vi.fn(async (key: string | string[]) => {
-        const keys = Array.isArray(key) ? key : [key];
-        let count = 0;
-        for (const k of keys) {
-          if (data.delete(k)) count++;
-          if (hashData.delete(k)) count++;
-          if (listData.delete(k)) count++;
-        }
-        return count;
-      }),
-      sAdd: vi.fn(async (key: string, member: string | string[]) => {
-        if (!setData.has(key)) setData.set(key, new Set());
-        const members = Array.isArray(member) ? member : [member];
-        let count = 0;
-        for (const m of members) {
-          if (!setData.get(key)!.has(m)) {
-            setData.get(key)!.add(m);
-            count++;
-          }
-        }
-        return count;
-      }),
-      sRem: vi.fn(async (key: string, member: string | string[]) => {
-        const set = setData.get(key);
-        if (!set) return 0;
-        const members = Array.isArray(member) ? member : [member];
-        let count = 0;
-        for (const m of members) {
-          if (set.delete(m)) count++;
-        }
-        return count;
-      }),
-      sMembers: vi.fn(async (key: string) => {
-        return [...(setData.get(key) ?? [])];
-      }),
-      sCard: vi.fn(async (key: string) => {
-        return setData.get(key)?.size ?? 0;
-      }),
-      rPush: vi.fn(async (key: string, values: string | string[]) => {
-        if (!listData.has(key)) listData.set(key, []);
-        const list = listData.get(key)!;
-        const arr = Array.isArray(values) ? values : [values];
-        for (const v of arr) list.push(v);
-        return list.length;
-      }),
-      lRange: vi.fn(async (key: string, start: number, stop: number) => {
-        const list = listData.get(key);
-        if (!list) return [];
-        const end = stop < 0 ? list.length + stop : stop;
-        return list.slice(start, end + 1);
-      }),
-      mGet: vi.fn(async (keys: string[]): Promise<Array<string | null>> => {
-        return keys.map((k) => data.get(k) ?? null);
-      }),
-      // ZADD semantics: if member is new, add and return 1; if member
-      // exists, update score and return 0. node-redis v5 returns the
-      // count of NEW members.
-      zAdd: vi.fn(async (key: string, member: { score: number; value: string }) => {
-        if (!zsetData.has(key)) zsetData.set(key, new Map());
-        const set = zsetData.get(key)!;
-        const isNew = !set.has(member.value);
-        set.set(member.value, member.score);
-        return isNew ? 1 : 0;
-      }),
-      zCard: vi.fn(async (key: string) => {
-        return zsetData.get(key)?.size ?? 0;
-      }),
-      zRem: vi.fn(async (key: string, member: string | string[]) => {
-        const set = zsetData.get(key);
-        if (!set) return 0;
-        const members = Array.isArray(member) ? member : [member];
-        let count = 0;
-        for (const m of members) {
-          if (set.delete(m)) count++;
-        }
-        return count;
-      }),
-      // ZRANGE: the node-redis v5 parameterized form. With
-      // BY:'SCORE' + REV:true this is the "ZREVRANGEBYSCORE" semantic.
-      // Production accepts any bounds; this mock only handles the
-      // '+inf' / '-inf' pair that our store uses, plus optional LIMIT.
-      // (The dedicated `zRevRangeByScore` method exists in node-redis v4
-      // but was removed in v5 — caught by the REDIS_URL-gated integration
-      // test suite.)
-      zRange: vi.fn(
-        async (
-          key: string,
-          start: number | string,
-          stop: number | string,
-          options?: {
-            BY?: 'SCORE' | 'LEX';
-            REV?: boolean;
-            LIMIT?: { offset: number; count: number };
-          },
-        ) => {
-          const set = zsetData.get(key);
-          if (!set) return [];
-          let entries = [...set.entries()];
-          // BY:SCORE filters by score; REV reverses (start/stop swap meaning).
-          // For our usage (start: '+inf', stop: '-inf', BY: 'SCORE', REV: true),
-          // we want everything in descending score order. Numeric bounds are
-          // also supported for completeness, mirroring real Redis.
-          if (options?.BY === 'SCORE') {
-            if (options.REV) {
-              const max = start;
-              const min = stop;
-              if (max !== '+inf' && typeof max !== 'string')
-                entries = entries.filter(([, score]) => score <= (max as number));
-              if (min !== '-inf' && typeof min !== 'string')
-                entries = entries.filter(([, score]) => score >= (min as number));
-              entries.sort((a, b) => b[1] - a[1]);
-            } else {
-              const min = start;
-              const max = stop;
-              if (min !== '-inf' && typeof min !== 'string')
-                entries = entries.filter(([, score]) => score >= (min as number));
-              if (max !== '+inf' && typeof max !== 'string')
-                entries = entries.filter(([, score]) => score <= (max as number));
-              entries.sort((a, b) => a[1] - b[1]);
-            }
-          } else {
-            // BY undefined → index-based (we don't use this path in production)
-            entries.sort((a, b) => a[1] - b[1]);
-            if (options?.REV) entries.reverse();
-          }
-          if (options?.LIMIT) {
-            entries = entries.slice(
-              options.LIMIT.offset,
-              options.LIMIT.offset + options.LIMIT.count,
-            );
-          }
-          return entries.map(([value]) => value);
-        },
-      ),
-      // multi() returns a chain object. Queue commands; on .exec(), apply
-      // them all atomically against the same backing Maps. Real Redis
-      // MULTI/EXEC is all-or-nothing, but our mock isn't simulating that
-      // — it just guarantees the queued ops run together without other
-      // mock interleaving (which is what callers actually care about).
-      // PTTL in milliseconds, with Redis's two sentinel values: -2 (no such
-      // key) and -1 (key exists, no TTL). The mock stores TTLs in seconds on a
-      // side map, so convert; `getEvalRetention` distinguishes all three.
-      pTTL: vi.fn(async (key: string) => {
-        const exists = data.has(key) || hashData.has(key) || listData.has(key);
-        if (!exists) return -2;
-        const seconds = ttls.get(key);
-        return seconds === undefined ? -1 : seconds * 1000;
-      }),
-      multi: vi.fn(() => createMockMulti(data, hashData, setData, zsetData, ttls, listData)),
-      quit: vi.fn(async () => {
-        if (!clientOpen) throw new Error('The client is closed');
-        clientOpen = false;
-      }),
-    };
-
-    // Bypass the private constructor and inject the mock client.
-    // Resolve TTLs the same way the factory does: per-category override
-    // beats default beats null (no TTL).
-    const store = Object.create(RedisStore.prototype) as RedisStore;
-    (store as any).client = mockClient;
-    (store as any).keyPrefix = keyPrefix;
-    (store as any).ttls = {
-      session: ttlConfig?.session ?? null,
-      sessionMeta: ttlConfig?.sessionMeta ?? null,
-      checkpoint: ttlConfig?.checkpoint ?? null,
-      executionState: ttlConfig?.executionState ?? null,
-      executionHistory: ttlConfig?.executionHistory ?? null,
-      evalHistory: ttlConfig?.evalHistory ?? null,
-      memory: ttlConfig?.memory ?? null,
-      streamingEvents: ttlConfig?.streamingEvents ?? null,
-    };
-
-    return { store, mockClient, data, hashData, setData, zsetData, ttls, listData };
-  }
-
   describe('keyPrefix', () => {
     it('uses the default "axl:" prefix when none is provided', async () => {
       const { store, mockClient } = createRedisStoreWithMockClient();
@@ -1938,12 +1503,13 @@ describe('RedisStore', () => {
       await store.deleteExecution('e1');
       expect(captured).toHaveLength(1);
       // Per-execution surfaces deleted together: history-set sRem + history
-      // blob del + history zRem + checkpoint del + exec-state del +
-      // pending-exec-set sRem + streaming-events del + streaming-ids sRem +
-      // decisions hash hDel = 9. Full sweep prevents resurrection via the
-      // streaming buffer and closes the GDPR right-to-be-forgotten leak
-      // path (no pending decision left behind for awaitHuman runs).
-      expect(captured[0]._queueLength()).toBe(9);
+      // blob del + history zRem + expiry zRem + checkpoint del +
+      // exec-state del + pending-exec-set sRem + streaming-events del +
+      // streaming-ids sRem + decisions hash hDel = 10.
+      // Full sweep prevents resurrection via the streaming buffer and closes
+      // the GDPR right-to-be-forgotten leak path (no pending decision left
+      // behind for awaitHuman runs).
+      expect(captured[0]._queueLength()).toBe(10);
 
       // No single-op delete commands escaped the MULTI
       expect(mockClient.sRem).not.toHaveBeenCalled();
@@ -2116,7 +1682,7 @@ describe('RedisStore', () => {
         const { store, mockClient } = createRedisStoreWithMockClient();
         for (let i = 0; i < 5; i++) await store.saveExecution(makeExec(`e${i}`, i * 100));
 
-        mockClient.zRange.mockClear();
+        mockClient.zRangeWithScores.mockClear();
         mockClient.mGet.mockClear();
         mockClient.get.mockClear();
 
@@ -2124,7 +1690,7 @@ describe('RedisStore', () => {
 
         expect(result.map((e) => e.executionId)).toEqual(['e4', 'e3', 'e2', 'e1', 'e0']);
         // Fast path: exactly ONE zRevRangeByScore + ONE mGet
-        expect(mockClient.zRange).toHaveBeenCalledTimes(1);
+        expect(mockClient.zRangeWithScores).toHaveBeenCalledTimes(1);
         expect(mockClient.mGet).toHaveBeenCalledTimes(1);
         // And NO per-ID get() — the legacy N+1 path
         expect(mockClient.get).not.toHaveBeenCalled();
@@ -2134,20 +1700,26 @@ describe('RedisStore', () => {
         const { store, mockClient } = createRedisStoreWithMockClient();
         for (let i = 0; i < 10; i++) await store.saveExecution(makeExec(`e${i}`, i * 100));
 
-        mockClient.zRange.mockClear();
+        mockClient.zRangeWithScores.mockClear();
         const result = await store.listExecutions(3);
 
         expect(result).toHaveLength(3);
         expect(result.map((e) => e.executionId)).toEqual(['e9', 'e8', 'e7']);
-        // Limit is pushed down to the ZSET with over-fetch (2x with +5 floor)
-        // so that TTL evictions between ZRANGE and MGET don't silently
-        // under-deliver. With limit=3 we fetch up to 8 candidates and stop
-        // at the first 3 non-null parsed rows.
-        expect(mockClient.zRange).toHaveBeenCalledWith('axl:exec-history-z', '+inf', '-inf', {
-          BY: 'SCORE',
-          REV: true,
-          LIMIT: { offset: 0, count: 8 },
-        });
+        // Limit is pushed down to the ZSET, reading a few extra (2x with a +5
+        // floor) so a handful of dead entries cost no extra round trip. With
+        // limit=3 the first read asks for 8 candidates; when all are live it
+        // stops at the first 3.
+        expect(mockClient.zRangeWithScores).toHaveBeenCalledTimes(1);
+        expect(mockClient.zRangeWithScores).toHaveBeenCalledWith(
+          'axl:exec-history-z',
+          '+inf',
+          '-inf',
+          {
+            BY: 'SCORE',
+            REV: true,
+            LIMIT: { offset: 0, count: 8 },
+          },
+        );
       });
 
       it('listExecutions delivers up to `limit` live entries even when some blobs are TTL-evicted', async () => {
@@ -2172,12 +1744,12 @@ describe('RedisStore', () => {
         await store.saveEvalResult({ id: 'ev1', eval: 't', timestamp: 1000, data: {} });
         await store.saveEvalResult({ id: 'ev2', eval: 't', timestamp: 2000, data: {} });
 
-        mockClient.zRange.mockClear();
+        mockClient.zRangeWithScores.mockClear();
         mockClient.mGet.mockClear();
         const result = await store.listEvalResults();
 
         expect(result.map((e) => e.id)).toEqual(['ev2', 'ev1']);
-        expect(mockClient.zRange).toHaveBeenCalledTimes(1);
+        expect(mockClient.zRangeWithScores).toHaveBeenCalledTimes(1);
         expect(mockClient.mGet).toHaveBeenCalledTimes(1);
       });
 
@@ -2198,7 +1770,7 @@ describe('RedisStore', () => {
         const result = await store.listExecutions();
         expect(result).toEqual([]);
         // Early-out at the SCARD probe — no need to hit the ZSET or mGet
-        expect(mockClient.zRange).not.toHaveBeenCalled();
+        expect(mockClient.zRangeWithScores).not.toHaveBeenCalled();
         expect(mockClient.mGet).not.toHaveBeenCalled();
       });
     });
@@ -2493,10 +2065,12 @@ describe('RedisStore', () => {
         });
         expect(ttls.get('axl:exec-history:e1')).toBe(60 * 60 * 24 * 30);
 
-        // Index keys (SET + ZSET) do NOT get TTLs — they age out lazily
-        // as data blobs expire and reads filter nulls.
+        // Index keys never carry a TTL themselves (a TTL would drop every
+        // entry at once). Their entries are removed by the prune that runs
+        // after each save, once the record they point at has expired.
         expect(ttls.has('axl:exec-history-ids')).toBe(false);
         expect(ttls.has('axl:exec-history-z')).toBe(false);
+        expect(ttls.has('axl:exec-history-exp')).toBe(false);
       });
 
       it('saveEvalResult applies TTL via SET ... EX', async () => {
@@ -3259,8 +2833,8 @@ describe('RedisStore', () => {
       });
 
       expect(mockClient.multi).toHaveBeenCalledTimes(1);
-      // sAdd + set + zAdd — three ops, all atomic
-      expect(chains[0]._queueLength()).toBe(3);
+      // sAdd + set + zAdd + expiry-set zRem (untimed) — four ops, all atomic
+      expect(chains[0]._queueLength()).toBe(4);
     });
 
     it('saveEvalResult queues set membership + data + zAdd in one MULTI', async () => {
@@ -3268,8 +2842,8 @@ describe('RedisStore', () => {
       const chains = instrumentMulti(mockClient);
       await store.saveEvalResult({ id: 'ev1', eval: 't', timestamp: 0, data: {} });
 
-      // sAdd + set + zAdd
-      expect(chains[0]._queueLength()).toBe(3);
+      // sAdd + set + zAdd + expiry-set zRem (untimed)
+      expect(chains[0]._queueLength()).toBe(4);
     });
 
     it('deleteEvalResult queues sRem + del + zRem in one MULTI and reads del() for the boolean', async () => {
@@ -3279,8 +2853,8 @@ describe('RedisStore', () => {
       const chains = instrumentMulti(mockClient);
       const result = await store.deleteEvalResult('ev1');
 
-      // sRem + del + zRem
-      expect(chains[0]._queueLength()).toBe(3);
+      // sRem + del + zRem + expiry zRem
+      expect(chains[0]._queueLength()).toBe(4);
       expect(result).toBe(true);
     });
 
@@ -3289,7 +2863,7 @@ describe('RedisStore', () => {
       const chains = instrumentMulti(mockClient);
       const result = await store.deleteEvalResult('does-not-exist');
 
-      expect(chains[0]._queueLength()).toBe(3);
+      expect(chains[0]._queueLength()).toBe(4);
       expect(result).toBe(false);
     });
 

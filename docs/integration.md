@@ -88,21 +88,40 @@ const runtime = new AxlRuntime({
 });
 ```
 
-**Without TTLs, every save accumulates and Redis OOMs.** Pick `defaultTtl` based on your retention policy; override per category as needed. `streamingEvents` is opt-in only (does NOT fall back to `defaultTtl`) so a generous default doesn't TTL-evict crashed-run buffers before recovery runs. See [docs/migration/state-store-durability.md](./migration/state-store-durability.md#tldr) for the full TTL strategy + window semantics (sliding vs. fixed-creation vs. fixed-refresh).
+**Without TTLs, every save accumulates and Redis OOMs.** Pick `defaultTtl` based on your retention policy and override per category as needed. `streamingEvents` is opt-in only (it does not fall back to `defaultTtl`), so a generous default can't expire crashed-run buffers before recovery runs. See [state store durability](./migration/state-store-durability.md#tldr) for how each category's window is counted.
 
 `keyPrefix` is the storage-layer isolation primitive for shared Redis clusters. Avoid Redis glob metacharacters (`*`, `?`, `[`, `]`) in the prefix; operators running `redis-cli SCAN MATCH` would otherwise have to escape them.
+
+### Execution history: retention and paging
+
+Every built-in store takes the same history retention, so you can keep, say, 30 days of runs:
+
+```ts
+const runtime = new AxlRuntime({
+  state: {
+    store: 'sqlite',
+    sqlite: { path: './data/axl.db', ttls: { executionHistory: 30 * 24 * 60 * 60 } },
+  },
+});
+```
+
+- **Defaults.** Nothing expires unless you set a retention. `SQLiteStore` and `RedisStore` warn once until you choose one (`null` keeps history forever on purpose). `MemoryStore` keeps the newest 1 000 runs (`state.memory.maxExecutions`).
+- **History you already have** keeps no expiry until you run `store.applyHistoryRetention()` once, for example from a deploy script.
+- **Shared stores.** `runtime.getExecutions()` and `getExecution(id)` read the store on every call, so app instances sharing a store see the same runs and deletes.
+- **Large histories.** Pass `{ limit, cursor }` to `getExecutions()` to read a page at a time.
+
+The [execution history retention guide](./migration/execution-history-retention.md) covers each of these with examples. Writing a custom store? Implement `getExecution` and set `historyPaging: true` with cursor support in `listExecutions` so reads stay cheap; see [optional StateStore methods](./api-reference.md#optional-methods).
 
 ### Boot wiring: recovery before accepting new work
 
 ```ts
-// 1. Hydrate the historical cache so recovery's "canonical exists" branch can fire
-await runtime.getExecutions();
-
-// 2. Reconstruct partial ExecutionInfos for crashed runs (if persist: 'streaming')
+// 1. Reconstruct partial ExecutionInfos for crashed runs (if persist: 'streaming').
+//    Each buffered run is checked against the store by id, so a run that
+//    already has a final record is skipped.
 const recovered = await runtime.recoverIncompleteStreams();
 console.log(`[boot] recovered ${recovered.length} crashed executions`);
 
-// 3. NOW accept new requests
+// 2. NOW accept new requests
 app.listen(3000);
 ```
 
@@ -151,14 +170,21 @@ app.post('/run', async (req, res) => {
   res.json(result);
 });
 
-// GDPR delete handler
+// GDPR delete handler: walk history a page at a time
 app.delete('/users/:id/data', async (req, res) => {
-  const execs = await runtime.getExecutions();
-  const userRuns = execs.filter((e) => e.metadata?.userId === req.params.id);
-  for (const e of userRuns) {
-    await runtime.deleteExecution(e.executionId);
-  }
-  res.json({ deleted: userRuns.length });
+  let deleted = 0;
+  let cursor: ExecutionCursor | undefined;
+  do {
+    const page = await runtime.getExecutions({ limit: 500, cursor });
+    for (const e of page) {
+      if (e.metadata?.userId !== req.params.id) continue;
+      await runtime.deleteExecution(e.executionId);
+      deleted++;
+    }
+    const last = page.at(-1);
+    cursor = last && { startedAt: last.startedAt, executionId: last.executionId };
+  } while (cursor);
+  res.json({ deleted });
 });
 
 // Audit trail
@@ -263,9 +289,10 @@ expire server-side while this process is offline. Stores therefore expose:
 getEvalRetention?(id: string): Promise<{ exists: boolean; expiresAt?: number }>;
 ```
 
-`MemoryStore` and `SQLiteStore` report existence with no expiry; `RedisStore`
-derives both from `PTTL`, so a configured `ttls.evalHistory` is mirrored onto
-the artifact as an absolute `expiresAt`.
+On every built-in store a configured `ttls.evalHistory` is mirrored onto the
+artifact as an absolute `expiresAt`. `MemoryStore` and `SQLiteStore` report the
+expiry they stored when the row was first written; `RedisStore` derives it from
+`PTTL`. With no eval retention, the row and its artifact never expire.
 
 **Re-saving an existing eval result never extends its retention.** Only a
 genuinely new row gets the configured `ttls.evalHistory` window; an existing one
@@ -286,9 +313,9 @@ the store:
 
 | Store | How | Note |
 |---|---|---|
-| `RedisStore` | `SET key value XX KEEPTTL` | **Requires Redis ≥ 6.0** for `KEEPTTL`. Nothing else in `RedisStore` does |
-| `SQLiteStore` | `UPDATE … WHERE id = ?` | no expiry, so a resurrection here would be permanent |
-| `MemoryStore` | presence check, then set | as above |
+| `RedisStore` | `SET key value XX KEEPTTL` | Covered by `RedisStore`'s Redis 7.0 requirement (see [RedisStore options](./api-reference.md#redisstore-options)) |
+| `SQLiteStore` | `UPDATE … WHERE id = ?` and not expired | a resurrected row would start a new retention window, or none at all without `ttls.evalHistory` |
+| `MemoryStore` | live-row check, then set | as above |
 | a custom store | omit it | corrections are then **not persisted at all**; the in-process cache is still corrected |
 
 On a Redis older than 6.0 the server rejects `KEEPTTL`, and the store raises an

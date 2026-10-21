@@ -5,10 +5,27 @@ import type {
   HistoricalExecutionInfo,
   HumanDecision,
 } from '../types.js';
-import type { StateStore, PendingDecision, ExecutionState, EvalHistoryEntry } from './types.js';
+import type {
+  StateStore,
+  PendingDecision,
+  ExecutionState,
+  EvalHistoryEntry,
+  ExecutionCursor,
+  HistoryRetentionCursor,
+  HistoryRetentionOptions,
+  HistoryRetentionResult,
+} from './types.js';
 import { AxlError } from '../errors.js';
 import { normalizePersistedSessionHistory } from '../input.js';
 import { getExecutionEventSchemaVersion, normalizeStoredExecution } from '../event-schema.js';
+import { warnDiagnosticOnce } from '../schema-diagnostics.js';
+import {
+  PRUNE_BATCH,
+  executionLastSavedAt,
+  resolveHistoryRetentionOptions,
+  retentionForUntimedRecord,
+  warnExecutionRetentionUnset,
+} from './retention.js';
 
 // Minimal interface for the node-redis client methods we use.
 // Avoids a hard compile-time dependency on the redis package.
@@ -71,11 +88,27 @@ interface RedisClient {
       LIMIT?: { offset: number; count: number };
     },
   ): Promise<string[]>;
+  // Same range as zRange, with each member's score. Listing pages by
+  // (score, member), so it needs the score of every member it reads,
+  // including members whose data blob is already gone.
+  zRangeWithScores(
+    key: string,
+    start: number | string,
+    stop: number | string,
+    options?: {
+      BY?: 'SCORE' | 'LEX';
+      REV?: boolean;
+      LIMIT?: { offset: number; count: number };
+    },
+  ): Promise<Array<{ value: string; score: number }>>;
   // multi() opens a transaction. Queued commands execute atomically on
   // exec() — a crash mid-MULTI leaves none of the queued writes applied,
   // which is what we want for the multi-key writes (saveSession,
   // saveExecution, etc.) that previously could half-commit on failure.
   multi(): RedisMulti;
+  // EVAL runs a Lua script atomically. Only PRUNE_HISTORY_INDEX_SCRIPT uses
+  // it; every key the script touches is passed in `keys`.
+  eval(script: string, options: { keys: string[]; arguments: string[] }): Promise<unknown>;
   quit(): Promise<void>;
   // node-redis reports its socket state here and rejects a QUIT once the
   // client is closed. Optional because a caller may inject a minimal client
@@ -96,8 +129,18 @@ interface RedisMulti {
   hSet(key: string, field: string, value: string): RedisMulti;
   hDel(key: string, field: string | string[]): RedisMulti;
   expire(key: string, seconds: number, mode?: 'NX' | 'XX' | 'GT' | 'LT'): RedisMulti;
-  zAdd(key: string, member: { score: number; value: string }): RedisMulti;
+  // `condition: 'NX'` only adds members that are not there yet (ZADD NX);
+  // the reply is the number of members added.
+  zAdd(
+    key: string,
+    member: { score: number; value: string },
+    options?: { condition?: 'NX' | 'XX' },
+  ): RedisMulti;
   zRem(key: string, member: string | string[]): RedisMulti;
+  // PEXPIREAT sets an absolute expiry in epoch ms. With `mode: 'NX'` it only
+  // applies to a key with no TTL; a timestamp in the past deletes the key
+  // (still subject to NX). Reply 1 if applied, 0 if not. Redis 7.0+ for NX.
+  pExpireAt(key: string, msTimestamp: number, mode?: 'NX' | 'XX' | 'GT' | 'LT'): RedisMulti;
   rPush(key: string, values: string | string[]): RedisMulti;
   // exec() returns the per-command results in queued order. We don't
   // type-narrow individual results because the callers that need a result
@@ -183,11 +226,19 @@ export interface RedisStoreOptions {
    *   new ones) eventually ages out. If you need read-activity to count
    *   as "active," issue a no-op `ctx.remember` against a sentinel key
    *   per session turn.
-   * - **Fixed window**: `checkpoint`, `executionState`, `executionHistory`,
-   *   `evalHistory`. The TTL is set on the first write and isn't extended
-   *   on subsequent writes (via `EXPIRE ... NX`). Designed for runtime-
-   *   controlled lifecycles like executions, where the data should age
-   *   out on a schedule from creation.
+   * - **Fixed from the first write**: `checkpoint`, `streamingEvents`
+   *   (`EXPIRE ... NX`) and `evalHistory` (a re-save re-applies the remaining
+   *   `PTTL`; `updateEvalResult` uses `KEEPTTL`). Later writes never extend
+   *   the window, and an eval row that exists without a TTL stays untimed.
+   * - **Restarted on every save**: `executionState`, `executionHistory`
+   *   (`SET ... EX`). An execution record is kept for the full window after
+   *   its last save, which is normally when the run finished.
+   *
+   * `executionHistory` and `evalHistory` have the same meaning as the
+   * `ttls` option of `MemoryStore` and `SQLiteStore` (see `HistoryTtls`).
+   * With neither `executionHistory` (any value, `null` included) nor
+   * {@link defaultTtl} set, `create()` warns once per process that
+   * execution history is kept forever.
    */
   ttls?: {
     session?: number | null;
@@ -228,6 +279,96 @@ type TtlCategory =
 /** Resolved per-category TTL (seconds), or `null` for "no TTL". */
 type ResolvedTtls = Record<TtlCategory, number | null>;
 
+type HistoryKind = 'execution' | 'eval';
+
+/**
+ * The keys behind one kind of history (executions or eval results):
+ *
+ * - `ids`: legacy id set, kept for the slow listing path and backfill.
+ * - `time`: sorted set scored by `startedAt` / `timestamp`; drives listing.
+ * - `expiry`: sorted set scored by the record's expiry (epoch ms). Only timed
+ *   records are in it. The prune reads it to find index entries whose record
+ *   may have expired.
+ */
+type HistoryIndex = {
+  kind: HistoryKind;
+  label: string;
+  ids: string;
+  time: string;
+  expiry: string;
+  dataKey(id: string): string;
+  /** When the record in a blob was last saved, as far as it shows, or `null`. */
+  lastSavedAtOf(raw: string): number | null;
+};
+
+/**
+ * Index cleanup for one kind of history, run with EVAL so each id is checked
+ * and updated atomically with respect to saves and deletes.
+ *
+ * KEYS: `[ids, time, expiry, dataKey(id_1), …, dataKey(id_n)]`.
+ * ARGV: `[nowMs, id_1, …, id_n]`. For each id, by its blob's PTTL:
+ *
+ * - `-2` (blob gone): remove the id from all three index keys.
+ * - `-1` (live, no TTL): remove it from the expiry set only.
+ * - otherwise (live, timed): re-score its expiry entry to now + PTTL.
+ *
+ * It never adds to the id set or the time sorted set and never writes a
+ * blob, so a missing blob is the only reason an id leaves the listing and a
+ * deleted record cannot be indexed again. Returns how many ids it removed.
+ *
+ * Exported for tests only; not part of the public API.
+ */
+export const PRUNE_HISTORY_INDEX_SCRIPT = `
+local now = tonumber(ARGV[1])
+local removed = 0
+for i = 2, #ARGV do
+  local id = ARGV[i]
+  local pttl = redis.call('PTTL', KEYS[i + 2])
+  if pttl == -2 then
+    redis.call('SREM', KEYS[1], id)
+    redis.call('ZREM', KEYS[2], id)
+    redis.call('ZREM', KEYS[3], id)
+    removed = removed + 1
+  elseif pttl == -1 then
+    redis.call('ZREM', KEYS[3], id)
+  else
+    redis.call('ZADD', KEYS[3], string.format('%d', now + pttl), id)
+  end
+end
+return removed
+`;
+
+/** A position in a history sorted set: score, then member. */
+type HistoryPosition = { score: number; id: string };
+
+/**
+ * Redis orders members that share a score by their bytes. The listing walk
+ * compares member ids the same way, so its cursor matches the server's order
+ * exactly, including for non-ASCII ids.
+ */
+function compareMembers(a: string, b: string): number {
+  return Buffer.compare(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8'));
+}
+
+/** Newest first: score descending, then member descending. */
+function compareNewestFirst(a: HistoryPosition, b: HistoryPosition): number {
+  if (a.score !== b.score) return b.score - a.score;
+  return compareMembers(b.id, a.id);
+}
+
+/**
+ * Warn once per process when a `RedisStore` keeps execution history forever
+ * because neither `ttls.executionHistory` (any value, `null` included) nor
+ * `defaultTtl` was set. Called by `RedisStore.create()`.
+ *
+ * @internal Exported for tests; not on the public barrel.
+ */
+export function warnIfRedisExecutionRetentionUnset(opts: RedisStoreOptions): void {
+  if (opts.ttls?.executionHistory === undefined && typeof opts.defaultTtl !== 'number') {
+    warnExecutionRetentionUnset('RedisStore');
+  }
+}
+
 /**
  * Redis-backed StateStore using the official `redis` (node-redis) client.
  *
@@ -243,6 +384,22 @@ export class RedisStore implements StateStore {
     private keyPrefix: string,
     private ttls: ResolvedTtls,
   ) {}
+
+  /**
+   * History kinds with a prune running in this process. A save skips its
+   * prune while another one of the same kind is in flight: the running one
+   * already covers the oldest expired entries. Created lazily so the
+   * instance needs no constructor state.
+   */
+  private prunesInFlight?: Set<HistoryKind>;
+
+  /**
+   * Supports `listExecutions(limit, { cursor })`. A getter rather than a
+   * field so it lives on the prototype.
+   */
+  get historyPaging(): boolean {
+    return true;
+  }
 
   /**
    * Resolve the TTL for a given storage category. Returns `undefined` when
@@ -341,6 +498,7 @@ export class RedisStore implements StateStore {
     };
 
     const store = new RedisStore(client, keyPrefix, effectiveTtls);
+    warnIfRedisExecutionRetentionUnset(opts);
 
     // Lazy backfill of the new sorted-set indexes for installs upgrading
     // from pre-ZSET versions. Cheap when there's nothing to do (two ZCARD
@@ -495,13 +653,9 @@ export class RedisStore implements StateStore {
     return `${this.keyPrefix}exec-history:${executionId}`;
   }
 
-  // NOTE for future implementer of #3 (TTL config): when the executionHistory
-  // and evalHistory data blobs gain TTLs, eviction MUST be driven by
-  // ZREMRANGEBYSCORE on the ZSET below — NOT by SREM on these legacy ID sets.
-  // The slow-path fallback (`listHistoryByZset`) reads from the SET when
-  // `zsetCard < setCard`, so SET-based eviction would race with the fallback
-  // and surface dead IDs whose data has been TTL'd away. ZSET eviction +
-  // dual-write `SREM` is the clean path; doc the assumption then.
+  // The legacy id set and the sorted set below always change together (save,
+  // delete, prune), so the slow-path guard `ZCARD >= SCARD` in
+  // `listHistoryByZset` and backfill stays meaningful.
   private execHistorySetKey(): string {
     return `${this.keyPrefix}exec-history-ids`;
   }
@@ -527,6 +681,37 @@ export class RedisStore implements StateStore {
   /** Sorted-set index for eval history, scored by `timestamp`. See above. */
   private evalHistoryZsetKey(): string {
     return `${this.keyPrefix}eval-history-z`;
+  }
+
+  /** Keys and blob parsing for one kind of history. See {@link HistoryIndex}. */
+  private historyIndex(kind: HistoryKind): HistoryIndex {
+    if (kind === 'execution') {
+      return {
+        kind,
+        label: 'execution-history',
+        ids: this.execHistorySetKey(),
+        time: this.execHistoryZsetKey(),
+        expiry: `${this.keyPrefix}exec-history-exp`,
+        dataKey: (id) => this.execHistoryKey(id),
+        lastSavedAtOf: (raw) => {
+          const record = JSON.parse(raw) as HistoricalExecutionInfo;
+          return typeof record.startedAt === 'number' ? executionLastSavedAt(record) : null;
+        },
+      };
+    }
+    return {
+      kind,
+      label: 'eval-history',
+      ids: this.evalHistorySetKey(),
+      time: this.evalHistoryZsetKey(),
+      expiry: `${this.keyPrefix}eval-history-exp`,
+      dataKey: (id) => this.evalHistoryKey(id),
+      // Eval retention counts from the first write, which is the row's timestamp.
+      lastSavedAtOf: (raw) => {
+        const timestamp = (JSON.parse(raw) as EvalHistoryEntry).timestamp;
+        return typeof timestamp === 'number' ? timestamp : null;
+      },
+    };
   }
 
   private memoryKey(scope: string): string {
@@ -844,27 +1029,29 @@ export class RedisStore implements StateStore {
     // gives us O(log N) score-ordered reads with one MGET; the SET is kept
     // as a fallback for installs that constructed with `skipMigration: true`.
     //
-    // TTL semantics: fixed window via `SET ... EX` on the data blob. Index
-    // entries (legacy SET + ZSET) intentionally have NO TTL — they're
-    // small (just IDs) and eventually-consistent: when the data blob ages
-    // out, mGet returns null and the reader filters it. Periodic cleanup
-    // (manual `ZREMRANGEBYSCORE` + `SREM`) can prune index bloat, but
-    // listExecutions stays correct regardless.
+    // TTL semantics: the window restarts on every save (`SET ... EX`). Index
+    // members cannot carry a TTL, so a timed record is also written to the
+    // expiry sorted set, scored by when it expires; the prune that follows
+    // every save uses it to remove index entries whose record has aged out.
+    // An untimed save takes the id out of the expiry set, so a record that
+    // stops being timed is never pruned.
     const ttl = this.ttlFor('executionHistory');
     const setOptions = ttl !== undefined ? { EX: ttl } : undefined;
+    const index = this.historyIndex('execution');
+    const id = execution.executionId;
     const storedExecution = normalizeStoredExecution({
       ...execution,
       eventSchemaVersion: getExecutionEventSchemaVersion(execution),
     } as HistoricalExecutionInfo);
-    await this.client
+    const tx = this.client
       .multi()
-      .sAdd(this.execHistorySetKey(), execution.executionId)
-      .set(this.execHistoryKey(execution.executionId), JSON.stringify(storedExecution), setOptions)
-      .zAdd(this.execHistoryZsetKey(), {
-        score: execution.startedAt,
-        value: execution.executionId,
-      })
-      .exec();
+      .sAdd(index.ids, id)
+      .set(index.dataKey(id), JSON.stringify(storedExecution), setOptions)
+      .zAdd(index.time, { score: execution.startedAt, value: id });
+    if (ttl !== undefined) tx.zAdd(index.expiry, { score: Date.now() + ttl * 1000, value: id });
+    else tx.zRem(index.expiry, id);
+    await tx.exec();
+    await this.pruneHistoryAfterSave(index);
   }
 
   async getExecution(executionId: string): Promise<HistoricalExecutionInfo | null> {
@@ -872,13 +1059,16 @@ export class RedisStore implements StateStore {
     return raw ? normalizeStoredExecution(JSON.parse(raw) as HistoricalExecutionInfo) : null;
   }
 
-  async listExecutions(limit?: number): Promise<HistoricalExecutionInfo[]> {
+  async listExecutions(
+    limit?: number,
+    options?: { cursor?: ExecutionCursor },
+  ): Promise<HistoricalExecutionInfo[]> {
+    const cursor = options?.cursor;
     const executions = await this.listHistoryByZset<HistoricalExecutionInfo>(
-      this.execHistorySetKey(),
-      this.execHistoryZsetKey(),
-      (id) => this.execHistoryKey(id),
-      (a, b) => b.startedAt - a.startedAt,
+      this.historyIndex('execution'),
+      (e) => ({ score: e.startedAt, id: e.executionId }),
       limit,
+      cursor !== undefined ? { score: cursor.startedAt, id: cursor.executionId } : undefined,
     );
     return executions.map(normalizeStoredExecution);
   }
@@ -900,11 +1090,13 @@ export class RedisStore implements StateStore {
     // surface. This matters for fail-closed pending decisions that may have
     // no canonical history blob yet: deleting the decision is still a
     // successful total deletion and must return true.
+    const index = this.historyIndex('execution');
     const results = await this.client
       .multi()
-      .sRem(this.execHistorySetKey(), executionId)
-      .del(this.execHistoryKey(executionId))
-      .zRem(this.execHistoryZsetKey(), executionId)
+      .sRem(index.ids, executionId)
+      .del(index.dataKey(executionId))
+      .zRem(index.time, executionId)
+      .zRem(index.expiry, executionId)
       .del(this.checkpointKey(executionId))
       .del(this.executionStateKey(executionId))
       .sRem(this.pendingExecSetKey(), executionId)
@@ -938,12 +1130,16 @@ export class RedisStore implements StateStore {
    * lifetime, so the race costs at most one window's length, never the window
    * itself. It also carries no Redis version floor, where `KEEPTTL` needs 6.0.
    *
-   * The index entries carry no TTL and age out lazily, as with `saveExecution`.
+   * As with `saveExecution`, a timed row is also scored in the expiry sorted
+   * set (by the expiry it carries, so a re-save keeps its score), an untimed
+   * one is taken out of it, and a bounded prune follows the save.
    */
   async saveEvalResult(entry: EvalHistoryEntry): Promise<void> {
     const ttl = this.ttlFor('evalHistory');
-    const key = this.evalHistoryKey(entry.id);
+    const index = this.historyIndex('eval');
+    const key = index.dataKey(entry.id);
     let setOptions: { EX: number } | { PX: number } | undefined;
+    let expiresAt: number | undefined;
     if (ttl !== undefined) {
       // -2 no such key, -1 the key exists with no TTL, otherwise ms remaining.
       const remaining = await this.client.pTTL(key);
@@ -951,15 +1147,23 @@ export class RedisStore implements StateStore {
       // predates `ttls.evalHistory`. Stamping the configured window on it would
       // shorten its retention from forever to finite, which is the same
       // violation as extending one, pointed the other way.
-      if (remaining === -2) setOptions = { EX: ttl };
-      else if (remaining > 0) setOptions = { PX: remaining };
+      if (remaining === -2) {
+        setOptions = { EX: ttl };
+        expiresAt = Date.now() + ttl * 1000;
+      } else if (remaining > 0) {
+        setOptions = { PX: remaining };
+        expiresAt = Date.now() + remaining;
+      }
     }
-    await this.client
+    const tx = this.client
       .multi()
-      .sAdd(this.evalHistorySetKey(), entry.id)
+      .sAdd(index.ids, entry.id)
       .set(key, JSON.stringify(entry), setOptions)
-      .zAdd(this.evalHistoryZsetKey(), { score: entry.timestamp, value: entry.id })
-      .exec();
+      .zAdd(index.time, { score: entry.timestamp, value: entry.id });
+    if (expiresAt !== undefined) tx.zAdd(index.expiry, { score: expiresAt, value: entry.id });
+    else tx.zRem(index.expiry, entry.id);
+    await tx.exec();
+    await this.pruneHistoryAfterSave(index);
   }
 
   /**
@@ -1006,11 +1210,9 @@ export class RedisStore implements StateStore {
   }
 
   async listEvalResults(limit?: number): Promise<EvalHistoryEntry[]> {
-    return this.listHistoryByZset(
-      this.evalHistorySetKey(),
-      this.evalHistoryZsetKey(),
-      (id) => this.evalHistoryKey(id),
-      (a, b) => b.timestamp - a.timestamp,
+    return this.listHistoryByZset<EvalHistoryEntry>(
+      this.historyIndex('eval'),
+      (e) => ({ score: e.timestamp, id: e.id }),
       limit,
     );
   }
@@ -1020,11 +1222,13 @@ export class RedisStore implements StateStore {
     // together. del()'s return is the "did it exist" signal — destructured
     // out of the exec() result so reordering the chain doesn't break the
     // boolean.
+    const index = this.historyIndex('eval');
     const [, deletedCount] = await this.client
       .multi()
-      .sRem(this.evalHistorySetKey(), id)
-      .del(this.evalHistoryKey(id))
-      .zRem(this.evalHistoryZsetKey(), id)
+      .sRem(index.ids, id)
+      .del(index.dataKey(id))
+      .zRem(index.time, id)
+      .zRem(index.expiry, id)
       .exec();
     const deleted = typeof deletedCount === 'number' ? deletedCount : 0;
     return deleted > 0;
@@ -1051,84 +1255,356 @@ export class RedisStore implements StateStore {
   }
 
   /**
-   * Shared list-by-sorted-set implementation. Uses ZREVRANGEBYSCORE +
-   * MGET when the ZSET is populated (post-migration). Falls back to the
-   * legacy SET + N×GET + JS-sort path when the ZSET is empty or smaller
-   * than the SET (covers users that constructed with `skipMigration: true`
-   * before calling backfill).
+   * Shared list-by-sorted-set implementation, newest first by
+   * `(score DESC, member DESC)`, starting strictly after `cursor` when given.
+   *
+   * Fast path (the time sorted set is at least as large as the id set): walk
+   * the sorted set in chunks and MGET each chunk's blobs. Index entries whose
+   * blob is gone (expired, or deleted before the prune caught up) are skipped,
+   * and the walk keeps reading until it has `limit` live records or the set
+   * runs out, however many dead entries are in the way. Each chunk restarts
+   * at the last member read, by score and member, rather than at an offset,
+   * so entries added or removed meanwhile cannot shift the walk.
+   *
+   * Slow path (the time sorted set is behind the id set: backfill has not
+   * run): read every id with GET, then sort and apply the cursor in process.
    */
   private async listHistoryByZset<T>(
-    setKey: string,
-    zsetKey: string,
-    dataKey: (id: string) => string,
-    sortCmp: (a: T, b: T) => number,
+    index: HistoryIndex,
+    positionOf: (entry: T) => HistoryPosition,
     limit?: number,
+    cursor?: HistoryPosition,
   ): Promise<T[]> {
     // Cheap probe: if the SET is empty, both indexes are empty and there's
     // nothing to list.
-    const setSize = await this.client.sCard(setKey);
+    const setSize = await this.client.sCard(index.ids);
     if (setSize === 0) return [];
 
-    const zsetSize = await this.client.zCard(zsetKey);
+    const zsetSize = await this.client.zCard(index.time);
+    const max = limit ? limit : undefined;
 
-    // Fast path: ZSET has caught up with the SET (post-migration or only
-    // ever had post-#4 writes). Use ZREVRANGEBYSCORE for ordered IDs, then
-    // bulk MGET for the data.
-    if (zsetSize >= setSize) {
-      // Over-fetch when a limit is requested: TTL can evict data blobs
-      // independent of ZSET entries, so MGET may return nulls. Without
-      // over-fetch, a caller asking for `limit=10` while 3 entries have
-      // been TTL'd between ZREVRANGEBYSCORE and MGET would silently get 7.
-      // 2x with a +5 floor handles a reasonable amount of drift; if more
-      // than half the requested entries are dead pointers, the slow-path
-      // null-filter still applies and the caller gets best-effort up to
-      // `limit`.
-      const fetchCount = limit !== undefined ? Math.max(limit * 2, limit + 5) : undefined;
-      // ZRANGE with BY:'SCORE' + REV:true is the node-redis v5 form of
-      // "ZREVRANGEBYSCORE" (the dedicated method was removed in v5 in favor
-      // of the parameterized zRange). With REV:true the start/stop args are
-      // interpreted in descending order — pass `'+inf'` as start, `'-inf'`
-      // as stop to walk from the highest score downward.
-      const ids = await this.client.zRange(zsetKey, '+inf', '-inf', {
-        BY: 'SCORE',
-        REV: true,
-        ...(fetchCount !== undefined ? { LIMIT: { offset: 0, count: fetchCount } } : {}),
-      });
-      if (ids.length === 0) return [];
-      const keys = ids.map(dataKey);
-      const raws = await this.client.mGet(keys);
-      // Filter nulls (data dropped by TTL after the ZSET was queried) AND
-      // parse failures. JSON.parse can throw — guard each row.
+    if (zsetSize < setSize) {
+      // Slow path (legacy SET): read via SET + N×GET so users aren't blocked
+      // on the data they have.
+      const ids = await this.client.sMembers(index.ids);
       const entries: T[] = [];
-      for (const raw of raws) {
+      for (const id of ids) {
+        const raw = await this.client.get(index.dataKey(id));
         if (raw == null) continue;
         try {
           entries.push(JSON.parse(raw) as T);
         } catch {
-          // Malformed JSON; skip silently. Same posture as the SET path.
+          // skip malformed
         }
-        if (limit !== undefined && entries.length >= limit) break;
       }
-      return entries;
+      const ordered = entries
+        .filter((e) => cursor === undefined || compareNewestFirst(cursor, positionOf(e)) < 0)
+        .sort((a, b) => compareNewestFirst(positionOf(a), positionOf(b)));
+      return max !== undefined ? ordered.slice(0, max) : ordered;
     }
 
-    // Slow path (legacy SET): the ZSET is behind the SET — either
-    // backfill hasn't run yet (skipMigration: true) or it errored partway.
-    // Read via SET + N×GET so users aren't blocked on the data they have.
-    const ids = await this.client.sMembers(setKey);
-    if (ids.length === 0) return [];
-    const entries: T[] = [];
-    for (const id of ids) {
-      const raw = await this.client.get(dataKey(id));
-      if (raw == null) continue;
-      try {
-        entries.push(JSON.parse(raw) as T);
-      } catch {
-        // skip malformed
+    const results: T[] = [];
+    const seen = new Set<string>();
+    // Results start strictly after `bound`: the cursor, then the last record
+    // returned.
+    let bound = cursor;
+    // Reads cover the members scored at most `rangeMax`, newest first.
+    let rangeMax: number | '+inf' = cursor !== undefined ? cursor.score : '+inf';
+    // The last member read and its position in that range. The next read
+    // starts at the anchor itself (`LIMIT offset`), so members already read
+    // are never transferred again, however many share one score. If the
+    // anchor is not where it was (entries removed or added meanwhile), the
+    // read is repeated from the start of the range.
+    let anchor: { id: string; score: number; pos: number } | undefined;
+    // Doubles while reads return nothing new (a long run of members at or
+    // before the cursor), so skipping them takes few round trips.
+    let grow = 1;
+    const read = (offset: number, count: number | undefined) =>
+      // ZRANGE BY SCORE REV: start is the highest score, stop the lowest.
+      this.client.zRangeWithScores(index.time, rangeMax, '-inf', {
+        BY: 'SCORE',
+        REV: true,
+        ...(count !== undefined ? { LIMIT: { offset, count } } : {}),
+      });
+    for (;;) {
+      const remaining = max !== undefined ? max - results.length : undefined;
+      // Read a little more than needed: a few index entries may be dead.
+      const want =
+        remaining !== undefined ? Math.max(remaining * 2, remaining + 5) * grow : undefined;
+      let offset = 0;
+      let count = want;
+      let members: Array<{ value: string; score: number }>;
+      if (anchor !== undefined && want !== undefined) {
+        offset = anchor.pos;
+        count = want + 1;
+        members = await read(offset, count);
+        if (members[0]?.value !== anchor.id) {
+          offset = 0;
+          count = anchor.pos + 1 + want;
+          members = await read(offset, count);
+        }
+      } else {
+        members = await read(offset, count);
+      }
+      const fresh = members.filter(
+        (m) =>
+          !seen.has(m.value) &&
+          (bound === undefined || compareNewestFirst(bound, { score: m.score, id: m.value }) < 0),
+      );
+      if (fresh.length > 0) {
+        const raws = await this.client.mGet(fresh.map((m) => index.dataKey(m.value)));
+        for (let i = 0; i < fresh.length; i++) {
+          seen.add(fresh[i].value);
+          const raw = raws[i];
+          // Null: the record expired or was deleted; its index entry waits
+          // for the prune. Parse failures are skipped too.
+          if (raw == null) continue;
+          try {
+            results.push(JSON.parse(raw) as T);
+          } catch {
+            continue;
+          }
+          if (max !== undefined && results.length >= max) return results;
+        }
+        const lastFresh = fresh[fresh.length - 1];
+        bound = { score: lastFresh.score, id: lastFresh.value };
+        grow = 1;
+      } else {
+        grow *= 2;
+      }
+      // A short read means the set is exhausted.
+      if (count === undefined || members.length < count) return results;
+      const last = members[members.length - 1];
+      if (last.score === rangeMax) {
+        anchor = { id: last.value, score: last.score, pos: offset + members.length - 1 };
+      } else {
+        // The range moves down to the last member's score. Every member at
+        // that score that sorts before it was in this read.
+        rangeMax = last.score;
+        const before = members.filter((m) => m.score === last.score).length - 1;
+        anchor = { id: last.value, score: last.score, pos: before };
       }
     }
-    entries.sort(sortCmp);
-    return limit ? entries.slice(0, limit) : entries;
+  }
+
+  // ── History index cleanup ──────────────────────────────────────────────
+  //
+  // Index members cannot carry a TTL, so when a history record expires its
+  // entries in the id set and the time sorted set stay behind. Every history
+  // save runs one bounded prune of its kind: it reads up to PRUNE_BATCH ids
+  // whose expiry has passed from the expiry sorted set, then runs
+  // PRUNE_HISTORY_INDEX_SCRIPT over them. The script checks each record's blob
+  // and updates the indexes in one atomic step, so a save or delete landing
+  // between the read and the script cannot be undone by it: a record saved
+  // again is seen live and stays listed, and a deleted one is already gone.
+  // The script only removes index entries and re-scores expiry entries; it
+  // never adds a listing entry or writes a blob, so it cannot bring back
+  // deleted data. Several instances pruning at once is safe.
+
+  /**
+   * Run one prune of `index`'s kind after a save. A prune failure does not
+   * fail the save, whose MULTI already committed the record: it is reported
+   * once per process and the next save of that kind tries again. That also
+   * covers a Redis user whose ACL denies `EVAL`.
+   */
+  private async pruneHistoryAfterSave(index: HistoryIndex): Promise<void> {
+    const inFlight = (this.prunesInFlight ??= new Set());
+    if (inFlight.has(index.kind)) return;
+    inFlight.add(index.kind);
+    try {
+      await this.pruneHistory(index);
+    } catch (err) {
+      warnDiagnosticOnce(
+        `redis_history_prune_failed\0${index.kind}`,
+        `RedisStore: removing expired ${index.label} index entries failed ` +
+          `(${err instanceof Error ? err.message : String(err)}). The record was saved; ` +
+          'the next save retries the cleanup. Listings stay correct meanwhile. The cleanup ' +
+          'runs a Lua script, so the Redis user needs permission to run EVAL.',
+        undefined,
+        'docs/api-reference.md#redisstore-options',
+      );
+    } finally {
+      inFlight.delete(index.kind);
+    }
+  }
+
+  private async pruneHistory(index: HistoryIndex): Promise<void> {
+    const candidates = await this.client.zRange(index.expiry, '-inf', Date.now(), {
+      BY: 'SCORE',
+      LIMIT: { offset: 0, count: PRUNE_BATCH },
+    });
+    if (candidates.length > 0) await this.runPruneScript(index, candidates);
+  }
+
+  /**
+   * Run {@link PRUNE_HISTORY_INDEX_SCRIPT} over `ids`, at most PRUNE_BATCH
+   * per call so one script never blocks the server for long.
+   */
+  private async runPruneScript(index: HistoryIndex, ids: string[]): Promise<void> {
+    for (let start = 0; start < ids.length; start += PRUNE_BATCH) {
+      const chunk = ids.slice(start, start + PRUNE_BATCH);
+      await this.client.eval(PRUNE_HISTORY_INDEX_SCRIPT, {
+        keys: [index.ids, index.time, index.expiry, ...chunk.map((id) => index.dataKey(id))],
+        arguments: [String(Date.now()), ...chunk],
+      });
+    }
+  }
+
+  // ── History maintenance ────────────────────────────────────────────────
+
+  /**
+   * See `StateStore.applyHistoryRetention`. One call:
+   *
+   * 1. On the first call of a walk (no cursor), backfills the time sorted
+   *    set from the id set if it is behind (see `backfillExecutionIndex`).
+   * 2. Reads the next `batchSize` ids from the time sorted set, oldest first
+   *    by `(score, member)`, strictly after the cursor. The read restarts at
+   *    the cursor's position by value, never by offset.
+   * 3. MGETs their blobs and reads each live blob's PTTL.
+   * 4. In one MULTI, for each live blob:
+   *    - a TTL (`PTTL > 0`): `ZADD NX` to the expiry set at now + PTTL. A
+   *      record already in the expiry set keeps its entry (`indexed` counts
+   *      only new entries).
+   *    - no TTL (`-1`), with a retention configured: `PEXPIREAT … NX` at last
+   *      save + retention. `NX` applies only to a key that still has no TTL,
+   *      so a record re-saved meanwhile keeps the fresh window its save gave
+   *      it. A window that has already passed uses a timestamp in the past,
+   *      which makes Redis delete the key, again only if it is still untimed.
+   * 5. Adds each newly armed record to the expiry set (`ZADD NX`).
+   * 6. Runs the prune script (`PRUNE_HISTORY_INDEX_SCRIPT`) over ids whose
+   *    blob is gone and ids just deleted in step 4. It checks each blob
+   *    atomically, so a record re-saved at any point stays listed and a
+   *    deleted one is never re-indexed.
+   *
+   * Blobs are never written. A record deleted while the call runs can leave
+   * an entry in the expiry set only; the next prune removes it.
+   */
+  async applyHistoryRetention(options: HistoryRetentionOptions): Promise<HistoryRetentionResult> {
+    const { kind, batchSize, cursor } = resolveHistoryRetentionOptions('RedisStore', options);
+    const index = this.historyIndex(kind === 'executions' ? 'execution' : 'eval');
+    const ttl = this.ttlFor(kind === 'executions' ? 'executionHistory' : 'evalHistory');
+
+    if (cursor === undefined) {
+      if (kind === 'executions') await this.backfillExecutionIndex();
+      else await this.backfillEvalIndex();
+    }
+
+    const positions = await this.readRetentionBatch(index, cursor, batchSize + 1);
+    const batch = positions.slice(0, batchSize);
+    const result: HistoryRetentionResult = {
+      expired: 0,
+      armed: 0,
+      indexed: 0,
+      deadIndexEntries: 0,
+      cursor:
+        positions.length > batchSize
+          ? { time: batch[batch.length - 1].score, id: batch[batch.length - 1].value }
+          : null,
+    };
+    if (batch.length === 0) return result;
+
+    const ids = batch.map((m) => m.value);
+    const raws = await this.client.mGet(ids.map((id) => index.dataKey(id)));
+    const dead = ids.filter((_, i) => raws[i] == null);
+    const present = ids.flatMap((id, i) => {
+      const raw = raws[i];
+      return raw == null ? [] : [{ id, raw }];
+    });
+    const pttls = await Promise.all(present.map((r) => this.client.pTTL(index.dataKey(r.id))));
+
+    const now = Date.now();
+    const tx = this.client.multi();
+    const queued: Array<
+      | { action: 'index'; id: string }
+      | { action: 'arm'; id: string; expiresAt: number }
+      | { action: 'expire'; id: string }
+    > = [];
+    for (let i = 0; i < present.length; i++) {
+      const { id, raw } = present[i];
+      const pttl = pttls[i];
+      if (pttl === -2) {
+        // Gone since the MGET: removed below like any other missing blob.
+        dead.push(id);
+      } else if (pttl > 0) {
+        tx.zAdd(index.expiry, { score: now + pttl, value: id }, { condition: 'NX' });
+        queued.push({ action: 'index', id });
+      } else if (pttl === -1 && ttl !== undefined) {
+        let lastSavedAt: number | null;
+        try {
+          lastSavedAt = index.lastSavedAtOf(raw);
+        } catch {
+          lastSavedAt = null;
+        }
+        // A blob without a usable time is left alone, as listing skips it.
+        if (lastSavedAt === null) continue;
+        const decision = retentionForUntimedRecord(lastSavedAt, ttl, now);
+        if (decision.expired) {
+          // Any timestamp in the past deletes the key; NX still requires
+          // that it has no TTL.
+          tx.pExpireAt(index.dataKey(id), 1, 'NX');
+          queued.push({ action: 'expire', id });
+        } else {
+          tx.pExpireAt(index.dataKey(id), decision.expiresAt, 'NX');
+          queued.push({ action: 'arm', id, expiresAt: decision.expiresAt });
+        }
+      }
+    }
+
+    const expiredIds: string[] = [];
+    const armed: Array<{ id: string; expiresAt: number }> = [];
+    if (queued.length > 0) {
+      const replies = await tx.exec();
+      for (let i = 0; i < queued.length; i++) {
+        if (Number(replies[i]) !== 1) continue;
+        const entry = queued[i];
+        if (entry.action === 'index') result.indexed++;
+        else if (entry.action === 'expire') expiredIds.push(entry.id);
+        else armed.push(entry);
+      }
+    }
+    if (armed.length > 0) {
+      const indexTx = this.client.multi();
+      for (const { id, expiresAt } of armed) {
+        indexTx.zAdd(index.expiry, { score: expiresAt, value: id }, { condition: 'NX' });
+      }
+      await indexTx.exec();
+    }
+    result.armed = armed.length;
+    result.expired = expiredIds.length;
+    result.deadIndexEntries = dead.length;
+    if (dead.length > 0 || expiredIds.length > 0) {
+      await this.runPruneScript(index, [...dead, ...expiredIds]);
+    }
+    return result;
+  }
+
+  /**
+   * Up to `count` members of the time sorted set strictly after `cursor`,
+   * oldest first by `(score, member)`. The members sharing the cursor's score
+   * are read in full and filtered by member; the rest start just above that
+   * score. Neither read uses an offset, so entries removed or added
+   * meanwhile cannot shift the walk.
+   */
+  private async readRetentionBatch(
+    index: HistoryIndex,
+    cursor: HistoryRetentionCursor | undefined,
+    count: number,
+  ): Promise<Array<{ value: string; score: number }>> {
+    if (cursor === undefined) {
+      return this.client.zRangeWithScores(index.time, '-inf', '+inf', {
+        BY: 'SCORE',
+        LIMIT: { offset: 0, count },
+      });
+    }
+    const ties = (
+      await this.client.zRangeWithScores(index.time, cursor.time, cursor.time, { BY: 'SCORE' })
+    ).filter((m) => compareMembers(m.value, cursor.id) > 0);
+    if (ties.length >= count) return ties.slice(0, count);
+    const rest = await this.client.zRangeWithScores(index.time, `(${cursor.time}`, '+inf', {
+      BY: 'SCORE',
+      LIMIT: { offset: 0, count: count - ties.length },
+    });
+    return [...ties, ...rest];
   }
 
   // ── Sessions (Studio introspection) ────────────────────────────────────

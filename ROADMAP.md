@@ -1,6 +1,6 @@
 # Roadmap
 
-> Last updated: September 2026
+> Last updated: October 2026
 
 ## Guiding Principles
 
@@ -12,6 +12,18 @@
 ## Status
 
 ### Complete
+
+- **Execution history retention** — Every built-in store takes the same
+  `ttls.executionHistory` / `ttls.evalHistory`, expired runs disappear from
+  reads at once and are cleaned up as new history is saved (Redis listing
+  indexes included), and the in-memory store keeps the newest 1 000 runs by
+  default. SQLite and Redis keep history forever until you choose a retention,
+  and warn once until you do.
+  The runtime reads history through the store on every call, so instances
+  sharing a store agree, and `getExecutions({ limit, cursor })` pages large
+  histories. `store.applyHistoryRetention()` applies a retention to history
+  saved before it was set. Studio's execution list is paged. See
+  [migration/execution-history-retention.md](docs/migration/execution-history-retention.md).
 
 - **Trustworthy eval accounting, budgets, and attempt diagnostics** — Cost is
   measured from operation settlement rather than trace events:
@@ -292,6 +304,24 @@ Both can coexist — (1) is simpler and deterministic, (2) handles large tool se
 - **Drop the hard tsx coupling at 1.0.** Once native support is stable across our supported Node range, tsx becomes purely opt-in for users with TS features that strip-types can't handle (enums, namespaces, JSX in config files — rare in practice).
 
 This is the long-term answer to the resolution complaint that drove the 0.17.x peerDep declaration. The peerDep is correct *given* tsx is the loader; the deeper fix is to stop assuming it has to be.
+
+#### Execution history follow-ups
+
+Retention shipped in 0.27.0; these were deliberately left out of it:
+
+- **Eval history read-through and paging.** The runtime still loads eval
+  history once per process, so an eval row that expired or was deleted in the
+  store can stay listed until restart (only when an eval retention is set).
+  The fix needs a store method to read one eval row.
+- **Summary listings at the store level.** Listing executions returns full
+  records, events included. A store-side summary listing would make history
+  lists and Studio's refreshes much cheaper.
+- **A default TTL for failed-run checkpoints on Redis.** Checkpoints of a run
+  that failed follow `ttls.checkpoint` / `defaultTtl` only.
+- **Store-side tenant filters.** Filtering by `metadata` happens in process,
+  a page at a time.
+- **Scheduled cleanup.** Stores clean up as history is saved and never run
+  timers; an opt-in background schedule for idle stores is not built.
 
 #### Portable Run State
 

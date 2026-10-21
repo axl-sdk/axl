@@ -81,7 +81,9 @@ function makeEvalEntry(overrides: Partial<EvalHistoryEntry> = {}): EvalHistoryEn
 function createMockRuntime(executions: ExecutionInfo[] = [], evalHistory: EvalHistoryEntry[] = []) {
   const emitter = new EventEmitter();
   return Object.assign(emitter, {
-    getExecutions: vi.fn().mockResolvedValue(executions),
+    getExecutions: vi
+      .fn()
+      .mockImplementation(async (opts?: { limit?: number }) => executions.slice(0, opts?.limit)),
     getExecution: vi
       .fn()
       .mockImplementation(async (id: string) => executions.find((e) => e.executionId === id)),

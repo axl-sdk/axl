@@ -1,21 +1,62 @@
 import { Hono } from 'hono';
 import type { StudioEnv } from '../types.js';
 import type { ConnectionManager } from '../ws/connection-manager.js';
-import { redactExecutionInfo, redactExecutionList } from '../redact.js';
-import type { HistoricalExecutionInfo } from '@axlsdk/axl';
+import { redactExecutionInfo, summarizeExecution } from '../redact.js';
+import { decodeExecutionCursor, encodeExecutionCursor } from '../execution-cursor.js';
+import type { ExecutionCursor, HistoricalExecutionInfo } from '@axlsdk/axl';
+
+const DEFAULT_PAGE_LIMIT = 100;
+const MAX_PAGE_LIMIT = 500;
 
 export function createExecutionRoutes(connMgr?: ConnectionManager): Hono<StudioEnv> {
   const app = new Hono<StudioEnv>();
 
-  // List all executions
+  // List executions, newest first, one page at a time. Items are summaries
+  // (no `events`); fetch `/executions/:id` for the events. `nextCursor` is
+  // `null` on the last page.
   app.get('/executions', async (c) => {
     const runtime = c.get('runtime');
-    const executions = await runtime.getExecutions();
+
+    const limitParam = c.req.query('limit');
+    let limit = DEFAULT_PAGE_LIMIT;
+    if (limitParam !== undefined) {
+      limit = Number(limitParam);
+      if (limitParam.trim() === '' || !Number.isInteger(limit) || limit < 1) {
+        return invalidParam('limit', `\`limit\` must be a positive integer (got "${limitParam}")`);
+      }
+      if (limit > MAX_PAGE_LIMIT) {
+        return invalidParam('limit', `\`limit\` must be at most ${MAX_PAGE_LIMIT} (got ${limit})`);
+      }
+    }
+
+    const cursorParam = c.req.query('cursor');
+    let cursor: ExecutionCursor | undefined;
+    if (cursorParam !== undefined) {
+      cursor = decodeExecutionCursor(cursorParam);
+      if (!cursor) return invalidParam('cursor', '`cursor` is not a valid cursor');
+    }
+
+    // One extra row tells us whether another page exists.
+    const rows = await runtime.getExecutions({ limit: limit + 1, cursor });
+    const page = rows.slice(0, limit);
+    const last = page.at(-1);
+    const redact = runtime.isRedactEnabled();
     return c.json({
       ok: true,
-      data: redactExecutionList(executions, runtime.isRedactEnabled()),
+      data: page.map((info) => summarizeExecution(info, redact)),
+      nextCursor:
+        rows.length > limit && last
+          ? encodeExecutionCursor({ startedAt: last.startedAt, executionId: last.executionId })
+          : null,
     });
   });
+
+  function invalidParam(param: string, message: string) {
+    return Response.json(
+      { ok: false, error: { code: 'INVALID_PARAM', message, param } },
+      { status: 400 },
+    );
+  }
 
   // Get execution by ID.
   //

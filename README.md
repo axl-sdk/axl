@@ -311,8 +311,7 @@ const runtime = new AxlRuntime({
   state: { store, persist: 'streaming' },  // flush traces during the run
 });
 
-// Boot sequence: hydrate, recover, accept new work
-await runtime.getExecutions();
+// Boot sequence: recover, then accept new work
 const recovered = await runtime.recoverIncompleteStreams();
 console.log(`Recovered ${recovered.length} crashed executions`);
 ```

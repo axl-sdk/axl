@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-10-21
+
+### Added
+
+- **Choose how long history is kept.** `MemoryStore` and `SQLiteStore` now take `ttls: { executionHistory, evalHistory }` in seconds, like `RedisStore` (runtime config: `state.memory`, `state.sqlite.ttls`). Expired runs disappear from reads and are cleaned up on later saves, with their leftover checkpoints and saved state. Nothing expires unless you set it. See [History retention](docs/api-reference.md#history-retention-historyttls).
+- **Apply a retention to history you already have.** A retention only affects runs saved from then on. Run `store.applyHistoryRetention({ kind, cursor })` once to bring older records under it; it works a batch at a time, can be resumed, and is safe while your app runs. Axl never runs it for you. See [Apply retention to records you already have](docs/migration/execution-history-retention.md#apply-retention-to-records-you-already-have).
+- **Read history a page at a time.** `runtime.getExecutions({ limit, cursor })` returns one page, newest first; build the next `cursor` from the last run. Calling it with no options still returns every run, with a one-time warning above 1 000 runs. Custom stores opt in to cursor paging with `historyPaging: true`. See [Page through large histories](docs/migration/execution-history-retention.md#page-through-large-histories).
+- **A reminder when history would grow forever.** `SQLiteStore` and `RedisStore` warn once per process until you choose an execution retention. Set `ttls.executionHistory` (`null` keeps history forever on purpose) to silence it. See [Silencing the retention warning](docs/migration/execution-history-retention.md#silencing-the-retention-warning).
+
+### Changed
+
+- **Breaking: the in-memory store keeps the newest 1 000 runs.** `MemoryStore`, the default when you configure no store, removes the oldest run when a save goes over 1 000. **Migration:** set `state.memory.maxExecutions` to a larger number, or `Infinity` to keep every run.
+- **Breaking: Studio `GET /api/executions` is paged.** It returns `{ ok, data, nextCursor }` with up to 100 summaries (no `events`, plus `eventCount`). The Trace Explorer gains a **Load more** button and loads a run's events when you select it. **Migration:** if you call the route directly, follow `nextCursor` until it is `null` and fetch events from `GET /api/executions/:id`. See [Paging executions](docs/studio-api.md#paging-executions).
+- **Every instance sees the same history.** `getExecutions()` and `getExecution()` read the state store on every call, so app instances sharing a store see each other's finished and deleted runs, and the runtime no longer keeps every finished run in memory. You no longer need to call `getExecutions()` before `recoverIncompleteStreams()` at startup.
+- **Stable listing order.** Runs that started in the same millisecond are always listed in the same order.
+
+### Fixed
+
+- **Deleted runs stay deleted.** Deleting a run right after it finished could let its pending history save bring it back. `runtime.deleteExecution()` now waits for that save first.
+- **Redis listing indexes no longer grow forever.** With a history retention set, `RedisStore` removes listing entries for expired records as history is saved, and `listExecutions(limit)` returns full pages even when many records have expired. The cleanup runs a small Lua script, so the Redis user needs `EVAL`; without it, saves still work and a one-time warning says the cleanup failed. See [RedisStore options](docs/api-reference.md#redisstore-options).
+
 ## [0.26.0] - 2026-10-16
 
 ### Changed
@@ -2291,7 +2312,8 @@ Initial public open-source release on npm under the `@axlsdk` scope. No new feat
 - `createServer()` factory, `ConnectionManager` for channel subscriptions, `CostAggregator` for cost tracking
 - Eight panels: Agent Playground, Workflow Runner, Trace Explorer, Cost Dashboard, Memory Browser, Session Manager, Tool Inspector, Eval Runner
 
-[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.26.0...HEAD
+[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.27.0...HEAD
+[0.27.0]: https://github.com/axl-sdk/axl/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/axl-sdk/axl/compare/v0.25.3...v0.26.0
 [0.25.3]: https://github.com/axl-sdk/axl/compare/v0.25.2...v0.25.3
 [0.25.2]: https://github.com/axl-sdk/axl/compare/v0.25.1...v0.25.2

@@ -143,6 +143,24 @@ const DOCS_URL = 'docs/observability.md#schema-diagnostics';
 const MAX_WARNED_KEYS = 2048;
 const warnedDiagnosticKeys = new Set<string>();
 
+let silencedDepth = 0;
+
+/**
+ * Run `fn` synchronously with every {@link warnDiagnosticOnce} call silenced.
+ * The runtime wraps the stores it constructs itself in this when
+ * `diagnostics.silent` is set, because a store warns from its constructor and
+ * cannot see runtime config. Synchronous only: work `fn` schedules for later
+ * is not covered. Re-entrant.
+ */
+export function withDiagnosticsSilenced<T>(fn: () => T): T {
+  silencedDepth++;
+  try {
+    return fn();
+  } finally {
+    silencedDepth--;
+  }
+}
+
 /**
  * Emit a `console.warn` at most once per `key`, unless silenced. Mirrors the
  * budget-unpriced precedent (`context.ts`): the structured `schema_diagnostic`
@@ -160,7 +178,7 @@ export function warnDiagnosticOnce(
   silent?: boolean,
   docs: string = DOCS_URL,
 ): void {
-  if (silent || process.env.AXL_DIAGNOSTICS_SILENT === 'true') return;
+  if (silent || silencedDepth > 0 || process.env.AXL_DIAGNOSTICS_SILENT === 'true') return;
   if (warnedDiagnosticKeys.has(key)) return;
   if (warnedDiagnosticKeys.size >= MAX_WARNED_KEYS) warnedDiagnosticKeys.clear();
   warnedDiagnosticKeys.add(key);

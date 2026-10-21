@@ -44,12 +44,21 @@ export type TraceConfig = {
   redact?: boolean;
 };
 
-import type { StateStore } from './state/types.js';
+import type { StateStore, HistoryTtls } from './state/types.js';
 
 /** State store configuration */
 export type StateConfig = {
   store?: StateStore | 'memory' | 'sqlite';
-  sqlite?: { path: string };
+  /**
+   * Options for the store built by `store: 'sqlite'`: the database file and
+   * optional history retention (seconds; see `HistoryTtls`).
+   */
+  sqlite?: { path: string; ttls?: HistoryTtls };
+  /**
+   * Options for the store built by `store: 'memory'` (the default): history
+   * retention in seconds and a maximum number of execution records.
+   */
+  memory?: { ttls?: HistoryTtls; maxExecutions?: number };
   /**
    * Maximum number of events retained in `ExecutionInfo.events` per
    * execution. Token and partial_object events are already excluded
@@ -72,6 +81,21 @@ export type StateConfig = {
    * integer or `Infinity`.
    */
   maxEventsPerExecution?: number;
+  /**
+   * How many recently finished runs the runtime keeps in process when the
+   * state store cannot keep execution history itself, that is, when it lacks
+   * `saveExecution` or `listExecutions`. The cache stands in for the missing
+   * methods: `getExecutions()` lists from it, and `getExecution(id)` falls
+   * back to it when the store cannot fetch by id either. The least recently
+   * used run is dropped first. (A store that saves and lists but has no
+   * `getExecution` needs no cache: by-id reads scan its listing.)
+   *
+   * The built-in stores have all three methods, so the runtime never keeps
+   * this cache for them: history is read through the store on every call.
+   *
+   * Default: 1_000. `0` turns the cache off. Must be a non-negative integer.
+   */
+  recentExecutionsCacheSize?: number;
   /**
    * When to persist execution events to the state store.
    *
@@ -138,8 +162,11 @@ export type DiagnosticsConfig = {
   schemaOversizedTokens?: number;
   /**
    * Silence the one-time `console.warn` diagnostics (the structured
-   * `schema_diagnostic` events still fire). Also silenceable process-wide via
-   * `AXL_DIAGNOSTICS_SILENT=true`.
+   * `schema_diagnostic` events still fire). This includes the large-listing
+   * warning and the retention warning of a SQLite store the runtime creates
+   * from `state.store: 'sqlite'`; a store you construct yourself warns before
+   * the runtime exists, so use its `ttls` or the environment variable. Also
+   * silenceable process-wide via `AXL_DIAGNOSTICS_SILENT=true`.
    */
   silent?: boolean;
   /**

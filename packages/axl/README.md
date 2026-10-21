@@ -755,7 +755,9 @@ const store = await RedisStore.create({
 
 The prefix is concatenated as-given — no normalization. Include a trailing colon if you want one. Empty string is rejected.
 
-**TTLs are strongly recommended in production** — without them every `save*` accumulates forever and Redis eventually OOMs. Sliding window: `memory`, `session`, `sessionMeta` (every write refreshes; reads do NOT). Fixed-creation: `checkpoint`, `streamingEvents`. Fixed-refresh: `executionState`, `executionHistory`, `evalHistory`. `streamingEvents` is opt-in only (does NOT fall back to `defaultTtl`). See [api-reference.md](../../docs/api-reference.md#redisstore-options) for the full table.
+**TTLs are strongly recommended in production** — without them every `save*` accumulates forever and Redis eventually OOMs. Sliding window: `memory`, `session`, `sessionMeta` (every write refreshes; reads do NOT). Fixed from the first write: `checkpoint`, `streamingEvents`, `evalHistory` (re-saves and corrections keep an eval row's expiry). Restarted on every save: `executionState`, `executionHistory`. `streamingEvents` is opt-in only (does NOT fall back to `defaultTtl`). See [api-reference.md](../../docs/api-reference.md#redisstore-options) for the full table.
+
+`MemoryStore` and `SQLiteStore` take the same `ttls.executionHistory` / `ttls.evalHistory`; `MemoryStore` keeps the newest 1 000 runs by default (`maxExecutions`). See the [execution history retention guide](../../docs/migration/execution-history-retention.md).
 
 #### Crash survival: `state.persist: 'streaming'`
 
@@ -771,8 +773,7 @@ const runtime = new AxlRuntime({
   },
 });
 
-// Boot sequence: lazy-load THEN recover THEN accept new work
-await runtime.getExecutions();
+// Boot sequence: recover THEN accept new work
 const recovered = await runtime.recoverIncompleteStreams();
 console.log(`Recovered ${recovered.length} crashed executions`);
 app.listen(3000);
@@ -803,7 +804,19 @@ runtime.on('decision_cleanup_failed', (e) => {
 
 If the execution is still running, the workflow is aborted (and a paused `ctx.awaitHuman()` correctly wakes with `AbortError` — fixed in 0.17.7). The resurrection guard ensures the workflow's eventual `workflow_end` doesn't re-create the row. Deletion waits for any in-process approval resolution or cancellation compensation before the store sweep. Custom stores must make `resolveDecision` idempotent and implement the complete execution-scoped sweep in `deleteExecution`.
 
-`ExecutionInfo.metadata` round-trips from `ExecuteOptions.metadata` (`userId`, `tenantId`, etc.) — queryable via `runtime.getExecutions().filter(...)`. Internal session control-plane keys (`sessionHistory`, `sessionId`) are stripped before persistence; they remain available via `ctx.metadata` for dynamic selectors.
+`ExecutionInfo.metadata` round-trips from `ExecuteOptions.metadata` (`userId`, `tenantId`, etc.). Filter on it as you read history; for large histories, read a page at a time:
+
+```typescript
+let cursor: ExecutionCursor | undefined;
+do {
+  const page = await runtime.getExecutions({ limit: 500, cursor });
+  for (const e of page) if (e.metadata?.tenantId === tenantId) handle(e);
+  const last = page.at(-1);
+  cursor = last && { startedAt: last.startedAt, executionId: last.executionId };
+} while (cursor);
+```
+
+Internal session control-plane keys (`sessionHistory`, `sessionId`) are stripped before persistence; they remain available via `ctx.metadata` for dynamic selectors.
 
 ### Session Options
 

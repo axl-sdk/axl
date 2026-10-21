@@ -121,6 +121,16 @@ export function redactExecutionInfo(
 ): HistoricalExecutionInfo {
   if (!redact) return info;
   return {
+    ...redactExecutionFields(info),
+    events: info.events.map((e) => redactStreamEvent(e, true)),
+  } as HistoricalExecutionInfo;
+}
+
+/** Row fields the REST boundary scrubs; shared by full records and list summaries. */
+function redactExecutionFields<T extends { result?: unknown; error?: string; metadata?: unknown }>(
+  info: T,
+): T {
+  return {
     ...info,
     ...(info.result !== undefined ? { result: REDACTED } : {}),
     ...(info.error !== undefined ? { error: REDACTED } : {}),
@@ -132,17 +142,23 @@ export function redactExecutionInfo(
     // queryable/serializable rather than dropping it (mirrors
     // `redactPendingDecision` on `decision.metadata`).
     ...(info.metadata !== undefined ? { metadata: { redacted: true } } : {}),
-    events: info.events.map((e) => redactStreamEvent(e, true)),
-  } as HistoricalExecutionInfo;
+  };
 }
 
-/** List variant: maps each entry through the single-item redactor. */
-export function redactExecutionList(
-  infos: HistoricalExecutionInfo[],
+/**
+ * A list row: an execution without its events, plus how many it has. The
+ * events stay behind `GET /api/executions/:id`.
+ */
+export type ExecutionSummary = Omit<HistoricalExecutionInfo, 'events'> & { eventCount: number };
+
+/** Strip events from a record and scrub the remaining fields when `redact` is true. */
+export function summarizeExecution(
+  info: HistoricalExecutionInfo,
   redact: boolean,
-): HistoricalExecutionInfo[] {
-  if (!redact) return infos;
-  return infos.map((info) => redactExecutionInfo(info, redact));
+): ExecutionSummary {
+  const { events, ...rest } = info;
+  const summary = { ...rest, eventCount: events.length } as ExecutionSummary;
+  return redact ? redactExecutionFields(summary) : summary;
 }
 
 /**

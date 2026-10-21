@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -6,6 +6,8 @@ import path from 'node:path';
 import { RedisStore } from '../state/redis.js';
 import { AxlRuntime } from '../runtime.js';
 import type { ExecutionInfo, AxlEvent } from '../types.js';
+import { gateRedisClient } from './redis-gated-client.js';
+import { __resetSchemaDiagnosticWarnings } from '../schema-diagnostics.js';
 
 /**
  * `REDIS_URL`-gated integration tests against a real Redis server.
@@ -211,6 +213,43 @@ describe.skipIf(!REDIS_URL)('RedisStore integration (real Redis)', () => {
       // After deletion PTTL returns -2, which must read as "owner gone" so the
       // artifact bytes get reclaimed rather than leaked forever.
       expect(await ttlStore.getEvalRetention(id)).toEqual({ exists: false });
+    });
+
+    it('P1-19 executionHistory expires on the server while an untimed eval row stays', async () => {
+      const mixed = await RedisStore.create({
+        url: REDIS_URL!,
+        keyPrefix: `${TEST_PREFIX}mixed-`,
+        skipMigration: true,
+        defaultTtl: 3600,
+        ttls: { executionHistory: 1, evalHistory: null },
+      });
+      try {
+        const execId = `exec-exp-${randomUUID()}`;
+        const evalId = `ev-keep-${randomUUID()}`;
+        const now = Date.now();
+        await mixed.saveExecution({
+          executionId: execId,
+          workflow: 'wf',
+          status: 'completed',
+          events: [],
+          totalCost: 0,
+          startedAt: now,
+          completedAt: now,
+          duration: 0,
+        } as ExecutionInfo);
+        await mixed.saveEvalResult({ id: evalId, eval: 'suite', timestamp: now, data: {} });
+
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+
+        expect(await mixed.getExecution(execId)).toBeNull();
+        expect((await mixed.listExecutions()).some((e) => e.executionId === execId)).toBe(false);
+        expect(await mixed.getEvalRetention(evalId)).toEqual({ exists: true });
+        const client = (mixed as unknown as { client: { pTTL(key: string): Promise<number> } })
+          .client;
+        expect(await client.pTTL(`${TEST_PREFIX}mixed-eval-history:${evalId}`)).toBe(-1);
+      } finally {
+        await mixed.close?.();
+      }
     });
 
     it('reports an absolute expiry for an eval row written under a TTL', async () => {
@@ -589,5 +628,412 @@ describe.skipIf(!REDIS_URL)('RedisStore integration (real Redis)', () => {
       // Cleanup
       await store.deleteExecution(live);
     });
+  });
+
+  // ── History paging and index cleanup ─────────────────────────────
+
+  describe('history paging and index cleanup', () => {
+    type RawClient = {
+      sMembers(key: string): Promise<string[]>;
+      zRange(key: string, start: number | string, stop: number | string): Promise<string[]>;
+      zScore(key: string, member: string): Promise<number | null>;
+      zAdd(key: string, member: { score: number; value: string }): Promise<number>;
+      zRem(key: string, member: string | string[]): Promise<number>;
+      del(keys: string | string[]): Promise<number>;
+      get(key: string): Promise<string | null>;
+      set(key: string, value: string, options?: { EX?: number }): Promise<string | null>;
+      pTTL(key: string): Promise<number>;
+    };
+    const rawClient = (s: RedisStore) => (s as unknown as { client: RawClient }).client;
+
+    const exec = (id: string, startedAt: number): ExecutionInfo => ({
+      executionId: id,
+      workflow: 'wf',
+      status: 'completed',
+      events: [],
+      totalCost: 0,
+      startedAt,
+      completedAt: startedAt,
+      duration: 0,
+    });
+
+    async function open(prefix: string, executionHistory: number | null = 60) {
+      return RedisStore.create({
+        url: REDIS_URL!,
+        keyPrefix: prefix,
+        skipMigration: true,
+        ttls: { executionHistory },
+      });
+    }
+
+    /** Index `id` as a record that has already expired: no blob, past expiry. */
+    async function plantDead(s: RedisStore, prefix: string, id: string, startedAt: number) {
+      await s.saveExecution(exec(id, startedAt));
+      const c = rawClient(s);
+      await c.del(`${prefix}exec-history:${id}`);
+      await c.zAdd(`${prefix}exec-history-exp`, { score: 1, value: id });
+    }
+
+    it('pages a startedAt tie group and skips dead entries with real ZRANGE WITHSCORES', async () => {
+      const prefix = `${TEST_PREFIX}paging-`;
+      const s = await open(prefix, null);
+      try {
+        for (const id of ['t-c', 'lo', 't-a', 't-g', 'hi', 't-e', 't-b', 't-f', 't-d']) {
+          await s.saveExecution(exec(id, id === 'hi' ? 2000 : id === 'lo' ? 500 : 1000));
+        }
+        // Dead index entries inside the tie group and around it.
+        for (const id of ['t-d0', 't-f0', 'zz']) {
+          await s.saveExecution(exec(id, id === 'zz' ? 3000 : 1000));
+          await rawClient(s).del(`${prefix}exec-history:${id}`);
+        }
+        const pages: string[][] = [];
+        let cursor: { startedAt: number; executionId: string } | undefined;
+        for (;;) {
+          const page = await s.listExecutions(3, cursor ? { cursor } : undefined);
+          pages.push(page.map((e) => e.executionId));
+          if (page.length === 0) break;
+          const last = page[page.length - 1];
+          cursor = { startedAt: last.startedAt, executionId: last.executionId };
+        }
+        expect(pages).toEqual([
+          ['hi', 't-g', 't-f'],
+          ['t-e', 't-d', 't-c'],
+          ['t-b', 't-a', 'lo'],
+          [],
+        ]);
+      } finally {
+        await s.close();
+      }
+    });
+
+    it('P2-15 expired records leave every index within one later save', async () => {
+      const prefix = `${TEST_PREFIX}prune-`;
+      const s = await open(prefix, 1);
+      try {
+        const now = Date.now();
+        for (const id of ['a', 'b', 'c']) await s.saveExecution(exec(id, now));
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        // ⌈3 / PRUNE_BATCH⌉ = 1 save.
+        await s.saveExecution(exec('d', now + 1));
+
+        expect((await s.listExecutions()).map((e) => e.executionId)).toEqual(['d']);
+        const c = rawClient(s);
+        expect(await c.sMembers(`${prefix}exec-history-ids`)).toEqual(['d']);
+        expect(await c.zRange(`${prefix}exec-history-z`, 0, -1)).toEqual(['d']);
+        expect(await c.zRange(`${prefix}exec-history-exp`, 0, -1)).toEqual(['d']);
+      } finally {
+        await s.close();
+      }
+    });
+
+    /** A gated S1 and an ungated S2 sharing `prefix`. */
+    async function pair(prefix: string, s2History: number | null = 60) {
+      const s1 = await open(prefix);
+      const s2 = await open(prefix, s2History);
+      const gate = gateRedisClient(rawClient(s1) as object);
+      (s1 as unknown as { client: unknown }).client = gate.client;
+      const close = async () => {
+        await s1.close();
+        await s2.close();
+      };
+      return { s1, s2, gate, close };
+    }
+
+    it('P2-05 a re-save between the read and the script stays listed (real client)', async () => {
+      const prefix = `${TEST_PREFIX}race-resave-`;
+      const { s1, s2, gate, close } = await pair(prefix);
+      try {
+        await plantDead(s2, prefix, 'x', 7);
+        const paused = gate.pauseAt('eval-prune');
+        const save = s1.saveExecution(exec('y', 10_000));
+        await paused;
+        await s2.saveExecution(exec('x', 123));
+        gate.release('eval-prune');
+        await save;
+
+        expect((await s1.listExecutions()).map((e) => e.executionId)).toEqual(['y', 'x']);
+        const c = rawClient(s2);
+        expect(await c.zScore(`${prefix}exec-history-z`, 'x')).toBe(123);
+        expect(await c.zScore(`${prefix}exec-history-exp`, 'x')).toBeGreaterThan(Date.now());
+      } finally {
+        await close();
+      }
+    });
+
+    it('P2-08 an untimed re-save between the read and the script stays listed (real client)', async () => {
+      const prefix = `${TEST_PREFIX}race-resave-untimed-`;
+      const { s1, s2, gate, close } = await pair(prefix, null);
+      try {
+        await plantDead(s2, prefix, 'x', 7);
+        const paused = gate.pauseAt('eval-prune');
+        const save = s1.saveExecution(exec('y', 10_000));
+        await paused;
+        await s2.saveExecution(exec('x', 123));
+        gate.release('eval-prune');
+        await save;
+
+        expect((await s1.listExecutions()).map((e) => e.executionId)).toEqual(['y', 'x']);
+        const c = rawClient(s2);
+        expect(await c.zScore(`${prefix}exec-history-z`, 'x')).toBe(123);
+        expect(await c.zScore(`${prefix}exec-history-exp`, 'x')).toBeNull();
+      } finally {
+        await close();
+      }
+    });
+
+    it('P2-06 a delete between the read and the script leaves nothing indexed (real client)', async () => {
+      const prefix = `${TEST_PREFIX}race-delete-`;
+      const { s1, s2, gate, close } = await pair(prefix);
+      try {
+        await plantDead(s2, prefix, 'x', 7);
+        const paused = gate.pauseAt('eval-prune');
+        const save = s1.saveExecution(exec('y', 10_000));
+        await paused;
+        await s2.saveExecution(exec('x', 123));
+        expect(await s2.deleteExecution('x')).toBe(true);
+        gate.release('eval-prune');
+        await save;
+
+        const c = rawClient(s2);
+        expect(await c.get(`${prefix}exec-history:x`)).toBeNull();
+        expect(await c.sMembers(`${prefix}exec-history-ids`)).toEqual(['y']);
+        expect(await c.zRange(`${prefix}exec-history-z`, 0, -1)).toEqual(['y']);
+        expect(await c.zScore(`${prefix}exec-history-exp`, 'x')).toBeNull();
+      } finally {
+        await close();
+      }
+    });
+
+    it('re-scores a live timed entry and takes a live untimed one out of the expiry set only (real client)', async () => {
+      const prefix = `${TEST_PREFIX}rescore-`;
+      const s = await open(prefix);
+      try {
+        const c = rawClient(s);
+        await s.saveExecution(exec('timed', 50));
+        await s.saveExecution(exec('untimed', 40));
+        await c.set(`${prefix}exec-history:untimed`, JSON.stringify(exec('untimed', 40))); // PERSIST
+        await c.set(`${prefix}exec-history:timed`, JSON.stringify(exec('timed', 50)), { EX: 30 });
+        for (const id of ['timed', 'untimed']) {
+          await c.zAdd(`${prefix}exec-history-exp`, { score: 1, value: id });
+        }
+        const before = Date.now();
+        await s.saveExecution(exec('n1', 10_000));
+
+        const timedExpiry = (await c.zScore(`${prefix}exec-history-exp`, 'timed'))!;
+        expect(timedExpiry).toBeGreaterThan(before + 25_000);
+        expect(timedExpiry).toBeLessThanOrEqual(Date.now() + 30_000);
+        expect(await c.zScore(`${prefix}exec-history-exp`, 'untimed')).toBeNull();
+        expect((await s.listExecutions()).map((e) => e.executionId)).toEqual([
+          'n1',
+          'timed',
+          'untimed',
+        ]);
+      } finally {
+        await s.close();
+      }
+    });
+
+    it('P2-10 a failed script leaves the indexes consistent and the next save completes it (real client)', async () => {
+      const prefix = `${TEST_PREFIX}failed-script-`;
+      const { s1, s2, gate, close } = await pair(prefix);
+      try {
+        await s2.saveExecution(exec('live', 500));
+        await plantDead(s2, prefix, 'dead', 7);
+        gate.failAt('eval-prune');
+        await s1.saveExecution(exec('y', 10_000));
+        const c = rawClient(s2);
+        expect((await c.sMembers(`${prefix}exec-history-ids`)).sort()).toEqual([
+          'dead',
+          'live',
+          'y',
+        ]);
+        expect((await s1.listExecutions()).map((e) => e.executionId)).toEqual(['y', 'live']);
+
+        await s1.saveExecution(exec('z', 20_000));
+        expect((await c.sMembers(`${prefix}exec-history-ids`)).sort()).toEqual(['live', 'y', 'z']);
+        expect(await c.zRange(`${prefix}exec-history-z`, 0, -1)).toEqual(['live', 'y', 'z']);
+        expect(await c.zRange(`${prefix}exec-history-exp`, 0, -1)).toEqual(['live', 'y', 'z']);
+      } finally {
+        await close();
+      }
+    });
+  });
+
+  describe('history maintenance (applyHistoryRetention)', () => {
+    type RawClient = {
+      sMembers(key: string): Promise<string[]>;
+      zRange(key: string, start: number | string, stop: number | string): Promise<string[]>;
+      zScore(key: string, member: string): Promise<number | null>;
+      zRem(key: string, member: string | string[]): Promise<number>;
+      del(keys: string | string[]): Promise<number>;
+      exists(key: string): Promise<number>;
+      pTTL(key: string): Promise<number>;
+    };
+    const rawClient = (s: RedisStore) => (s as unknown as { client: RawClient }).client;
+
+    const exec = (id: string, startedAt: number, completedAt = startedAt): ExecutionInfo => ({
+      executionId: id,
+      workflow: 'wf',
+      status: 'completed',
+      events: [],
+      totalCost: 0,
+      startedAt,
+      completedAt,
+      duration: 0,
+    });
+
+    async function open(prefix: string, executionHistory: number | null) {
+      return RedisStore.create({
+        url: REDIS_URL!,
+        keyPrefix: prefix,
+        skipMigration: true,
+        ttls: { executionHistory },
+      });
+    }
+
+    async function runToCompletion(s: RedisStore, batchSize: number) {
+      const totals = { expired: 0, armed: 0, indexed: 0, deadIndexEntries: 0, calls: 0 };
+      let cursor: { time: number; id: string } | null = null;
+      do {
+        const r = await s.applyHistoryRetention({ kind: 'executions', batchSize, cursor });
+        totals.expired += r.expired;
+        totals.armed += r.armed;
+        totals.indexed += r.indexed;
+        totals.deadIndexEntries += r.deadIndexEntries;
+        totals.calls++;
+        cursor = r.cursor;
+      } while (cursor !== null);
+      return totals;
+    }
+
+    it('P5-02/03/04/06 arms, expires, indexes and repairs pre-upgrade history, then is a no-op', async () => {
+      const prefix = `${TEST_PREFIX}maintenance-`;
+      const legacy = await open(prefix, null);
+      const timed = await open(prefix, 30);
+      const now = Date.now();
+      // Untimed records from before the upgrade: L1 finished 30 s ago, L2
+      // 120 s ago, plus a startedAt tie group that crosses batch boundaries.
+      await legacy.saveExecution(exec('L1', now - 3_600_000, now - 30_000));
+      await legacy.saveExecution(exec('L2', now - 3_600_000, now - 120_000));
+      for (const id of ['tie-a', 'tie-b', 'tie-c']) {
+        await legacy.saveExecution(exec(id, now - 1_000_000, now - 1000));
+      }
+      // Timed before the upgrade: a TTL but no expiry-set entry.
+      await timed.saveExecution(exec('T1', now - 2_000_000));
+      await rawClient(timed).zRem(`${prefix}exec-history-exp`, 'T1');
+      // A dead index entry: indexed, no blob.
+      await legacy.saveExecution(exec('D', now - 500_000));
+      await rawClient(legacy).del(`${prefix}exec-history:D`);
+      const s = await open(prefix, 60);
+      try {
+        const totals = await runToCompletion(s, 2);
+        expect(totals).toMatchObject({ armed: 4, expired: 1, indexed: 1, deadIndexEntries: 1 });
+
+        const c = rawClient(s);
+        expect(await c.zScore(`${prefix}exec-history-exp`, 'L1')).toBe(now - 30_000 + 60_000);
+        const l1 = await c.pTTL(`${prefix}exec-history:L1`);
+        expect(Math.abs(now - 30_000 + 60_000 - (Date.now() + l1))).toBeLessThan(1000);
+        expect(await c.exists(`${prefix}exec-history:L2`)).toBe(0);
+        const t1 = await c.pTTL(`${prefix}exec-history:T1`);
+        expect(t1).toBeGreaterThan(25_000);
+        expect(t1).toBeLessThanOrEqual(30_000);
+        expect(await c.zScore(`${prefix}exec-history-exp`, 'T1')).toBeGreaterThan(Date.now());
+        for (const id of ['L2', 'D']) {
+          expect(await c.zScore(`${prefix}exec-history-z`, id)).toBeNull();
+          expect(await c.sMembers(`${prefix}exec-history-ids`)).not.toContain(id);
+        }
+        expect((await s.listExecutions()).map((e) => e.executionId)).toEqual([
+          'tie-c',
+          'tie-b',
+          'tie-a',
+          'T1',
+          'L1',
+        ]);
+
+        // P5-06: a second full run changes nothing.
+        const before = await c.zScore(`${prefix}exec-history-exp`, 'tie-b');
+        expect(await runToCompletion(s, 2)).toMatchObject({
+          armed: 0,
+          expired: 0,
+          indexed: 0,
+          deadIndexEntries: 0,
+        });
+        expect(await c.zScore(`${prefix}exec-history-exp`, 'tie-b')).toBe(before);
+      } finally {
+        await legacy.close();
+        await timed.close();
+        await s.close();
+      }
+    });
+
+    it('a record re-saved before it is armed or expired keeps its fresh window (real client)', async () => {
+      const prefix = `${TEST_PREFIX}maintenance-resave-`;
+      const legacy = await open(prefix, null);
+      const s = await open(prefix, 60);
+      const maintainer = await open(prefix, 60);
+      const gate = gateRedisClient(rawClient(maintainer) as object);
+      (maintainer as unknown as { client: unknown }).client = gate.client;
+      try {
+        const now = Date.now();
+        await legacy.saveExecution(exec('past', now - 3_600_000));
+        await legacy.saveExecution(exec('inside', now - 1000));
+        const paused = gate.pauseAt('retention-multi');
+        const run = maintainer.applyHistoryRetention({ kind: 'executions' });
+        await paused;
+        await s.saveExecution(exec('past', now - 3_600_000));
+        await s.saveExecution(exec('inside', now - 1000));
+        gate.release('retention-multi');
+        expect(await run).toMatchObject({ armed: 0, expired: 0 });
+
+        const c = rawClient(s);
+        for (const id of ['past', 'inside']) {
+          expect(await c.pTTL(`${prefix}exec-history:${id}`)).toBeGreaterThan(55_000);
+        }
+        expect((await s.listExecutions()).map((e) => e.executionId)).toEqual(['inside', 'past']);
+      } finally {
+        await legacy.close();
+        await s.close();
+        await maintainer.close();
+      }
+    });
+  });
+});
+
+describe.skipIf(!REDIS_URL)('RedisStore.create() retention warning (real Redis, AC1.6)', () => {
+  /** Connect with `options`, close again, and count retention warnings. */
+  async function warningsFor(...optionsList: Array<Record<string, unknown>>): Promise<number> {
+    __resetSchemaDiagnosticWarnings();
+    vi.stubEnv('AXL_DIAGNOSTICS_SILENT', '');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      for (const options of optionsList) {
+        // Nothing is written, so the throwaway prefix leaves no keys behind.
+        const store = await RedisStore.create({
+          url: REDIS_URL!,
+          keyPrefix: `axl-test-${randomUUID()}:`,
+          skipMigration: true,
+          ...options,
+        });
+        await store.close();
+      }
+      return warn.mock.calls.filter((args) =>
+        String(args[0]).includes('RedisStore keeps execution history forever'),
+      ).length;
+    } finally {
+      warn.mockRestore();
+      vi.unstubAllEnvs();
+      __resetSchemaDiagnosticWarnings();
+    }
+  }
+
+  it('warns once per process when neither ttls.executionHistory nor defaultTtl is set', async () => {
+    expect(await warningsFor({}, {})).toBe(1);
+    expect(await warningsFor({ ttls: { evalHistory: 60 } })).toBe(1);
+  });
+
+  it('is silenced by any explicit executionHistory value or a defaultTtl', async () => {
+    expect(await warningsFor({ ttls: { executionHistory: null } })).toBe(0);
+    expect(await warningsFor({ ttls: { executionHistory: 60 } })).toBe(0);
+    expect(await warningsFor({ defaultTtl: 60 })).toBe(0);
   });
 });

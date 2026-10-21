@@ -1,5 +1,5 @@
 import { useState, useCallback, useMemo } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useInfiniteQuery, useQuery } from '@tanstack/react-query';
 import { Activity, RefreshCw } from 'lucide-react';
 import { PanelHeader } from '../../components/layout/PanelHeader';
 import { EmptyState } from '../../components/shared/EmptyState';
@@ -9,10 +9,10 @@ import { CostBadge } from '../../components/shared/CostBadge';
 import { JsonViewer } from '../../components/shared/JsonViewer';
 import { CommandPicker } from '../../components/shared/CommandPicker';
 import { TraceEventList } from '../../components/shared/TraceEventList';
-import { fetchExecutions } from '../../lib/api';
+import { fetchExecution, fetchExecutions } from '../../lib/api';
 import { useWs } from '../../hooks/use-ws';
 import { cn, formatCost, formatDuration } from '../../lib/utils';
-import type { ExecutionInfo, AxlEvent, ObservationStatus } from '../../lib/types';
+import type { ExecutionSummary, AxlEvent, ObservationStatus } from '../../lib/types';
 import { StatCard } from '../../components/shared/StatCard';
 import { ResizableSplit } from '../../components/shared/ResizableSplit';
 import { executionEventSchemaVersion } from '../../lib/trace-utils';
@@ -62,16 +62,48 @@ function incompleteObservationMessage(observation: Exclude<ObservationStatus, { 
 
 export function TraceExplorerPanel() {
   const [traceTab, setTraceTab] = useState<'events' | 'stats'>('events');
-  const [selectedExecution, setSelectedExecution] = useState<ExecutionInfo | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
   const [liveEvents, setLiveEvents] = useState<AxlEvent[]>([]);
   const [typeFilter, setTypeFilter] = useState('');
   const [agentFilter, setAgentFilter] = useState('');
 
-  const { data: executions = [], refetch } = useQuery({
+  // The list holds summaries only; "Load more" appends older pages. The 3 s
+  // refetch re-reads every loaded page from the top, so new runs appear first
+  // and older pages stay consistent with them.
+  const {
+    data: executionPages,
+    refetch,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+    error: listError,
+  } = useInfiniteQuery({
     queryKey: ['executions'],
-    queryFn: fetchExecutions,
+    queryFn: ({ pageParam }) => fetchExecutions(pageParam),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (lastPage) => lastPage.nextCursor ?? undefined,
     refetchInterval: 3000,
   });
+  const executions: ExecutionSummary[] = useMemo(() => {
+    const seen = new Set<string>();
+    return (executionPages?.pages ?? [])
+      .flatMap((page) => page.data)
+      .filter((exec) => !seen.has(exec.executionId) && !!seen.add(exec.executionId));
+  }, [executionPages]);
+
+  // Events come from the per-run detail fetch, not the list.
+  const {
+    data: selectedExecution = null,
+    refetch: refetchDetail,
+    isPending: detailLoading,
+    error: detailError,
+  } = useQuery({
+    queryKey: ['execution', selectedId],
+    queryFn: () => fetchExecution(selectedId!),
+    enabled: selectedId !== null,
+    refetchInterval: (query) => (query.state.data?.status === 'running' ? 3000 : false),
+  });
+  const selectedSummary = executions.find((e) => e.executionId === selectedId) ?? null;
 
   // Subscribe to all trace events for live updates
   useWs(
@@ -81,7 +113,7 @@ export function TraceExplorerPanel() {
     }, []),
   );
 
-  const allEvents = selectedExecution ? selectedExecution.events : liveEvents;
+  const allEvents = selectedId ? (selectedExecution?.events ?? []) : liveEvents;
 
   let filteredEvents = allEvents;
   if (typeFilter) filteredEvents = filteredEvents.filter((e) => e.type === typeFilter);
@@ -128,20 +160,25 @@ export function TraceExplorerPanel() {
       <PanelHeader
         title="Trace Explorer"
         description={
-          selectedExecution ? (
+          selectedId ? (
             <>
-              <span>{selectedExecution.workflow}</span>
+              <span>{(selectedExecution ?? selectedSummary)?.workflow}</span>
               <span className="opacity-40 mx-1.5">·</span>
-              <span className="font-mono">{selectedExecution.executionId.slice(0, 8)}</span>
-              <span className="opacity-40 mx-1.5">·</span>
-              <span>
-                {selectedExecution.events.length} event
-                {selectedExecution.events.length !== 1 ? 's' : ''}
-              </span>
+              <span className="font-mono">{selectedId.slice(0, 8)}</span>
+              {selectedExecution && (
+                <>
+                  <span className="opacity-40 mx-1.5">·</span>
+                  <span>
+                    {selectedExecution.events.length} event
+                    {selectedExecution.events.length !== 1 ? 's' : ''}
+                  </span>
+                </>
+              )}
             </>
           ) : (
             <>
               {executions.length} execution{executions.length !== 1 ? 's' : ''}
+              {hasNextPage ? '+' : ''}
               <span className="opacity-40 mx-1.5">·</span>
               {liveEvents.length} live event{liveEvents.length !== 1 ? 's' : ''}
             </>
@@ -188,6 +225,7 @@ export function TraceExplorerPanel() {
             <button
               onClick={() => {
                 refetch();
+                if (selectedId) refetchDetail();
                 setLiveEvents([]);
               }}
               className={cn(
@@ -248,27 +286,27 @@ export function TraceExplorerPanel() {
               <h3 className="text-sm font-medium mb-2">Executions</h3>
               <button
                 onClick={() => {
-                  setSelectedExecution(null);
+                  setSelectedId(null);
                 }}
                 className={cn(
                   'w-full text-left px-3 py-2 text-xs rounded-xl border',
-                  !selectedExecution
+                  !selectedId
                     ? 'border-[hsl(var(--primary))] bg-[hsl(var(--accent))]'
                     : 'border-[hsl(var(--border))] hover:bg-[hsl(var(--accent))]',
                 )}
               >
                 Live Events ({liveEvents.length})
               </button>
-              {executions.map((exec: ExecutionInfo) => (
+              {executions.map((exec: ExecutionSummary) => (
                 <button
                   key={exec.executionId}
                   onClick={() => {
-                    setSelectedExecution(exec);
+                    setSelectedId(exec.executionId);
                   }}
                   className={cn(
                     'w-full text-left px-3 py-2.5 text-xs rounded-xl border border-l-[3px] transition-colors',
                     STATUS_TINT[exec.status] ?? 'border-l-slate-400',
-                    selectedExecution?.executionId === exec.executionId
+                    selectedId === exec.executionId
                       ? 'border-[hsl(var(--primary))] bg-[hsl(var(--accent))]'
                       : 'border-[hsl(var(--border))] hover:bg-[hsl(var(--accent))]',
                   )}
@@ -289,7 +327,7 @@ export function TraceExplorerPanel() {
                   </div>
                   <div className="flex items-center justify-between mt-1">
                     <span className="text-[hsl(var(--muted-foreground))] truncate">
-                      {exec.executionId.slice(0, 8)}… | {exec.events.length} events
+                      {exec.executionId.slice(0, 8)}… | {exec.eventCount} events
                     </span>
                     {(exec.totalCost > 0 || exec.unpriced) && (
                       <CostBadge cost={exec.totalCost} unpriced={exec.unpriced} />
@@ -306,8 +344,23 @@ export function TraceExplorerPanel() {
                   </div>
                 </button>
               ))}
-              {executions.length === 0 && (
+              {executions.length === 0 && !listError && (
                 <p className="text-xs text-[hsl(var(--muted-foreground))]">No executions yet</p>
+              )}
+              {listError && (
+                <p role="alert" className="text-xs text-red-600 dark:text-red-400">
+                  Failed to load executions: {listError.message}
+                </p>
+              )}
+              {hasNextPage && (
+                <button
+                  type="button"
+                  onClick={() => fetchNextPage()}
+                  disabled={isFetchingNextPage}
+                  className="w-full px-3 py-2 text-xs rounded-xl border border-[hsl(var(--border))] hover:bg-[hsl(var(--accent))] disabled:opacity-50 cursor-pointer"
+                >
+                  {isFetchingNextPage ? 'Loading…' : 'Load more'}
+                </button>
               )}
             </div>
           }
@@ -355,7 +408,13 @@ export function TraceExplorerPanel() {
                 </div>
               )}
 
-              {filteredEvents.length === 0 ? (
+              {selectedId && detailError ? (
+                <p role="alert" className="text-xs text-red-600 dark:text-red-400">
+                  Failed to load execution: {detailError.message}
+                </p>
+              ) : selectedId && detailLoading ? (
+                <p className="text-xs text-[hsl(var(--muted-foreground))]">Loading events…</p>
+              ) : filteredEvents.length === 0 ? (
                 <EmptyState
                   icon={<Activity size={32} />}
                   title="No trace events"

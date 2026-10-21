@@ -229,7 +229,7 @@ describe('A13 — save, delete and reconciliation', () => {
     const store = runtime.getDiagnosticArtifactStore()!;
     const manifest = (await store.list()).find((m) => m.artifactId === artifactId)!;
     expect(manifest.state).toBe('committed');
-    // Memory history never expires, so no expiry is mirrored onto the artifact.
+    // No eval retention is configured, so no expiry is mirrored onto the artifact.
     expect(manifest.expiresAt).toBeUndefined();
     await runtime.shutdown();
   });
@@ -623,6 +623,60 @@ describe('getEvalRetention', () => {
     expect(await store.getEvalRetention('missing')).toEqual({ exists: false });
     await store.close();
   });
+});
+
+// ── P1-09 / AC1.4: artifacts follow eval retention on Memory and SQLite ──
+
+describe('artifacts follow a configured eval retention (AC1.4)', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const stores: Array<[string, (ttls?: { evalHistory?: number | null }) => StateStore]> = [
+    ['MemoryStore', (ttls) => new MemoryStore({ ttls })],
+    ['SQLiteStore', (ttls) => new SQLiteStore(path.join(root, 'retention.db'), { ttls })],
+  ];
+
+  for (const [name, makeStore] of stores) {
+    it(`${name}: the manifest mirrors the row's expiry and both go once it passes (P1-09)`, async () => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      const t0 = 1_700_000_000_000;
+      vi.setSystemTime(t0);
+      const runtime = artifactRuntime({ store: makeStore({ evalHistory: 60 }) });
+      const { artifactId, data } = await stagedResult(runtime, 'run-ttl');
+      await runtime.saveEvalResult({ id: 'run-ttl', eval: 'e', timestamp: t0, data });
+
+      const store = runtime.getStateStore();
+      expect(await store.getEvalRetention!('run-ttl')).toEqual({
+        exists: true,
+        expiresAt: t0 + 60_000,
+      });
+      const manifest = (await runtime.getDiagnosticArtifactStore()!.list()).find(
+        (m) => m.artifactId === artifactId,
+      )!;
+      expect(manifest.state).toBe('committed');
+      expect(manifest.expiresAt).toBe(t0 + 60_000);
+
+      vi.setSystemTime(t0 + 60_000);
+      expect(await store.getEvalRetention!('run-ttl')).toEqual({ exists: false });
+      expect(await runtime.openDiagnosticArtifact(artifactId)).toBeUndefined();
+      const { removed } = await runtime.reconcileDiagnosticArtifacts();
+      expect(removed).toContain(artifactId);
+      await runtime.shutdown();
+    });
+
+    it(`${name}: with no eval retention the manifest carries no expiry`, async () => {
+      const runtime = artifactRuntime({ store: makeStore({ evalHistory: null }) });
+      const { artifactId, data } = await stagedResult(runtime, 'run-forever');
+      await runtime.saveEvalResult({ id: 'run-forever', eval: 'e', timestamp: 1, data });
+      const manifest = (await runtime.getDiagnosticArtifactStore()!.list()).find(
+        (m) => m.artifactId === artifactId,
+      )!;
+      expect(manifest.state).toBe('committed');
+      expect(manifest.expiresAt).toBeUndefined();
+      await runtime.shutdown();
+    });
+  }
 });
 
 // ── A12.7: capture off by default stays off ──────────────────────────

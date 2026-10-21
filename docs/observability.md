@@ -799,7 +799,8 @@ The filter applies at three layers:
 
 | Route | Scrubbed fields | Preserved |
 |---|---|---|
-| `GET /api/executions` / `:id` | `result`, `error`, `metadata` (replaced with `{ redacted: true }` — caller-supplied `userId`/`tenantId`/correlation ids are PII surfaces) | `executionId`, `workflow`, `status`, `duration`, `totalCost`, `startedAt`, `completedAt`, `events` (already scrubbed at emit time) |
+| `GET /api/executions` | `result`, `error`, `metadata` (replaced with `{ redacted: true }` — caller-supplied `userId`/`tenantId`/correlation ids are PII surfaces) | `executionId`, `workflow`, `status`, `duration`, `totalCost`, `startedAt`, `completedAt`, `eventCount`. Items are summaries without `events`; see [Paging executions](./studio-api.md#paging-executions) |
+| `GET /api/executions/:id` | `result`, `error`, `metadata` (as above) | `executionId`, `workflow`, `status`, `duration`, `totalCost`, `startedAt`, `completedAt`, `events` (already scrubbed at emit time) |
 | `DELETE /api/executions/:id` | (no content) | (blocked in `readOnly`; also scrubs the WS replay buffer for `execution:{id}` via `ConnectionManager.clearChannelBuffer`) |
 | `GET /api/memory/:scope` / `:key` | `value` | `key` (programmer-chosen identifier, needed for navigation) |
 | `GET /api/sessions/:id` | `message.content`, `message.tool_calls[*].function.arguments`; `message.providerMetadata` is dropped entirely (opaque bag that may carry encoded reasoning / cache keys) | `role`, `name`, `tool_call_id`, `tool_calls[*].id`, `tool_calls[*].type`, `tool_calls[*].function.name`, `handoffHistory` (no content fields to scrub) |
@@ -1307,8 +1308,7 @@ const runtime = new AxlRuntime({
   },
 });
 
-// On the NEXT process, after a crash:
-await runtime.getExecutions();              // hydrate historical cache first
+// On the NEXT process, after a crash, before accepting requests:
 const recovered = await runtime.recoverIncompleteStreams();
 console.log(`Recovered ${recovered.length} crashed executions`);
 // Now safe to accept new requests
@@ -1334,6 +1334,8 @@ recovered runs from dashboards.
 - Recovery skips ids actively running in the current process (prevents corrupting a live workflow).
 - `saveExecution` failure during recovery preserves the streaming buffer for the next attempt (no data loss on intermittent Redis failures).
 - Recovery is idempotent — re-running it is safe; "canonical exists" branch drops orphan buffers without writing.
+- Recovery asks the store for each buffered run by id (`getExecution`) and skips any run that already has a final record. It does not list history, so startup cost tracks the number of crashed runs, not the size of the store.
+- A `deleteExecution(id)` issued while recovery works on that run waits for recovery to finish, so the recovered record does not outlive the delete.
 
 **Store coverage:** `RedisStore` implements the streaming methods atomically via MULTI. `MemoryStore` implements them in-process (good for tests; lost on crash by design). `SQLiteStore` does NOT — single-process file storage gets less value from crash-survival, and the runtime emits a one-shot warning when `persist: 'streaming'` is configured against it.
 
@@ -1353,7 +1355,7 @@ Each aggregate panel is backed by a typed aggregator that:
 
 1. **Rebuilds from history** on server start — replays persisted executions (up to 2000) or eval entries (up to 500) through a pure reducer function
 2. **Folds live events** as they arrive via the runtime's event emitter
-3. **Periodically rebuilds** every 5 minutes to evict events that fall outside time windows
+3. **Periodically rebuilds** every 5 minutes to evict events that fall outside time windows. Deleting a run also triggers a rebuild (at most two for a burst of deletes)
 
 Aggregate state is compute-on-read from the existing `ExecutionInfo.events` and `EvalHistoryEntry` data — no new persisted schema or materialized tables.
 

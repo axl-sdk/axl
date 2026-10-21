@@ -311,7 +311,7 @@ The `execution_deleted` event fires on every call — including attempts against
 
 **`DELETE /api/executions/:id`** (Studio) — wraps `runtime.deleteExecution` AND scrubs the WebSocket replay buffer for the deleted execution channel via `ConnectionManager.clearChannelBuffer('execution:{id}')`. Without this scrub, late WebSocket subscribers could replay events for a deleted run for up to 30 seconds after stream completion. Blocked in `readOnly` mode (405 with `error.code: 'READ_ONLY'`).
 
-**For bulk eviction by age**, use `RedisStore` TTLs (`defaultTtl` / `ttls.<category>`) instead — the deleteExecution path is for targeted operator-driven scrubs, not retention policy.
+**For deletion by age**, set a history retention instead: `ttls.executionHistory` / `ttls.evalHistory` on any built-in store (plus `defaultTtl` and the other categories on `RedisStore`). `deleteExecution` is for targeted scrubs, not retention policy. A retention applies to runs saved after you set it; history saved before keeps no expiry, and is never deleted by age, until you run `store.applyHistoryRetention()`. If your retention policy is a compliance commitment, run it once after setting the retention so older records follow the same rule. See [Execution history retention](./migration/execution-history-retention.md).
 
 See [docs/migration/state-store-durability.md](./migration/state-store-durability.md#1-runtimedeleteexecutionid) for the full delete contract and the per-store sweep table.
 

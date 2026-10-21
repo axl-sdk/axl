@@ -187,6 +187,9 @@ export type ExecutionInfo = {
   observation?: ObservationStatus;
 };
 
+/** A row from `GET /api/executions`: an execution without its events. */
+export type ExecutionSummary = Omit<ExecutionInfo, 'events'> & { eventCount: number };
+
 type CostBucket = { cost: number; calls: number; unpricedCalls: number };
 
 type TokenCostBucket = CostBucket & { tokens: { input: number; output: number } };

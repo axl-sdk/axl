@@ -75,8 +75,28 @@ export interface StateStore {
   saveExecution?(execution: HistoricalExecutionInfo): Promise<void>;
   /** Get a specific execution by ID from history. */
   getExecution?(executionId: string): Promise<HistoricalExecutionInfo | null>;
-  /** List recent executions (most recent first). */
-  listExecutions?(limit?: number): Promise<HistoricalExecutionInfo[]>;
+  /**
+   * List recent executions, most recent first. The built-in stores order by
+   * `startedAt` descending and break ties by `executionId` descending, so the
+   * order is total and stable across calls.
+   *
+   * `options.cursor` asks for the page that starts strictly after that
+   * position in the same order. The runtime passes it only when the store
+   * sets {@link StateStore.historyPaging}; other stores are listed in full and
+   * paged in process.
+   */
+  listExecutions?(
+    limit?: number,
+    options?: { cursor?: ExecutionCursor },
+  ): Promise<HistoricalExecutionInfo[]>;
+  /**
+   * Set to `true` when `listExecutions` honors `options.cursor` with the
+   * `(startedAt DESC, executionId DESC)` order. The built-in stores set it.
+   * Leave it unset if your store ignores the cursor: the runtime then lists
+   * everything and pages in process, which is correct but reads the whole
+   * history on every page.
+   */
+  readonly historyPaging?: boolean;
   /**
    * Delete an execution from history by ID. Returns `true` if an entry was
    * deleted, `false` if the ID didn't exist. Used for GDPR right-to-be-
@@ -140,13 +160,50 @@ export interface StateStore {
    * bytes on a timer and at startup. Physical deletion is therefore EVENTUAL,
    * not synchronous with the store's expiry.
    *
-   * Built-ins implement it: `MemoryStore` and `SqliteStore` never expire, so
-   * `expiresAt` is `undefined`; `RedisStore` reports existence and any live TTL.
+   * Built-ins implement it. `MemoryStore` and `SQLiteStore` report the
+   * absolute expiry they stored when `ttls.evalHistory` was configured at the
+   * row's first write, and no `expiresAt` otherwise; `RedisStore` reports
+   * existence and any live TTL. An expired row reports `{ exists: false }`.
    * A custom store WITHOUT this method cannot host managed artifact capture —
    * `AxlRuntime` rejects that configuration when it is constructed rather than
    * after a run has spent money.
    */
   getEvalRetention?(id: string): Promise<{ exists: boolean; expiresAt?: number }>;
+
+  // History maintenance
+  /**
+   * Apply the store's configured history retention to records that were
+   * saved without one (for example before an upgrade, or before a retention
+   * was set), and repair the store's listing indexes. Processes one batch and
+   * returns the cursor to continue from; call again with that cursor until it
+   * is `null`. Axl never calls this itself: run it when you choose to.
+   *
+   * For each record in the batch that has no expiry, and only when a
+   * retention is configured for `options.kind`:
+   * - a record whose window has already passed is deleted, with the same
+   *   per-run data a normal expiry removes;
+   * - any other record gets the expiry it would have had: the retention
+   *   counted from its last save (`completedAt` for executions, falling back
+   *   to `startedAt`; `timestamp` for eval rows).
+   *
+   * Records that already have an expiry keep it. With no retention
+   * configured for the kind (unset or `null`), nothing is expired or armed.
+   *
+   * The walk is oldest first, by `(startedAt, executionId)` for executions
+   * and `(timestamp, id)` for eval rows, and the cursor is a position in that
+   * order rather than an offset, so records removed behind it (by this call,
+   * a concurrent delete or an expiry) never cause a record to be skipped.
+   * Running it to completion twice changes nothing the second time.
+   *
+   * **Custom store implementors:** custom stores own their retention and may
+   * implement this with the same contract, or leave it out. Built-ins:
+   * - `MemoryStore` and `SQLiteStore` act on their rows directly; they keep
+   *   no separate index, so `indexed` and `deadIndexEntries` are always `0`.
+   * - `RedisStore` also adds records that already carry a TTL to its expiry
+   *   index (`indexed`) and removes index entries whose record is gone
+   *   (`deadIndexEntries`).
+   */
+  applyHistoryRetention?(options: HistoryRetentionOptions): Promise<HistoryRetentionResult>;
 
   // Sessions (Studio introspection)
   /** List all session IDs (used by Studio session browser). */
@@ -206,6 +263,77 @@ export interface StateStore {
   close?(): Promise<void>;
   deleteCheckpoints?(executionId: string): Promise<void>;
 }
+
+/**
+ * Position in execution history, used to fetch the next page. Pages are
+ * ordered by `startedAt` descending, then `executionId` descending; a cursor
+ * built from the last item of one page returns the items strictly after it.
+ */
+export type ExecutionCursor = {
+  startedAt: number;
+  executionId: string;
+};
+
+/**
+ * History retention, in **seconds**, shared by the built-in stores
+ * (`MemoryStore`, `SQLiteStore`, and the matching categories of
+ * `RedisStore`'s `ttls`).
+ *
+ * - A positive number expires the record that many seconds after it is saved.
+ * - `null` or unset keeps it forever.
+ *
+ * Windows differ per category:
+ * - `executionHistory` counts from the record's **last** save; saving the same
+ *   execution again restarts the window.
+ * - `evalHistory` counts from the row's **first** write. Saving the same eval
+ *   id again keeps the expiry it already had, and `updateEvalResult` never
+ *   changes it.
+ *
+ * Retention applies to records saved while it is configured; rows written
+ * before keep whatever expiry they had until you run
+ * {@link StateStore.applyHistoryRetention}. Custom stores own their retention.
+ */
+export type HistoryTtls = {
+  executionHistory?: number | null;
+  evalHistory?: number | null;
+};
+
+/** Which history {@link StateStore.applyHistoryRetention} processes. */
+export type HistoryRetentionKind = 'executions' | 'evals';
+
+/**
+ * Where {@link StateStore.applyHistoryRetention} continues from: the last
+ * record of the previous batch, oldest-first. `time` is `startedAt` for
+ * executions and `timestamp` for eval rows. Pass it back unchanged; it is
+ * plain JSON, so it can be stored between runs.
+ */
+export type HistoryRetentionCursor = {
+  time: number;
+  id: string;
+};
+
+/** Options for {@link StateStore.applyHistoryRetention}. */
+export type HistoryRetentionOptions = {
+  kind: HistoryRetentionKind;
+  /** Records examined per call. A positive integer; defaults to 500. */
+  batchSize?: number;
+  /** The `cursor` returned by the previous call. Omit or pass `null` to start. */
+  cursor?: HistoryRetentionCursor | null;
+};
+
+/** What one {@link StateStore.applyHistoryRetention} call did. */
+export type HistoryRetentionResult = {
+  /** Records with no expiry whose window had already passed, now deleted. */
+  expired: number;
+  /** Records with no expiry that now have one. */
+  armed: number;
+  /** Records that already had an expiry, newly added to the store's expiry index (Redis). */
+  indexed: number;
+  /** Index entries whose record no longer exists, now removed (Redis). */
+  deadIndexEntries: number;
+  /** Pass to the next call, or `null` when the walk is finished. */
+  cursor: HistoryRetentionCursor | null;
+};
 
 /** Persisted eval history entry. */
 export type EvalHistoryEntry = {

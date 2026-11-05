@@ -115,6 +115,25 @@ interface RedisClient {
   // shim that does not expose it — one that omits it keeps the old
   // quit-unconditionally behavior.
   readonly isOpen?: boolean;
+  // True only while connected and past the handshake. `isOpen && !isReady`
+  // means node-redis is reconnecting. Optional for the same reason as isOpen.
+  readonly isReady?: boolean;
+  destroy?(): void;
+  unref?(): void;
+}
+
+/** Client options {@link RedisStore.create} passes to node-redis. */
+interface RedisClientOptions {
+  url?: string;
+  disableOfflineQueue: boolean;
+  socket: { reconnectStrategy: (retries: number) => number | false };
+}
+
+/** The node-redis client surface only `create()` needs, on top of {@link RedisClient}. */
+interface ConnectableRedisClient extends RedisClient {
+  connect(): Promise<unknown>;
+  on(event: 'error', listener: (error: unknown) => void): unknown;
+  on(event: 'connect' | 'ready', listener: () => void): unknown;
 }
 
 // Chainable transaction builder returned by `client.multi()`. Queues
@@ -148,6 +167,16 @@ interface RedisMulti {
   exec(): Promise<unknown[]>;
 }
 
+/**
+ * A change in a {@link RedisStore}'s connection, passed to
+ * {@link RedisStoreOptions.onConnectionEvent}.
+ *
+ * - `error`: the connection was lost or a reconnect attempt failed. Arrives
+ *   once per attempt while Redis is down.
+ * - `reconnected`: the store is connected again and commands work.
+ */
+export type RedisConnectionEvent = { type: 'error'; error: Error } | { type: 'reconnected' };
+
 /** Options accepted by {@link RedisStore.create}. */
 export interface RedisStoreOptions {
   /** Redis connection URL (e.g. `redis://localhost:6379`). Defaults to `redis://localhost:6379`. */
@@ -172,6 +201,16 @@ export interface RedisStoreOptions {
    * operator experience.
    */
   keyPrefix?: string;
+  /**
+   * Called when the connection is lost, a reconnect attempt fails, or the
+   * connection comes back, for routing to a logger, metrics, or a health check.
+   * Replaces the default logging of one line per outage and one on recovery.
+   *
+   * Not called for a failed `create()`, whose rejection reports the failure,
+   * or after `close()`. A callback that throws or rejects is reported with
+   * `console.error` and otherwise ignored.
+   */
+  onConnectionEvent?: (event: RedisConnectionEvent) => void;
   /**
    * Skip the lazy backfill of legacy execution / eval-history entries into
    * the sorted-set indexes during `RedisStore.create()`. Default `false`
@@ -369,6 +408,115 @@ export function warnIfRedisExecutionRetentionUnset(opts: RedisStoreOptions): voi
   }
 }
 
+/** How long `close()` waits for Redis to answer `QUIT`. */
+const CLOSE_TIMEOUT_MS = 2000;
+
+/** Matches node-redis's default backoff: exponential, capped at 2 s, with up to 200 ms of jitter. */
+function reconnectDelayMs(retries: number): number {
+  return Math.min(2 ** retries * 50, 2000) + Math.floor(Math.random() * 200);
+}
+
+/**
+ * Stop a client without Redis's cooperation. `destroy()` rejects queued
+ * commands, then throws if `quit()` already began, in which case the socket
+ * stays open and `unref()` keeps it from holding the process open.
+ */
+function abandonConnection(client: RedisClient): void {
+  try {
+    client.destroy?.();
+  } catch {
+    // Already closing; the queued commands were rejected before the throw.
+  }
+  client.unref?.();
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Where connection events go. A throw from here would escape into node-redis's
+ * socket handler and become the uncaught exception this exists to prevent, so
+ * a host callback is contained against both throwing and rejecting.
+ */
+function connectionEventReporter(
+  client: RedisClient,
+  onConnectionEvent: RedisStoreOptions['onConnectionEvent'],
+): (event: RedisConnectionEvent) => void {
+  if (onConnectionEvent) {
+    const reportFailure = (error: unknown) =>
+      console.error(`[axl] RedisStore: onConnectionEvent failed: ${errorMessage(error)}`);
+    return (event) => {
+      try {
+        Promise.resolve(onConnectionEvent(event) as unknown).catch(reportFailure);
+      } catch (error) {
+        reportFailure(error);
+      }
+    };
+  }
+  let outageLogged = false;
+  return (event) => {
+    if (event.type === 'reconnected') {
+      outageLogged = false;
+      console.warn('[axl] RedisStore: reconnected to Redis.');
+    } else if (!outageLogged) {
+      // An error on a healthy connection has no matching recovery to reset the flag.
+      outageLogged = client.isReady === false;
+      console.warn(
+        `[axl] RedisStore: Redis connection lost (${event.error.message}). Store calls fail ` +
+          'until it reconnects, which happens automatically.',
+      );
+    }
+  };
+}
+
+/**
+ * Create and connect a client whose connection problems can't reach the host
+ * process as uncaught exceptions.
+ */
+async function connectClient(
+  createClient: (clientOpts: RedisClientOptions) => ConnectableRedisClient,
+  opts: RedisStoreOptions,
+): Promise<ConnectableRedisClient> {
+  // A failed first connection must reject `create()` rather than retry
+  // forever, so hosts see bad config at startup. Only reconnect after the
+  // connection has worked once.
+  let established = false;
+  const client = createClient({
+    ...(opts.url ? { url: opts.url } : {}),
+    // A command accepted just before a drop rejects instead of waiting for
+    // the reconnect.
+    disableOfflineQueue: true,
+    socket: { reconnectStrategy: (retries) => (established ? reconnectDelayMs(retries) : false) },
+  });
+  // node-redis reports a closed socket as an `error` event. With no listener,
+  // Node throws it as an uncaught exception and the host process exits.
+  const reportConnectionEvent = connectionEventReporter(client, opts.onConnectionEvent);
+  client.on('error', (error) => {
+    if (!established || client.isOpen === false) return;
+    reportConnectionEvent({
+      type: 'error',
+      error: error instanceof Error ? error : new Error(String(error)),
+    });
+  });
+  // A reconnect attempt already mid-connect survives `destroy()`: node-redis
+  // keeps going once the TCP connect finishes, and offers no way to close that
+  // socket. Unreferencing it here keeps it from holding the process open; it
+  // stays connected to Redis, idle, until the process exits.
+  client.on('connect', () => {
+    if (client.isOpen === false) client.unref?.();
+  });
+  client.on('ready', () => {
+    if (!established) {
+      established = true;
+    } else if (client.isOpen !== false) {
+      reportConnectionEvent({ type: 'reconnected' });
+    }
+  });
+  await client.connect();
+  return client;
+}
+
 /**
  * Redis-backed StateStore using the official `redis` (node-redis) client.
  *
@@ -380,10 +528,41 @@ export function warnIfRedisExecutionRetentionUnset(opts: RedisStoreOptions): voi
  */
 export class RedisStore implements StateStore {
   private constructor(
-    private client: RedisClient,
+    private connection: RedisClient,
     private keyPrefix: string,
     private ttls: ResolvedTtls,
   ) {}
+
+  /**
+   * Whether the store can send commands right now, for a health check or for
+   * telling an outage from other failures when a call rejects. `false` while
+   * reconnecting and after `close()`.
+   */
+  get isConnected(): boolean {
+    return this.connection.isOpen !== false && this.connection.isReady !== false;
+  }
+
+  /**
+   * The client for sending a command, failing immediately while disconnected.
+   *
+   * Every command goes through here because node-redis's `disableOfflineQueue`
+   * rejects single commands but not `multi().exec()`, which would wait for a
+   * reconnect attempt to fail or succeed. Nothing may `await` between
+   * `client.multi()` and `.exec()`, or a transaction could get past this check.
+   *
+   * A closed store isn't "unavailable": it falls through to node-redis's own
+   * "The client is closed" rejection.
+   */
+  private get client(): RedisClient {
+    if (this.connection.isOpen !== false && this.connection.isReady === false) {
+      throw new AxlError(
+        'REDIS_UNAVAILABLE',
+        'RedisStore: not connected to Redis, so the command was not sent. ' +
+          'The store reconnects automatically; retry once Redis is back.',
+      );
+    }
+    return this.connection;
+  }
 
   /**
    * History kinds with a prune running in this process. A save skips its
@@ -449,7 +628,7 @@ export class RedisStore implements StateStore {
       );
     }
 
-    let createClient: (clientOpts?: { url?: string }) => RedisClient & { connect(): Promise<void> };
+    let createClient: (clientOpts: RedisClientOptions) => ConnectableRedisClient;
     try {
       const mod = require('redis');
       createClient = mod.createClient ?? mod.default?.createClient;
@@ -463,8 +642,7 @@ export class RedisStore implements StateStore {
       throw new Error('redis is required for RedisStore. Install it with: npm install redis');
     }
 
-    const client = opts.url ? createClient({ url: opts.url }) : createClient();
-    await client.connect();
+    const client = await connectClient(createClient, opts);
 
     // Resolve effective per-category TTL: per-category override beats
     // defaultTtl beats "no TTL". `null` in overrides means explicit opt-out
@@ -505,8 +683,15 @@ export class RedisStore implements StateStore {
     // calls); typically a few seconds for installs with sub-10k entries.
     // Users at six-figure counts opt out via `skipMigration: true`.
     if (!opts.skipMigration) {
-      await store.backfillExecutionIndex();
-      await store.backfillEvalIndex();
+      try {
+        await store.backfillExecutionIndex();
+        await store.backfillEvalIndex();
+      } catch (error) {
+        // The caller never gets the store, so nothing else could stop the
+        // client reconnecting forever.
+        abandonConnection(client);
+        throw error;
+      }
     }
 
     return store;
@@ -908,7 +1093,7 @@ export class RedisStore implements StateStore {
     if (dead.length > 0) {
       // Fire-and-forget — listing must not block on cleanup. Pass the
       // array so node-redis batches it into one SREM round-trip.
-      this.client.sRem(this.pendingExecSetKey(), dead).catch((err: unknown) => {
+      this.connection.sRem(this.pendingExecSetKey(), dead).catch((err: unknown) => {
         console.error(
           `[axl] RedisStore: failed to prune ${dead.length} stale pending-exec ids: ` +
             (err instanceof Error ? err.message : String(err)),
@@ -992,7 +1177,7 @@ export class RedisStore implements StateStore {
     // surfaced.
     const ttl = this.ttlFor('memory');
     if (ttl !== undefined) {
-      this.client.expire(this.memoryKey(scope), ttl).catch((err: unknown) => {
+      this.connection.expire(this.memoryKey(scope), ttl).catch((err: unknown) => {
         console.error(
           `[axl] RedisStore: failed to set TTL on migrated memory key ${this.memoryKey(scope)}: ` +
             (err instanceof Error ? err.message : String(err)),
@@ -1414,6 +1599,9 @@ export class RedisStore implements StateStore {
     try {
       await this.pruneHistory(index);
     } catch (err) {
+      // A lost connection isn't the permission problem this warning explains,
+      // and spending the one-time warning on it would hide a real one later.
+      if (this.connection.isReady === false) return;
       warnDiagnosticOnce(
         `redis_history_prune_failed\0${index.kind}`,
         `RedisStore: removing expired ${index.label} index entries failed ` +
@@ -1682,10 +1870,31 @@ export class RedisStore implements StateStore {
    * must not get a rejected promise for it. `MemoryStore.close()` and
    * better-sqlite3's `close()` are both no-ops the second time; node-redis
    * instead rejects with "The client is closed", so absorb that here.
+   *
+   * Bounded, so a shutdown can't hang on Redis. `QUIT` lets queued commands
+   * finish on a healthy connection, but node-redis never settles it if the
+   * socket closes first, and a stalled server may never answer it. While
+   * disconnected it couldn't be sent at all.
    */
   async close(): Promise<void> {
-    if (this.client.isOpen === false) return;
-    await this.client.quit();
+    if (this.connection.isOpen === false) return;
+    if (this.connection.isReady === false) {
+      abandonConnection(this.connection);
+      return;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        this.connection.quit(),
+        new Promise((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error('QUIT timed out')), CLOSE_TIMEOUT_MS);
+        }),
+      ]);
+    } catch {
+      abandonConnection(this.connection);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   async deleteCheckpoints(executionId: string): Promise<void> {

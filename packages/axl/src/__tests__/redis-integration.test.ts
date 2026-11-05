@@ -30,6 +30,40 @@ import { __resetSchemaDiagnosticWarnings } from '../schema-diagnostics.js';
 
 const REDIS_URL = process.env.REDIS_URL;
 
+describe.skipIf(!REDIS_URL)('RedisStore connection loss (real Redis)', () => {
+  type Commands = { sendCommand(args: string[]): Promise<unknown>; isReady: boolean };
+  const raw = (s: RedisStore) => (s as unknown as { connection: Commands }).connection;
+
+  it('reconnects after its connection is killed, and rejects the waiting command', async () => {
+    const prefix = `axl-test-${randomUUID()}:`;
+    const options = { url: REDIS_URL!, keyPrefix: prefix, skipMigration: true };
+    const onConnectionEvent = vi.fn();
+    const store = await RedisStore.create({ ...options, onConnectionEvent });
+    const killer = await RedisStore.create(options);
+    try {
+      const id = String(await raw(store).sendCommand(['CLIENT', 'ID']));
+      const blocked = expect(
+        raw(store).sendCommand(['BLPOP', `${prefix}never`, '30']),
+      ).rejects.toThrow();
+
+      await raw(killer).sendCommand(['CLIENT', 'KILL', 'ID', id]);
+      await blocked;
+      expect(onConnectionEvent).toHaveBeenCalledWith(expect.objectContaining({ type: 'error' }));
+
+      await vi.waitFor(() => expect(raw(store).isReady).toBe(true));
+      await store.saveSession('after', [{ role: 'user', content: 'hi' }]);
+      expect(await store.getSession('after')).toEqual([{ role: 'user', content: 'hi' }]);
+      await vi.waitFor(() =>
+        expect(onConnectionEvent).toHaveBeenCalledWith({ type: 'reconnected' }),
+      );
+      await store.deleteSession('after');
+    } finally {
+      await store.close();
+      await killer.close();
+    }
+  });
+});
+
 describe.skipIf(!REDIS_URL)('RedisStore integration (real Redis)', () => {
   // Unique prefix per test run so this suite can run safely against a
   // shared Redis without colliding with concurrent runs or production data.
@@ -731,7 +765,7 @@ describe.skipIf(!REDIS_URL)('RedisStore integration (real Redis)', () => {
       const s1 = await open(prefix);
       const s2 = await open(prefix, s2History);
       const gate = gateRedisClient(rawClient(s1) as object);
-      (s1 as unknown as { client: unknown }).client = gate.client;
+      (s1 as unknown as { connection: unknown }).connection = gate.client;
       const close = async () => {
         await s1.close();
         await s2.close();
@@ -972,7 +1006,7 @@ describe.skipIf(!REDIS_URL)('RedisStore integration (real Redis)', () => {
       const s = await open(prefix, 60);
       const maintainer = await open(prefix, 60);
       const gate = gateRedisClient(rawClient(maintainer) as object);
-      (maintainer as unknown as { client: unknown }).client = gate.client;
+      (maintainer as unknown as { connection: unknown }).connection = gate.client;
       try {
         const now = Date.now();
         await legacy.saveExecution(exec('past', now - 3_600_000));

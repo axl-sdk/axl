@@ -2902,13 +2902,47 @@ describe('config.state.maxEventsPerExecution (memory cap)', () => {
   });
 });
 
+describe('automatic checkpoint save failures', () => {
+  it('keeps the answer, and stops saving so a replay cannot mix old and new steps', async () => {
+    const provider = new TestProvider([{ content: 'first' }, { content: 'second' }]);
+    const { runtime } = createRuntime(provider);
+    const testAgent = agent({ name: 'test', model: 'test:default', system: 'test' });
+    const store = (runtime as unknown as { stateStore: MemoryStore }).stateStore;
+    const realSave = store.saveCheckpoint.bind(store);
+    const saved: string[] = [];
+    let failNext = true;
+    store.saveCheckpoint = async (executionId, name, data) => {
+      if (failNext && name.includes('/ask/')) {
+        failNext = false;
+        throw new Error('store is down');
+      }
+      saved.push(name);
+      return realSave(executionId, name, data);
+    };
+    runtime.register(
+      workflow({
+        name: 'two-asks',
+        input: z.object({}),
+        handler: async (ctx) => [await ctx.ask(testAgent, 'a'), await ctx.ask(testAgent, 'b')],
+      }),
+    );
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await expect(runtime.execute('two-asks', {})).resolves.toEqual(['first', 'second']);
+
+    // The store recovered before the second ask. Saving it would let a replay
+    // re-run the first step yet replay an answer derived from the old first step.
+    expect(saved.filter((name) => name.includes('/ask/'))).toEqual([]);
+    expect(logged.mock.calls.flat().join(' ')).toContain('store is down');
+    logged.mockRestore();
+  });
+});
+
 describe('workflow_end idempotency', () => {
   it('does not fire workflow_end twice when post-emit side-effects throw', async () => {
-    // Reviewer bug B1: `_emitWorkflowEnd(completed)` fires BEFORE
-    // `deleteCheckpoints` / `persistExecution`. If either throws, the
-    // outer catch would fire a second `_emitWorkflowEnd(failed)` with
-    // conflicting status. The idempotency guard on WorkflowContext
-    // makes the second call a no-op — first-wins semantics.
+    // `_emitWorkflowEnd(completed)` fires BEFORE `deleteCheckpoints` /
+    // `persistExecution`. A cleanup failure must not turn that completed run
+    // into a failed one, in the event or in what the caller receives.
     const provider = new TestProvider([{ content: 'ok', cost: 0.01 }]);
     const { runtime } = createRuntime(provider);
     const testAgent = agent({ name: 'test', model: 'test:default', system: 'test' });
@@ -2937,13 +2971,12 @@ describe('workflow_end idempotency', () => {
       if (ev.type === 'workflow_end') ends.push(ev);
     });
 
-    await expect(runtime.execute('wfend-idempotency', {})).rejects.toThrow(
-      'checkpoint delete failed',
-    );
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    await expect(runtime.execute('wfend-idempotency', {})).resolves.toBe('ok');
     expect(ends).toHaveLength(1);
-    // First (completed) event stands — the cleanup failure didn't
-    // transform a succeeded workflow into a failed one.
     expect(ends[0].data.status).toBe('completed');
+    expect(logged.mock.calls.flat().join(' ')).toContain('checkpoint delete failed');
+    logged.mockRestore();
   });
 });
 

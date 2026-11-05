@@ -831,7 +831,7 @@ export type WorkflowContextInit = {
    *    fn callbacks). Composed name: `__auto/<primitive>/<n>`.
    *
    *  Root contexts default to a fresh `{ byAgent: new Map(), root: 0 }`. */
-  autoCheckpointCounters?: { byAgent: Map<string, number>; root: number };
+  autoCheckpointCounters?: AutoCheckpointState;
   /** Internal: root-shared state for branch continuations that must settle
    *  before the runtime emits the workflow terminal and snapshots cost. */
   branchDrainState?: BranchDrainState;
@@ -861,6 +861,14 @@ export type PendingDecisionResolver = {
   /** Resolves after cancellation compensation and resolver cleanup finish.
    *  deleteExecution joins this barrier before its total store sweep. */
   cleanupFinished: Promise<void>;
+};
+
+/** Automatic checkpoint bookkeeping, shared by an execution's child contexts. */
+type AutoCheckpointState = {
+  byAgent: Map<string, number>;
+  root: number;
+  /** An automatic checkpoint failed to save, so none are saved from here on. */
+  saveFailed?: boolean;
 };
 
 /**
@@ -910,7 +918,7 @@ export class WorkflowContext<TInput = unknown> {
    * does NOT touch these counters — it goes straight to the store under
    * the caller-supplied key.
    */
-  private autoCheckpointCounters: { byAgent: Map<string, number>; root: number };
+  private autoCheckpointCounters: AutoCheckpointState;
   private readonly branchDrainState: BranchDrainState;
   /** Bounded exact-identity failure association for this execution tree.
    * Unlike a process-global marker, this cannot affect another context that
@@ -4220,7 +4228,7 @@ export class WorkflowContext<TInput = unknown> {
         `ctx.checkpoint name "${name}" is reserved — names starting with "__auto/" (case-insensitive) are used by the runtime for ask/spawn/race/parallel/map auto-checkpointing.`,
       );
     }
-    return this._checkpoint(name, fn);
+    return this._checkpoint(name, fn, { saveRequired: true });
   }
 
   /**
@@ -4238,7 +4246,7 @@ export class WorkflowContext<TInput = unknown> {
   private async _checkpoint<T>(
     name: string,
     fn: () => Promise<T>,
-    options?: { agent?: string },
+    options?: { agent?: string; saveRequired?: boolean },
   ): Promise<T> {
     // If no state store, just execute without persistence
     if (!this.stateStore) {
@@ -4262,7 +4270,25 @@ export class WorkflowContext<TInput = unknown> {
     // Execute and save the result
     const result = await fn();
 
-    await this.stateStore.saveCheckpoint(this.executionId, name, result);
+    // After one failed save, a replay re-runs that step, so a later step's saved
+    // answer could derive from a result the replay no longer has. Saving nothing
+    // further means a replay re-runs everything from the failure onward.
+    if (!options?.saveRequired && this.autoCheckpointCounters.saveFailed) return result;
+
+    try {
+      await this.stateStore.saveCheckpoint(this.executionId, name, result);
+    } catch (err) {
+      if (options?.saveRequired) throw err;
+      this.autoCheckpointCounters.saveFailed = true;
+      // The automatic checkpoints around ctx.ask and friends only save work on
+      // a later replay. Failing the run here would discard a model answer that
+      // is already paid for, to protect a replay that might never happen.
+      console.error(
+        `[axl] Failed to save checkpoint "${name}" for executionId=${this.executionId}; ` +
+          `a replay would run this step and later ones again: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return result;
+    }
 
     this.emitEvent({
       type: 'checkpoint_save',

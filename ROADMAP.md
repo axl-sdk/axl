@@ -323,6 +323,18 @@ Retention shipped in 0.27.0; these were deliberately left out of it:
 - **Scheduled cleanup.** Stores clean up as history is saved and never run
   timers; an opt-in background schedule for idle stores is not built.
 
+#### RedisStore outage follow-ups
+
+`RedisStore` survives dropped connections as of 0.27.1. These were left out of that fix:
+
+- **Detecting a connection that drops silently.** A network partition with no
+  TCP close isn't noticed, so commands wait on the operating system. Health
+  checks with `pingInterval` and `socketTimeout` detect it on node-redis 5.12.1
+  but not on 5.0.0, so this needs a higher `redis` peer version.
+- **A short wait before failing during a brief blip.** Calls fail at once while
+  disconnected, so a reconnect that takes a moment can still fail the next
+  store call. We'll revisit this if real outages show that it matters.
+
 #### Portable Run State
 
 `ctx.checkpoint()` stores named results inside one execution scope; it is not a cross-process workflow-resume protocol. Durable resumption needs a portable serializable run state plus decision claims, leases, checkpoint lineage, and idempotency boundaries. Serverless environments (Lambda, Cloudflare Workers) make that missing contract especially visible.

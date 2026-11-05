@@ -1119,6 +1119,13 @@ same explicit execution scope evaluates the checkpoint again. Axl does not
 automatically restart or resume workflows across processes; do not use a
 checkpoint alone as an exactly-once side-effect boundary.
 
+If the save fails, `ctx.checkpoint` rejects even though `fn` already ran. The
+automatic checkpoints around `ctx.ask`, `ctx.spawn`, `ctx.race`, `ctx.parallel`
+and `ctx.map` instead log the failure, return the result, and save no further
+automatic checkpoints for that run. An explicit `ctx.checkpoint` after that still
+saves, so a replay returns its saved value even though the automatic steps before
+it run again.
+
 ```typescript
 const value = await ctx.checkpoint('refund-customer', async () => expensiveOperation());
 ```
@@ -2216,12 +2223,13 @@ Per store:
 
 `RedisStore` requires Redis 7.0 or newer. It cleans up history listing indexes with a small Lua script, so the Redis user also needs permission to run `EVAL`. If your ACL denies scripting, saves still succeed, the indexes are not cleaned up, and the store prints a one-time warning per history kind saying the cleanup failed.
 
-`RedisStore.create()` accepts either a URL string (back-compat) or an options object:
+`RedisStore.create()` accepts either a URL string (back-compat) or an options object. `store.isConnected` reports whether the store can send commands right now: `false` while reconnecting and after `close()`.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `url` | `string?` | `'redis://localhost:6379'` | Redis connection URL |
 | `keyPrefix` | `string?` | `'axl:'` | Prepended to every key written by this store. Concatenated as-given — no normalization (include the trailing colon if you want one). Empty string is rejected. Useful when two Axl deployments share a Redis cluster, or when coexisting with other applications' keys |
+| `onConnectionEvent` | `(event: RedisConnectionEvent) => void` | — | Called with `{ type: 'error', error }` when the connection is lost and for each failed reconnect attempt, and `{ type: 'reconnected' }` when it comes back. Replaces the default logging of one line per outage and one on recovery. Not called for a failed `create()` or after `close()`. If it throws or rejects, the failure goes to `console.error` and is otherwise ignored. See [Riding out a Redis outage](./integration.md#riding-out-a-redis-outage) |
 | `skipMigration` | `boolean?` | `false` | Skip the one-time lazy backfill of the execution / eval-history sorted-set indexes on startup. Set to `true` for installs at six-figure execution counts where the startup cost is unacceptable, then call `store.backfillExecutionIndex()` / `store.backfillEvalIndex()` manually during a maintenance window. Until then, `listExecutions` / `listEvalResults` fall back to the legacy SET + N×GET + JS-sort read path — correct but slow at scale |
 | `defaultTtl` | `number?` | — | Default TTL in **seconds** applied to every TTL-capable storage category. Without a TTL, every `save*` accumulates forever — strongly recommended in production |
 | `ttls` | `object?` | — | Per-category TTL overrides in seconds (`session`, `sessionMeta`, `checkpoint`, `executionState`, `executionHistory`, `evalHistory`, `memory`, `streamingEvents`). Set a category to `null` to explicitly opt out even when `defaultTtl` is set. `pendingDecision` is intentionally NOT configurable — pending decisions share a hash, so a TTL would expire all of them at once. **Window semantics:** `memory`, `session`, and `sessionMeta` are sliding (every write refreshes TTL — active users keep their data, inactive users forget; reads do NOT refresh); `checkpoint` and `streamingEvents` are fixed from the first write (TTL set once); `executionState` and `executionHistory` restart their window on every save; `evalHistory` is fixed from the row's first write, as described in [History retention](#history-retention-historyttls). **`streamingEvents` is opt-in only** — does NOT fall back to `defaultTtl`. Must be longer than your max time-between-restarts or `recoverIncompleteStreams()` will miss crashed-run buffers that aged out before the next process started. Non-positive and non-finite values (`0`, negative, `NaN`, `Infinity`) are defensively treated as no-TTL. Per-category TTLs are independent. Legacy memory entries (pre-`memory-methods` patch) migrate forward on first read with the configured TTL applied. `listPendingExecutions` self-prunes stale ids when their `executionState` blob has TTL-evicted |
@@ -2470,8 +2478,8 @@ These methods are optional (`?` on the interface). The runtime checks for their 
 | Method | Description |
 |--------|-------------|
 | `listSessions?()` | List all session IDs (used by Studio's session browser) |
-| `close?()` | Close the underlying connection (called by `runtime.shutdown()`) |
-| `deleteCheckpoints?(executionId)` | Delete all checkpoints for an execution (called on successful completion) |
+| `close?()` | Close the underlying connection (called by `runtime.shutdown()`). `RedisStore` waits at most 2 seconds for Redis to answer, and closes at once while disconnected |
+| `deleteCheckpoints?(executionId)` | Delete all checkpoints for an execution (called on successful completion). If it rejects, the failure is logged and the run still succeeds |
 | `applyHistoryRetention?(options)` | Apply your store's retention to history saved without one, one batch per call, resuming from a cursor. Never called by the runtime; implement it if you want the same maintenance call as the built-ins. Contract: [Applying retention to existing history](#applying-retention-to-existing-history) |
 
 ### Implementing a Custom StateStore
@@ -2800,6 +2808,7 @@ All errors extend `AxlError`.
 | `AxlError` / `INCOMPATIBLE_ACCOUNTING_SCOPE` | paid operation or nested `trackOutcome` under another loaded copy's incompatible active scope | Refuses the operation before dispatch; the enclosing accounting becomes `incomplete` / `uninstrumented` |
 | `GuardrailError` | `ctx.ask()` | Guardrail blocked and retries exhausted. Includes `.guardrailType`, `.reason` |
 | `ProviderError` | provider adapters (via `ctx.ask()`) | Non-2xx HTTP response, or a normalized network failure (`status: 0`). `code: 'PROVIDER_ERROR'`. Includes `.provider`, `.status`, `.retryable`, `.retryAfterMs?`, `.requestId?`, `.body?`, `.timing?`. Message is the provider's text verbatim (no prefix). |
+| `AxlError` with `code: 'REDIS_UNAVAILABLE'` | any `RedisStore` call | `RedisStore` isn't connected, so the command wasn't sent. It reconnects automatically. See [Riding out a Redis outage](./integration.md#riding-out-a-redis-outage) |
 | `InvalidModelInputError` | `ctx.ask()`, `ctx.delegate()`, `agent.ask()` | Malformed `ModelInput`. `code: 'INVALID_MODEL_INPUT'`. Invalid inputs fail before dispatch and the message never includes raw media. |
 | `UnsupportedModelInputError` | rich `ctx.ask()` / `ctx.delegate()` | Axl cannot safely map the provider/source/composition, or the effective model ID is empty. `code: 'UNSUPPORTED_MODEL_INPUT'`; includes safe `.provider`, `.model`, `.modality`, and optional `.source`, never the raw locator or bytes. `.modality` is typed `string` and is today `'image'` or `'audio'`, derived from the **offending part** — a mixed input whose audio part is rejected reports `'audio'`, and one whose image part is rejected reports `'image'`. The unsupported *feature* is named in `.message` only; it is not a retained field. For catalog-capable transports, an upstream model-capability rejection is instead a `ProviderError`. |
 | `UnsupportedModelOptionError` | model-specific provider option/tool guards | Local pre-dispatch rejection. `code: 'UNSUPPORTED_MODEL_OPTION'`; includes safe `.provider`, effective `.model`, rejected `.option`, and actionable `.remediation`. GPT-6 Chat tool and reasoning/sampling combinations use this error. |

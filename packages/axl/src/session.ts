@@ -249,11 +249,20 @@ export class Session {
       const completion = axlStream.promise.then(
         (result) =>
           this.commitHistory(history!, result).catch((err) => {
-            this.runtime.emit('error', {
-              type: 'session_history_save_failed',
-              sessionId: this.sessionId,
-              error: err instanceof Error ? err.message : String(err),
-            });
+            const error = err instanceof Error ? err.message : String(err);
+            try {
+              this.runtime.emit('error', {
+                type: 'session_history_save_failed',
+                sessionId: this.sessionId,
+                error,
+              });
+            } catch {
+              // emit('error') throws with no listener. The stream's result is
+              // already delivered, so this log is all that records the lost turn.
+              console.error(
+                `[axl] Failed to save session history for sessionId=${this.sessionId}: ${error}`,
+              );
+            }
           }),
         () => undefined,
       );

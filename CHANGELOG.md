@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.1] - 2026-11-05
+
+### Fixed
+
+- **A dropped Redis connection no longer crashes your process.** `RedisStore` now keeps running through a Redis restart, failover or dropped connection, and reconnects by itself. Calls made while disconnected reject at once with `AxlError` code `REDIS_UNAVAILABLE`, so you can return a 503. See [Riding out a Redis outage](docs/integration.md#riding-out-a-redis-outage).
+- **`store.close()` and `runtime.shutdown()` no longer depend on Redis answering.** `RedisStore.close()` waits at most 2 seconds, and returns at once while disconnected.
+- **A completed workflow keeps its result when checkpoint cleanup fails.** On any store, `execute()` used to reject after the workflow had finished. The failure is now logged.
+- **A paid model answer survives a Redis failure during the call.** When the automatic checkpoint around `ctx.ask`, `ctx.spawn`, `ctx.race`, `ctx.parallel` or `ctx.map` can't be saved, on any store, the run now continues without saving further automatic checkpoints, and logs the failure. A replay would run those steps again. An explicit `ctx.checkpoint` still rejects.
+- **Lost history is now logged.** A failed execution history save, and a failed `session.stream` history save with no `runtime.on('error')` listener, now reach `console.error` instead of disappearing.
+
+### Added
+
+- **`onConnectionEvent` on `RedisStore.create()`.** Send connection errors and recovery to your logger, metrics or health check. Without it, each outage logs one line at the start and one at the end.
+- **`store.isConnected` on `RedisStore`.** Use it for readiness probes, or to tell an outage from other failures when a call rejects.
+- **`RedisStoreOptions` and `RedisConnectionEvent` are exported** from `@axlsdk/axl`.
+
 ## [0.27.0] - 2026-10-21
 
 ### Added
@@ -2312,7 +2328,8 @@ Initial public open-source release on npm under the `@axlsdk` scope. No new feat
 - `createServer()` factory, `ConnectionManager` for channel subscriptions, `CostAggregator` for cost tracking
 - Eight panels: Agent Playground, Workflow Runner, Trace Explorer, Cost Dashboard, Memory Browser, Session Manager, Tool Inspector, Eval Runner
 
-[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.27.0...HEAD
+[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.27.1...HEAD
+[0.27.1]: https://github.com/axl-sdk/axl/compare/v0.27.0...v0.27.1
 [0.27.0]: https://github.com/axl-sdk/axl/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/axl-sdk/axl/compare/v0.25.3...v0.26.0
 [0.25.3]: https://github.com/axl-sdk/axl/compare/v0.25.2...v0.25.3

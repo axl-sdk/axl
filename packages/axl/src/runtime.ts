@@ -1666,7 +1666,15 @@ export class AxlRuntime extends EventEmitter {
 
       // Clean up checkpoints for completed execution
       if (this.stateStore.deleteCheckpoints) {
-        await this.stateStore.deleteCheckpoints(execInfo.executionId);
+        // The workflow has already succeeded and emitted workflow_end, so a
+        // store failure here must not turn it into a failed run. The leftover
+        // checkpoints are never read again.
+        await this.stateStore.deleteCheckpoints(execInfo.executionId).catch((err: unknown) => {
+          console.error(
+            `[axl] Failed to delete checkpoints for executionId=${execInfo.executionId}: ` +
+              (err instanceof Error ? err.message : String(err)),
+          );
+        });
       }
 
       span?.setAttribute('axl.workflow.cost', execInfo.totalCost);
@@ -1789,8 +1797,12 @@ export class AxlRuntime extends EventEmitter {
             // Buffer becomes an orphan; recoverIncompleteStreams cleans up.
           });
         })
-        .catch(() => {
+        .catch((err: unknown) => {
           // Save failed; leave buffer in place for next-process recovery.
+          console.error(
+            `[axl] Failed to save execution history for executionId=${id}: ` +
+              (err instanceof Error ? err.message : String(err)),
+          );
         })
         .then(() => undefined);
       this.persistInflight.add(chain);

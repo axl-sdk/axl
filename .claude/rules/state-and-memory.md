@@ -13,6 +13,9 @@ paths:
 - **`StateConfig.store` takes `'memory' | 'sqlite' | StateStore`.** `'redis'` is **not** a
   valid string — construct `await RedisStore.create(url | options)` and pass the instance
   (a private constructor enforces the async factory).
+- **RedisStore commands go through `this.client`**, which rejects immediately while
+  disconnected. Node-redis doesn't check readiness at `multi().exec()`, so never `await` between
+  `client.multi()` and `.exec()`. Only lifecycle code and fire-and-forget cleanup use `connection`.
 - **`deleteExecution` is a total sweep** (GDPR right-to-be-forgotten). A custom store's
   `deleteExecution` must drop the canonical row + indexes + checkpoints + suspended state +
   pending decisions + streaming buffer in one transaction. The runtime no longer calls

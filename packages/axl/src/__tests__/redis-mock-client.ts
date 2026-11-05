@@ -282,7 +282,7 @@ export function createRedisStoreOverClient(
   // Resolve TTLs the same way the factory does: per-category override
   // beats default beats null (no TTL).
   const store = Object.create(RedisStore.prototype) as RedisStore;
-  (store as any).client = client;
+  (store as any).connection = client;
   (store as any).keyPrefix = keyPrefix;
   (store as any).ttls = {
     session: ttlConfig?.session ?? null,

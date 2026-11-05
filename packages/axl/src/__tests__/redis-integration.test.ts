@@ -731,7 +731,7 @@ describe.skipIf(!REDIS_URL)('RedisStore integration (real Redis)', () => {
       const s1 = await open(prefix);
       const s2 = await open(prefix, s2History);
       const gate = gateRedisClient(rawClient(s1) as object);
-      (s1 as unknown as { client: unknown }).client = gate.client;
+      (s1 as unknown as { connection: unknown }).connection = gate.client;
       const close = async () => {
         await s1.close();
         await s2.close();
@@ -972,7 +972,7 @@ describe.skipIf(!REDIS_URL)('RedisStore integration (real Redis)', () => {
       const s = await open(prefix, 60);
       const maintainer = await open(prefix, 60);
       const gate = gateRedisClient(rawClient(maintainer) as object);
-      (maintainer as unknown as { client: unknown }).client = gate.client;
+      (maintainer as unknown as { connection: unknown }).connection = gate.client;
       try {
         const now = Date.now();
         await legacy.saveExecution(exec('past', now - 3_600_000));

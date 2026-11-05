@@ -404,6 +404,7 @@ export type { MemoryStoreOptions } from './state/memory.js';
 export { SQLiteStore } from './state/sqlite.js';
 export type { SQLiteStoreOptions } from './state/sqlite.js';
 export { RedisStore } from './state/redis.js';
+export type { RedisStoreOptions, RedisConnectionEvent } from './state/redis.js';
 
 // Memory
 export { MemoryManager } from './memory/manager.js';

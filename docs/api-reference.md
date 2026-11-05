@@ -1119,6 +1119,11 @@ same explicit execution scope evaluates the checkpoint again. Axl does not
 automatically restart or resume workflows across processes; do not use a
 checkpoint alone as an exactly-once side-effect boundary.
 
+If the save fails, `ctx.checkpoint` rejects even though `fn` already ran. The
+automatic checkpoints around `ctx.ask`, `ctx.spawn`, `ctx.race`, `ctx.parallel`
+and `ctx.map` instead log the failure, return the result, and save nothing further
+for that run.
+
 ```typescript
 const value = await ctx.checkpoint('refund-customer', async () => expensiveOperation());
 ```

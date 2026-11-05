@@ -162,6 +162,8 @@ export async function startFakeRedis(options?: { auth?: 'reject' }): Promise<Fak
     net.createServer((socket) => {
       connections++;
       sockets.add(socket);
+      // Only the client's sockets should show up as keeping the process alive.
+      socket.unref();
       let buffered = Buffer.alloc(0) as Buffer;
       const state: { queued: string[][] | null } = { queued: null };
       socket.on('error', () => {});

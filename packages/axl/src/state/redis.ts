@@ -133,7 +133,7 @@ interface RedisClientOptions {
 interface ConnectableRedisClient extends RedisClient {
   connect(): Promise<unknown>;
   on(event: 'error', listener: (error: unknown) => void): unknown;
-  on(event: 'ready', listener: () => void): unknown;
+  on(event: 'connect' | 'ready', listener: () => void): unknown;
 }
 
 // Chainable transaction builder returned by `client.multi()`. Queues
@@ -419,9 +419,7 @@ function reconnectDelayMs(retries: number): number {
 /**
  * Stop a client without Redis's cooperation. `destroy()` rejects queued
  * commands, then throws if `quit()` already began, in which case the socket
- * stays open. A reconnect attempt that's mid-connect also survives `destroy()`,
- * and node-redis offers no way to close its socket afterwards. `unref()` keeps
- * either from holding the process open.
+ * stays open and `unref()` keeps it from holding the process open.
  */
 function abandonConnection(client: RedisClient): void {
   try {
@@ -608,6 +606,13 @@ export class RedisStore implements StateStore {
         type: 'error',
         error: error instanceof Error ? error : new Error(String(error)),
       });
+    });
+    // A reconnect attempt already mid-connect survives `destroy()`: node-redis
+    // keeps going once the TCP connect finishes, and offers no way to close that
+    // socket. Unreferencing it here keeps it from holding the process open; it
+    // stays connected to Redis, idle, until the process exits.
+    client.on('connect', () => {
+      if (client.isOpen === false) client.unref?.();
     });
     client.on('ready', () => {
       if (!established) {

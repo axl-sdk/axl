@@ -25,6 +25,10 @@ async function waitUntil(condition: () => boolean, timeoutMs = 3000): Promise<vo
 
 const isApplicationCommand = (command: string[]) => !isHandshakeCommand(command);
 
+/** Open TCP sockets holding the process open. The fake server's own are unref'd. */
+const socketsHoldingProcess = () =>
+  process.getActiveResourcesInfo().filter((resource) => resource === 'TCPSocketWrap').length;
+
 describe('RedisStore connection handling', () => {
   let fake: FakeRedis;
   let stores: RedisStore[];
@@ -314,6 +318,7 @@ describe('RedisStore connection handling', () => {
     });
 
     it('rejects when the connection drops during startup work, and stops trying', async () => {
+      const socketsBefore = socketsHoldingProcess();
       fake.hold = isApplicationCommand;
       const creating = RedisStore.create({ url: fake.url, ttls: { executionHistory: null } });
       await fake.waitForCommand(isApplicationCommand);
@@ -327,6 +332,7 @@ describe('RedisStore connection handling', () => {
       const after = fake.connectionCount();
       await sleep(400);
       expect(fake.connectionCount()).toBe(after);
+      expect(socketsHoldingProcess()).toBe(socketsBefore);
     });
 
     it('does not report a failed create() through the callback or the log', async () => {

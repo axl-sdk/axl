@@ -110,6 +110,9 @@ export async function startFakeRedis(options?: { auth?: 'reject' }): Promise<Fak
       case 'RPUSH':
       case 'HSET':
         return ':0\r\n';
+      case 'HGET':
+        return '$-1\r\n';
+      case 'HGETALL':
       case 'SMEMBERS':
       case 'ZRANGE':
       case 'LRANGE':

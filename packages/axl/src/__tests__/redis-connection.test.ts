@@ -1,4 +1,8 @@
 import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
+import { z } from 'zod';
+import { AxlRuntime } from '../runtime.js';
+import { agent } from '../agent.js';
+import { workflow } from '../workflow.js';
 import { RedisStore } from '../state/redis.js';
 import type { RedisConnectionEvent } from '../state/redis.js';
 import { startFakeRedis, isHandshakeCommand, type FakeRedis } from './redis-fake-server.js';
@@ -416,6 +420,173 @@ describe('RedisStore connection handling', () => {
 
       expect(unhandled).not.toHaveBeenCalled();
       expect(error.mock.calls.flat().join(' ')).toContain('async callback broke');
+    });
+  });
+
+  describe('the runtime during an outage', () => {
+    const unavailable = { code: 'REDIS_UNAVAILABLE' };
+    const provider = {
+      name: 'test',
+      chat: async () => ({
+        content: 'done',
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        cost: 0,
+      }),
+      async *stream() {
+        yield { type: 'text_delta' as const, content: 'done' };
+        yield {
+          type: 'done' as const,
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        };
+      },
+    };
+    const assistant = agent({ name: 'assistant', model: 'test:m', system: 's' });
+    const input = z.object({ q: z.string() });
+
+    /**
+     * A runtime on the store, with one workflow that runs `before`, signals
+     * `running`, waits for `release`, then runs `body`.
+     */
+    const setup = async <T>(
+      body: (ctx: never, earlier: unknown) => Promise<T>,
+      before: (ctx: never) => Promise<unknown> = async () => undefined,
+    ) => {
+      const store = await open();
+      const runtime = new AxlRuntime({ state: { store } });
+      runtime.registerProvider('test', provider as never);
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => (release = resolve));
+      let started!: () => void;
+      const running = new Promise<void>((resolve) => (started = resolve));
+      runtime.register(
+        workflow({
+          name: 'wf',
+          input,
+          handler: async (ctx) => {
+            const earlier = await before(ctx as never);
+            started();
+            await released;
+            return body(ctx as never, earlier);
+          },
+        }),
+      );
+      const disconnect = async () => {
+        await fake.stop();
+        await waitUntil(() => !isReady(store));
+      };
+      return { store, runtime, release, running, disconnect };
+    };
+    const errorLogs = () => error.mock.calls.flat().map(String).join('\n');
+
+    it('returns the result of a workflow that finishes, and logs the lost history', async () => {
+      const { runtime, release, running, disconnect } = await setup(async () => 'result');
+      const execution = runtime.execute('wf', { q: 'hi' });
+      await running;
+
+      await disconnect();
+      release();
+
+      await expect(execution).resolves.toBe('result');
+      await waitUntil(() => errorLogs().includes('execution history'));
+      expect(errorLogs()).toContain('not connected to Redis');
+    });
+
+    it('fails a workflow whose checkpoint needs the store', async () => {
+      const { runtime, release, running, disconnect } = await setup((ctx: any) =>
+        ctx.checkpoint('step', async () => 1),
+      );
+      const execution = runtime.execute('wf', { q: 'hi' });
+      await running;
+
+      await disconnect();
+      release();
+
+      await expect(execution).rejects.toMatchObject(unavailable);
+    });
+
+    it('fails a workflow awaiting approval with the outage error', async () => {
+      const { runtime, release, running, disconnect } = await setup((ctx: any) =>
+        ctx.awaitHuman({ channel: 'ops', prompt: 'approve?' }),
+      );
+      const execution = runtime.execute('wf', { q: 'hi' });
+      await running;
+
+      await disconnect();
+      release();
+
+      await expect(execution).rejects.toMatchObject(unavailable);
+    });
+
+    it('fails ctx.ask before calling the model, so no spend is lost', async () => {
+      const chat = vi.spyOn(provider, 'chat');
+      const { runtime, release, running, disconnect } = await setup((ctx: any) =>
+        ctx.ask(assistant, 'hi'),
+      );
+      const execution = runtime.execute('wf', { q: 'hi' });
+      await running;
+
+      await disconnect();
+      release();
+
+      await expect(execution).rejects.toMatchObject(unavailable);
+      expect(chat).not.toHaveBeenCalled();
+    });
+
+    it('rejects session.send immediately, before calling the workflow', async () => {
+      const { runtime, disconnect, release } = await setup(async () => 'result');
+      release();
+      await disconnect();
+
+      await expect(runtime.session('s1').send('wf', { q: 'hi' })).rejects.toMatchObject(
+        unavailable,
+      );
+    });
+
+    it('delivers a session.stream result and logs the lost turn with no listener', async () => {
+      const { runtime, release, running, disconnect } = await setup(
+        async (_ctx, answer) => answer,
+        (ctx: any) => ctx.ask(assistant, 'hi'),
+      );
+      const stream = await runtime.session('s1').stream('wf', { q: 'hi' });
+      await running;
+
+      await disconnect();
+      release();
+
+      await expect(stream.promise).resolves.toBe('done');
+      await waitUntil(() => errorLogs().includes('session history'));
+    });
+
+    it('emits the lost session.stream turn to a runtime error listener instead', async () => {
+      const { runtime, release, running, disconnect } = await setup(
+        async (_ctx, answer) => answer,
+        (ctx: any) => ctx.ask(assistant, 'hi'),
+      );
+      const onError = vi.fn();
+      runtime.on('error', onError);
+      const stream = await runtime.session('s1').stream('wf', { q: 'hi' });
+      await running;
+
+      await disconnect();
+      release();
+      await stream.promise;
+
+      await waitUntil(() => onError.mock.calls.length > 0);
+      expect(onError).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'session_history_save_failed', sessionId: 's1' }),
+      );
+      expect(errorLogs()).not.toContain('session history');
+    });
+
+    it('shuts down in bounded time while disconnected', async () => {
+      const { runtime, release, disconnect } = await setup(async () => 'result');
+      release();
+      await disconnect();
+
+      const start = Date.now();
+      await runtime.shutdown();
+
+      expect(Date.now() - start).toBeLessThan(500);
     });
   });
 });

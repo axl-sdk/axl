@@ -92,6 +92,47 @@ const runtime = new AxlRuntime({
 
 `keyPrefix` is the storage-layer isolation primitive for shared Redis clusters. Avoid Redis glob metacharacters (`*`, `?`, `[`, `]`) in the prefix; operators running `redis-cli SCAN MATCH` would otherwise have to escape them.
 
+### Riding out a Redis outage
+
+When Redis restarts or a connection drops, `RedisStore` reconnects by itself, with no setup. While it's disconnected, calls fail right away, so you can return a 503 instead of holding the request:
+
+```ts
+import { AxlError, RedisStore } from '@axlsdk/axl';
+
+const store = await RedisStore.create({
+  url: process.env.REDIS_URL!,
+  onConnectionEvent: (event) => {
+    if (event.type === 'error') logger.warn({ err: event.error }, 'redis connection problem');
+    else logger.info('redis reconnected');
+  },
+});
+
+try {
+  return await session.send('chat', input);
+} catch (err) {
+  if (err instanceof AxlError && err.code === 'REDIS_UNAVAILABLE') {
+    return reply.status(503).send({ error: 'Try again shortly' });
+  }
+  throw err;
+}
+```
+
+Without `onConnectionEvent`, the store logs one line when an outage starts and one when it ends. With it, you get an `error` event for each failed reconnect attempt, up to about one every 2 seconds.
+
+| What was happening | What you see |
+|---|---|
+| Call made while disconnected | Rejects at once with `AxlError` code `REDIS_UNAVAILABLE`. It's never sent later |
+| Call waiting on Redis when the connection dropped | Rejects at once with the Redis client's error, such as `Socket closed unexpectedly`. **A write may still have applied**, so make retries safe to repeat |
+| `ctx.ask`, `ctx.checkpoint` or `ctx.awaitHuman` during an outage | Rejects with `REDIS_UNAVAILABLE`. `ctx.ask` reads its checkpoint first, so the model isn't called and nothing is spent |
+| `session.send` | Rejects. If only its final save fails, the model has already been paid for and the turn isn't saved |
+| `session.stream`, when its final save fails | You still get the result. The lost turn goes to `runtime.on('error')` as `session_history_save_failed`, or to `console.error` with no listener |
+| Workflow that finishes during an outage | You still get the result. Its execution history record isn't saved, and `console.error` says so. Streaming persistence and the leftover buffer follow [crash recovery](./migration/state-store-durability.md) |
+| `store.close()` or `runtime.shutdown()` | Finishes without waiting for Redis to return |
+
+`RedisStore.create()` doesn't retry: if Redis is unreachable or rejects your credentials at startup, it rejects with that error. Retry it yourself if your app should wait for Redis.
+
+An outage only counts once the connection has visibly closed. If a network failure drops packets with no close, calls wait until the operating system gives up on the connection.
+
 ### Execution history: retention and paging
 
 Every built-in store takes the same history retention, so you can keep, say, 30 days of runs:

@@ -1121,8 +1121,10 @@ checkpoint alone as an exactly-once side-effect boundary.
 
 If the save fails, `ctx.checkpoint` rejects even though `fn` already ran. The
 automatic checkpoints around `ctx.ask`, `ctx.spawn`, `ctx.race`, `ctx.parallel`
-and `ctx.map` instead log the failure, return the result, and save nothing further
-for that run.
+and `ctx.map` instead log the failure, return the result, and save no further
+automatic checkpoints for that run. An explicit `ctx.checkpoint` after that still
+saves, so a replay returns its saved value even though the automatic steps before
+it run again.
 
 ```typescript
 const value = await ctx.checkpoint('refund-customer', async () => expensiveOperation());

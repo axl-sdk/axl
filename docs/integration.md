@@ -97,7 +97,7 @@ const runtime = new AxlRuntime({
 When Redis restarts or a connection drops, `RedisStore` reconnects by itself, with no setup. While it's disconnected, calls fail right away, so you can return a 503 instead of holding the request:
 
 ```ts
-import { AxlError, RedisStore } from '@axlsdk/axl';
+import { RedisStore } from '@axlsdk/axl';
 
 const store = await RedisStore.create({
   url: process.env.REDIS_URL!,
@@ -110,12 +110,15 @@ const store = await RedisStore.create({
 try {
   return await session.send('chat', input);
 } catch (err) {
-  if (err instanceof AxlError && err.code === 'REDIS_UNAVAILABLE') {
+  // `isConnected` also catches calls that were waiting on Redis when it dropped.
+  if (!store.isConnected) {
     return reply.status(503).send({ error: 'Try again shortly' });
   }
   throw err;
 }
 ```
+
+`store.isConnected` also works for a readiness probe. To detect only calls that were never sent, check for `AxlError` code `REDIS_UNAVAILABLE`.
 
 Without `onConnectionEvent`, the store logs one line when an outage starts and one when it ends. With it, you get an `error` event for each failed reconnect attempt, up to about one every 2 seconds.
 
@@ -123,15 +126,17 @@ Without `onConnectionEvent`, the store logs one line when an outage starts and o
 |---|---|
 | Call made while disconnected | Rejects at once with `AxlError` code `REDIS_UNAVAILABLE`. It's never sent later |
 | Call waiting on Redis when the connection dropped | Rejects at once with the Redis client's error, such as `Socket closed unexpectedly`. **A write may still have applied**, so make retries safe to repeat |
-| `ctx.ask`, `ctx.checkpoint` or `ctx.awaitHuman` during an outage | Rejects with `REDIS_UNAVAILABLE`. `ctx.ask` reads its checkpoint first, so the model isn't called and nothing is spent |
+| `ctx.ask` started during an outage | Rejects with `REDIS_UNAVAILABLE` before calling the model, so nothing is spent |
+| Redis drops while `ctx.ask` waits for the model | You still get the answer. It isn't saved as a checkpoint, so a replay would ask again, and `console.error` says so |
+| `ctx.checkpoint` or `ctx.awaitHuman` during an outage | Rejects with `REDIS_UNAVAILABLE`. If `ctx.checkpoint` can't save after your function ran, it rejects even though your function's work is done |
 | `session.send` | Rejects. If only its final save fails, the model has already been paid for and the turn isn't saved |
 | `session.stream`, when its final save fails | You still get the result. The lost turn goes to `runtime.on('error')` as `session_history_save_failed`, or to `console.error` with no listener |
-| Workflow that finishes during an outage | You still get the result. Its execution history record isn't saved, and `console.error` says so. Streaming persistence and the leftover buffer follow [crash recovery](./migration/state-store-durability.md) |
+| Workflow that finishes during an outage | You still get the result. Its execution history record isn't saved, and `console.error` says so. Its checkpoints stay until `ttls.checkpoint` expires them. With `state.persist: 'streaming'`, events already in Redis are reported as an incomplete run by the next `recoverIncompleteStreams()` |
 | `store.close()` or `runtime.shutdown()` | Finishes without waiting for Redis to return |
 
 `RedisStore.create()` doesn't retry: if Redis is unreachable or rejects your credentials at startup, it rejects with that error. Retry it yourself if your app should wait for Redis.
 
-An outage only counts once the connection has visibly closed. If a network failure drops packets with no close, calls wait until the operating system gives up on the connection.
+All of this starts once the connection has visibly closed. If a network failure drops packets with no close, calls wait until the operating system gives up on the connection.
 
 ### Execution history: retention and paging
 

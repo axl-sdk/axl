@@ -471,6 +471,53 @@ function connectionEventReporter(
 }
 
 /**
+ * Create and connect a client whose connection problems can't reach the host
+ * process as uncaught exceptions.
+ */
+async function connectClient(
+  createClient: (clientOpts: RedisClientOptions) => ConnectableRedisClient,
+  opts: RedisStoreOptions,
+): Promise<ConnectableRedisClient> {
+  // A failed first connection must reject `create()` rather than retry
+  // forever, so hosts see bad config at startup. Only reconnect after the
+  // connection has worked once.
+  let established = false;
+  const client = createClient({
+    ...(opts.url ? { url: opts.url } : {}),
+    // A command accepted just before a drop rejects instead of waiting for
+    // the reconnect.
+    disableOfflineQueue: true,
+    socket: { reconnectStrategy: (retries) => (established ? reconnectDelayMs(retries) : false) },
+  });
+  // node-redis reports a closed socket as an `error` event. With no listener,
+  // Node throws it as an uncaught exception and the host process exits.
+  const reportConnectionEvent = connectionEventReporter(client, opts.onConnectionEvent);
+  client.on('error', (error) => {
+    if (!established || client.isOpen === false) return;
+    reportConnectionEvent({
+      type: 'error',
+      error: error instanceof Error ? error : new Error(String(error)),
+    });
+  });
+  // A reconnect attempt already mid-connect survives `destroy()`: node-redis
+  // keeps going once the TCP connect finishes, and offers no way to close that
+  // socket. Unreferencing it here keeps it from holding the process open; it
+  // stays connected to Redis, idle, until the process exits.
+  client.on('connect', () => {
+    if (client.isOpen === false) client.unref?.();
+  });
+  client.on('ready', () => {
+    if (!established) {
+      established = true;
+    } else if (client.isOpen !== false) {
+      reportConnectionEvent({ type: 'reconnected' });
+    }
+  });
+  await client.connect();
+  return client;
+}
+
+/**
  * Redis-backed StateStore using the official `redis` (node-redis) client.
  *
  * Designed for multi-process and sidecar deployments where
@@ -485,6 +532,15 @@ export class RedisStore implements StateStore {
     private keyPrefix: string,
     private ttls: ResolvedTtls,
   ) {}
+
+  /**
+   * Whether the store can send commands right now, for a health check or for
+   * telling an outage from other failures when a call rejects. `false` while
+   * reconnecting and after `close()`.
+   */
+  get isConnected(): boolean {
+    return this.connection.isOpen !== false && this.connection.isReady !== false;
+  }
 
   /**
    * The client for sending a command, failing immediately while disconnected.
@@ -586,42 +642,7 @@ export class RedisStore implements StateStore {
       throw new Error('redis is required for RedisStore. Install it with: npm install redis');
     }
 
-    // A failed first connection must reject `create()` rather than retry
-    // forever, so hosts see bad config at startup. Only reconnect after the
-    // connection has worked once.
-    let established = false;
-    const client = createClient({
-      ...(opts.url ? { url: opts.url } : {}),
-      // A command accepted just before a drop rejects instead of waiting for
-      // the reconnect.
-      disableOfflineQueue: true,
-      socket: { reconnectStrategy: (retries) => (established ? reconnectDelayMs(retries) : false) },
-    });
-    // node-redis reports a closed socket as an `error` event. With no listener,
-    // Node throws it as an uncaught exception and the host process exits.
-    const reportConnectionEvent = connectionEventReporter(client, opts.onConnectionEvent);
-    client.on('error', (error) => {
-      if (!established || client.isOpen === false) return;
-      reportConnectionEvent({
-        type: 'error',
-        error: error instanceof Error ? error : new Error(String(error)),
-      });
-    });
-    // A reconnect attempt already mid-connect survives `destroy()`: node-redis
-    // keeps going once the TCP connect finishes, and offers no way to close that
-    // socket. Unreferencing it here keeps it from holding the process open; it
-    // stays connected to Redis, idle, until the process exits.
-    client.on('connect', () => {
-      if (client.isOpen === false) client.unref?.();
-    });
-    client.on('ready', () => {
-      if (!established) {
-        established = true;
-      } else if (client.isOpen !== false) {
-        reportConnectionEvent({ type: 'reconnected' });
-      }
-    });
-    await client.connect();
+    const client = await connectClient(createClient, opts);
 
     // Resolve effective per-category TTL: per-category override beats
     // defaultTtl beats "no TTL". `null` in overrides means explicit opt-out

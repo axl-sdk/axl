@@ -4220,7 +4220,7 @@ export class WorkflowContext<TInput = unknown> {
         `ctx.checkpoint name "${name}" is reserved — names starting with "__auto/" (case-insensitive) are used by the runtime for ask/spawn/race/parallel/map auto-checkpointing.`,
       );
     }
-    return this._checkpoint(name, fn);
+    return this._checkpoint(name, fn, { saveRequired: true });
   }
 
   /**
@@ -4238,7 +4238,7 @@ export class WorkflowContext<TInput = unknown> {
   private async _checkpoint<T>(
     name: string,
     fn: () => Promise<T>,
-    options?: { agent?: string },
+    options?: { agent?: string; saveRequired?: boolean },
   ): Promise<T> {
     // If no state store, just execute without persistence
     if (!this.stateStore) {
@@ -4262,7 +4262,19 @@ export class WorkflowContext<TInput = unknown> {
     // Execute and save the result
     const result = await fn();
 
-    await this.stateStore.saveCheckpoint(this.executionId, name, result);
+    try {
+      await this.stateStore.saveCheckpoint(this.executionId, name, result);
+    } catch (err) {
+      if (options?.saveRequired) throw err;
+      // The automatic checkpoints around ctx.ask and friends only save work on
+      // a later replay. Failing the run here would discard a model answer that
+      // is already paid for, to protect a replay that might never happen.
+      console.error(
+        `[axl] Failed to save checkpoint "${name}" for executionId=${this.executionId}; ` +
+          `a replay would run this step again: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return result;
+    }
 
     this.emitEvent({
       type: 'checkpoint_save',

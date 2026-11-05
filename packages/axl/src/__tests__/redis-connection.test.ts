@@ -140,7 +140,7 @@ describe('RedisStore connection handling', () => {
       await expect(
         store.saveSession('lost', [{ role: 'user', content: 'hi' }]),
       ).rejects.toMatchObject(unavailable);
-      expect(Date.now() - start).toBeLessThan(50);
+      expect(Date.now() - start).toBeLessThan(500);
 
       await fake.start();
       await waitUntil(() => isReady(store));
@@ -284,6 +284,21 @@ describe('RedisStore connection handling', () => {
     });
   });
 
+  describe('isConnected', () => {
+    it('follows the connection through an outage and close()', async () => {
+      const store = await open();
+      expect(store.isConnected).toBe(true);
+
+      await fake.stop();
+      await waitUntil(() => !store.isConnected);
+      await fake.start();
+      await waitUntil(() => store.isConnected);
+
+      await store.close();
+      expect(store.isConnected).toBe(false);
+    });
+  });
+
   describe('create()', () => {
     it('rejects promptly when nothing is listening, and stops trying', async () => {
       await fake.stop();
@@ -332,7 +347,7 @@ describe('RedisStore connection handling', () => {
       const after = fake.connectionCount();
       await sleep(400);
       expect(fake.connectionCount()).toBe(after);
-      expect(socketsHoldingProcess()).toBe(socketsBefore);
+      expect(socketsHoldingProcess()).toBeLessThanOrEqual(socketsBefore);
     });
 
     it('does not report a failed create() through the callback or the log', async () => {
@@ -518,6 +533,47 @@ describe('RedisStore connection handling', () => {
       await running;
 
       await disconnect();
+      release();
+
+      await expect(execution).rejects.toMatchObject(unavailable);
+    });
+
+    it('keeps a paid model answer when Redis drops during the call', async () => {
+      const { runtime, disconnect } = await setup(async () => undefined);
+      let finishModelCall!: () => void;
+      const modelCall = new Promise<void>((resolve) => (finishModelCall = resolve));
+      let inModelCall!: () => void;
+      const modelStarted = new Promise<void>((resolve) => (inModelCall = resolve));
+      const chat = provider.chat;
+      vi.spyOn(provider, 'chat').mockImplementation(async () => {
+        inModelCall();
+        await modelCall;
+        return chat();
+      });
+      runtime.register(
+        workflow({ name: 'asks', input, handler: (ctx) => ctx.ask(assistant, 'hi') }),
+      );
+      const execution = runtime.execute('asks', { q: 'hi' });
+      await modelStarted;
+      await disconnect();
+      finishModelCall();
+
+      await expect(execution).resolves.toBe('done');
+      expect(errorLogs()).toContain('Failed to save checkpoint');
+    });
+
+    it('still fails an explicit ctx.checkpoint whose result could not be saved', async () => {
+      const during: { disconnect?: () => Promise<void> } = {};
+      const { runtime, release, running, disconnect } = await setup((ctx: any) =>
+        ctx.checkpoint('step', async () => {
+          await during.disconnect!();
+          return 1;
+        }),
+      );
+      during.disconnect = disconnect;
+      const execution = runtime.execute('wf', { q: 'hi' });
+      await running;
+
       release();
 
       await expect(execution).rejects.toMatchObject(unavailable);

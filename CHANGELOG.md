@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Calls cut off by a lost connection have their own error code.** A `RedisStore` call that was waiting for Redis when the connection dropped, when `responseTimeoutMs` reset it, or when `close()` gave up, now rejects with `AxlError` code `REDIS_CONNECTION_LOST`. Before, it got the Redis client's own error. The code is separate from `REDIS_UNAVAILABLE` because the call was sent and a write may have applied. Errors on a healthy connection, from Redis or from a bad argument, come through unchanged. The client's error is in `cause`, and its message stays part of the new one. Checks with `instanceof` against node-redis error classes need to look at `cause` instead. See [Riding out a Redis outage](docs/integration.md#riding-out-a-redis-outage).
 - **`onConnectionEvent` reports a background store's first connection.** With `waitForConnection: false`, a `{ type: 'connected' }` event comes once when the store first connects, so startup work no longer needs to poll `isConnected`. A cold start that had to retry used to report `reconnected`, and the default log said the connection was lost. Both now describe a first connection. Code that handles every `RedisConnectionEvent` type needs a case for `connected`.
 
+### Fixed
+
+- **A checkpoint whose function returns nothing now replays.** When `fn` returned `undefined` or `null`, a replay ran it again on every store, so a step like charging a card could repeat. On `SQLiteStore` and `RedisStore`, an explicit `ctx.checkpoint` returning `undefined` failed to save and rejected. Checkpoints saved by earlier versions read as before.
+
 ## [0.27.2] - 2026-11-07
 
 ### Added

@@ -1133,7 +1133,7 @@ const value = await ctx.checkpoint('refund-customer', async () => expensiveOpera
 | Param | Type | Description |
 |-------|------|-------------|
 | `name` | `string` | Stable, caller-supplied identifier. Must be the same across runs of the same execution for replay to work. Names starting with `__auto/` are reserved for runtime auto-checkpointing of `ctx.ask` / `spawn` / `race` / `parallel` / `map` and will throw |
-| `fn` | `() => Promise<T>` | Function whose result is checkpointed |
+| `fn` | `() => Promise<T>` | Function whose result is checkpointed. It can return nothing: `undefined` and `null` replay like any other result |
 
 Names are scoped to a single execution and must be unique within it. Reusing a name (e.g. inside a loop) gives last-write-wins behavior — for loops, compose names from the iterator: `ctx.checkpoint(\`process-${id}\`, fn)`.
 

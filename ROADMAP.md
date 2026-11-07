@@ -327,10 +327,9 @@ Retention shipped in 0.27.0; these were deliberately left out of it:
 
 `RedisStore` survives dropped connections as of 0.27.1. These were left out of that fix:
 
-- **Detecting a connection that drops silently.** A network partition with no
-  TCP close isn't noticed, so commands wait on the operating system. Health
-  checks with `pingInterval` and `socketTimeout` detect it on node-redis 5.12.1
-  but not on 5.0.0, so this needs a higher `redis` peer version.
+- **Turning on `responseTimeoutMs` by default.** Detecting a server that stops
+  answering is opt-in, because a default could reconnect during a long command
+  or a blocked event loop. We'll revisit this once it has run in production.
 - **A short wait before failing during a brief blip.** Calls fail at once while
   disconnected, so a reconnect that takes a moment can still fail the next
   store call. We'll revisit this if real outages show that it matters.

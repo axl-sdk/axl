@@ -137,7 +137,26 @@ Without `onConnectionEvent`, the store logs one line when an outage starts and o
 
 `RedisStore.create()` doesn't retry: if Redis is unreachable or rejects your credentials at startup, it rejects with that error. Retry it yourself if your app should wait for Redis.
 
-All of this starts once the connection has visibly closed. If a network failure drops packets with no close, calls wait until the operating system gives up on the connection.
+#### When Redis stops answering
+
+All of the above starts once the connection has visibly closed. If Redis hangs or the network silently drops packets, calls can wait for many minutes, or forever if the connection stays open. Set `responseTimeoutMs` to reconnect instead:
+
+```ts
+const store = await RedisStore.create({
+  url: process.env.REDIS_URL!,
+  responseTimeoutMs: 30_000,
+});
+```
+
+The store sends a `PING` about every third of that time. If one goes unanswered for the full time, the store drops the connection and reconnects. Calls waiting on Redis reject, and calls made until it reconnects reject with `REDIS_UNAVAILABLE`. A problem is noticed within about 1.3 times the value, and `create()` rejects if Redis hasn't finished connecting within it.
+
+Choosing a value:
+
+- **Set it above your slowest expected command.** Replies come back in order, so a `PING` waits behind everything sent before it. It applies to the whole connection, so you can't exempt one slow command. A large session save, or a server busy for longer than the value, looks like a stall.
+- **A rejected write may still have been applied.** Redis may have run it before the connection dropped, so check before retrying a write that isn't safe to repeat.
+- **A blocked Node.js event loop can cause a reconnect.** The store allows for blocks up to about twice the value. Longer ones can drop a healthy connection, which clears up after the reconnect.
+
+It works on every supported `redis` version. Giving up on a reconnect that reached a server which never answers needs `redis` 5.1.0 or later.
 
 ### Execution history: retention and paging
 

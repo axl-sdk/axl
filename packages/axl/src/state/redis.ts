@@ -109,6 +109,9 @@ interface RedisClient {
   // EVAL runs a Lua script atomically. Only PRUNE_HISTORY_INDEX_SCRIPT uses
   // it; every key the script touches is passed in `keys`.
   eval(script: string, options: { keys: string[]; arguments: string[] }): Promise<unknown>;
+  // Only sent when `responseTimeoutMs` is set. Any reply, even an error, shows
+  // the server is answering.
+  ping(): Promise<unknown>;
   quit(): Promise<void>;
   // node-redis reports its socket state here and rejects a QUIT once the
   // client is closed. Optional because a caller may inject a minimal client
@@ -126,7 +129,10 @@ interface RedisClient {
 interface RedisClientOptions {
   url?: string;
   disableOfflineQueue: boolean;
-  socket: { reconnectStrategy: (retries: number) => number | false };
+  socket: {
+    reconnectStrategy: (retries: number) => number | false;
+    socketTimeout?: number;
+  };
 }
 
 /** The node-redis client surface only `create()` needs, on top of {@link RedisClient}. */
@@ -211,6 +217,21 @@ export interface RedisStoreOptions {
    * `console.error` and otherwise ignored.
    */
   onConnectionEvent?: (event: RedisConnectionEvent) => void;
+  /**
+   * Reconnect when Redis stops answering, in milliseconds. Off by default.
+   *
+   * The store sends a `PING` about every third of this time. If one goes
+   * unanswered for this long, it drops the connection and reconnects: calls in
+   * flight reject, and calls made until it reconnects reject with
+   * `REDIS_UNAVAILABLE`. `create()` also rejects if Redis hasn't finished
+   * connecting within this time.
+   *
+   * It's a limit on the whole connection, not on one command, because replies
+   * come back in order. Set it above your slowest expected command, or a large
+   * save or busy server looks like a stall. A call that rejects this way may
+   * still have been applied by Redis.
+   */
+  responseTimeoutMs?: number;
   /**
    * Skip the lazy backfill of legacy execution / eval-history entries into
    * the sorted-set indexes during `RedisStore.create()`. Default `false`
@@ -470,24 +491,141 @@ function connectionEventReporter(
   };
 }
 
+/** A deadline timer this much late means the event loop was blocked, not Redis. */
+const LOOP_STALL_TOLERANCE_MS = 100;
+/** Extra time a late deadline waits, so a reply held up by the blocked loop can be read. */
+const LOOP_STALL_GRACE_MS = 1000;
+
+/**
+ * Reconnect `client` when a `PING` goes unanswered for `timeoutMs`. Returns a
+ * function that stops watching.
+ *
+ * This is a deadline on a reply rather than node-redis's `socketTimeout`, which
+ * is an idle timer that every write resets: an instance that keeps sending
+ * commands to a stalled server would never trip it. `commandOptions.timeout`
+ * doesn't help either, because node-redis drops it once a command is written.
+ *
+ * Only a ready client is reset. A reconnect in progress has a retry loop that
+ * a second `connect()` would run alongside, and `socketTimeout` already bounds
+ * its handshake.
+ */
+function watchResponses(
+  client: ConnectableRedisClient,
+  timeoutMs: number,
+  reportConnectionEvent: (event: RedisConnectionEvent) => void,
+): () => void {
+  const checkEveryMs = timeoutMs / 3;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let stopped = false;
+  const schedule = (run: () => void, delayMs: number) => {
+    timer = setTimeout(run, delayMs);
+    timer.unref?.();
+  };
+
+  const check = () => {
+    if (client.isReady === false) {
+      schedule(check, checkEveryMs);
+      return;
+    }
+    let settled = false;
+    const onReply = () => {
+      if (settled || stopped) return;
+      settled = true;
+      clearTimeout(timer);
+      schedule(check, checkEveryMs);
+    };
+    const expireAfter = (delayMs: number) => {
+      const dueAt = Date.now() + delayMs;
+      schedule(() => {
+        if (settled || stopped) return;
+        if (Date.now() - dueAt > LOOP_STALL_TOLERANCE_MS) {
+          expireAfter(LOOP_STALL_GRACE_MS);
+          return;
+        }
+        reset();
+      }, delayMs);
+    };
+    const reset = () => {
+      settled = true;
+      // Dropped since the check began: its own retry loop is already running.
+      if (client.isReady === false) {
+        schedule(check, checkEveryMs);
+        return;
+      }
+      // Rejects every command in flight, transactions included.
+      client.destroy?.();
+      // Retries by itself, so this settles only on success or close().
+      client.connect().catch(() => {});
+      reportConnectionEvent({
+        type: 'error',
+        error: new Error(`Redis did not answer within ${timeoutMs}ms; reconnecting.`),
+      });
+      schedule(check, checkEveryMs);
+    };
+    client.ping().then(onReply, onReply);
+    expireAfter(timeoutMs);
+  };
+
+  schedule(check, checkEveryMs);
+  return () => {
+    stopped = true;
+    clearTimeout(timer);
+  };
+}
+
+/**
+ * Reject when `connecting` hasn't finished within `timeoutMs`: a server can
+ * accept the connection and then never answer the handshake.
+ */
+async function connectWithin(connecting: Promise<unknown>, timeoutMs: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      connecting,
+      new Promise((_resolve, reject) => {
+        timer = setTimeout(
+          () =>
+            reject(
+              new AxlError(
+                'REDIS_UNAVAILABLE',
+                `RedisStore: Redis did not finish connecting within ${timeoutMs}ms.`,
+              ),
+            ),
+          timeoutMs,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /**
  * Create and connect a client whose connection problems can't reach the host
- * process as uncaught exceptions.
+ * process as uncaught exceptions. Returns it with the function that stops its
+ * response watch.
  */
 async function connectClient(
   createClient: (clientOpts: RedisClientOptions) => ConnectableRedisClient,
   opts: RedisStoreOptions,
-): Promise<ConnectableRedisClient> {
+): Promise<{ client: ConnectableRedisClient; stopResponseWatch?: () => void }> {
   // A failed first connection must reject `create()` rather than retry
   // forever, so hosts see bad config at startup. Only reconnect after the
   // connection has worked once.
   let established = false;
+  const responseTimeoutMs = opts.responseTimeoutMs;
   const client = createClient({
     ...(opts.url ? { url: opts.url } : {}),
     // A command accepted just before a drop rejects instead of waiting for
     // the reconnect.
     disableOfflineQueue: true,
-    socket: { reconnectStrategy: (retries) => (established ? reconnectDelayMs(retries) : false) },
+    socket: {
+      reconnectStrategy: (retries) => (established ? reconnectDelayMs(retries) : false),
+      // Bounds a reconnect's handshake, where the response watch doesn't run.
+      // Twice the timeout so that on an open connection the watch acts first:
+      // this timer fires after any long event-loop block, which the watch allows for.
+      ...(responseTimeoutMs !== undefined ? { socketTimeout: responseTimeoutMs * 2 } : {}),
+    },
   });
   // node-redis reports a closed socket as an `error` event. With no listener,
   // Node throws it as an uncaught exception and the host process exits.
@@ -513,8 +651,20 @@ async function connectClient(
       reportConnectionEvent({ type: 'reconnected' });
     }
   });
-  await client.connect();
-  return client;
+  if (responseTimeoutMs === undefined) {
+    await client.connect();
+    return { client };
+  }
+  try {
+    await connectWithin(client.connect(), responseTimeoutMs);
+  } catch (error) {
+    abandonConnection(client);
+    throw error;
+  }
+  return {
+    client,
+    stopResponseWatch: watchResponses(client, responseTimeoutMs, reportConnectionEvent),
+  };
 }
 
 /**
@@ -572,6 +722,9 @@ export class RedisStore implements StateStore {
    */
   private prunesInFlight?: Set<HistoryKind>;
 
+  /** Stops the `responseTimeoutMs` health checks; unset when the option is off. */
+  private stopResponseWatch?: () => void;
+
   /**
    * Supports `listExecutions(limit, { cursor })`. A getter rather than a
    * field so it lives on the prototype.
@@ -628,6 +781,16 @@ export class RedisStore implements StateStore {
       );
     }
 
+    const responseTimeoutMs = opts.responseTimeoutMs;
+    if (
+      responseTimeoutMs !== undefined &&
+      !(Number.isFinite(responseTimeoutMs) && responseTimeoutMs > 0)
+    ) {
+      throw new Error(
+        `RedisStore: responseTimeoutMs must be a positive number of milliseconds, got ${responseTimeoutMs}.`,
+      );
+    }
+
     let createClient: (clientOpts: RedisClientOptions) => ConnectableRedisClient;
     try {
       const mod = require('redis');
@@ -642,7 +805,7 @@ export class RedisStore implements StateStore {
       throw new Error('redis is required for RedisStore. Install it with: npm install redis');
     }
 
-    const client = await connectClient(createClient, opts);
+    const { client, stopResponseWatch } = await connectClient(createClient, opts);
 
     // Resolve effective per-category TTL: per-category override beats
     // defaultTtl beats "no TTL". `null` in overrides means explicit opt-out
@@ -676,6 +839,7 @@ export class RedisStore implements StateStore {
     };
 
     const store = new RedisStore(client, keyPrefix, effectiveTtls);
+    store.stopResponseWatch = stopResponseWatch;
     warnIfRedisExecutionRetentionUnset(opts);
 
     // Lazy backfill of the new sorted-set indexes for installs upgrading
@@ -689,6 +853,7 @@ export class RedisStore implements StateStore {
       } catch (error) {
         // The caller never gets the store, so nothing else could stop the
         // client reconnecting forever.
+        stopResponseWatch?.();
         abandonConnection(client);
         throw error;
       }
@@ -1877,6 +2042,7 @@ export class RedisStore implements StateStore {
    * disconnected it couldn't be sent at all.
    */
   async close(): Promise<void> {
+    this.stopResponseWatch?.();
     if (this.connection.isOpen === false) return;
     if (this.connection.isReady === false) {
       abandonConnection(this.connection);

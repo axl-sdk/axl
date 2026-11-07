@@ -754,7 +754,9 @@ describe('RedisStore connection handling', () => {
     it('gets past a server that accepts the connection but never answers', async () => {
       fake.hold = () => true;
       const store = await openInBackground();
-      await waitUntil(() => fake.connectionCount() > 0);
+      // Accepting isn't enough: a handshake that arrives after the server starts
+      // answering again would simply succeed, with no new connection needed.
+      await fake.waitForCommand(isHandshakeCommand);
       expect(store.isConnected).toBe(false);
       await expect(store.getSession('s')).rejects.toMatchObject({ code: 'REDIS_UNAVAILABLE' });
 

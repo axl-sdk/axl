@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type {
   AxlEvent,
   ChatMessage,
@@ -7,6 +8,7 @@ import type {
 } from '../types.js';
 import type {
   StateStore,
+  SessionUpdate,
   PendingDecision,
   ExecutionState,
   EvalHistoryEntry,
@@ -17,6 +19,7 @@ import type {
 } from './types.js';
 import { AxlError } from '../errors.js';
 import { normalizePersistedSessionHistory } from '../input.js';
+import { updateSessionThroughOverrides } from './session-update.js';
 import { getExecutionEventSchemaVersion, normalizeStoredExecution } from '../event-schema.js';
 import { warnDiagnosticOnce } from '../schema-diagnostics.js';
 import {
@@ -65,6 +68,11 @@ interface RedisClient {
   sRem(key: string, member: string | string[]): Promise<number>;
   sCard(key: string): Promise<number>;
   sMembers(key: string): Promise<string[]>;
+  sScan(
+    key: string,
+    cursor: string,
+    options?: { COUNT?: number },
+  ): Promise<{ cursor: string; members: string[] }>;
   // List ops for streaming-event persistence. RPUSH appends batches of
   // JSON-serialized events to a per-execution list; LRANGE 0 -1 reads
   // them back on recovery. Used by appendStreamingEvents / getStreamingEvents.
@@ -109,11 +117,11 @@ interface RedisClient {
   // EVAL runs a Lua script atomically. Only PRUNE_HISTORY_INDEX_SCRIPT uses
   // it; every key the script touches is passed in `keys`.
   eval(script: string, options: { keys: string[]; arguments: string[] }): Promise<unknown>;
-  quit(): Promise<void>;
-  // node-redis reports its socket state here and rejects a QUIT once the
-  // client is closed. Optional because a caller may inject a minimal client
-  // shim that does not expose it — one that omits it keeps the old
-  // quit-unconditionally behavior.
+  // Sent when `responseTimeoutMs` is set, and by `close()`. Any reply, even an
+  // error, shows the server is answering.
+  ping(): Promise<unknown>;
+  // node-redis reports its socket state here. Optional because a caller may inject a minimal client
+  // shim that does not expose it.
   readonly isOpen?: boolean;
   // True only while connected and past the handshake. `isOpen && !isReady`
   // means node-redis is reconnecting. Optional for the same reason as isOpen.
@@ -126,7 +134,10 @@ interface RedisClient {
 interface RedisClientOptions {
   url?: string;
   disableOfflineQueue: boolean;
-  socket: { reconnectStrategy: (retries: number) => number | false };
+  socket: {
+    reconnectStrategy: (retries: number) => number | false;
+    socketTimeout?: number;
+  };
 }
 
 /** The node-redis client surface only `create()` needs, on top of {@link RedisClient}. */
@@ -211,6 +222,34 @@ export interface RedisStoreOptions {
    * `console.error` and otherwise ignored.
    */
   onConnectionEvent?: (event: RedisConnectionEvent) => void;
+  /**
+   * Reconnect when Redis stops answering, in milliseconds. Off by default.
+   *
+   * The store sends a `PING` about every third of this time. If one goes
+   * unanswered for this long, it drops the connection and reconnects: calls in
+   * flight reject, and calls made until it reconnects reject with
+   * `REDIS_UNAVAILABLE`. `create()` also rejects if Redis hasn't finished
+   * connecting within this time.
+   *
+   * It's a limit on the whole connection, not on one command, because replies
+   * come back in order. Set it above your slowest expected command, or a large
+   * save or busy server looks like a stall. A call that rejects this way may
+   * still have been applied by Redis.
+   */
+  responseTimeoutMs?: number;
+  /**
+   * Set to `false` so that `create()` returns right away and the store connects
+   * in the background, retrying until Redis is available. Calls reject with
+   * `REDIS_UNAVAILABLE` until then. Defaults to `true`, where `create()` rejects
+   * if Redis is unavailable, which surfaces bad configuration at startup.
+   *
+   * Requires {@link responseTimeoutMs}, so that a server that accepts the
+   * connection but never answers can't leave it connecting forever. Nothing
+   * rejects if the configuration is wrong: failed attempts go to
+   * {@link onConnectionEvent}, and `isConnected` stays `false`. The startup
+   * backfill runs after the first connection instead of during `create()`.
+   */
+  waitForConnection?: boolean;
   /**
    * Skip the lazy backfill of legacy execution / eval-history entries into
    * the sorted-set indexes during `RedisStore.create()`. Default `false`
@@ -377,6 +416,63 @@ end
 return removed
 `;
 
+/**
+ * Removes ids from the listing set when their session is gone, and the
+ * session's metadata with them. `ttls.session` and `ttls.sessionMeta` are
+ * independent, so metadata can outlive its session, and once the id is gone
+ * nothing could find that metadata to delete it. The script decides by what
+ * exists when it runs, so a session saved just before it is kept.
+ *
+ * KEYS: the id set, then each id's session key and metadata key.
+ * ARGV: the ids. Returns the ids it removed.
+ *
+ * Exported for tests only; not part of the public API.
+ */
+export const PRUNE_SESSION_IDS_SCRIPT = `
+local removed = {}
+for i, id in ipairs(ARGV) do
+  if redis.call('EXISTS', KEYS[i * 2]) == 0 then
+    redis.call('SREM', KEYS[1], id)
+    redis.call('DEL', KEYS[i * 2 + 1])
+    removed[#removed + 1] = id
+  end
+end
+return removed
+`;
+
+/** Session ids checked per script run, and how many one save asks SSCAN for. */
+const SESSION_ID_BATCH = 100;
+const SESSION_SWEEP_COUNT = 50;
+
+/**
+ * Write a session only if it's unchanged since it was read, by comparing the
+ * SHA-1 of the stored value. Hashing what's stored needs no version key or new
+ * format, so a write from an older instance during a rolling deploy counts as
+ * a change too.
+ *
+ * KEYS: `[session, sessionIds]`. ARGV: `[expectedSha1 or '' if absent, next,
+ * ttlSeconds or '', sessionId]`. Returns 1 if written, 0 if the session changed.
+ *
+ * Exported for tests only; not part of the public API.
+ */
+export const UPDATE_SESSION_SCRIPT = `
+local stored = redis.call('GET', KEYS[1])
+local actual = stored and redis.sha1hex(stored) or ''
+if actual ~= ARGV[1] then
+  return 0
+end
+if ARGV[3] ~= '' then
+  redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
+else
+  redis.call('SET', KEYS[1], ARGV[2])
+end
+redis.call('SADD', KEYS[2], ARGV[4])
+return 1
+`;
+
+/** How many writes `updateSession` tries before reporting a conflict. */
+const UPDATE_SESSION_ATTEMPTS = 10;
+
 /** A position in a history sorted set: score, then member. */
 type HistoryPosition = { score: number; id: string };
 
@@ -408,7 +504,7 @@ export function warnIfRedisExecutionRetentionUnset(opts: RedisStoreOptions): voi
   }
 }
 
-/** How long `close()` waits for Redis to answer `QUIT`. */
+/** How long `close()` waits for commands already sent to be answered. */
 const CLOSE_TIMEOUT_MS = 2000;
 
 /** Matches node-redis's default backoff: exponential, capped at 2 s, with up to 200 ms of jitter. */
@@ -416,18 +512,13 @@ function reconnectDelayMs(retries: number): number {
   return Math.min(2 ** retries * 50, 2000) + Math.floor(Math.random() * 200);
 }
 
-/**
- * Stop a client without Redis's cooperation. `destroy()` rejects queued
- * commands, then throws if `quit()` already began, in which case the socket
- * stays open and `unref()` keeps it from holding the process open.
- */
+/** Close a client's socket now, rejecting any commands still waiting for an answer. */
 function abandonConnection(client: RedisClient): void {
   try {
     client.destroy?.();
   } catch {
-    // Already closing; the queued commands were rejected before the throw.
+    // Another close got there first, and the socket is already closed.
   }
-  client.unref?.();
 }
 
 function errorMessage(error: unknown): string {
@@ -470,30 +561,154 @@ function connectionEventReporter(
   };
 }
 
+/** A deadline timer this much late means the event loop was blocked, not Redis. */
+const LOOP_STALL_TOLERANCE_MS = 100;
+/**
+ * Extra time a late deadline waits, once, so a reply held up by the blocked loop
+ * can be read. Only once: on a loop that stays busy every timer is late, and
+ * waiting again each time would never detect a stalled server.
+ */
+const LOOP_STALL_GRACE_MS = 1000;
+
+/**
+ * Reconnect `client` when a `PING` goes unanswered for `timeoutMs`. Returns a
+ * function that stops watching.
+ *
+ * This is a deadline on a reply rather than node-redis's `socketTimeout`, which
+ * is an idle timer that every write resets: an instance that keeps sending
+ * commands to a stalled server would never trip it. `commandOptions.timeout`
+ * doesn't help either, because node-redis drops it once a command is written.
+ *
+ * Only a ready client is reset. A reconnect in progress has a retry loop that
+ * a second `connect()` would run alongside, and `socketTimeout` already bounds
+ * its handshake.
+ */
+function watchResponses(
+  client: ConnectableRedisClient,
+  timeoutMs: number,
+  reportConnectionEvent: (event: RedisConnectionEvent) => void,
+): () => void {
+  const checkEveryMs = timeoutMs / 3;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let stopped = false;
+  const schedule = (run: () => void, delayMs: number) => {
+    timer = setTimeout(run, delayMs);
+    timer.unref?.();
+  };
+
+  const check = () => {
+    if (client.isReady === false) {
+      schedule(check, checkEveryMs);
+      return;
+    }
+    let settled = false;
+    const onReply = () => {
+      if (settled || stopped) return;
+      settled = true;
+      clearTimeout(timer);
+      schedule(check, checkEveryMs);
+    };
+    const expireAfter = (delayMs: number, mayWaitForBlockedLoop: boolean) => {
+      const dueAt = Date.now() + delayMs;
+      schedule(() => {
+        if (settled || stopped) return;
+        if (mayWaitForBlockedLoop && Date.now() - dueAt > LOOP_STALL_TOLERANCE_MS) {
+          expireAfter(LOOP_STALL_GRACE_MS, false);
+          return;
+        }
+        reset();
+      }, delayMs);
+    };
+    const reset = () => {
+      settled = true;
+      // Dropped since the check began: its own retry loop is already running.
+      if (client.isReady === false) {
+        schedule(check, checkEveryMs);
+        return;
+      }
+      // Rejects every command in flight, transactions included.
+      client.destroy?.();
+      // Retries by itself, so this settles only on success or close().
+      client.connect().catch(() => {});
+      reportConnectionEvent({
+        type: 'error',
+        error: new Error(`Redis did not answer within ${timeoutMs}ms; reconnecting.`),
+      });
+      schedule(check, checkEveryMs);
+    };
+    client.ping().then(onReply, onReply);
+    expireAfter(timeoutMs, true);
+  };
+
+  schedule(check, checkEveryMs);
+  return () => {
+    stopped = true;
+    clearTimeout(timer);
+  };
+}
+
+/**
+ * Reject when `connecting` hasn't finished within `timeoutMs`: a server can
+ * accept the connection and then never answer the handshake.
+ */
+async function connectWithin(connecting: Promise<unknown>, timeoutMs: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      connecting,
+      new Promise((_resolve, reject) => {
+        timer = setTimeout(
+          () =>
+            reject(
+              new AxlError(
+                'REDIS_UNAVAILABLE',
+                `RedisStore: Redis did not finish connecting within ${timeoutMs}ms.`,
+              ),
+            ),
+          timeoutMs,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /**
  * Create and connect a client whose connection problems can't reach the host
- * process as uncaught exceptions.
+ * process as uncaught exceptions. Returns it with the function that stops its
+ * response watch.
  */
 async function connectClient(
   createClient: (clientOpts: RedisClientOptions) => ConnectableRedisClient,
   opts: RedisStoreOptions,
-): Promise<ConnectableRedisClient> {
+): Promise<{ client: ConnectableRedisClient; stopResponseWatch?: () => void }> {
   // A failed first connection must reject `create()` rather than retry
   // forever, so hosts see bad config at startup. Only reconnect after the
-  // connection has worked once.
-  let established = false;
+  // connection has worked once, unless the host asked to connect in the background.
+  const inBackground = opts.waitForConnection === false;
+  let established = inBackground;
+  let everFailed = false;
+  const responseTimeoutMs = opts.responseTimeoutMs;
   const client = createClient({
     ...(opts.url ? { url: opts.url } : {}),
     // A command accepted just before a drop rejects instead of waiting for
     // the reconnect.
     disableOfflineQueue: true,
-    socket: { reconnectStrategy: (retries) => (established ? reconnectDelayMs(retries) : false) },
+    socket: {
+      reconnectStrategy: (retries) => (established ? reconnectDelayMs(retries) : false),
+      // Bounds a reconnect's handshake, where the response watch doesn't run.
+      // Twice the timeout so that on an open connection the watch acts first:
+      // this timer fires after any long event-loop block, which the watch allows for.
+      ...(responseTimeoutMs !== undefined ? { socketTimeout: responseTimeoutMs * 2 } : {}),
+    },
   });
   // node-redis reports a closed socket as an `error` event. With no listener,
   // Node throws it as an uncaught exception and the host process exits.
   const reportConnectionEvent = connectionEventReporter(client, opts.onConnectionEvent);
   client.on('error', (error) => {
     if (!established || client.isOpen === false) return;
+    everFailed = true;
     reportConnectionEvent({
       type: 'error',
       error: error instanceof Error ? error : new Error(String(error)),
@@ -509,12 +724,32 @@ async function connectClient(
   client.on('ready', () => {
     if (!established) {
       established = true;
-    } else if (client.isOpen !== false) {
+    } else if (client.isOpen !== false && (!inBackground || everFailed)) {
       reportConnectionEvent({ type: 'reconnected' });
     }
   });
-  await client.connect();
-  return client;
+  if (inBackground) {
+    // Retries by itself, so this settles only on success or close().
+    client.connect().catch(() => {});
+    return {
+      client,
+      stopResponseWatch: watchResponses(client, responseTimeoutMs!, reportConnectionEvent),
+    };
+  }
+  if (responseTimeoutMs === undefined) {
+    await client.connect();
+    return { client };
+  }
+  try {
+    await connectWithin(client.connect(), responseTimeoutMs);
+  } catch (error) {
+    abandonConnection(client);
+    throw error;
+  }
+  return {
+    client,
+    stopResponseWatch: watchResponses(client, responseTimeoutMs, reportConnectionEvent),
+  };
 }
 
 /**
@@ -527,6 +762,13 @@ async function connectClient(
  * async `RedisStore.create()` factory, which connects before returning.
  */
 export class RedisStore implements StateStore {
+  /** Set when `close()` starts, while the connection is still open. */
+  private closing = false;
+  /** Where the next save's check of listed sessions picks up. */
+  private sessionSweepCursor = '0';
+  /** Overlapping saves would all check the same page, so only one checks at a time. */
+  private sessionSweepRunning = false;
+
   private constructor(
     private connection: RedisClient,
     private keyPrefix: string,
@@ -539,7 +781,7 @@ export class RedisStore implements StateStore {
    * reconnecting and after `close()`.
    */
   get isConnected(): boolean {
-    return this.connection.isOpen !== false && this.connection.isReady !== false;
+    return !this.closing && this.connection.isOpen !== false && this.connection.isReady !== false;
   }
 
   /**
@@ -554,6 +796,9 @@ export class RedisStore implements StateStore {
    * "The client is closed" rejection.
    */
   private get client(): RedisClient {
+    // Same rejection as after `close()` finishes. A command sent now could
+    // apply in Redis and still be rejected when the socket closes.
+    if (this.closing) throw new Error('The client is closed');
     if (this.connection.isOpen !== false && this.connection.isReady === false) {
       throw new AxlError(
         'REDIS_UNAVAILABLE',
@@ -571,6 +816,9 @@ export class RedisStore implements StateStore {
    * instance needs no constructor state.
    */
   private prunesInFlight?: Set<HistoryKind>;
+
+  /** Stops the `responseTimeoutMs` health checks; unset when the option is off. */
+  private stopResponseWatch?: () => void;
 
   /**
    * Supports `listExecutions(limit, { cursor })`. A getter rather than a
@@ -628,6 +876,22 @@ export class RedisStore implements StateStore {
       );
     }
 
+    const responseTimeoutMs = opts.responseTimeoutMs;
+    if (
+      responseTimeoutMs !== undefined &&
+      !(Number.isFinite(responseTimeoutMs) && responseTimeoutMs > 0)
+    ) {
+      throw new Error(
+        `RedisStore: responseTimeoutMs must be a positive number of milliseconds, got ${responseTimeoutMs}.`,
+      );
+    }
+    if (opts.waitForConnection === false && responseTimeoutMs === undefined) {
+      throw new Error(
+        'RedisStore: waitForConnection: false requires responseTimeoutMs, so a server that ' +
+          'accepts the connection but never answers cannot leave it connecting forever.',
+      );
+    }
+
     let createClient: (clientOpts: RedisClientOptions) => ConnectableRedisClient;
     try {
       const mod = require('redis');
@@ -642,7 +906,7 @@ export class RedisStore implements StateStore {
       throw new Error('redis is required for RedisStore. Install it with: npm install redis');
     }
 
-    const client = await connectClient(createClient, opts);
+    const { client, stopResponseWatch } = await connectClient(createClient, opts);
 
     // Resolve effective per-category TTL: per-category override beats
     // defaultTtl beats "no TTL". `null` in overrides means explicit opt-out
@@ -676,7 +940,13 @@ export class RedisStore implements StateStore {
     };
 
     const store = new RedisStore(client, keyPrefix, effectiveTtls);
+    store.stopResponseWatch = stopResponseWatch;
     warnIfRedisExecutionRetentionUnset(opts);
+
+    if (opts.waitForConnection === false) {
+      if (!opts.skipMigration) store.backfillOnceConnected(client);
+      return store;
+    }
 
     // Lazy backfill of the new sorted-set indexes for installs upgrading
     // from pre-ZSET versions. Cheap when there's nothing to do (two ZCARD
@@ -689,6 +959,7 @@ export class RedisStore implements StateStore {
       } catch (error) {
         // The caller never gets the store, so nothing else could stop the
         // client reconnecting forever.
+        stopResponseWatch?.();
         abandonConnection(client);
         throw error;
       }
@@ -698,54 +969,74 @@ export class RedisStore implements StateStore {
   }
 
   /**
+   * Run the startup backfill when a connection becomes ready, until it succeeds.
+   * Nothing is waiting on it, and listings work without it, so a failure is
+   * reported and the next connection tries again.
+   */
+  private backfillOnceConnected(client: ConnectableRedisClient): void {
+    let state: 'waiting' | 'running' | 'done' = 'waiting';
+    client.on('ready', () => {
+      if (state !== 'waiting') return;
+      state = 'running';
+      this.backfillExecutionIndex()
+        .then(() => this.backfillEvalIndex())
+        .then(
+          () => {
+            state = 'done';
+          },
+          (err: unknown) => {
+            state = 'waiting';
+            // A lost connection is already reported, and the next one retries.
+            if (client.isReady === false || client.isOpen === false) return;
+            console.warn(
+              '[axl] RedisStore: the startup index backfill failed ' +
+                `(${errorMessage(err)}). Listings stay correct meanwhile.`,
+            );
+          },
+        );
+    });
+  }
+
+  /**
    * Backfill the execution-history sorted-set from the legacy ID set.
    * Idempotent — runs only if the ZSET is missing entries the SET has.
    * Safe to call manually if you constructed the store with
    * `skipMigration: true`.
    */
   async backfillExecutionIndex(): Promise<void> {
-    await this.backfillHistoryIndex(
-      this.execHistorySetKey(),
-      this.execHistoryZsetKey(),
-      (id) => this.execHistoryKey(id),
-      (raw) => {
-        const exec = JSON.parse(raw) as HistoricalExecutionInfo;
-        return typeof exec.startedAt === 'number'
-          ? { score: exec.startedAt, value: exec.executionId }
-          : null;
-      },
-      'execution-history',
-    );
+    await this.backfillHistoryIndex(this.historyIndex('execution'), (raw) => {
+      const exec = JSON.parse(raw) as HistoricalExecutionInfo;
+      return typeof exec.startedAt === 'number'
+        ? { score: exec.startedAt, value: exec.executionId }
+        : null;
+    });
   }
 
   /** Backfill the eval-history sorted-set. Symmetric to `backfillExecutionIndex`. */
   async backfillEvalIndex(): Promise<void> {
-    await this.backfillHistoryIndex(
-      this.evalHistorySetKey(),
-      this.evalHistoryZsetKey(),
-      (id) => this.evalHistoryKey(id),
-      (raw) => {
-        const entry = JSON.parse(raw) as EvalHistoryEntry;
-        return typeof entry.timestamp === 'number'
-          ? { score: entry.timestamp, value: entry.id }
-          : null;
-      },
-      'eval-history',
-    );
+    await this.backfillHistoryIndex(this.historyIndex('eval'), (raw) => {
+      const entry = JSON.parse(raw) as EvalHistoryEntry;
+      return typeof entry.timestamp === 'number'
+        ? { score: entry.timestamp, value: entry.id }
+        : null;
+    });
   }
 
   /**
    * Shared implementation for both backfill paths. Reads SET members,
    * batch-MGETs their data blobs in chunks, and ZADDs each into the new
    * sorted-set inside a single MULTI per chunk.
+   *
+   * Ids with no data blob are removed from the id set. Left there, the set stays
+   * larger than the sorted set, so every startup repeats this walk and listing
+   * stays on its slow path.
    */
   private async backfillHistoryIndex(
-    setKey: string,
-    zsetKey: string,
-    dataKey: (id: string) => string,
+    index: HistoryIndex,
     scoreOf: (raw: string) => { score: number; value: string } | null,
-    label: string,
   ): Promise<void> {
+    const setKey = index.ids;
+    const zsetKey = index.time;
     const [setSize, zsetSize] = await Promise.all([
       this.client.sCard(setKey),
       this.client.zCard(zsetKey),
@@ -761,10 +1052,11 @@ export class RedisStore implements StateStore {
     const CHUNK_SIZE = 500;
     let migrated = 0;
     let skipped = 0;
+    const missing: string[] = [];
 
     for (let i = 0; i < allIds.length; i += CHUNK_SIZE) {
       const chunk = allIds.slice(i, i + CHUNK_SIZE);
-      const dataKeys = chunk.map((id) => dataKey(id));
+      const dataKeys = chunk.map((id) => index.dataKey(id));
       const raws = await this.client.mGet(dataKeys);
 
       const tx = this.client.multi();
@@ -773,9 +1065,9 @@ export class RedisStore implements StateStore {
         const raw = raws[j];
         if (raw == null) {
           // SET has the ID but no data blob — partial state from a
-          // pre-MULTI/EXEC release. Skip; the reader's null-guard catches
-          // this too.
+          // pre-MULTI/EXEC release. The reader's null-guard catches this too.
           skipped++;
+          missing.push(chunk[j]);
           continue;
         }
         try {
@@ -796,9 +1088,16 @@ export class RedisStore implements StateStore {
       if (queuedInChunk > 0) await tx.exec();
     }
 
+    // The script checks each blob again, so an id saved since the read stays.
+    if (missing.length > 0) {
+      await this.runPruneScript(index, missing).catch((err: unknown) =>
+        this.warnPruneFailed(index, err),
+      );
+    }
+
     if (migrated > 0 || skipped > 0) {
       console.log(
-        `[axl] RedisStore: backfilled ${migrated} ${label} entries into sorted-set index` +
+        `[axl] RedisStore: backfilled ${migrated} ${index.label} entries into sorted-set index` +
           (skipped > 0 ? ` (${skipped} skipped — missing or malformed)` : ''),
       );
     }
@@ -977,6 +1276,58 @@ export class RedisStore implements StateStore {
       )
       .sAdd(this.sessionIdsKey(), sessionId)
       .exec();
+    await this.sweepSessionIds();
+  }
+
+  async updateSession(sessionId: string, update: SessionUpdate): Promise<void> {
+    if (
+      this.saveSession !== RedisStore.prototype.saveSession ||
+      this.getSession !== RedisStore.prototype.getSession
+    ) {
+      return updateSessionThroughOverrides(this, 'RedisStore', sessionId, update);
+    }
+    const key = this.sessionKey(sessionId);
+    const ttl = this.ttlFor('session');
+    for (let attempt = 0; attempt < UPDATE_SESSION_ATTEMPTS; attempt++) {
+      const raw = await this.client.get(key);
+      const next = update(raw ? (JSON.parse(raw) as ChatMessage[]) : null);
+      if (next === null) return;
+      let written: unknown;
+      try {
+        written = await this.client.eval(UPDATE_SESSION_SCRIPT, {
+          keys: [key, this.sessionIdsKey()],
+          arguments: [
+            raw === null ? '' : createHash('sha1').update(raw).digest('hex'),
+            JSON.stringify(normalizePersistedSessionHistory(next)),
+            ttl === undefined ? '' : String(ttl),
+            sessionId,
+          ],
+        });
+      } catch (err) {
+        if (!errorMessage(err).includes('NOPERM')) throw err;
+        warnDiagnosticOnce(
+          'redis_update_session_denied',
+          'RedisStore: saving a session turn safely runs a Lua script, which this Redis user ' +
+            'may not run, so it was saved without that protection. Overlapping turns from ' +
+            'different instances can overwrite each other until the user may run EVAL.',
+          undefined,
+          'docs/api-reference.md#concurrency-and-races',
+        );
+        await this.saveSession(sessionId, next);
+        return;
+      }
+      if (Number(written) === 1) {
+        await this.sweepSessionIds();
+        return;
+      }
+      const backoffMs = Math.min(20 * 2 ** attempt, 200);
+      await new Promise((resolve) => setTimeout(resolve, Math.random() * backoffMs));
+    }
+    throw new AxlError(
+      'SESSION_CONFLICT',
+      `RedisStore: gave up saving session "${sessionId}" after ${UPDATE_SESSION_ATTEMPTS} ` +
+        'conflicting writes from other instances.',
+    );
   }
 
   async getSession(sessionId: string): Promise<ChatMessage[]> {
@@ -1599,21 +1950,26 @@ export class RedisStore implements StateStore {
     try {
       await this.pruneHistory(index);
     } catch (err) {
-      // A lost connection isn't the permission problem this warning explains,
-      // and spending the one-time warning on it would hide a real one later.
-      if (this.connection.isReady === false) return;
-      warnDiagnosticOnce(
-        `redis_history_prune_failed\0${index.kind}`,
-        `RedisStore: removing expired ${index.label} index entries failed ` +
-          `(${err instanceof Error ? err.message : String(err)}). The record was saved; ` +
-          'the next save retries the cleanup. Listings stay correct meanwhile. The cleanup ' +
-          'runs a Lua script, so the Redis user needs permission to run EVAL.',
-        undefined,
-        'docs/api-reference.md#redisstore-options',
-      );
+      this.warnPruneFailed(index, err);
     } finally {
       inFlight.delete(index.kind);
     }
+  }
+
+  private warnPruneFailed(index: HistoryIndex, err: unknown): void {
+    // A lost connection or a closing store isn't the permission problem this
+    // warning explains, and spending the one-time warning on it would hide a
+    // real one later.
+    if (!this.isConnected) return;
+    warnDiagnosticOnce(
+      `redis_history_prune_failed\0${index.kind}`,
+      `RedisStore: removing expired ${index.label} index entries failed ` +
+        `(${err instanceof Error ? err.message : String(err)}). The cleanup is tried ` +
+        'again later, and listings stay correct meanwhile. The cleanup runs a Lua script, ' +
+        'so the Redis user needs permission to run EVAL.',
+      undefined,
+      'docs/api-reference.md#redisstore-options',
+    );
   }
 
   private async pruneHistory(index: HistoryIndex): Promise<void> {
@@ -1798,9 +2154,79 @@ export class RedisStore implements StateStore {
   // ── Sessions (Studio introspection) ────────────────────────────────────
 
   async listSessions(): Promise<string[]> {
-    // Redis doesn't have a built-in way to list keys by pattern without SCAN,
-    // so we maintain a set of session IDs alongside the session data.
-    return this.client.sMembers(this.sessionIdsKey());
+    // Redis has no way to list keys by pattern without scanning the keyspace,
+    // so we maintain a set of session IDs alongside the session data. SSCAN
+    // keeps a large set from blocking the server the way SMEMBERS would.
+    const live = new Set<string>();
+    let cursor = '0';
+    do {
+      const page = await this.client.sScan(this.sessionIdsKey(), cursor, {
+        COUNT: SESSION_ID_BATCH,
+      });
+      cursor = page.cursor;
+      const removed = new Set(await this.pruneSessionIds(page.members));
+      for (const id of page.members) if (!removed.has(id)) live.add(id);
+    } while (cursor !== '0');
+    return [...live];
+  }
+
+  /**
+   * Check a few listed sessions after a save, so ids of expired sessions go
+   * away for apps that never list. Sessions without a TTL don't expire, so
+   * there's nothing to do. The save has already succeeded, so failing here
+   * can't fail it.
+   */
+  private async sweepSessionIds(): Promise<void> {
+    if (this.ttlFor('session') === undefined || this.sessionSweepRunning) return;
+    this.sessionSweepRunning = true;
+    try {
+      const page = await this.client.sScan(this.sessionIdsKey(), this.sessionSweepCursor, {
+        COUNT: SESSION_SWEEP_COUNT,
+      });
+      this.sessionSweepCursor = page.cursor;
+      await this.pruneSessionIds(page.members);
+    } catch (err) {
+      this.warnSessionPruneFailed(err);
+    } finally {
+      this.sessionSweepRunning = false;
+    }
+  }
+
+  /** Returns the ids removed. Without permission to run the script, removes none and warns. */
+  private async pruneSessionIds(ids: string[]): Promise<string[]> {
+    const removed: string[] = [];
+    // SSCAN returns a small set whole, whatever COUNT asks for.
+    for (let start = 0; start < ids.length; start += SESSION_ID_BATCH) {
+      const batch = ids.slice(start, start + SESSION_ID_BATCH);
+      try {
+        const result = await this.client.eval(PRUNE_SESSION_IDS_SCRIPT, {
+          keys: [
+            this.sessionIdsKey(),
+            ...batch.flatMap((id) => [this.sessionKey(id), this.sessionMetaKey(id)]),
+          ],
+          arguments: batch,
+        });
+        removed.push(...(result as string[]));
+      } catch (err) {
+        if (!errorMessage(err).includes('NOPERM')) throw err;
+        this.warnSessionPruneFailed(err);
+        return removed;
+      }
+    }
+    return removed;
+  }
+
+  private warnSessionPruneFailed(err: unknown): void {
+    // A lost connection or a closing store isn't the permission problem this warning explains.
+    if (!this.isConnected) return;
+    warnDiagnosticOnce(
+      'redis_session_ids_prune_failed',
+      `RedisStore: removing expired session ids failed (${errorMessage(err)}), so ` +
+        'listSessions can return sessions that have expired. The cleanup runs a Lua script, ' +
+        'so the Redis user needs permission to run EVAL.',
+      undefined,
+      'docs/api-reference.md#redisstore-options',
+    );
   }
 
   // ── Streaming events (for state.persist: 'streaming') ──────────────────
@@ -1871,30 +2297,34 @@ export class RedisStore implements StateStore {
    * better-sqlite3's `close()` are both no-ops the second time; node-redis
    * instead rejects with "The client is closed", so absorb that here.
    *
-   * Bounded, so a shutdown can't hang on Redis. `QUIT` lets queued commands
-   * finish on a healthy connection, but node-redis never settles it if the
-   * socket closes first, and a stalled server may never answer it. While
-   * disconnected it couldn't be sent at all.
+   * Bounded, so a shutdown can't hang on Redis. Replies arrive in order, so a
+   * reply to this PING means every earlier command has finished.
+   *
+   * Not `quit()`: it marks the client closed before the server answers, and
+   * `destroy()` then throws without touching the socket, so a stalled server's
+   * socket could never be closed. There's no other public way to close it. A
+   * closed socket is all Redis needs to clean up, so nothing is lost.
    */
   async close(): Promise<void> {
+    this.closing = true;
+    this.stopResponseWatch?.();
     if (this.connection.isOpen === false) return;
-    if (this.connection.isReady === false) {
-      abandonConnection(this.connection);
-      return;
+    if (this.connection.isReady !== false) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          this.connection.ping(),
+          new Promise((_resolve, reject) => {
+            timer = setTimeout(() => reject(new Error('PING timed out')), CLOSE_TIMEOUT_MS);
+          }),
+        ]);
+      } catch {
+        // Stalled or disconnected. Waiting commands are rejected below.
+      } finally {
+        clearTimeout(timer);
+      }
     }
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      await Promise.race([
-        this.connection.quit(),
-        new Promise((_resolve, reject) => {
-          timer = setTimeout(() => reject(new Error('QUIT timed out')), CLOSE_TIMEOUT_MS);
-        }),
-      ]);
-    } catch {
-      abandonConnection(this.connection);
-    } finally {
-      clearTimeout(timer);
-    }
+    abandonConnection(this.connection);
   }
 
   async deleteCheckpoints(executionId: string): Promise<void> {

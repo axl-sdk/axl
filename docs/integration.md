@@ -61,7 +61,7 @@ app.listen(3000);
 
 The same pattern works with any Node.js framework (Hono, Fastify, NestJS, Next.js API routes, etc.). The runtime is a plain TypeScript object — no middleware or plugin system required.
 
-> **⚠️ Multi-worker deployments need sticky sessions.** `Session.send` is serialized per id within ONE Node process. If you run multiple workers behind a load balancer, you must route requests with the same `sessionId` to the same worker (sticky routing) — otherwise two workers may concurrently `send` on the same session id and the later writer will clobber the earlier one's update. See [API Reference → Sessions → Concurrency](./api-reference.md#concurrency-and-races).
+> **Running several workers?** Turns on one session only queue within a single process. Across workers they run at the same time: both are saved, but neither sees the other's reply. To keep a conversation strictly in order, route each `sessionId` to one worker or hold your own per-session lock. See [Several app instances sharing a session](./api-reference.md#several-app-instances-sharing-a-session).
 
 ## Production State-Store Deployment
 
@@ -135,9 +135,51 @@ Without `onConnectionEvent`, the store logs one line when an outage starts and o
 | Workflow that finishes during an outage | You still get the result. Its execution history record isn't saved, and `console.error` says so. Its checkpoints stay until `ttls.checkpoint` expires them. With `state.persist: 'streaming'`, events already in Redis are reported as an incomplete run by the next `recoverIncompleteStreams()` |
 | `store.close()` or `runtime.shutdown()` | Finishes without waiting for Redis to return |
 
-`RedisStore.create()` doesn't retry: if Redis is unreachable or rejects your credentials at startup, it rejects with that error. Retry it yourself if your app should wait for Redis.
+`RedisStore.create()` doesn't retry: if Redis is unreachable or rejects your credentials at startup, it rejects with that error. Retry it yourself if your app should wait for Redis, or let the store connect in the background.
 
-All of this starts once the connection has visibly closed. If a network failure drops packets with no close, calls wait until the operating system gives up on the connection.
+#### Starting while Redis is down
+
+To let your app start during a Redis outage, pass `waitForConnection: false`. `create()` returns right away and the store keeps trying to connect:
+
+```ts
+const store = await RedisStore.create({
+  url: process.env.REDIS_URL!,
+  waitForConnection: false,
+  responseTimeoutMs: 30_000,
+  onConnectionEvent: (event) => {
+    if (event.type === 'error') logger.warn({ err: event.error }, 'redis connection problem');
+    else logger.info('redis connected');
+  },
+});
+```
+
+Until it connects, calls reject with `REDIS_UNAVAILABLE` and `store.isConnected` is `false`, the same as during an outage. Startup work that needs the store, such as `runtime.recoverIncompleteStreams()`, rejects too, so wait for `store.isConnected` or retry it.
+
+- **`responseTimeoutMs` is required.** It stops a server that accepts the connection but never answers from leaving the store connecting forever.
+- **Wrong settings don't stop your app.** A bad password or URL host shows up as repeated `error` events, not as a failed `create()`, so watch `onConnectionEvent` or `isConnected`.
+- **`store.close()` is safe at any time**, including while connecting.
+- **The index backfill runs after the first connection**, and doesn't hold up `create()`. If it fails, the next connection tries again.
+
+#### When Redis stops answering
+
+All of the above starts once the connection has visibly closed. If Redis hangs or the network silently drops packets, calls can wait for many minutes, or forever if the connection stays open. Set `responseTimeoutMs` to reconnect instead:
+
+```ts
+const store = await RedisStore.create({
+  url: process.env.REDIS_URL!,
+  responseTimeoutMs: 30_000,
+});
+```
+
+The store sends a `PING` about every third of that time. If one goes unanswered for the full time, the store drops the connection and reconnects. Calls waiting on Redis reject, and calls made until it reconnects reject with `REDIS_UNAVAILABLE`. A problem is noticed within about 1.3 times the value, and `create()` rejects if Redis hasn't finished connecting within it.
+
+Choosing a value:
+
+- **Set it above your slowest expected command.** Replies come back in order, so a `PING` waits behind everything sent before it. It applies to the whole connection, so you can't exempt one slow command. A large session save, or a server busy for longer than the value, looks like a stall.
+- **A rejected write may still have been applied.** Redis may have run it before the connection dropped, so check before retrying a write that isn't safe to repeat.
+- **A blocked Node.js event loop can cause a reconnect.** The store waits one extra second when a block delays its check. A single block longer than about twice the value, or blocks in quick succession, can still drop a healthy connection, which clears up after the reconnect.
+
+It works on every supported `redis` version. On `redis` 5.0.x with a password, a reconnect that reaches a server which never answers isn't given up on, so use 5.1.0 or later.
 
 ### Execution history: retention and paging
 

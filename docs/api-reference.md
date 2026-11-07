@@ -1768,13 +1768,28 @@ The `AxlRuntime` extends `EventEmitter`. Subscribe to lifecycle signals:
 | `'eval_deleted'` | `{ id, eval, removed }` | Symmetric audit signal for `runtime.deleteEvalResult(id)`. Fires on every call; `eval` captured before delete. Studio's `EvalAggregator` subscribes and rebuilds eval-trends snapshots on delete |
 | `'decision_cleanup_failed'` | `DecisionCleanupFailedEvent` (`{ executionId, workflow?, operation: 'resolveDecision_compensation', error }`) | Operational signal that cancellation compensation could not remove a persisted approval request. The request remains visible for retry or `deleteExecution`. Listener errors are logged and isolated so they cannot replace the workflow's original failure |
 | `'session_lock_contended'` | `{ sessionId }` | Fires when a `Session.send` / `stream` / `end` / `fork` queues behind an in-flight task on the same id |
+| `'session_turns_merged'` | `{ sessionId }` | Fires when another instance saved to the same session during this turn, so this turn was added after it. See [Several app instances](#several-app-instances-sharing-a-session) |
+| `'session_turn_discarded'` | `{ sessionId }` | Fires when a session was ended or expired during a turn, so the turn wasn't saved. You still get its result |
 
-> **⚠️ Cross-process locking is NOT provided.** The lock is in-process — multiple Node workers (e.g., a horizontally-scaled web app) all hitting the same Redis-backed `sessionId` will still race. Production deployments behind a load balancer must either:
->
-> - **Pin sessions to workers** (sticky routing on `sessionId`), so all writes for a given session go through the same process, or
-> - **Use distinct `sessionId`s per request** if cross-request continuity isn't required.
->
-> A future release may offer optimistic concurrency on the StateStore — in the meantime, treat session ids as single-writer.
+#### Several app instances sharing a session
+
+The queue above works within one runtime. When several app instances share a store, turns on the same session from different instances run at the same time. With a built-in store, both turns are kept:
+
+- **Each turn stays in one piece.** A turn's messages are added together after whatever was saved during it, so history stays in the order the turns finished.
+- **Overlapping turns can't see each other.** Both run, both cost money, and neither knows about the other's reply. `session_turns_merged` tells you it happened.
+- **`history.maxMessages` applies on the next turn.** Stored history can go over the limit after a merge. The next turn trims it, and summarizes what it drops if `summarize` is on, before calling the model.
+- **An ended session stays ended.** A turn that was running when another instance called `end()` isn't saved, and `session_turn_discarded` fires. If the session had no messages when the turn started, the turn is saved instead, because nothing shows the session existed.
+- **Summaries are a best effort under overlap.** A summary isn't saved if the session changed while it was being generated. A write in the brief moment after that check can still replace a newer summary, and a summary can repeat content. To rule this out, run one turn at a time.
+
+To run one turn at a time per session across instances, route each session to one instance, or hold your own per-session lock around `send()` and `stream()`.
+
+These stores and setups don't get the protection against overwrites, so the last save wins:
+
+| Setup | What happens |
+|---|---|
+| Redis user without permission to run `EVAL` | Turns use `saveSession`, with a one-time warning |
+| Subclass of a built-in store that overrides `saveSession` or `getSession` | Turns go through your overrides, with a one-time warning. Override [`updateSession`](#statestore) too to get the protection |
+| Custom store without [`updateSession`](#statestore) | Turns use `saveSession` |
 
 **Lifecycle ordering.** `end()` sets a per-instance `closed` flag synchronously, then queues the delete behind the lock. After `await session.end()` resolves, no further calls on that `Session` instance succeed (`closed` short-circuits at the top of `send`/`stream`). However, `closed` is per-instance — a *different* `Session` object on the same id (e.g., from a fresh `runtime.session(id)` call elsewhere) is unaffected. If you need a global "this id is dead" signal, coordinate it at the application layer.
 
@@ -2221,7 +2236,7 @@ Per store:
 
 ### RedisStore options
 
-`RedisStore` requires Redis 7.0 or newer. It cleans up history listing indexes with a small Lua script, so the Redis user also needs permission to run `EVAL`. If your ACL denies scripting, saves still succeed, the indexes are not cleaned up, and the store prints a one-time warning per history kind saying the cleanup failed.
+`RedisStore` requires Redis 7.0 or newer. It saves session turns and cleans up its listing indexes with small Lua scripts, so the Redis user also needs permission to run `EVAL`. If your ACL denies scripting, saves still succeed, the indexes are not cleaned up, and the store prints a one-time warning per history kind saying the cleanup failed.
 
 `RedisStore.create()` accepts either a URL string (back-compat) or an options object. `store.isConnected` reports whether the store can send commands right now: `false` while reconnecting and after `close()`.
 
@@ -2229,7 +2244,9 @@ Per store:
 |-------|------|---------|-------------|
 | `url` | `string?` | `'redis://localhost:6379'` | Redis connection URL |
 | `keyPrefix` | `string?` | `'axl:'` | Prepended to every key written by this store. Concatenated as-given — no normalization (include the trailing colon if you want one). Empty string is rejected. Useful when two Axl deployments share a Redis cluster, or when coexisting with other applications' keys |
-| `onConnectionEvent` | `(event: RedisConnectionEvent) => void` | — | Called with `{ type: 'error', error }` when the connection is lost and for each failed reconnect attempt, and `{ type: 'reconnected' }` when it comes back. Replaces the default logging of one line per outage and one on recovery. Not called for a failed `create()` or after `close()`. If it throws or rejects, the failure goes to `console.error` and is otherwise ignored. See [Riding out a Redis outage](./integration.md#riding-out-a-redis-outage) |
+| `onConnectionEvent` | `(event: RedisConnectionEvent) => void` | — | Called with `{ type: 'error', error }` when the connection is lost, for each failed reconnect attempt, and when `responseTimeoutMs` drops an unresponsive connection, and `{ type: 'reconnected' }` when it comes back. Replaces the default logging of one line per outage and one on recovery. Not called for a failed `create()` or after `close()`. If it throws or rejects, the failure goes to `console.error` and is otherwise ignored. See [Riding out a Redis outage](./integration.md#riding-out-a-redis-outage) |
+| `responseTimeoutMs` | `number?` | off | Drop the connection and reconnect when a health-check `PING` goes unanswered for this many milliseconds. Must be positive. Also limits how long `create()` waits for the connection. Applies to the whole connection, so set it above your slowest expected command. See [When Redis stops answering](./integration.md#when-redis-stops-answering) |
+| `waitForConnection` | `boolean?` | `true` | Set to `false` so that `create()` returns right away and the store connects in the background, retrying until Redis is available. Requires `responseTimeoutMs`. See [Starting while Redis is down](./integration.md#starting-while-redis-is-down) |
 | `skipMigration` | `boolean?` | `false` | Skip the one-time lazy backfill of the execution / eval-history sorted-set indexes on startup. Set to `true` for installs at six-figure execution counts where the startup cost is unacceptable, then call `store.backfillExecutionIndex()` / `store.backfillEvalIndex()` manually during a maintenance window. Until then, `listExecutions` / `listEvalResults` fall back to the legacy SET + N×GET + JS-sort read path — correct but slow at scale |
 | `defaultTtl` | `number?` | — | Default TTL in **seconds** applied to every TTL-capable storage category. Without a TTL, every `save*` accumulates forever — strongly recommended in production |
 | `ttls` | `object?` | — | Per-category TTL overrides in seconds (`session`, `sessionMeta`, `checkpoint`, `executionState`, `executionHistory`, `evalHistory`, `memory`, `streamingEvents`). Set a category to `null` to explicitly opt out even when `defaultTtl` is set. `pendingDecision` is intentionally NOT configurable — pending decisions share a hash, so a TTL would expire all of them at once. **Window semantics:** `memory`, `session`, and `sessionMeta` are sliding (every write refreshes TTL — active users keep their data, inactive users forget; reads do NOT refresh); `checkpoint` and `streamingEvents` are fixed from the first write (TTL set once); `executionState` and `executionHistory` restart their window on every save; `evalHistory` is fixed from the row's first write, as described in [History retention](#history-retention-historyttls). **`streamingEvents` is opt-in only** — does NOT fall back to `defaultTtl`. Must be longer than your max time-between-restarts or `recoverIncompleteStreams()` will miss crashed-run buffers that aged out before the next process started. Non-positive and non-finite values (`0`, negative, `NaN`, `Infinity`) are defensively treated as no-TTL. Per-category TTLs are independent. Legacy memory entries (pre-`memory-methods` patch) migrate forward on first read with the configured TTL applied. `listPendingExecutions` self-prunes stale ids when their `executionState` blob has TTL-evicted |
@@ -2419,6 +2436,7 @@ Every `StateStore` implementation must provide these methods.
 |--------|-------------|
 | `saveSession(sessionId, history)` | Save session message history |
 | `getSession(sessionId)` | Get session message history (returns `[]` if not found) |
+| `updateSession?(sessionId, update)` | Optional. Replace a session's history based on what's stored, without overwriting a write from another process. `update` receives the stored history, or `null` if there is none, and returns the new history, or `null` to write nothing. It may run more than once, so the read and write must be atomic. Sessions use `saveSession` on a store without it |
 | `deleteSession(sessionId)` | Delete a session and its metadata |
 | `saveSessionMeta(sessionId, key, value)` | Save session metadata (e.g., context summaries) |
 | `getSessionMeta(sessionId, key)` | Get session metadata |
@@ -2477,7 +2495,7 @@ These methods are optional (`?` on the interface). The runtime checks for their 
 
 | Method | Description |
 |--------|-------------|
-| `listSessions?()` | List all session IDs (used by Studio's session browser) |
+| `listSessions?()` | List the IDs of sessions that still exist (used by Studio's session browser). On `RedisStore`, this also removes the IDs and metadata of expired sessions |
 | `close?()` | Close the underlying connection (called by `runtime.shutdown()`). `RedisStore` waits at most 2 seconds for Redis to answer, and closes at once while disconnected |
 | `deleteCheckpoints?(executionId)` | Delete all checkpoints for an execution (called on successful completion). If it rejects, the failure is logged and the run still succeeds |
 | `applyHistoryRetention?(options)` | Apply your store's retention to history saved without one, one batch per call, resuming from a cursor. Never called by the runtime; implement it if you want the same maintenance call as the built-ins. Contract: [Applying retention to existing history](#applying-retention-to-existing-history) |
@@ -2808,6 +2826,7 @@ All errors extend `AxlError`.
 | `AxlError` / `INCOMPATIBLE_ACCOUNTING_SCOPE` | paid operation or nested `trackOutcome` under another loaded copy's incompatible active scope | Refuses the operation before dispatch; the enclosing accounting becomes `incomplete` / `uninstrumented` |
 | `GuardrailError` | `ctx.ask()` | Guardrail blocked and retries exhausted. Includes `.guardrailType`, `.reason` |
 | `ProviderError` | provider adapters (via `ctx.ask()`) | Non-2xx HTTP response, or a normalized network failure (`status: 0`). `code: 'PROVIDER_ERROR'`. Includes `.provider`, `.status`, `.retryable`, `.retryAfterMs?`, `.requestId?`, `.body?`, `.timing?`. Message is the provider's text verbatim (no prefix). |
+| `AxlError` with `code: 'SESSION_CONFLICT'` | `session.send`, `RedisStore.updateSession` | The session kept changing, so the turn couldn't be saved after 10 attempts. The turn has already run. `session.stream` reports this through `session_history_save_failed` instead |
 | `AxlError` with `code: 'REDIS_UNAVAILABLE'` | any `RedisStore` call | `RedisStore` isn't connected, so the command wasn't sent. It reconnects automatically. See [Riding out a Redis outage](./integration.md#riding-out-a-redis-outage) |
 | `InvalidModelInputError` | `ctx.ask()`, `ctx.delegate()`, `agent.ask()` | Malformed `ModelInput`. `code: 'INVALID_MODEL_INPUT'`. Invalid inputs fail before dispatch and the message never includes raw media. |
 | `UnsupportedModelInputError` | rich `ctx.ask()` / `ctx.delegate()` | Axl cannot safely map the provider/source/composition, or the effective model ID is empty. `code: 'UNSUPPORTED_MODEL_INPUT'`; includes safe `.provider`, `.model`, `.modality`, and optional `.source`, never the raw locator or bytes. `.modality` is typed `string` and is today `'image'` or `'audio'`, derived from the **offending part** — a mixed input whose audio part is rejected reports `'audio'`, and one whose image part is rejected reports `'image'`. The unsupported *feature* is named in `.message` only; it is not a retained field. For catalog-capable transports, an upstream model-capability rejection is instead a `ProviderError`. |

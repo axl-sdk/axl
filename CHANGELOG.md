@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.2] - 2026-11-07
+
+### Added
+
+- **`RedisStore` can recover when Redis stops answering.** Set `responseTimeoutMs` so that a hung server or a silently dropped connection rejects waiting calls and reconnects, instead of leaving them pending, even while your app keeps sending commands. It also limits how long `create()` waits for a server that accepts the connection but never answers. Off by default. See [When Redis stops answering](docs/integration.md#when-redis-stops-answering).
+- **Your app can start while Redis is down.** With `RedisStore.create({ waitForConnection: false, responseTimeoutMs })`, `create()` returns right away and the store connects in the background. Calls reject with `REDIS_UNAVAILABLE` until it connects. See [Starting while Redis is down](docs/integration.md#starting-while-redis-is-down).
+
+### Fixed
+
+- **Overlapping session turns from different app instances no longer lose messages.** With a built-in store, a turn that finishes after another instance saved to the same session is added after it, instead of overwriting it. Overlapping turns still run separately and can't see each other's replies. A turn no longer brings back a session another instance ended while it ran. Listen for `session_turns_merged` and `session_turn_discarded` to see when this happens. Custom stores can implement the new optional `StateStore.updateSession`, and otherwise keep today's behavior. A subclass of a built-in store that overrides `saveSession` or `getSession` keeps today's behavior too, with a one-time warning. On Redis, this needs permission to run `EVAL`. See [Several app instances sharing a session](docs/api-reference.md#several-app-instances-sharing-a-session).
+- **`RedisStore.listSessions()` no longer returns expired sessions.** With `ttls.session` set, ids of expired sessions stayed listed forever. Listing now removes them along with any metadata those sessions left behind, and each save removes a few, so the list stops growing for apps that never list. A large list also no longer blocks Redis while it's read. This needs permission to run `EVAL`, and otherwise listing still works but warns once.
+- **`RedisStore.close()` closes the connection when Redis has stopped answering.** The socket used to stay open until the server or the operating system ended it. Commands already sent still finish when Redis is healthy, and `close()` waits at most 2 seconds.
+- **`RedisStore` no longer repeats its index backfill on every startup.** An id in the older history index with no record behind it kept the backfill re-reading the whole index at each start, and kept listings on their slow path. Those ids are now removed the first time.
+
 ## [0.27.1] - 2026-11-05
 
 ### Fixed
@@ -2328,7 +2342,8 @@ Initial public open-source release on npm under the `@axlsdk` scope. No new feat
 - `createServer()` factory, `ConnectionManager` for channel subscriptions, `CostAggregator` for cost tracking
 - Eight panels: Agent Playground, Workflow Runner, Trace Explorer, Cost Dashboard, Memory Browser, Session Manager, Tool Inspector, Eval Runner
 
-[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.27.1...HEAD
+[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.27.2...HEAD
+[0.27.2]: https://github.com/axl-sdk/axl/compare/v0.27.1...v0.27.2
 [0.27.1]: https://github.com/axl-sdk/axl/compare/v0.27.0...v0.27.1
 [0.27.0]: https://github.com/axl-sdk/axl/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/axl-sdk/axl/compare/v0.25.3...v0.26.0

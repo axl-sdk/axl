@@ -2,8 +2,14 @@
  * In-memory mock of the node-redis client surface `RedisStore` uses, shared by
  * the store unit tests. Moved unchanged from `state.test.ts`.
  */
+import { createHash } from 'node:crypto';
 import { vi } from 'vitest';
-import { PRUNE_HISTORY_INDEX_SCRIPT, RedisStore } from '../state/redis.js';
+import {
+  PRUNE_HISTORY_INDEX_SCRIPT,
+  PRUNE_SESSION_IDS_SCRIPT,
+  RedisStore,
+  UPDATE_SESSION_SCRIPT,
+} from '../state/redis.js';
 
 type ZRangeOptions = {
   BY?: 'SCORE' | 'LEX';
@@ -284,6 +290,7 @@ export function createRedisStoreOverClient(
   const store = Object.create(RedisStore.prototype) as RedisStore;
   (store as any).connection = client;
   (store as any).keyPrefix = keyPrefix;
+  (store as any).sessionSweepCursor = '0';
   (store as any).ttls = {
     session: ttlConfig?.session ?? null,
     sessionMeta: ttlConfig?.sessionMeta ?? null,
@@ -310,7 +317,7 @@ export function createRedisStoreWithMockClient(keyPrefix = 'axl:', ttlConfig?: M
   const ttls = new Map<string, number>();
   // Lists for streaming-event persistence (RPUSH / LRANGE).
   const listData = new Map<string, string[]>();
-  // node-redis exposes an open socket as `isOpen` and rejects a QUIT on a
+  // node-redis exposes an open socket as `isOpen` and `destroy()` throws on a
   // closed client; a real Redis run proved it, so the mock reproduces it.
   let clientOpen = true;
 
@@ -424,6 +431,17 @@ export function createRedisStoreWithMockClient(keyPrefix = 'axl:', ttlConfig?: M
     sMembers: vi.fn(async (key: string) => {
       return [...(setData.get(key) ?? [])];
     }),
+    // Like the real command: pages through the set, and a page's cursor is
+    // only valid for that set. '0' starts over and means the scan finished.
+    sScan: vi.fn(async (key: string, cursor: string, options?: { COUNT?: number }) => {
+      const members = [...(setData.get(key) ?? [])];
+      const start = Number(cursor);
+      const end = start + (options?.COUNT ?? 10);
+      return {
+        cursor: end >= members.length ? '0' : String(end),
+        members: members.slice(start, end),
+      };
+    }),
     sCard: vi.fn(async (key: string) => {
       return setData.get(key)?.size ?? 0;
     }),
@@ -499,12 +517,35 @@ export function createRedisStoreWithMockClient(keyPrefix = 'axl:', ttlConfig?: M
       return seconds === undefined ? -1 : Math.round(seconds * 1000);
     }),
     multi: vi.fn(() => createMockMulti(data, hashData, setData, zsetData, ttls, listData)),
-    // EVAL: the mock knows exactly one script, PRUNE_HISTORY_INDEX_SCRIPT,
-    // and runs a JS copy of it synchronously, so nothing interleaves with it
-    // (Redis runs a script atomically). Any other script is a test bug.
+    // EVAL: the mock knows the store's two scripts and runs a JS copy of each
+    // synchronously, so nothing interleaves with it (Redis runs a script
+    // atomically). Any other script is a test bug.
     eval: vi.fn(async (script: string, options: { keys: string[]; arguments: string[] }) => {
+      if (script === UPDATE_SESSION_SCRIPT) {
+        const [sessionKey, sessionIdsKey] = options.keys;
+        const [expected, next, ttl, sessionId] = options.arguments;
+        const stored = data.get(sessionKey);
+        const actual = stored === undefined ? '' : createHash('sha1').update(stored).digest('hex');
+        if (actual !== expected) return 0;
+        data.set(sessionKey, next);
+        if (ttl !== '') ttls.set(sessionKey, Number(ttl));
+        else ttls.delete(sessionKey);
+        if (!setData.has(sessionIdsKey)) setData.set(sessionIdsKey, new Set());
+        setData.get(sessionIdsKey)!.add(sessionId);
+        return 1;
+      }
+      if (script === PRUNE_SESSION_IDS_SCRIPT) {
+        const removed: string[] = [];
+        options.arguments.forEach((id, i) => {
+          if (data.has(options.keys[(i + 1) * 2 - 1])) return;
+          setData.get(options.keys[0])?.delete(id);
+          hashData.delete(options.keys[(i + 1) * 2]);
+          removed.push(id);
+        });
+        return removed;
+      }
       if (script !== PRUNE_HISTORY_INDEX_SCRIPT) {
-        throw new Error('redis mock: EVAL supports only PRUNE_HISTORY_INDEX_SCRIPT');
+        throw new Error("redis mock: EVAL supports only the store's scripts");
       }
       const [idsKey, timeKey, expiryKey, ...dataKeys] = options.keys;
       const [nowArg, ...ids] = options.arguments;
@@ -531,7 +572,11 @@ export function createRedisStoreWithMockClient(keyPrefix = 'axl:', ttlConfig?: M
       }
       return removed;
     }),
-    quit: vi.fn(async () => {
+    ping: vi.fn(async () => {
+      if (!clientOpen) throw new Error('The client is closed');
+      return 'PONG';
+    }),
+    destroy: vi.fn(() => {
       if (!clientOpen) throw new Error('The client is closed');
       clientOpen = false;
     }),

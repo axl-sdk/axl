@@ -37,7 +37,10 @@ describe('RedisStore connection handling', () => {
   let warn: ReturnType<typeof vi.spyOn>;
   let error: ReturnType<typeof vi.spyOn>;
 
-  const open = async (extra?: { onConnectionEvent?: (event: RedisConnectionEvent) => void }) => {
+  const open = async (extra?: {
+    onConnectionEvent?: (event: RedisConnectionEvent) => void;
+    responseTimeoutMs?: number;
+  }) => {
     const store = await RedisStore.create({
       url: fake.url,
       skipMigration: true,
@@ -235,25 +238,60 @@ describe('RedisStore connection handling', () => {
       expect(fake.connectionCount()).toBe(after);
     });
 
-    it('resolves when the connection drops before QUIT is answered', async () => {
+    it('resolves when the connection drops before the server answers', async () => {
       const store = await open();
-      fake.hold = (command) => command[0] === 'QUIT';
+      fake.hold = (command) => command[0] === 'PING';
       const closing = store.close();
-      await fake.waitForCommand((command) => command[0] === 'QUIT');
+      await fake.waitForCommand((command) => command[0] === 'PING');
 
       fake.dropConnections();
 
       await expect(closing).resolves.toBeUndefined();
     });
 
-    it('resolves when the server never answers QUIT', async () => {
+    it('resolves when the server never answers', async () => {
       const store = await open();
-      fake.hold = (command) => command[0] === 'QUIT';
+      fake.hold = () => true;
 
       const start = Date.now();
       await store.close();
 
       expect(Date.now() - start).toBeLessThan(2500);
+    });
+
+    it('closes the socket when the server stops answering', async () => {
+      const store = await open();
+      expect(fake.openConnectionCount()).toBe(1);
+      fake.hold = () => true;
+
+      await store.close();
+
+      await waitUntil(() => fake.openConnectionCount() === 0);
+      expect(store.isConnected).toBe(false);
+    });
+
+    it('refuses new commands without sending them while it waits', async () => {
+      const store = await open();
+      fake.hold = (command) => command[0] === 'PING';
+      const closing = store.close();
+      await fake.waitForCommand((command) => command[0] === 'PING');
+
+      expect(store.isConnected).toBe(false);
+      await expect(store.saveSession('late', [{ role: 'user', content: 'hi' }])).rejects.toThrow(
+        'The client is closed',
+      );
+      expect(fake.commands.some((command) => command.includes('late'))).toBe(false);
+      await closing;
+    });
+
+    it('rejects commands that never got an answer', async () => {
+      const store = await open();
+      fake.hold = () => true;
+      const read = store.getSession('s1');
+
+      await store.close();
+
+      await expect(read).rejects.toThrow();
     });
 
     it('resolves and reports nothing further when a reconnect is mid-handshake', async () => {
@@ -280,7 +318,7 @@ describe('RedisStore connection handling', () => {
       await store.close();
 
       await expect(read).resolves.toEqual([{ role: 'user', content: 'hi' }]);
-      expect(fake.commands.at(-1)?.[0]).toBe('QUIT');
+      await waitUntil(() => fake.openConnectionCount() === 0);
     });
   });
 
@@ -441,6 +479,374 @@ describe('RedisStore connection handling', () => {
 
       expect(unhandled).not.toHaveBeenCalled();
       expect(error.mock.calls.flat().join(' ')).toContain('async callback broke');
+    });
+  });
+
+  describe('responseTimeoutMs', () => {
+    const isPing = (command: string[]) => command[0] === 'PING';
+    const stallServer = () => {
+      fake.hold = isApplicationCommand;
+    };
+    /**
+     * Keep sending commands, more often than any idle timer allows, until one
+     * rejects. Measured with timers, so it works while `Date.now` is mocked.
+     */
+    const firstRejectionUnderTraffic = async (store: RedisStore) => {
+      let rejected = false;
+      for (let elapsed = 0; elapsed < 3000 && !rejected; elapsed += 10) {
+        store.getSession('s').catch(() => {
+          rejected = true;
+        });
+        await sleep(10);
+      }
+      return rejected ? 'rejected' : 'still pending after 3s';
+    };
+    const blockEventLoop = (ms: number) => {
+      const until = Date.now() + ms;
+      while (Date.now() < until);
+    };
+
+    it('sends no health checks unless it is set', async () => {
+      const store = await open();
+      await sleep(100);
+      expect(fake.commands.some(isPing)).toBe(false);
+      expect(store.isConnected).toBe(true);
+    });
+
+    it('rejects an invalid value', async () => {
+      for (const responseTimeoutMs of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+        await expect(open({ responseTimeoutMs })).rejects.toThrow(/responseTimeoutMs/);
+      }
+      expect(fake.connectionCount()).toBe(0);
+    });
+
+    it('keeps a responsive connection through idle time', async () => {
+      const events: RedisConnectionEvent[] = [];
+      const store = await open({ responseTimeoutMs: 60, onConnectionEvent: (e) => events.push(e) });
+      await sleep(300);
+      expect(fake.commands.some(isPing)).toBe(true);
+      expect(fake.connectionCount()).toBe(1);
+      expect(events).toEqual([]);
+      expect(store.isConnected).toBe(true);
+    });
+
+    it('rejects calls on a stalled server even while the app keeps sending commands', async () => {
+      const events: RedisConnectionEvent[] = [];
+      const store = await open({
+        responseTimeoutMs: 100,
+        onConnectionEvent: (e) => events.push(e),
+      });
+      stallServer();
+      const started = Date.now();
+      const firstRejection = new Promise<number>((resolve, reject) => {
+        let stop = false;
+        void (async () => {
+          // More often than the timeout, so an idle timer would never fire.
+          while (!stop && Date.now() - started < 2000) {
+            store.getSession('s').catch(() => {
+              stop = true;
+              resolve(Date.now() - started);
+            });
+            await sleep(10);
+          }
+          if (!stop) reject(new Error('no call rejected within 2s'));
+        })();
+      });
+      expect(await firstRejection).toBeLessThan(1000);
+      expect(events.some((e) => e.type === 'error')).toBe(true);
+      expect(uncaught).not.toHaveBeenCalled();
+      expect(unhandled).not.toHaveBeenCalled();
+    });
+
+    it('rejects a transaction in flight, then recovers once the server answers', async () => {
+      const events: RedisConnectionEvent[] = [];
+      const store = await open({
+        responseTimeoutMs: 100,
+        onConnectionEvent: (e) => events.push(e),
+      });
+      stallServer();
+      await expect(store.saveSession('s', [{ role: 'user', content: 'hi' }])).rejects.toThrow();
+      fake.hold = () => false;
+      await waitUntil(() => store.isConnected && events.some((e) => e.type === 'reconnected'));
+      await expect(store.getSession('nothing')).resolves.toEqual([]);
+    });
+
+    it('fails fast while it re-establishes the connection', async () => {
+      const store = await open({ responseTimeoutMs: 100 });
+      fake.hold = (command) => isApplicationCommand(command);
+      await store.getSession('s').catch(() => {});
+      // The handshake is held from here on, so the store stays disconnected.
+      fake.hold = () => true;
+      await waitUntil(() => !store.isConnected);
+      await expect(store.getSession('s')).rejects.toMatchObject({ code: 'REDIS_UNAVAILABLE' });
+    });
+
+    it('recovers when a reconnect reached a server that never finished the handshake', async () => {
+      const events: RedisConnectionEvent[] = [];
+      const store = await open({
+        responseTimeoutMs: 100,
+        onConnectionEvent: (e) => events.push(e),
+      });
+      fake.hold = () => true;
+      await waitUntil(() => !store.isConnected);
+      const connectionsWhileSilent = fake.connectionCount();
+      // Released handshakes on the stuck connection are never answered, so
+      // recovery requires the store to give up on it and open another.
+      await sleep(250);
+      fake.hold = () => false;
+      await waitUntil(() => fake.connectionCount() > connectionsWhileSilent && store.isConnected);
+      await expect(store.getSession('nothing')).resolves.toEqual([]);
+    });
+
+    it('does not reset a healthy connection when the event loop was blocked', async () => {
+      const events: RedisConnectionEvent[] = [];
+      const store = await open({
+        responseTimeoutMs: 300,
+        onConnectionEvent: (e) => events.push(e),
+      });
+      // The fake server shares this event loop. Blocking while it handles a
+      // PING leaves that PING unanswered with its deadline passing, and timers
+      // run before the reply can be read. Each block outlasts the timeout, but
+      // not the idle timer at twice it.
+      let blocks = 0;
+      fake.hold = (command) => {
+        if (isPing(command) && blocks < 3) {
+          blocks++;
+          blockEventLoop(500);
+        }
+        return false;
+      };
+      await waitUntil(() => blocks === 3, 5000);
+      await sleep(400);
+      expect(events).toEqual([]);
+      expect(fake.connectionCount()).toBe(1);
+      expect(store.isConnected).toBe(true);
+    });
+
+    it('still resets a stalled connection when the event loop stays busy', async () => {
+      const store = await open({ responseTimeoutMs: 100 });
+      stallServer();
+      // Every clock read looks later than the last, so every timer seems late,
+      // as on a host whose event loop never catches up.
+      const realNow = Date.now.bind(Date);
+      let skew = 0;
+      const now = vi.spyOn(Date, 'now').mockImplementation(() => realNow() + (skew += 200));
+      try {
+        await expect(firstRejectionUnderTraffic(store)).resolves.toBe('rejected');
+      } finally {
+        now.mockRestore();
+      }
+    });
+
+    it('detects a second stall after recovering from the first', async () => {
+      const store = await open({ responseTimeoutMs: 100 });
+      for (let stall = 0; stall < 2; stall++) {
+        stallServer();
+        await expect(firstRejectionUnderTraffic(store)).resolves.toBe('rejected');
+        fake.hold = () => false;
+        await waitUntil(() => store.isConnected);
+        await expect(store.getSession('nothing')).resolves.toEqual([]);
+      }
+    });
+
+    it('rejects create() when the server accepts the connection but never answers', async () => {
+      fake.hold = () => true;
+      const started = Date.now();
+      await expect(open({ responseTimeoutMs: 100 })).rejects.toMatchObject({
+        code: 'REDIS_UNAVAILABLE',
+      });
+      expect(Date.now() - started).toBeLessThan(1000);
+      const connections = fake.connectionCount();
+      await sleep(250);
+      expect(fake.connectionCount()).toBe(connections);
+    });
+
+    it('rejects create() when the server stalls during startup work, and stops trying', async () => {
+      fake.hold = (command) => command[0] === 'SCARD';
+      const create = RedisStore.create({
+        url: fake.url,
+        responseTimeoutMs: 100,
+        ttls: { executionHistory: null },
+      });
+      await expect(create).rejects.toThrow();
+      const connections = fake.connectionCount();
+      const pings = fake.commands.filter(isPing).length;
+      await sleep(250);
+      expect(fake.connectionCount()).toBe(connections);
+      expect(fake.commands.filter(isPing).length).toBe(pings);
+    });
+
+    it('stops checking after close() and does not hold the process open', async () => {
+      const store = await open({ responseTimeoutMs: 40 });
+      await sleep(80);
+      await store.close();
+      const pings = fake.commands.filter(isPing).length;
+      await sleep(150);
+      expect(fake.commands.filter(isPing).length).toBe(pings);
+      expect(fake.connectionCount()).toBe(1);
+      await waitUntil(() => socketsHoldingProcess() === 0);
+    });
+
+    it('closes promptly while the server is stalled', async () => {
+      const store = await open({ responseTimeoutMs: 5000 });
+      stallServer();
+      const pending = store.getSession('s').catch(() => 'rejected');
+      await fake.waitForCommand((command) => command[0] === 'GET');
+      const started = Date.now();
+      await store.close();
+      expect(Date.now() - started).toBeLessThan(3000);
+      await expect(pending).resolves.toBe('rejected');
+    });
+  });
+
+  describe('waitForConnection: false', () => {
+    const openInBackground = async (extra?: {
+      onConnectionEvent?: (event: RedisConnectionEvent) => void;
+      skipMigration?: boolean;
+    }) => {
+      const store = await RedisStore.create({
+        url: fake.url,
+        skipMigration: true,
+        ttls: { executionHistory: null },
+        waitForConnection: false,
+        responseTimeoutMs: 100,
+        ...extra,
+      });
+      stores.push(store);
+      return store;
+    };
+
+    it('requires responseTimeoutMs, so a silent server cannot leave it connecting forever', async () => {
+      await expect(RedisStore.create({ url: fake.url, waitForConnection: false })).rejects.toThrow(
+        /responseTimeoutMs/,
+      );
+      expect(fake.connectionCount()).toBe(0);
+    });
+
+    it('returns while Redis is down, fails fast, and connects once Redis is up', async () => {
+      await fake.stop();
+      const events: RedisConnectionEvent[] = [];
+      const started = Date.now();
+      const store = await openInBackground({ onConnectionEvent: (e) => events.push(e) });
+      expect(Date.now() - started).toBeLessThan(500);
+
+      expect(store.isConnected).toBe(false);
+      expect(store.historyPaging).toBe(true);
+      await expect(store.getSession('s')).rejects.toMatchObject({ code: 'REDIS_UNAVAILABLE' });
+      await expect(store.saveSession('s', [])).rejects.toMatchObject({ code: 'REDIS_UNAVAILABLE' });
+      await waitUntil(() => events.some((e) => e.type === 'error'));
+
+      await fake.start();
+      await waitUntil(() => store.isConnected, 5000);
+      expect(store.historyPaging).toBe(true);
+      await expect(store.getSession('nothing')).resolves.toEqual([]);
+      expect(events.at(-1)).toEqual({ type: 'reconnected' });
+      expect(uncaught).not.toHaveBeenCalled();
+      expect(unhandled).not.toHaveBeenCalled();
+    });
+
+    it('stays quiet on a first connection that simply works', async () => {
+      const store = await openInBackground();
+      await waitUntil(() => store.isConnected);
+      expect(connectionLogs()).toEqual([]);
+    });
+
+    it('gets past a server that accepts the connection but never answers', async () => {
+      fake.hold = () => true;
+      const store = await openInBackground();
+      await waitUntil(() => fake.connectionCount() > 0);
+      expect(store.isConnected).toBe(false);
+      await expect(store.getSession('s')).rejects.toMatchObject({ code: 'REDIS_UNAVAILABLE' });
+
+      // The stuck connection never gets an answer, so this needs a new one.
+      const connectionsWhileSilent = fake.connectionCount();
+      fake.hold = () => false;
+      await waitUntil(
+        () => fake.connectionCount() > connectionsWhileSilent && store.isConnected,
+        5000,
+      );
+      await expect(store.getSession('nothing')).resolves.toEqual([]);
+    });
+
+    it('reports each failed attempt and keeps trying', async () => {
+      fake.hold = () => true;
+      const events: RedisConnectionEvent[] = [];
+      const store = await openInBackground({ onConnectionEvent: (e) => events.push(e) });
+      await waitUntil(() => events.filter((e) => e.type === 'error').length >= 2, 5000);
+      fake.hold = () => false;
+      await waitUntil(() => store.isConnected, 5000);
+    });
+
+    it('closes promptly while connecting, stops trying, and leaves nothing running', async () => {
+      await fake.stop();
+      const store = await openInBackground();
+      await sleep(50);
+      const started = Date.now();
+      await store.close();
+      await store.close();
+      expect(Date.now() - started).toBeLessThan(500);
+      expect(store.isConnected).toBe(false);
+
+      await fake.start();
+      const connections = fake.connectionCount();
+      await sleep(2500);
+      expect(fake.connectionCount()).toBe(connections);
+      await waitUntil(() => socketsHoldingProcess() === 0);
+    });
+
+    it('closes promptly during a handshake the server never answers', async () => {
+      fake.hold = () => true;
+      const store = await openInBackground();
+      await waitUntil(() => fake.connectionCount() > 0);
+      const started = Date.now();
+      await store.close();
+      expect(Date.now() - started).toBeLessThan(500);
+      const connections = fake.connectionCount();
+      await sleep(400);
+      expect(fake.connectionCount()).toBe(connections);
+    });
+
+    it('runs the backfill only after connecting, without holding up create()', async () => {
+      await fake.stop();
+      const store = await openInBackground({ skipMigration: false });
+      expect(fake.commands.some((c) => c[0] === 'SCARD')).toBe(false);
+      await fake.start();
+      await fake.waitForCommand((c) => c[0] === 'SCARD', 5000);
+      await waitUntil(() => store.isConnected);
+    });
+
+    it('retries a backfill that failed, on the next connection', async () => {
+      const store = await openInBackground({ skipMigration: false });
+      await fake.waitForCommand((c) => c[0] === 'SCARD');
+      const scards = () => fake.commands.filter((c) => c[0] === 'SCARD').length;
+      await waitUntil(() => store.isConnected);
+      expect(scards()).toBeGreaterThan(0);
+
+      await store.close();
+      const failing = await RedisStore.create({
+        url: fake.url,
+        ttls: { executionHistory: null },
+        waitForConnection: false,
+        responseTimeoutMs: 100,
+      });
+      stores.push(failing);
+      fake.hold = (c) => c[0] === 'SCARD' || c[0] === 'ZCARD';
+      await waitUntil(() => failing.isConnected);
+      const before = scards();
+      await fake.waitForCommand((c) => c[0] === 'SCARD');
+      fake.dropConnections();
+      fake.hold = () => false;
+      await waitUntil(() => scards() > before, 5000);
+      expect(unhandled).not.toHaveBeenCalled();
+    });
+
+    it('does not start a backfill after close()', async () => {
+      await fake.stop();
+      const store = await openInBackground({ skipMigration: false });
+      await store.close();
+      await fake.start();
+      await sleep(400);
+      expect(fake.commands.some((c) => c[0] === 'SCARD')).toBe(false);
     });
   });
 

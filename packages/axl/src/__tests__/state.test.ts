@@ -1122,12 +1122,12 @@ describe('RedisStore', () => {
   });
 
   describe('close', () => {
-    it('calls quit on the redis client', async () => {
+    it('closes the redis client', async () => {
       const { store, mockClient } = createRedisStoreWithMockClient();
 
       await store.close();
 
-      expect(mockClient.quit).toHaveBeenCalledOnce();
+      expect(mockClient.isOpen).toBe(false);
     });
 
     it('closes idempotently, so a caller may close a store its runtime already closed', async () => {
@@ -1140,7 +1140,7 @@ describe('RedisStore', () => {
       await store.close();
       await expect(store.close()).resolves.toBeUndefined();
 
-      expect(mockClient.quit).toHaveBeenCalledOnce();
+      expect(mockClient.destroy).toHaveBeenCalledOnce();
     });
   });
 
@@ -1889,6 +1889,34 @@ describe('RedisStore', () => {
         expect(zsetData.get('axl:exec-history-z')?.size).toBe(1);
         expect(zsetData.get('axl:exec-history-z')?.has('has-data')).toBe(true);
         expect(zsetData.get('axl:exec-history-z')?.has('orphan')).toBe(false);
+      });
+
+      it('removes ids with no data, so later startups and listings stop paying for them', async () => {
+        const { store, mockClient, data, setData } = createRedisStoreWithMockClient();
+        setData.set('axl:exec-history-ids', new Set(['has-data', 'orphan']));
+        data.set('axl:exec-history:has-data', JSON.stringify(makeExec('has-data', 100)));
+
+        await store.backfillExecutionIndex();
+        expect(setData.get('axl:exec-history-ids')?.has('orphan')).toBe(false);
+
+        mockClient.sMembers.mockClear();
+        mockClient.mGet.mockClear();
+        await store.backfillExecutionIndex();
+        expect(mockClient.sMembers).not.toHaveBeenCalled();
+        expect(mockClient.mGet).not.toHaveBeenCalled();
+      });
+
+      it('keeps the backfill going when the cleanup is not permitted', async () => {
+        const { store, mockClient, data, setData, zsetData } = createRedisStoreWithMockClient();
+        setData.set('axl:exec-history-ids', new Set(['has-data', 'orphan']));
+        data.set('axl:exec-history:has-data', JSON.stringify(makeExec('has-data', 100)));
+        mockClient.eval.mockRejectedValueOnce(new Error('NOPERM'));
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+        await expect(store.backfillExecutionIndex()).resolves.toBeUndefined();
+
+        expect(zsetData.get('axl:exec-history-z')?.has('has-data')).toBe(true);
+        warn.mockRestore();
       });
 
       it('skips malformed JSON without crashing the whole backfill', async () => {

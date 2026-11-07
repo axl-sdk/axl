@@ -26,6 +26,13 @@ export type ExecutionState = {
 };
 
 /**
+ * Computes a session's new history from what's stored, for
+ * {@link StateStore.updateSession}. Receives `null` when no session is stored.
+ * Returns `null` to write nothing. May run more than once.
+ */
+export type SessionUpdate = (current: ChatMessage[] | null) => ChatMessage[] | null;
+
+/**
  * Pluggable state persistence interface.
  *
  * Built-in implementations: MemoryStore (testing), SQLiteStore (file-based),
@@ -42,6 +49,18 @@ export interface StateStore {
 
   // Sessions
   saveSession(sessionId: string, history: ChatMessage[]): Promise<void>;
+  /**
+   * Replace a session's history based on what's stored at that moment, without
+   * overwriting a write made by another process in between. Sessions use it to
+   * save each turn. The built-in stores implement it; without it, a store gets
+   * `saveSession`, where the last writer wins.
+   *
+   * **Custom store implementors:** the read and the write must be atomic. Use a
+   * transaction or a compare-and-set, and call `update` again if another writer
+   * got in first, so `update` may run more than once. It receives `null` when no
+   * session is stored. When it returns `null`, write nothing.
+   */
+  updateSession?(sessionId: string, update: SessionUpdate): Promise<void>;
   getSession(sessionId: string): Promise<ChatMessage[]>;
   deleteSession(sessionId: string): Promise<void>;
 

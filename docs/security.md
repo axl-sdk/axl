@@ -284,6 +284,8 @@ For **business rule validation** on the parsed typed object (not raw text), use 
 
 ## Right-to-be-Forgotten / Execution Deletion
 
+> **Deleting a user's sessions:** call `deleteSession` for each of their session ids, or `session.end()`. Don't rely on `ttls.session` for this. An expired session's id, and its metadata such as summaries, stay in Redis until a later `listSessions()` or save removes them, and session ids are visible in that list. On each save, `RedisStore` checks only a few ids.
+
 Two operator-facing primitives implement the GDPR deletion contract:
 
 **`runtime.deleteExecution(id)`** — total per-execution sweep. Removes from the in-memory caches, the configured `StateStore`, AND every execution-scoped side surface:

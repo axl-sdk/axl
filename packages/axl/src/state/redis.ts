@@ -68,6 +68,11 @@ interface RedisClient {
   sRem(key: string, member: string | string[]): Promise<number>;
   sCard(key: string): Promise<number>;
   sMembers(key: string): Promise<string[]>;
+  sScan(
+    key: string,
+    cursor: string,
+    options?: { COUNT?: number },
+  ): Promise<{ cursor: string; members: string[] }>;
   // List ops for streaming-event persistence. RPUSH appends batches of
   // JSON-serialized events to a per-execution list; LRANGE 0 -1 reads
   // them back on recovery. Used by appendStreamingEvents / getStreamingEvents.
@@ -415,6 +420,34 @@ return removed
 `;
 
 /**
+ * Removes ids from the listing set when their session is gone, and the
+ * session's metadata with them. `ttls.session` and `ttls.sessionMeta` are
+ * independent, so metadata can outlive its session, and once the id is gone
+ * nothing could find that metadata to delete it. The script decides by what
+ * exists when it runs, so a session saved just before it is kept.
+ *
+ * KEYS: the id set, then each id's session key and metadata key.
+ * ARGV: the ids. Returns the ids it removed.
+ *
+ * Exported for tests only; not part of the public API.
+ */
+export const PRUNE_SESSION_IDS_SCRIPT = `
+local removed = {}
+for i, id in ipairs(ARGV) do
+  if redis.call('EXISTS', KEYS[i * 2]) == 0 then
+    redis.call('SREM', KEYS[1], id)
+    redis.call('DEL', KEYS[i * 2 + 1])
+    removed[#removed + 1] = id
+  end
+end
+return removed
+`;
+
+/** Session ids checked per script run, and how many one save asks SSCAN for. */
+const SESSION_ID_BATCH = 100;
+const SESSION_SWEEP_COUNT = 50;
+
+/**
  * Write a session only if it's unchanged since it was read, by comparing the
  * SHA-1 of the stored value. Hashing what's stored needs no version key or new
  * format, so a write from an older instance during a rolling deploy counts as
@@ -737,6 +770,9 @@ async function connectClient(
  * async `RedisStore.create()` factory, which connects before returning.
  */
 export class RedisStore implements StateStore {
+  /** Where the next save's check of listed sessions picks up. */
+  private sessionSweepCursor = '0';
+
   private constructor(
     private connection: RedisClient,
     private keyPrefix: string,
@@ -1241,6 +1277,7 @@ export class RedisStore implements StateStore {
       )
       .sAdd(this.sessionIdsKey(), sessionId)
       .exec();
+    await this.sweepSessionIds();
   }
 
   async updateSession(sessionId: string, update: SessionUpdate): Promise<void> {
@@ -1280,7 +1317,10 @@ export class RedisStore implements StateStore {
         await this.saveSession(sessionId, next);
         return;
       }
-      if (Number(written) === 1) return;
+      if (Number(written) === 1) {
+        await this.sweepSessionIds();
+        return;
+      }
       const backoffMs = Math.min(20 * 2 ** attempt, 200);
       await new Promise((resolve) => setTimeout(resolve, Math.random() * backoffMs));
     }
@@ -2114,9 +2154,76 @@ export class RedisStore implements StateStore {
   // ── Sessions (Studio introspection) ────────────────────────────────────
 
   async listSessions(): Promise<string[]> {
-    // Redis doesn't have a built-in way to list keys by pattern without SCAN,
-    // so we maintain a set of session IDs alongside the session data.
-    return this.client.sMembers(this.sessionIdsKey());
+    // Redis has no way to list keys by pattern without scanning the keyspace,
+    // so we maintain a set of session IDs alongside the session data. SSCAN
+    // keeps a large set from blocking the server the way SMEMBERS would.
+    const live = new Set<string>();
+    let cursor = '0';
+    do {
+      const page = await this.client.sScan(this.sessionIdsKey(), cursor, {
+        COUNT: SESSION_ID_BATCH,
+      });
+      cursor = page.cursor;
+      const removed = new Set(await this.pruneSessionIds(page.members));
+      for (const id of page.members) if (!removed.has(id)) live.add(id);
+    } while (cursor !== '0');
+    return [...live];
+  }
+
+  /**
+   * Check a few listed sessions after a save, so ids of expired sessions go
+   * away for apps that never list. Sessions without a TTL don't expire, so
+   * there's nothing to do. The save has already succeeded, so failing here
+   * can't fail it.
+   */
+  private async sweepSessionIds(): Promise<void> {
+    if (this.ttlFor('session') === undefined) return;
+    try {
+      const page = await this.client.sScan(this.sessionIdsKey(), this.sessionSweepCursor, {
+        COUNT: SESSION_SWEEP_COUNT,
+      });
+      this.sessionSweepCursor = page.cursor;
+      await this.pruneSessionIds(page.members);
+    } catch (err) {
+      this.warnSessionPruneFailed(err);
+    }
+  }
+
+  /** Returns the ids removed. Without permission to run the script, removes none and warns. */
+  private async pruneSessionIds(ids: string[]): Promise<string[]> {
+    const removed: string[] = [];
+    // SSCAN returns a small set whole, whatever COUNT asks for.
+    for (let start = 0; start < ids.length; start += SESSION_ID_BATCH) {
+      const batch = ids.slice(start, start + SESSION_ID_BATCH);
+      try {
+        const result = await this.client.eval(PRUNE_SESSION_IDS_SCRIPT, {
+          keys: [
+            this.sessionIdsKey(),
+            ...batch.flatMap((id) => [this.sessionKey(id), this.sessionMetaKey(id)]),
+          ],
+          arguments: batch,
+        });
+        removed.push(...(result as string[]));
+      } catch (err) {
+        if (!errorMessage(err).includes('NOPERM')) throw err;
+        this.warnSessionPruneFailed(err);
+        return removed;
+      }
+    }
+    return removed;
+  }
+
+  private warnSessionPruneFailed(err: unknown): void {
+    // A lost connection isn't the permission problem this warning explains.
+    if (this.connection.isReady === false) return;
+    warnDiagnosticOnce(
+      'redis_session_ids_prune_failed',
+      `RedisStore: removing expired session ids failed (${errorMessage(err)}), so ` +
+        'listSessions can return sessions that have expired. The cleanup runs a Lua script, ' +
+        'so the Redis user needs permission to run EVAL.',
+      undefined,
+      'docs/api-reference.md#redisstore-options',
+    );
   }
 
   // ── Streaming events (for state.persist: 'streaming') ──────────────────

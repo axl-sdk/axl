@@ -2495,7 +2495,7 @@ These methods are optional (`?` on the interface). The runtime checks for their 
 
 | Method | Description |
 |--------|-------------|
-| `listSessions?()` | List all session IDs (used by Studio's session browser) |
+| `listSessions?()` | List the IDs of sessions that still exist (used by Studio's session browser). On `RedisStore`, this also removes the IDs and metadata of expired sessions |
 | `close?()` | Close the underlying connection (called by `runtime.shutdown()`). `RedisStore` waits at most 2 seconds for Redis to answer, and closes at once while disconnected |
 | `deleteCheckpoints?(executionId)` | Delete all checkpoints for an execution (called on successful completion). If it rejects, the failure is logged and the run still succeeds |
 | `applyHistoryRetention?(options)` | Apply your store's retention to history saved without one, one batch per call, resuming from a cursor. Never called by the runtime; implement it if you want the same maintenance call as the built-ins. Contract: [Applying retention to existing history](#applying-retention-to-existing-history) |

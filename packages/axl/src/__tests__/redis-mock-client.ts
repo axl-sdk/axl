@@ -4,7 +4,12 @@
  */
 import { createHash } from 'node:crypto';
 import { vi } from 'vitest';
-import { PRUNE_HISTORY_INDEX_SCRIPT, RedisStore, UPDATE_SESSION_SCRIPT } from '../state/redis.js';
+import {
+  PRUNE_HISTORY_INDEX_SCRIPT,
+  PRUNE_SESSION_IDS_SCRIPT,
+  RedisStore,
+  UPDATE_SESSION_SCRIPT,
+} from '../state/redis.js';
 
 type ZRangeOptions = {
   BY?: 'SCORE' | 'LEX';
@@ -285,6 +290,7 @@ export function createRedisStoreOverClient(
   const store = Object.create(RedisStore.prototype) as RedisStore;
   (store as any).connection = client;
   (store as any).keyPrefix = keyPrefix;
+  (store as any).sessionSweepCursor = '0';
   (store as any).ttls = {
     session: ttlConfig?.session ?? null,
     sessionMeta: ttlConfig?.sessionMeta ?? null,
@@ -425,6 +431,17 @@ export function createRedisStoreWithMockClient(keyPrefix = 'axl:', ttlConfig?: M
     sMembers: vi.fn(async (key: string) => {
       return [...(setData.get(key) ?? [])];
     }),
+    // Like the real command: pages through the set, and a page's cursor is
+    // only valid for that set. '0' starts over and means the scan finished.
+    sScan: vi.fn(async (key: string, cursor: string, options?: { COUNT?: number }) => {
+      const members = [...(setData.get(key) ?? [])];
+      const start = Number(cursor);
+      const end = start + (options?.COUNT ?? 10);
+      return {
+        cursor: end >= members.length ? '0' : String(end),
+        members: members.slice(start, end),
+      };
+    }),
     sCard: vi.fn(async (key: string) => {
       return setData.get(key)?.size ?? 0;
     }),
@@ -516,6 +533,16 @@ export function createRedisStoreWithMockClient(keyPrefix = 'axl:', ttlConfig?: M
         if (!setData.has(sessionIdsKey)) setData.set(sessionIdsKey, new Set());
         setData.get(sessionIdsKey)!.add(sessionId);
         return 1;
+      }
+      if (script === PRUNE_SESSION_IDS_SCRIPT) {
+        const removed: string[] = [];
+        options.arguments.forEach((id, i) => {
+          if (data.has(options.keys[(i + 1) * 2 - 1])) return;
+          setData.get(options.keys[0])?.delete(id);
+          hashData.delete(options.keys[(i + 1) * 2]);
+          removed.push(id);
+        });
+        return removed;
       }
       if (script !== PRUNE_HISTORY_INDEX_SCRIPT) {
         throw new Error("redis mock: EVAL supports only the store's scripts");

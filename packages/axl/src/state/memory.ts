@@ -9,6 +9,7 @@ import type {
 } from '../types.js';
 import type {
   StateStore,
+  SessionUpdate,
   PendingDecision,
   ExecutionState,
   EvalHistoryEntry,
@@ -163,6 +164,13 @@ export class MemoryStore implements StateStore {
 
   async saveSession(sessionId: string, history: ChatMessage[]): Promise<void> {
     this.sessions.set(sessionId, structuredClone(normalizePersistedSessionHistory(history)));
+  }
+
+  async updateSession(sessionId: string, update: SessionUpdate): Promise<void> {
+    // No `await` before the save's body runs, so nothing can interleave.
+    const stored = this.sessions.get(sessionId);
+    const next = update(stored ? structuredClone(stored) : null);
+    if (next !== null) await this.saveSession(sessionId, next);
   }
 
   async getSession(sessionId: string): Promise<ChatMessage[]> {

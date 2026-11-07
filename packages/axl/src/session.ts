@@ -33,12 +33,20 @@ export type SessionOptions = {
  * `AxlRuntime`, not the `Session` instance). `history()` and
  * `handoffs()` bypass the lock and return the last persisted snapshot.
  *
- * **⚠️ Cross-process locking is NOT provided.** Multiple Node workers
- * behind a load balancer hitting the same Redis-backed `sessionId`
- * will still race. Pin sessions to workers (sticky routing) or use
- * distinct ids per request. See `docs/api-reference.md` →
- * Sessions → Concurrency.
+ * **Across processes,** turns aren't queued: overlapping turns on one id both
+ * run, and neither sees the other's reply. Saves don't overwrite each other on
+ * a store with `updateSession`; the later one is appended. See
+ * `docs/api-reference.md` → Sessions → Concurrency.
  */
+/** What a turn needs at save time to tell whether another process wrote meanwhile. */
+type TurnBase = {
+  /** The stored history this turn started from, serialized, before any trimming. */
+  storedJson: string;
+  hadHistory: boolean;
+  /** Where this turn's own messages start in its working history. */
+  firstOwnMessage: number;
+};
+
 export class Session {
   private closed = false;
   private options: SessionOptions;
@@ -76,10 +84,10 @@ export class Session {
     signal: AbortSignal | undefined,
     events: EventStreamOptions | undefined,
   ): Promise<unknown> {
-    const { history, metadata } = await this.prepareHistory(input);
+    const { history, metadata, base } = await this.prepareHistory(input);
     try {
       const result = await this.runtime.execute(workflowName, input, { metadata, signal, events });
-      await this.commitHistory(history, result);
+      await this.commitHistory(history, base, result);
       return result;
     } finally {
       clearSessionInput(history);
@@ -96,9 +104,12 @@ export class Session {
   private async prepareHistory(input: unknown): Promise<{
     history: ChatMessage[];
     metadata: Record<string, unknown>;
+    base: TurnBase;
   }> {
     const preparedInput = prepareSessionInput(input);
     const history = await this.store.getSession(this.sessionId);
+    const storedJson = JSON.stringify(history);
+    const hadHistory = history.length > 0;
     let cachedSummary = (await this.store.getSessionMeta(this.sessionId, 'summaryCache')) as
       | string
       | null;
@@ -131,6 +142,7 @@ export class Session {
       history.push(...trimmed.map(withoutAnthropicThinking));
     }
 
+    const base: TurnBase = { storedJson, hadHistory, firstOwnMessage: history.length };
     const userMessage: ChatMessage = { role: 'user', content: preparedInput.content };
     history.push(userMessage);
     if (this.options.deduplicateInput !== false && preparedInput.normalizedInput !== undefined) {
@@ -145,14 +157,18 @@ export class Session {
       // agent-scoped ask-summary records the runtime would otherwise cache.
       ...(this.options.persist === false ? { sessionPersist: false } : {}),
     };
-    return { history, metadata };
+    return { history, metadata, base };
   }
 
   /** Push the assistant reply (if `executeAgentCall` didn't already) and
    *  persist. Shared by `sendImpl` and `streamImpl`. The fallback assistant
    *  push has no agent context and so leaves `agent` undefined — see the
    *  `ChatMessage.agent` field doc. */
-  private async commitHistory(history: ChatMessage[], result: unknown): Promise<void> {
+  private async commitHistory(
+    history: ChatMessage[],
+    base: TurnBase,
+    result: unknown,
+  ): Promise<void> {
     // executeAgentCall may have already pushed the assistant message (with
     // providerMetadata for Gemini thought signatures etc.). Only add one if needed.
     const lastMsg = history[history.length - 1];
@@ -163,8 +179,36 @@ export class Session {
       });
     }
 
-    if (this.options.persist !== false) {
+    if (this.options.persist === false) return;
+    if (!this.store.updateSession) {
       await this.store.saveSession(this.sessionId, history);
+      return;
+    }
+
+    let outcome = 'saved' as 'saved' | 'merged' | 'discarded';
+    await this.store.updateSession(this.sessionId, (current) => {
+      if (current === null) {
+        // Ended elsewhere during this turn (or expired). A first turn has
+        // nothing to tell that from, so it saves.
+        outcome = base.hadHistory ? 'discarded' : 'saved';
+        return base.hadHistory ? null : history;
+      }
+      if (JSON.stringify(current) === base.storedJson) {
+        outcome = 'saved';
+        return history;
+      }
+      // Another process saved during this turn, so only this turn's messages
+      // are added to what it wrote. Trimming and summarizing wait for the next
+      // turn: doing them here would drop messages from the summary. The
+      // messages before these changed, which invalidates signed thinking.
+      outcome = 'merged';
+      return [...current, ...history.slice(base.firstOwnMessage).map(withoutAnthropicThinking)];
+    });
+
+    if (outcome === 'merged') {
+      this.runtime.emit('session_turns_merged', { sessionId: this.sessionId });
+    } else if (outcome === 'discarded') {
+      this.runtime.emit('session_turn_discarded', { sessionId: this.sessionId });
     }
   }
 
@@ -221,10 +265,12 @@ export class Session {
     events: EventStreamOptions | undefined,
   ): Promise<void> {
     let history: ChatMessage[] | undefined;
+    let base: TurnBase;
     let axlStream: AxlStream;
     try {
       const prepared = await this.prepareHistory(input);
       history = prepared.history;
+      base = prepared.base;
       axlStream = this.runtime.stream(workflowName, input, {
         metadata: prepared.metadata,
         signal,
@@ -248,7 +294,7 @@ export class Session {
     try {
       const completion = axlStream.promise.then(
         (result) =>
-          this.commitHistory(history!, result).catch((err) => {
+          this.commitHistory(history!, base, result).catch((err) => {
             const error = err instanceof Error ? err.message : String(err);
             try {
               this.runtime.emit('error', {

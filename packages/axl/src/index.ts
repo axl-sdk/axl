@@ -389,6 +389,7 @@ export type { McpToolDefinition, McpServer, McpToolResult, McpServerConfig } fro
 // State
 export type {
   StateStore,
+  SessionUpdate,
   ExecutionState,
   PendingDecision,
   EvalHistoryEntry,

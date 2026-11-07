@@ -334,6 +334,14 @@ Retention shipped in 0.27.0; these were deliberately left out of it:
   disconnected, so a reconnect that takes a moment can still fail the next
   store call. We'll revisit this if real outages show that it matters.
 
+#### Multi-instance session follow-ups
+
+Overlapping turns from different instances no longer lose messages. These were left out of that fix:
+
+- **Idempotent turns.** An `idempotencyKey` on `session.send` and `session.stream` that returns a stored result and joins a run in progress on another instance. Joining a stream needs a way to relay tokens between processes, and claims and leases to handle crashes, so this belongs with Portable Run State below.
+- **One turn at a time across instances.** Queuing needs a distributed lock with leases. Apps that need it can hold their own lock around `send()` and `stream()`.
+- **Handoff records under overlap.** Overlapping turns that both hand off can lose one entry from `session.handoffs()`, because that record is still read and rewritten without protection. The conversation history isn't affected.
+
 #### Portable Run State
 
 `ctx.checkpoint()` stores named results inside one execution scope; it is not a cross-process workflow-resume protocol. Durable resumption needs a portable serializable run state plus decision claims, leases, checkpoint lineage, and idempotency boundaries. Serverless environments (Lambda, Cloudflare Workers) make that missing contract especially visible.

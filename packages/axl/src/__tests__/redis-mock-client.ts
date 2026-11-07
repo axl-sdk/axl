@@ -2,8 +2,9 @@
  * In-memory mock of the node-redis client surface `RedisStore` uses, shared by
  * the store unit tests. Moved unchanged from `state.test.ts`.
  */
+import { createHash } from 'node:crypto';
 import { vi } from 'vitest';
-import { PRUNE_HISTORY_INDEX_SCRIPT, RedisStore } from '../state/redis.js';
+import { PRUNE_HISTORY_INDEX_SCRIPT, RedisStore, UPDATE_SESSION_SCRIPT } from '../state/redis.js';
 
 type ZRangeOptions = {
   BY?: 'SCORE' | 'LEX';
@@ -499,12 +500,25 @@ export function createRedisStoreWithMockClient(keyPrefix = 'axl:', ttlConfig?: M
       return seconds === undefined ? -1 : Math.round(seconds * 1000);
     }),
     multi: vi.fn(() => createMockMulti(data, hashData, setData, zsetData, ttls, listData)),
-    // EVAL: the mock knows exactly one script, PRUNE_HISTORY_INDEX_SCRIPT,
-    // and runs a JS copy of it synchronously, so nothing interleaves with it
-    // (Redis runs a script atomically). Any other script is a test bug.
+    // EVAL: the mock knows the store's two scripts and runs a JS copy of each
+    // synchronously, so nothing interleaves with it (Redis runs a script
+    // atomically). Any other script is a test bug.
     eval: vi.fn(async (script: string, options: { keys: string[]; arguments: string[] }) => {
+      if (script === UPDATE_SESSION_SCRIPT) {
+        const [sessionKey, sessionIdsKey] = options.keys;
+        const [expected, next, ttl, sessionId] = options.arguments;
+        const stored = data.get(sessionKey);
+        const actual = stored === undefined ? '' : createHash('sha1').update(stored).digest('hex');
+        if (actual !== expected) return 0;
+        data.set(sessionKey, next);
+        if (ttl !== '') ttls.set(sessionKey, Number(ttl));
+        else ttls.delete(sessionKey);
+        if (!setData.has(sessionIdsKey)) setData.set(sessionIdsKey, new Set());
+        setData.get(sessionIdsKey)!.add(sessionId);
+        return 1;
+      }
       if (script !== PRUNE_HISTORY_INDEX_SCRIPT) {
-        throw new Error('redis mock: EVAL supports only PRUNE_HISTORY_INDEX_SCRIPT');
+        throw new Error("redis mock: EVAL supports only the store's scripts");
       }
       const [idsKey, timeKey, expiryKey, ...dataKeys] = options.keys;
       const [nowArg, ...ids] = options.arguments;

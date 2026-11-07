@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type {
   AxlEvent,
   ChatMessage,
@@ -7,6 +8,7 @@ import type {
 } from '../types.js';
 import type {
   StateStore,
+  SessionUpdate,
   PendingDecision,
   ExecutionState,
   EvalHistoryEntry,
@@ -410,6 +412,35 @@ for i = 2, #ARGV do
 end
 return removed
 `;
+
+/**
+ * Write a session only if it's unchanged since it was read, by comparing the
+ * SHA-1 of the stored value. Hashing what's stored needs no version key or new
+ * format, so a write from an older instance during a rolling deploy counts as
+ * a change too.
+ *
+ * KEYS: `[session, sessionIds]`. ARGV: `[expectedSha1 or '' if absent, next,
+ * ttlSeconds or '', sessionId]`. Returns 1 if written, 0 if the session changed.
+ *
+ * Exported for tests only; not part of the public API.
+ */
+export const UPDATE_SESSION_SCRIPT = `
+local stored = redis.call('GET', KEYS[1])
+local actual = stored and redis.sha1hex(stored) or ''
+if actual ~= ARGV[1] then
+  return 0
+end
+if ARGV[3] ~= '' then
+  redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
+else
+  redis.call('SET', KEYS[1], ARGV[2])
+end
+redis.call('SADD', KEYS[2], ARGV[4])
+return 1
+`;
+
+/** How many writes `updateSession` tries before reporting a conflict. */
+const UPDATE_SESSION_ATTEMPTS = 10;
 
 /** A position in a history sorted set: score, then member. */
 type HistoryPosition = { score: number; id: string };
@@ -1209,6 +1240,48 @@ export class RedisStore implements StateStore {
       )
       .sAdd(this.sessionIdsKey(), sessionId)
       .exec();
+  }
+
+  async updateSession(sessionId: string, update: SessionUpdate): Promise<void> {
+    const key = this.sessionKey(sessionId);
+    const ttl = this.ttlFor('session');
+    for (let attempt = 0; attempt < UPDATE_SESSION_ATTEMPTS; attempt++) {
+      const raw = await this.client.get(key);
+      const next = update(raw ? (JSON.parse(raw) as ChatMessage[]) : null);
+      if (next === null) return;
+      let written: unknown;
+      try {
+        written = await this.client.eval(UPDATE_SESSION_SCRIPT, {
+          keys: [key, this.sessionIdsKey()],
+          arguments: [
+            raw === null ? '' : createHash('sha1').update(raw).digest('hex'),
+            JSON.stringify(normalizePersistedSessionHistory(next)),
+            ttl === undefined ? '' : String(ttl),
+            sessionId,
+          ],
+        });
+      } catch (err) {
+        if (!errorMessage(err).includes('NOPERM')) throw err;
+        warnDiagnosticOnce(
+          'redis_update_session_denied',
+          'RedisStore: saving a session turn safely runs a Lua script, which this Redis user ' +
+            'may not run, so it was saved without that protection. Overlapping turns from ' +
+            'different instances can overwrite each other until the user may run EVAL.',
+          undefined,
+          'docs/api-reference.md#concurrency-and-races',
+        );
+        await this.saveSession(sessionId, next);
+        return;
+      }
+      if (Number(written) === 1) return;
+      const backoffMs = Math.min(20 * 2 ** attempt, 200);
+      await new Promise((resolve) => setTimeout(resolve, Math.random() * backoffMs));
+    }
+    throw new AxlError(
+      'SESSION_CONFLICT',
+      `RedisStore: gave up saving session "${sessionId}" after ${UPDATE_SESSION_ATTEMPTS} ` +
+        'conflicting writes from other instances.',
+    );
   }
 
   async getSession(sessionId: string): Promise<ChatMessage[]> {

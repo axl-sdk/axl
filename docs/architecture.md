@@ -122,10 +122,4 @@ const runtime = new AxlRuntime({ state: { store } });
 
 For production deployments, see [docs/integration.md](./integration.md) for the multi-tenant `keyPrefix`, TTL configuration, and crash-recovery wiring patterns. The complete state-store design (persistence modes, TTL strategy, GDPR delete contract, `ExecutionInfo.metadata`) is in [docs/migration/state-store-durability.md](./migration/state-store-durability.md).
 
-> **⚠️ Multi-process session writes are NOT serialized.** RedisStore makes session state visible across processes, but the per-session-id lock that protects `Session.send`/`stream`/`end`/`fork` from read-modify-write races is **in-process only**. Two Node workers behind a load balancer concurrently calling `runtime.session('user-123').send(...)` will both read the same Redis snapshot, both append, and the later write will clobber the earlier one — losing an entire user/assistant exchange.
->
-> For multi-worker deployments you must either:
-> - **Pin sessions to workers** (sticky routing on `sessionId`) so all writes for a given session go through the same Node process, or
-> - **Use distinct `sessionId`s per request** if continuity isn't required.
->
-> This is a known limitation; a future release may add optimistic concurrency on top of the StateStore. See [Sessions → Concurrency](api-reference.md#concurrency-and-races).
+> **Turns on one session only queue within a process.** Across workers sharing a store, turns on the same session run at the same time. Each turn's save checks what's stored and adds its messages to anything saved meanwhile, so both are kept, but neither turn sees the other's reply. See [Several app instances sharing a session](api-reference.md#several-app-instances-sharing-a-session).

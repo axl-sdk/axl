@@ -7,6 +7,7 @@ import type {
 import { getExecutionEventSchemaVersion, normalizeStoredExecution } from '../event-schema.js';
 import type {
   StateStore,
+  SessionUpdate,
   PendingDecision,
   ExecutionState,
   EvalHistoryEntry,
@@ -379,6 +380,23 @@ export class SQLiteStore implements StateStore {
       'INSERT OR REPLACE INTO sessions (session_id, history) VALUES (?, ?)',
     );
     stmt.run(sessionId, JSON.stringify(normalizePersistedSessionHistory(history)));
+  }
+
+  async updateSession(sessionId: string, update: SessionUpdate): Promise<void> {
+    // IMMEDIATE takes the write lock before reading, so another process sharing
+    // the file can't write between the read and the write.
+    this.db
+      .transaction(() => {
+        const row = this.db
+          .prepare('SELECT history FROM sessions WHERE session_id = ?')
+          .get(sessionId) as { history: string } | undefined;
+        const next = update(row ? ((safeJsonParse(row.history) as ChatMessage[]) ?? []) : null);
+        if (next === null) return;
+        this.db
+          .prepare('INSERT OR REPLACE INTO sessions (session_id, history) VALUES (?, ?)')
+          .run(sessionId, JSON.stringify(normalizePersistedSessionHistory(next)));
+      })
+      .immediate();
   }
 
   async getSession(sessionId: string): Promise<ChatMessage[]> {

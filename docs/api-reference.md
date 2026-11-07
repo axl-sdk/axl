@@ -1768,13 +1768,21 @@ The `AxlRuntime` extends `EventEmitter`. Subscribe to lifecycle signals:
 | `'eval_deleted'` | `{ id, eval, removed }` | Symmetric audit signal for `runtime.deleteEvalResult(id)`. Fires on every call; `eval` captured before delete. Studio's `EvalAggregator` subscribes and rebuilds eval-trends snapshots on delete |
 | `'decision_cleanup_failed'` | `DecisionCleanupFailedEvent` (`{ executionId, workflow?, operation: 'resolveDecision_compensation', error }`) | Operational signal that cancellation compensation could not remove a persisted approval request. The request remains visible for retry or `deleteExecution`. Listener errors are logged and isolated so they cannot replace the workflow's original failure |
 | `'session_lock_contended'` | `{ sessionId }` | Fires when a `Session.send` / `stream` / `end` / `fork` queues behind an in-flight task on the same id |
+| `'session_turns_merged'` | `{ sessionId }` | Fires when another instance saved to the same session during this turn, so this turn was added after it. See [Several app instances](#several-app-instances-sharing-a-session) |
+| `'session_turn_discarded'` | `{ sessionId }` | Fires when a session was ended or expired during a turn, so the turn wasn't saved. You still get its result |
 
-> **⚠️ Cross-process locking is NOT provided.** The lock is in-process — multiple Node workers (e.g., a horizontally-scaled web app) all hitting the same Redis-backed `sessionId` will still race. Production deployments behind a load balancer must either:
->
-> - **Pin sessions to workers** (sticky routing on `sessionId`), so all writes for a given session go through the same process, or
-> - **Use distinct `sessionId`s per request** if cross-request continuity isn't required.
->
-> A future release may offer optimistic concurrency on the StateStore — in the meantime, treat session ids as single-writer.
+#### Several app instances sharing a session
+
+The queue above works within one runtime. When several app instances share a store, turns on the same session from different instances run at the same time. With a built-in store, both turns are kept:
+
+- **Each turn stays in one piece.** A turn's messages are added together after whatever was saved during it, so history stays in the order the turns finished.
+- **Overlapping turns can't see each other.** Both run, both cost money, and neither knows about the other's reply. `session_turns_merged` tells you it happened.
+- **`history.maxMessages` applies on the next turn.** Stored history can go over the limit after a merge. The next turn trims it, and summarizes what it drops if `summarize` is on, before calling the model.
+- **An ended session stays ended.** A turn that was running when another instance called `end()` isn't saved, and `session_turn_discarded` fires. If that was the session's first turn, it's saved instead, because nothing shows the session ever existed.
+
+To run one turn at a time per session across instances, route each session to one instance, or hold your own per-session lock around `send()` and `stream()`.
+
+On Redis this needs permission to run `EVAL`. Without it, turns are saved with `saveSession` and a one-time warning, and overlapping turns can overwrite each other. Custom stores get the same protection by implementing [`updateSession`](#statestore), and otherwise the last save wins.
 
 **Lifecycle ordering.** `end()` sets a per-instance `closed` flag synchronously, then queues the delete behind the lock. After `await session.end()` resolves, no further calls on that `Session` instance succeed (`closed` short-circuits at the top of `send`/`stream`). However, `closed` is per-instance — a *different* `Session` object on the same id (e.g., from a fresh `runtime.session(id)` call elsewhere) is unaffected. If you need a global "this id is dead" signal, coordinate it at the application layer.
 
@@ -2421,6 +2429,7 @@ Every `StateStore` implementation must provide these methods.
 |--------|-------------|
 | `saveSession(sessionId, history)` | Save session message history |
 | `getSession(sessionId)` | Get session message history (returns `[]` if not found) |
+| `updateSession?(sessionId, update)` | Optional. Replace a session's history based on what's stored, without overwriting a write from another process. `update` receives the stored history, or `null` if there is none, and returns the new history, or `null` to write nothing. It may run more than once, so the read and write must be atomic. Sessions use `saveSession` on a store without it |
 | `deleteSession(sessionId)` | Delete a session and its metadata |
 | `saveSessionMeta(sessionId, key, value)` | Save session metadata (e.g., context summaries) |
 | `getSessionMeta(sessionId, key)` | Get session metadata |
@@ -2810,6 +2819,7 @@ All errors extend `AxlError`.
 | `AxlError` / `INCOMPATIBLE_ACCOUNTING_SCOPE` | paid operation or nested `trackOutcome` under another loaded copy's incompatible active scope | Refuses the operation before dispatch; the enclosing accounting becomes `incomplete` / `uninstrumented` |
 | `GuardrailError` | `ctx.ask()` | Guardrail blocked and retries exhausted. Includes `.guardrailType`, `.reason` |
 | `ProviderError` | provider adapters (via `ctx.ask()`) | Non-2xx HTTP response, or a normalized network failure (`status: 0`). `code: 'PROVIDER_ERROR'`. Includes `.provider`, `.status`, `.retryable`, `.retryAfterMs?`, `.requestId?`, `.body?`, `.timing?`. Message is the provider's text verbatim (no prefix). |
+| `AxlError` with `code: 'SESSION_CONFLICT'` | `session.send`, `RedisStore.updateSession` | The session kept changing, so the turn couldn't be saved after 10 attempts. The turn has already run. `session.stream` reports this through `session_history_save_failed` instead |
 | `AxlError` with `code: 'REDIS_UNAVAILABLE'` | any `RedisStore` call | `RedisStore` isn't connected, so the command wasn't sent. It reconnects automatically. See [Riding out a Redis outage](./integration.md#riding-out-a-redis-outage) |
 | `InvalidModelInputError` | `ctx.ask()`, `ctx.delegate()`, `agent.ask()` | Malformed `ModelInput`. `code: 'INVALID_MODEL_INPUT'`. Invalid inputs fail before dispatch and the message never includes raw media. |
 | `UnsupportedModelInputError` | rich `ctx.ask()` / `ctx.delegate()` | Axl cannot safely map the provider/source/composition, or the effective model ID is empty. `code: 'UNSUPPORTED_MODEL_INPUT'`; includes safe `.provider`, `.model`, `.modality`, and optional `.source`, never the raw locator or bytes. `.modality` is typed `string` and is today `'image'` or `'audio'`, derived from the **offending part** — a mixed input whose audio part is rejected reports `'audio'`, and one whose image part is rejected reports `'image'`. The unsupported *feature* is named in `.message` only; it is not a retained field. For catalog-capable transports, an upstream model-capability rejection is instead a `ProviderError`. |

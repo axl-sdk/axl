@@ -110,23 +110,29 @@ const store = await RedisStore.create({
 try {
   return await session.send('chat', input);
 } catch (err) {
-  const neverSent = err instanceof AxlError && err.code === 'REDIS_UNAVAILABLE';
-  // Calls waiting on Redis when it dropped reject with the Redis client's own error.
-  if (neverSent || !store.isConnected) {
+  const redisDown =
+    err instanceof AxlError &&
+    (err.code === 'REDIS_UNAVAILABLE' || err.code === 'REDIS_CONNECTION_LOST');
+  if (redisDown) {
     return reply.status(503).send({ error: 'Try again shortly' });
   }
   throw err;
 }
 ```
 
-`!store.isConnected` is a best guess: an unrelated failure during an outage also matches it, and a very fast reconnect can miss a dropped call. It also works for a readiness probe.
+The two codes differ in whether the call reached Redis:
+
+- **`REDIS_UNAVAILABLE`:** the call was never sent, so it's safe to retry.
+- **`REDIS_CONNECTION_LOST`:** the call was sent and the connection failed before Redis answered. **A write may still have applied**, so make retries safe to repeat. The Redis client's error is in `cause`, and its message is part of this one.
+
+Errors Redis itself returns, such as `NOPERM`, come through unchanged. For a readiness probe, use `store.isConnected`.
 
 Without `onConnectionEvent`, the store logs one line when an outage starts and one when it ends. With it, you get an `error` event for each failed reconnect attempt, up to about one every 2 seconds.
 
 | What was happening | What you see |
 |---|---|
 | Call made while disconnected | Rejects at once with `AxlError` code `REDIS_UNAVAILABLE`. It's never sent later |
-| Call waiting on Redis when the connection dropped | Rejects at once with the Redis client's error, such as `Socket closed unexpectedly`. **A write may still have applied**, so make retries safe to repeat |
+| Call waiting on Redis when the connection dropped | Rejects at once with `AxlError` code `REDIS_CONNECTION_LOST`. **A write may still have applied**, so make retries safe to repeat |
 | `ctx.ask` started during an outage | Rejects with `REDIS_UNAVAILABLE` before calling the model, so nothing is spent |
 | Redis drops while `ctx.ask` waits for the model | You still get the answer. It isn't saved as a checkpoint, and neither are later automatic steps in that run, so a replay would run them again. `console.error` says so |
 | `ctx.checkpoint` or `ctx.awaitHuman` during an outage | Rejects with `REDIS_UNAVAILABLE`. If `ctx.checkpoint` can't save after your function ran, it rejects even though your function's work is done |
@@ -153,7 +159,15 @@ const store = await RedisStore.create({
 });
 ```
 
-Until it connects, calls reject with `REDIS_UNAVAILABLE` and `store.isConnected` is `false`, the same as during an outage. Startup work that needs the store, such as `runtime.recoverIncompleteStreams()`, rejects too, so wait for `store.isConnected` or retry it.
+Until it connects, calls reject with `REDIS_UNAVAILABLE` and `store.isConnected` is `false`, the same as during an outage. Startup work that needs the store, such as `runtime.recoverIncompleteStreams()`, rejects too, so start it on the `connected` event:
+
+```ts
+onConnectionEvent: (event) => {
+  if (event.type === 'connected') void runtime.recoverIncompleteStreams();
+},
+```
+
+`connected` comes once, on the first connection. Later recoveries are `reconnected`. Without `onConnectionEvent`, the store logs that it can't reach Redis yet, and then that it connected.
 
 - **`responseTimeoutMs` is required.** It stops a server that accepts the connection but never answers from leaving the store connecting forever.
 - **Wrong settings don't stop your app.** A bad password or URL host shows up as repeated `error` events, not as a failed `create()`, so watch `onConnectionEvent` or `isConnected`.
@@ -171,7 +185,7 @@ const store = await RedisStore.create({
 });
 ```
 
-The store sends a `PING` about every third of that time. If one goes unanswered for the full time, the store drops the connection and reconnects. Calls waiting on Redis reject, and calls made until it reconnects reject with `REDIS_UNAVAILABLE`. A problem is noticed within about 1.3 times the value, and `create()` rejects if Redis hasn't finished connecting within it.
+The store sends a `PING` about every third of that time. If one goes unanswered for the full time, the store drops the connection and reconnects. Calls waiting on Redis reject with `REDIS_CONNECTION_LOST`, and calls made until it reconnects reject with `REDIS_UNAVAILABLE`. A problem is noticed within about 1.3 times the value, and `create()` rejects if Redis hasn't finished connecting within it.
 
 Choosing a value:
 

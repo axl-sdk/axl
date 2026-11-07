@@ -69,6 +69,7 @@ describe('RedisStore connection handling', () => {
   });
 
   afterEach(async () => {
+    fake.reply = () => undefined;
     fake.hold = () => false;
     await Promise.allSettled(stores.map((store) => store.close()));
     await fake.stop().catch(() => {});
@@ -102,9 +103,24 @@ describe('RedisStore connection handling', () => {
 
       fake.dropConnections();
 
-      await expect(read).rejects.toThrow('Socket closed unexpectedly');
-      await expect(write).rejects.toThrow('Socket closed unexpectedly');
+      // Both were sent, so either may have applied: a code of their own, not REDIS_UNAVAILABLE.
+      for (const call of [read, write]) {
+        const error = await call.catch((e: unknown) => e);
+        expect(error).toMatchObject({ name: 'AxlError', code: 'REDIS_CONNECTION_LOST' });
+        expect((error as Error).message).toContain('Socket closed unexpectedly');
+        expect((error as Error).cause).toBeInstanceOf(Error);
+      }
       expect(uncaught).not.toHaveBeenCalled();
+    });
+
+    it('passes an error Redis sent back through unchanged', async () => {
+      const store = await open();
+      fake.reply = (command) => (command[0] === 'GET' ? '-NOPERM no permission\r\n' : undefined);
+      const error = await store.getSession('s1').catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(Error);
+      expect((error as { code?: string }).code).toBeUndefined();
+      expect((error as Error).message).toContain('NOPERM');
+      expect(store.isConnected).toBe(true);
     });
 
     it('recovers after the server stops and comes back on the same port', async () => {
@@ -291,7 +307,7 @@ describe('RedisStore connection handling', () => {
 
       await store.close();
 
-      await expect(read).rejects.toThrow();
+      await expect(read).rejects.toMatchObject({ name: 'AxlError', code: 'REDIS_CONNECTION_LOST' });
     });
 
     it('resolves and reports nothing further when a reconnect is mid-handshake', async () => {
@@ -565,7 +581,9 @@ describe('RedisStore connection handling', () => {
         onConnectionEvent: (e) => events.push(e),
       });
       stallServer();
-      await expect(store.saveSession('s', [{ role: 'user', content: 'hi' }])).rejects.toThrow();
+      await expect(store.saveSession('s', [{ role: 'user', content: 'hi' }])).rejects.toMatchObject(
+        { name: 'AxlError', code: 'REDIS_CONNECTION_LOST' },
+      );
       fake.hold = () => false;
       await waitUntil(() => store.isConnected && events.some((e) => e.type === 'reconnected'));
       await expect(store.getSession('nothing')).resolves.toEqual([]);
@@ -740,7 +758,13 @@ describe('RedisStore connection handling', () => {
       await waitUntil(() => store.isConnected, 5000);
       expect(store.historyPaging).toBe(true);
       await expect(store.getSession('nothing')).resolves.toEqual([]);
-      expect(events.at(-1)).toEqual({ type: 'reconnected' });
+      // The first connection, not a recovery from an outage.
+      expect(events.at(-1)).toEqual({ type: 'connected' });
+      expect(events.some((e) => e.type === 'reconnected')).toBe(false);
+
+      fake.dropConnections();
+      await waitUntil(() => events.at(-1)?.type === 'reconnected', 5000);
+      expect(events.filter((e) => e.type === 'connected')).toHaveLength(1);
       expect(uncaught).not.toHaveBeenCalled();
       expect(unhandled).not.toHaveBeenCalled();
     });
@@ -749,6 +773,27 @@ describe('RedisStore connection handling', () => {
       const store = await openInBackground();
       await waitUntil(() => store.isConnected);
       expect(connectionLogs()).toEqual([]);
+    });
+
+    it('reports the first connection, so startup work need not poll', async () => {
+      const events: RedisConnectionEvent[] = [];
+      const store = await openInBackground({ onConnectionEvent: (e) => events.push(e) });
+      await waitUntil(() => events.length > 0);
+      expect(events).toEqual([{ type: 'connected' }]);
+      expect(store.isConnected).toBe(true);
+    });
+
+    it('logs a cold start as not connected yet, then connected', async () => {
+      await fake.stop();
+      const store = await openInBackground();
+      await waitUntil(() => connectionLogs().length === 1);
+      expect(connectionLogs()[0]).toMatch(/can't reach Redis yet/);
+      expect(connectionLogs()[0]).not.toMatch(/lost/);
+      await fake.start();
+      await waitUntil(() => store.isConnected, 5000);
+      await waitUntil(() => connectionLogs().length === 2);
+      expect(connectionLogs()[1]).toMatch(/connected to Redis/);
+      expect(connectionLogs()[1]).not.toMatch(/reconnected/);
     });
 
     it('gets past a server that accepts the connection but never answers', async () => {

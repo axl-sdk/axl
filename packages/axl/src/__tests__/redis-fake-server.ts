@@ -15,6 +15,8 @@ export interface FakeRedis {
   connectionCount(): number;
   /** Connections open right now, as this server sees them. */
   openConnectionCount(): number;
+  /** Return a raw RESP reply to send instead of the usual answer, such as an error. */
+  reply: (command: string[]) => string | undefined;
   /** Return true to leave a command unanswered, as a stalled server would. */
   hold: (command: string[]) => boolean;
   /** Close every client connection. The server keeps listening. */
@@ -130,6 +132,7 @@ export async function startFakeRedis(options?: { auth?: 'reject' }): Promise<Fak
     commands,
     connectionCount: () => connections,
     openConnectionCount: () => sockets.size,
+    reply: () => undefined,
     hold: () => false,
     dropConnections() {
       for (const socket of sockets) socket.destroy();
@@ -183,7 +186,7 @@ export async function startFakeRedis(options?: { auth?: 'reject' }): Promise<Fak
             }
           }
           if (fake.hold(command)) continue;
-          socket.write(respond(command, state));
+          socket.write(fake.reply(command) ?? respond(command, state));
         }
       });
     });

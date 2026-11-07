@@ -17,6 +17,7 @@ import type {
   HistoryTtls,
 } from './types.js';
 import { normalizePersistedSessionHistory } from '../input.js';
+import { updateSessionThroughOverrides } from './session-update.js';
 import { AxlError } from '../errors.js';
 import {
   PRUNE_BATCH,
@@ -383,6 +384,12 @@ export class SQLiteStore implements StateStore {
   }
 
   async updateSession(sessionId: string, update: SessionUpdate): Promise<void> {
+    if (
+      this.saveSession !== SQLiteStore.prototype.saveSession ||
+      this.getSession !== SQLiteStore.prototype.getSession
+    ) {
+      return updateSessionThroughOverrides(this, 'SQLiteStore', sessionId, update);
+    }
     // IMMEDIATE takes the write lock before reading, so another process sharing
     // the file can't write between the read and the write.
     this.db

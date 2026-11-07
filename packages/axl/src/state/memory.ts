@@ -21,6 +21,7 @@ import type {
 } from './types.js';
 import { getExecutionEventSchemaVersion, normalizeStoredExecution } from '../event-schema.js';
 import { normalizePersistedSessionHistory } from '../input.js';
+import { updateSessionThroughOverrides } from './session-update.js';
 import { AxlError } from '../errors.js';
 import {
   PRUNE_BATCH,
@@ -167,6 +168,12 @@ export class MemoryStore implements StateStore {
   }
 
   async updateSession(sessionId: string, update: SessionUpdate): Promise<void> {
+    if (
+      this.saveSession !== MemoryStore.prototype.saveSession ||
+      this.getSession !== MemoryStore.prototype.getSession
+    ) {
+      return updateSessionThroughOverrides(this, 'MemoryStore', sessionId, update);
+    }
     // No `await` before the save's body runs, so nothing can interleave.
     const stored = this.sessions.get(sessionId);
     const next = update(stored ? structuredClone(stored) : null);

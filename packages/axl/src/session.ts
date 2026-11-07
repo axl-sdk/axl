@@ -131,7 +131,14 @@ export class Session {
           summaryModel,
           cachedSummary ? { previousSummary: cachedSummary } : undefined,
         );
-        await this.store.saveSessionMeta(this.sessionId, 'summaryCache', summary);
+        // Summarizing is slow. If another instance saved meanwhile, it may have
+        // summarized further and trimmed, and this older summary would erase
+        // that: those messages would be in neither the history nor the summary.
+        // This turn still uses it. The next turn summarizes from what's stored.
+        const stored = JSON.stringify(await this.store.getSession(this.sessionId));
+        if (stored === storedJson) {
+          await this.store.saveSessionMeta(this.sessionId, 'summaryCache', summary);
+        }
         // Update local reference so the workflow receives the fresh summary
         cachedSummary = summary;
       }
@@ -205,10 +212,18 @@ export class Session {
       return [...current, ...history.slice(base.firstOwnMessage).map(withoutAnthropicThinking)];
     });
 
-    if (outcome === 'merged') {
-      this.runtime.emit('session_turns_merged', { sessionId: this.sessionId });
-    } else if (outcome === 'discarded') {
-      this.runtime.emit('session_turn_discarded', { sessionId: this.sessionId });
+    if (outcome === 'merged') this.notify('session_turns_merged');
+    else if (outcome === 'discarded') this.notify('session_turn_discarded');
+  }
+
+  /** The turn is already saved, so a listener that throws can't be allowed to fail it. */
+  private notify(event: 'session_turns_merged' | 'session_turn_discarded'): void {
+    try {
+      this.runtime.emit(event, { sessionId: this.sessionId });
+    } catch (err) {
+      console.error(
+        `[axl] A ${event} listener failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   }
 

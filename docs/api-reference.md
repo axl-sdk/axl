@@ -1778,11 +1778,18 @@ The queue above works within one runtime. When several app instances share a sto
 - **Each turn stays in one piece.** A turn's messages are added together after whatever was saved during it, so history stays in the order the turns finished.
 - **Overlapping turns can't see each other.** Both run, both cost money, and neither knows about the other's reply. `session_turns_merged` tells you it happened.
 - **`history.maxMessages` applies on the next turn.** Stored history can go over the limit after a merge. The next turn trims it, and summarizes what it drops if `summarize` is on, before calling the model.
-- **An ended session stays ended.** A turn that was running when another instance called `end()` isn't saved, and `session_turn_discarded` fires. If that was the session's first turn, it's saved instead, because nothing shows the session ever existed.
+- **An ended session stays ended.** A turn that was running when another instance called `end()` isn't saved, and `session_turn_discarded` fires. If the session had no messages when the turn started, the turn is saved instead, because nothing shows the session existed.
+- **Summaries are a best effort under overlap.** A summary isn't saved if the session changed while it was being generated. A write in the brief moment after that check can still replace a newer summary, and a summary can repeat content. To rule this out, run one turn at a time.
 
 To run one turn at a time per session across instances, route each session to one instance, or hold your own per-session lock around `send()` and `stream()`.
 
-On Redis this needs permission to run `EVAL`. Without it, turns are saved with `saveSession` and a one-time warning, and overlapping turns can overwrite each other. Custom stores get the same protection by implementing [`updateSession`](#statestore), and otherwise the last save wins.
+These stores and setups don't get the protection against overwrites, so the last save wins:
+
+| Setup | What happens |
+|---|---|
+| Redis user without permission to run `EVAL` | Turns use `saveSession`, with a one-time warning |
+| Subclass of a built-in store that overrides `saveSession` or `getSession` | Turns go through your overrides, with a one-time warning. Override [`updateSession`](#statestore) too to get the protection |
+| Custom store without [`updateSession`](#statestore) | Turns use `saveSession` |
 
 **Lifecycle ordering.** `end()` sets a per-instance `closed` flag synchronously, then queues the delete behind the lock. After `await session.end()` resolves, no further calls on that `Session` instance succeed (`closed` short-circuits at the top of `send`/`stream`). However, `closed` is per-instance — a *different* `Session` object on the same id (e.g., from a fresh `runtime.session(id)` call elsewhere) is unaffected. If you need a global "this id is dead" signal, coordinate it at the application layer.
 

@@ -359,6 +359,156 @@ describe('MemoryStore subclasses', () => {
   });
 });
 
+describe('built-in stores whose session methods are overridden', () => {
+  /** Add this to any store class: what it writes can't be read without its own getSession. */
+  function encrypting<T extends new (...args: never[]) => StateStore>(Base: T) {
+    return class extends Base {
+      writes = 0;
+      override async saveSession(id: string, history: ChatMessage[]): Promise<void> {
+        this.writes++;
+        const sealed = Buffer.from(JSON.stringify(history)).toString('base64');
+        await super.saveSession(id, [{ role: 'user', content: sealed }]);
+      }
+      override async getSession(id: string): Promise<ChatMessage[]> {
+        const [sealed] = await super.getSession(id);
+        if (!sealed) return [];
+        return JSON.parse(Buffer.from(String(sealed.content), 'base64').toString());
+      }
+    };
+  }
+
+  const sqliteStore = () => {
+    const dir = mkdtempSync(join(tmpdir(), 'axl-session-'));
+    tempDirs.push(dir);
+    const Encrypting = encrypting(SQLiteStore as never) as unknown as new (
+      path: string,
+    ) => StateStore & {
+      writes: number;
+    };
+    return new Encrypting(join(dir, 'state.db'));
+  };
+  const redisStore = () => {
+    const { store } = createRedisStoreWithMockClient();
+    const Encrypting = encrypting(RedisStore as never) as unknown as { prototype: object };
+    Object.setPrototypeOf(store, Encrypting.prototype);
+    return Object.assign(store, { writes: 0 });
+  };
+
+  it.each([
+    ['SQLiteStore', sqliteStore],
+    ['RedisStore', redisStore],
+  ])('%s goes through the overrides, and says it has no protection', async (name, create) => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const store = create();
+    const { first, release } = twoInstances(store);
+    for (const input of ['A', 'B']) {
+      release(input);
+      await first.session('chat').send('chat', input);
+    }
+
+    expect(store.writes).toBe(2);
+    expect(contents(await store.getSession('chat'))).toEqual([
+      'A',
+      'reply to A',
+      'B',
+      'reply to B',
+    ]);
+    const warnings = warn.mock.calls.flat().join(' ');
+    expect(warnings).toContain(name);
+    expect(warnings).toContain('updateSession');
+    warn.mockRestore();
+  });
+});
+
+describe('a summary written during an overlap', () => {
+  const options = { history: { maxMessages: 2, summarize: true, summaryModel: 'mock:summary' } };
+  const seed: ChatMessage[] = ['1', '2', '3', '4', '5', '6'].map((content) => ({
+    role: 'user',
+    content,
+  }));
+
+  it('does not replace a newer summary when history changed while it was generated', async () => {
+    const store = new MemoryStore();
+    await store.saveSession('chat', seed);
+    const { second, release } = twoInstances(store);
+    const summarizing = makeGate();
+    const finishSummary = makeGate();
+    vi.spyOn(second, 'summarizeMessages').mockImplementation(async () => {
+      summarizing.open();
+      await finishSummary.opened;
+      return 'older summary';
+    });
+
+    release('B');
+    const turn = second.session('chat', options).send('chat', 'B');
+    await summarizing.opened;
+    // Another instance summarizes further and trims while this one is still working.
+    await store.saveSessionMeta('chat', 'summaryCache', 'newer summary');
+    await store.saveSession('chat', seed.slice(-2));
+    finishSummary.open();
+    await turn;
+
+    expect(await store.getSessionMeta('chat', 'summaryCache')).toBe('newer summary');
+    expect(contents(await store.getSession('chat'))).toEqual(['5', '6', 'B', 'reply to B']);
+  });
+
+  it('saves the summary when nothing else changed', async () => {
+    const store = new MemoryStore();
+    await store.saveSession('chat', seed);
+    const { first, release } = twoInstances(store);
+    vi.spyOn(first, 'summarizeMessages').mockResolvedValue('a summary');
+    release('A');
+    await first.session('chat', options).send('chat', 'A');
+    expect(await store.getSessionMeta('chat', 'summaryCache')).toBe('a summary');
+    expect(contents(await store.getSession('chat'))).toEqual(['5', '6', 'A', 'reply to A']);
+  });
+});
+
+describe('a listener that throws', () => {
+  it('does not fail a turn that was saved', async () => {
+    const store = new MemoryStore();
+    const { first, second, release, untilStarted } = twoInstances(store);
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    second.on('session_turns_merged', () => {
+      throw new Error('listener broke');
+    });
+    const failed = vi.fn();
+    second.on('error', failed);
+
+    const a = first.session('chat').send('chat', 'A');
+    await untilStarted('A');
+    const b = await second.session('chat').stream('chat', 'B');
+    await untilStarted('B');
+    release('A');
+    await a;
+    release('B');
+    await b.promise;
+
+    await vi.waitFor(async () => {
+      expect(contents(await store.getSession('chat'))).toEqual([
+        'A',
+        'reply to A',
+        'B',
+        'reply to B',
+      ]);
+    });
+    await vi.waitFor(() =>
+      expect(consoleError.mock.calls.flat().join(' ')).toContain('listener broke'),
+    );
+    expect(failed).not.toHaveBeenCalled();
+
+    const c = first.session('chat').send('chat', 'C');
+    await untilStarted('C');
+    const d = second.session('chat').send('chat', 'D');
+    await untilStarted('D');
+    release('C');
+    await c;
+    release('D');
+    await expect(d).resolves.toBe('reply to D');
+    consoleError.mockRestore();
+  });
+});
+
 describe('RedisStore.updateSession', () => {
   const message = (content: string): ChatMessage => ({ role: 'user', content });
 

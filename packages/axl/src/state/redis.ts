@@ -19,6 +19,7 @@ import type {
 } from './types.js';
 import { AxlError } from '../errors.js';
 import { normalizePersistedSessionHistory } from '../input.js';
+import { updateSessionThroughOverrides } from './session-update.js';
 import { getExecutionEventSchemaVersion, normalizeStoredExecution } from '../event-schema.js';
 import { warnDiagnosticOnce } from '../schema-diagnostics.js';
 import {
@@ -1243,6 +1244,12 @@ export class RedisStore implements StateStore {
   }
 
   async updateSession(sessionId: string, update: SessionUpdate): Promise<void> {
+    if (
+      this.saveSession !== RedisStore.prototype.saveSession ||
+      this.getSession !== RedisStore.prototype.getSession
+    ) {
+      return updateSessionThroughOverrides(this, 'RedisStore', sessionId, update);
+    }
     const key = this.sessionKey(sessionId);
     const ttl = this.ttlFor('session');
     for (let attempt = 0; attempt < UPDATE_SESSION_ATTEMPTS; attempt++) {

@@ -1,5 +1,4 @@
 import { createHash } from 'node:crypto';
-import { createRequire } from 'node:module';
 import type {
   AxlEvent,
   ChatMessage,
@@ -527,41 +526,27 @@ function abandonConnection(client: RedisClient): void {
 }
 
 /**
- * How to recognize an error Redis sent back. node-redis's base class for them,
- * `ErrorReply`, is exported by `redis` only from 5.1, but by `@redis/client`
- * throughout 5.x, so load it from beside the installed `redis`.
- */
-function redisReplyCheck(redisModule: { ErrorReply?: unknown }): (error: unknown) => boolean {
-  let ErrorReply = redisModule.ErrorReply;
-  if (typeof ErrorReply !== 'function') {
-    ErrorReply = createRequire(require.resolve('redis'))('@redis/client').ErrorReply;
-  }
-  if (typeof ErrorReply !== 'function') {
-    throw new Error(
-      'redis package does not export ErrorReply. Ensure you have redis ^5.0.0 installed: npm install redis',
-    );
-  }
-  const replyClass = ErrorReply as new (...args: never[]) => Error;
-  return (error) => error instanceof replyClass;
-}
-
-/**
- * Give commands that fail after they were sent a code of their own. They may
- * have applied, so they can't share `REDIS_UNAVAILABLE`, which promises a
- * command was never sent. node-redis rejects them with whatever ended the
- * socket, from its own errors to the operating system's `ECONNRESET`, so the
- * test is what they aren't: an error Redis sent back. Our own errors, such as
- * `REDIS_UNAVAILABLE`, pass through.
+ * Give commands cut off by a lost connection a code of their own. They were
+ * sent and may have applied, so they can't share `REDIS_UNAVAILABLE`, which
+ * promises a command was never sent.
+ *
+ * The test is the connection's state when the rejection arrives, not the
+ * error's class: node-redis rejects them with whatever ended the socket, up to
+ * the operating system's `ECONNRESET`, and it also rejects a bad argument
+ * without sending anything. Every loss leaves the connection down before the
+ * rejection is handled, because node-redis fails waiting commands as it tears
+ * the socket down. On a healthy connection, errors pass through unchanged,
+ * whether Redis sent them, like `NOPERM`, or node-redis did, like a bad
+ * argument. A call that fails for another reason at the moment the connection
+ * fails is labeled lost too, which only makes a retry more careful.
  *
  * A transaction is built by chaining on the object `multi()` returns, so that
  * object is wrapped too, and the chain keeps returning the wrapper.
  */
-function withLostConnectionErrors(
-  client: RedisClient,
-  isRedisReply: (error: unknown) => boolean,
-): RedisClient {
+function withLostConnectionErrors(client: RedisClient): RedisClient {
   const relabel = (error: unknown): never => {
-    if (error instanceof AxlError || isRedisReply(error)) throw error;
+    const connected = client.isReady !== false && client.isOpen !== false;
+    if (connected || error instanceof AxlError) throw error;
     const lost = new AxlError(
       'REDIS_CONNECTION_LOST',
       `RedisStore: the connection to Redis failed before it answered (${errorMessage(error)}). ` +
@@ -891,23 +876,16 @@ export class RedisStore implements StateStore {
           'The store reconnects automatically; retry once Redis is back.',
       );
     }
-    if (!this.isRedisReply) return this.connection;
     // Keyed by the connection it wraps, so a connection swapped in later is used.
     if (this.reportingLostConnections?.wraps !== this.connection) {
       this.reportingLostConnections = {
         wraps: this.connection,
-        client: withLostConnectionErrors(this.connection, this.isRedisReply),
+        client: withLostConnectionErrors(this.connection),
       };
     }
     return this.reportingLostConnections.client;
   }
 
-  /**
-   * Whether an error is one Redis sent back, such as `NOPERM`. Any other
-   * failure of a command that was sent means the connection failed. Unset for
-   * a store built over a test client, whose errors pass through as they are.
-   */
-  private isRedisReply?: (error: unknown) => boolean;
   private reportingLostConnections?: { wraps: RedisClient; client: RedisClient };
 
   /**
@@ -994,11 +972,9 @@ export class RedisStore implements StateStore {
     }
 
     let createClient: (clientOpts: RedisClientOptions) => ConnectableRedisClient;
-    let isRedisReply: (error: unknown) => boolean;
     try {
       const mod = require('redis');
       createClient = mod.createClient ?? mod.default?.createClient;
-      isRedisReply = redisReplyCheck(mod);
       if (typeof createClient !== 'function') {
         throw new Error(
           'redis package does not export createClient. Ensure you have redis ^5.0.0 installed: npm install redis',
@@ -1044,7 +1020,6 @@ export class RedisStore implements StateStore {
 
     const store = new RedisStore(client, keyPrefix, effectiveTtls);
     store.stopResponseWatch = stopResponseWatch;
-    store.isRedisReply = isRedisReply;
     warnIfRedisExecutionRetentionUnset(opts);
 
     if (opts.waitForConnection === false) {

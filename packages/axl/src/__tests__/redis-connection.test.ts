@@ -113,6 +113,16 @@ describe('RedisStore connection handling', () => {
       expect(uncaught).not.toHaveBeenCalled();
     });
 
+    it('passes a bad argument through unchanged, since nothing was sent', async () => {
+      const store = await open();
+      const sent = fake.commands.length;
+      const error = await store
+        .saveCheckpoint('e', 'n', undefined as unknown as object)
+        .catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(TypeError);
+      expect(fake.commands.slice(sent).some((command) => command[0] === 'HSET')).toBe(false);
+    });
+
     it('passes an error Redis sent back through unchanged', async () => {
       const store = await open();
       fake.reply = (command) => (command[0] === 'GET' ? '-NOPERM no permission\r\n' : undefined);

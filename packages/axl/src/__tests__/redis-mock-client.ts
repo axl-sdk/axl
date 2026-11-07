@@ -317,7 +317,7 @@ export function createRedisStoreWithMockClient(keyPrefix = 'axl:', ttlConfig?: M
   const ttls = new Map<string, number>();
   // Lists for streaming-event persistence (RPUSH / LRANGE).
   const listData = new Map<string, string[]>();
-  // node-redis exposes an open socket as `isOpen` and rejects a QUIT on a
+  // node-redis exposes an open socket as `isOpen` and `destroy()` throws on a
   // closed client; a real Redis run proved it, so the mock reproduces it.
   let clientOpen = true;
 
@@ -572,7 +572,11 @@ export function createRedisStoreWithMockClient(keyPrefix = 'axl:', ttlConfig?: M
       }
       return removed;
     }),
-    quit: vi.fn(async () => {
+    ping: vi.fn(async () => {
+      if (!clientOpen) throw new Error('The client is closed');
+      return 'PONG';
+    }),
+    destroy: vi.fn(() => {
       if (!clientOpen) throw new Error('The client is closed');
       clientOpen = false;
     }),

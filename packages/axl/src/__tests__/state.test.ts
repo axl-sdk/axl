@@ -1122,12 +1122,12 @@ describe('RedisStore', () => {
   });
 
   describe('close', () => {
-    it('calls quit on the redis client', async () => {
+    it('closes the redis client', async () => {
       const { store, mockClient } = createRedisStoreWithMockClient();
 
       await store.close();
 
-      expect(mockClient.quit).toHaveBeenCalledOnce();
+      expect(mockClient.isOpen).toBe(false);
     });
 
     it('closes idempotently, so a caller may close a store its runtime already closed', async () => {
@@ -1140,7 +1140,7 @@ describe('RedisStore', () => {
       await store.close();
       await expect(store.close()).resolves.toBeUndefined();
 
-      expect(mockClient.quit).toHaveBeenCalledOnce();
+      expect(mockClient.destroy).toHaveBeenCalledOnce();
     });
   });
 

@@ -117,14 +117,11 @@ interface RedisClient {
   // EVAL runs a Lua script atomically. Only PRUNE_HISTORY_INDEX_SCRIPT uses
   // it; every key the script touches is passed in `keys`.
   eval(script: string, options: { keys: string[]; arguments: string[] }): Promise<unknown>;
-  // Only sent when `responseTimeoutMs` is set. Any reply, even an error, shows
-  // the server is answering.
+  // Sent when `responseTimeoutMs` is set, and by `close()`. Any reply, even an
+  // error, shows the server is answering.
   ping(): Promise<unknown>;
-  quit(): Promise<void>;
-  // node-redis reports its socket state here and rejects a QUIT once the
-  // client is closed. Optional because a caller may inject a minimal client
-  // shim that does not expose it — one that omits it keeps the old
-  // quit-unconditionally behavior.
+  // node-redis reports its socket state here. Optional because a caller may inject a minimal client
+  // shim that does not expose it.
   readonly isOpen?: boolean;
   // True only while connected and past the handshake. `isOpen && !isReady`
   // means node-redis is reconnecting. Optional for the same reason as isOpen.
@@ -507,7 +504,7 @@ export function warnIfRedisExecutionRetentionUnset(opts: RedisStoreOptions): voi
   }
 }
 
-/** How long `close()` waits for Redis to answer `QUIT`. */
+/** How long `close()` waits for commands already sent to be answered. */
 const CLOSE_TIMEOUT_MS = 2000;
 
 /** Matches node-redis's default backoff: exponential, capped at 2 s, with up to 200 ms of jitter. */
@@ -515,18 +512,13 @@ function reconnectDelayMs(retries: number): number {
   return Math.min(2 ** retries * 50, 2000) + Math.floor(Math.random() * 200);
 }
 
-/**
- * Stop a client without Redis's cooperation. `destroy()` rejects queued
- * commands, then throws if `quit()` already began, in which case the socket
- * stays open and `unref()` keeps it from holding the process open.
- */
+/** Close a client's socket now, rejecting any commands still waiting for an answer. */
 function abandonConnection(client: RedisClient): void {
   try {
     client.destroy?.();
   } catch {
-    // Already closing; the queued commands were rejected before the throw.
+    // Another close got there first, and the socket is already closed.
   }
-  client.unref?.();
 }
 
 function errorMessage(error: unknown): string {
@@ -2299,31 +2291,33 @@ export class RedisStore implements StateStore {
    * better-sqlite3's `close()` are both no-ops the second time; node-redis
    * instead rejects with "The client is closed", so absorb that here.
    *
-   * Bounded, so a shutdown can't hang on Redis. `QUIT` lets queued commands
-   * finish on a healthy connection, but node-redis never settles it if the
-   * socket closes first, and a stalled server may never answer it. While
-   * disconnected it couldn't be sent at all.
+   * Bounded, so a shutdown can't hang on Redis. Replies arrive in order, so a
+   * reply to this PING means every earlier command has finished.
+   *
+   * Not `quit()`: it marks the client closed before the server answers, and
+   * `destroy()` then throws without touching the socket, so a stalled server's
+   * socket could never be closed. There's no other public way to close it. A
+   * closed socket is all Redis needs to clean up, so nothing is lost.
    */
   async close(): Promise<void> {
     this.stopResponseWatch?.();
     if (this.connection.isOpen === false) return;
-    if (this.connection.isReady === false) {
-      abandonConnection(this.connection);
-      return;
+    if (this.connection.isReady !== false) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          this.connection.ping(),
+          new Promise((_resolve, reject) => {
+            timer = setTimeout(() => reject(new Error('PING timed out')), CLOSE_TIMEOUT_MS);
+          }),
+        ]);
+      } catch {
+        // Stalled or disconnected. Waiting commands are rejected below.
+      } finally {
+        clearTimeout(timer);
+      }
     }
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      await Promise.race([
-        this.connection.quit(),
-        new Promise((_resolve, reject) => {
-          timer = setTimeout(() => reject(new Error('QUIT timed out')), CLOSE_TIMEOUT_MS);
-        }),
-      ]);
-    } catch {
-      abandonConnection(this.connection);
-    } finally {
-      clearTimeout(timer);
-    }
+    abandonConnection(this.connection);
   }
 
   async deleteCheckpoints(executionId: string): Promise<void> {

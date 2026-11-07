@@ -238,25 +238,46 @@ describe('RedisStore connection handling', () => {
       expect(fake.connectionCount()).toBe(after);
     });
 
-    it('resolves when the connection drops before QUIT is answered', async () => {
+    it('resolves when the connection drops before the server answers', async () => {
       const store = await open();
-      fake.hold = (command) => command[0] === 'QUIT';
+      fake.hold = (command) => command[0] === 'PING';
       const closing = store.close();
-      await fake.waitForCommand((command) => command[0] === 'QUIT');
+      await fake.waitForCommand((command) => command[0] === 'PING');
 
       fake.dropConnections();
 
       await expect(closing).resolves.toBeUndefined();
     });
 
-    it('resolves when the server never answers QUIT', async () => {
+    it('resolves when the server never answers', async () => {
       const store = await open();
-      fake.hold = (command) => command[0] === 'QUIT';
+      fake.hold = () => true;
 
       const start = Date.now();
       await store.close();
 
       expect(Date.now() - start).toBeLessThan(2500);
+    });
+
+    it('closes the socket when the server stops answering', async () => {
+      const store = await open();
+      expect(fake.openConnectionCount()).toBe(1);
+      fake.hold = () => true;
+
+      await store.close();
+
+      await waitUntil(() => fake.openConnectionCount() === 0);
+      expect(store.isConnected).toBe(false);
+    });
+
+    it('rejects commands that never got an answer', async () => {
+      const store = await open();
+      fake.hold = () => true;
+      const read = store.getSession('s1');
+
+      await store.close();
+
+      await expect(read).rejects.toThrow();
     });
 
     it('resolves and reports nothing further when a reconnect is mid-handshake', async () => {
@@ -283,7 +304,7 @@ describe('RedisStore connection handling', () => {
       await store.close();
 
       await expect(read).resolves.toEqual([{ role: 'user', content: 'hi' }]);
-      expect(fake.commands.at(-1)?.[0]).toBe('QUIT');
+      await waitUntil(() => fake.openConnectionCount() === 0);
     });
   });
 

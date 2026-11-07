@@ -123,7 +123,7 @@ try {
 The two codes differ in whether the call reached Redis:
 
 - **`REDIS_UNAVAILABLE`:** the call was never sent, so it's safe to retry.
-- **`REDIS_CONNECTION_LOST`:** the call was sent and the connection failed before Redis answered. **A write may still have applied**, so make retries safe to repeat. The Redis client's error is in `cause`, and its message is part of this one.
+- **`REDIS_CONNECTION_LOST`:** the connection failed before Redis answered, and the call may have reached Redis. **A write may still have applied**, so make retries safe to repeat. The Redis client's error is in `cause`, and its message is part of this one.
 
 Errors on a healthy connection come through unchanged, whether Redis returned them, such as `NOPERM`, or the call had a bad argument. For a readiness probe, use `store.isConnected`.
 

@@ -2236,7 +2236,7 @@ Per store:
 
 ### RedisStore options
 
-`RedisStore` requires Redis 7.0 or newer. It cleans up history listing indexes with a small Lua script, so the Redis user also needs permission to run `EVAL`. If your ACL denies scripting, saves still succeed, the indexes are not cleaned up, and the store prints a one-time warning per history kind saying the cleanup failed.
+`RedisStore` requires Redis 7.0 or newer. It saves session turns and cleans up its listing indexes with small Lua scripts, so the Redis user also needs permission to run `EVAL`. If your ACL denies scripting, saves still succeed, the indexes are not cleaned up, and the store prints a one-time warning per history kind saying the cleanup failed.
 
 `RedisStore.create()` accepts either a URL string (back-compat) or an options object. `store.isConnected` reports whether the store can send commands right now: `false` while reconnecting and after `close()`.
 

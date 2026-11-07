@@ -772,6 +772,8 @@ async function connectClient(
 export class RedisStore implements StateStore {
   /** Where the next save's check of listed sessions picks up. */
   private sessionSweepCursor = '0';
+  /** Overlapping saves would all check the same page, so only one checks at a time. */
+  private sessionSweepRunning = false;
 
   private constructor(
     private connection: RedisClient,
@@ -2177,7 +2179,8 @@ export class RedisStore implements StateStore {
    * can't fail it.
    */
   private async sweepSessionIds(): Promise<void> {
-    if (this.ttlFor('session') === undefined) return;
+    if (this.ttlFor('session') === undefined || this.sessionSweepRunning) return;
+    this.sessionSweepRunning = true;
     try {
       const page = await this.client.sScan(this.sessionIdsKey(), this.sessionSweepCursor, {
         COUNT: SESSION_SWEEP_COUNT,
@@ -2186,6 +2189,8 @@ export class RedisStore implements StateStore {
       await this.pruneSessionIds(page.members);
     } catch (err) {
       this.warnSessionPruneFailed(err);
+    } finally {
+      this.sessionSweepRunning = false;
     }
   }
 

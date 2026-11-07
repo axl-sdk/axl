@@ -110,6 +110,34 @@ describe('RedisStore session id cleanup on save', () => {
     expect(mockClient.sScan).not.toHaveBeenCalled();
   });
 
+  it('skips the check while another save is already doing one', async () => {
+    const { store, mockClient } = createRedisStoreWithMockClient('axl:', { session: 60 });
+    const realScan = mockClient.sScan.getMockImplementation()!;
+    let finishScan = () => {};
+    const scanFinished = new Promise<void>((resolve) => (finishScan = resolve));
+    mockClient.sScan.mockImplementationOnce(async (key, cursor, options) => {
+      await scanFinished;
+      return realScan(key, cursor, options);
+    });
+
+    const slow = store.saveSession('a', history);
+    await vi.waitFor(() => expect(mockClient.sScan).toHaveBeenCalledTimes(1));
+    await store.saveSession('b', history);
+    expect(mockClient.sScan).toHaveBeenCalledTimes(1);
+
+    finishScan();
+    await slow;
+    await store.saveSession('c', history);
+    expect(mockClient.sScan).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not fail a save when the check loses its connection', async () => {
+    const { store, mockClient } = createRedisStoreWithMockClient('axl:', { session: 60 });
+    mockClient.sScan.mockRejectedValueOnce(new Error('Socket closed unexpectedly'));
+    await expect(store.saveSession('s', history)).resolves.toBeUndefined();
+    expect(await store.getSession('s')).toEqual(history);
+  });
+
   it('does not fail a save when the cleanup fails', async () => {
     const { store, mockClient } = createRedisStoreWithMockClient('axl:', { session: 60 });
     await store.saveSession('first', history);

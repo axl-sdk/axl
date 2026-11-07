@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **`RedisStore` can recover when Redis stops answering.** Set `responseTimeoutMs` so that a hung server or a silently dropped connection rejects waiting calls and reconnects, instead of leaving them pending, even while your app keeps sending commands. It also limits how long `create()` waits for a server that accepts the connection but never answers. Off by default. See [When Redis stops answering](docs/integration.md#when-redis-stops-answering).
+- **Your app can start while Redis is down.** With `RedisStore.create({ waitForConnection: false, responseTimeoutMs })`, `create()` returns right away and the store connects in the background. Calls reject with `REDIS_UNAVAILABLE` until it connects. See [Starting while Redis is down](docs/integration.md#starting-while-redis-is-down).
 
 ### Fixed
 

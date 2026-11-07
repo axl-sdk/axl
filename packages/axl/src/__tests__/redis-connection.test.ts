@@ -664,6 +664,157 @@ describe('RedisStore connection handling', () => {
     });
   });
 
+  describe('waitForConnection: false', () => {
+    const openInBackground = async (extra?: {
+      onConnectionEvent?: (event: RedisConnectionEvent) => void;
+      skipMigration?: boolean;
+    }) => {
+      const store = await RedisStore.create({
+        url: fake.url,
+        skipMigration: true,
+        ttls: { executionHistory: null },
+        waitForConnection: false,
+        responseTimeoutMs: 100,
+        ...extra,
+      });
+      stores.push(store);
+      return store;
+    };
+
+    it('requires responseTimeoutMs, so a silent server cannot leave it connecting forever', async () => {
+      await expect(RedisStore.create({ url: fake.url, waitForConnection: false })).rejects.toThrow(
+        /responseTimeoutMs/,
+      );
+      expect(fake.connectionCount()).toBe(0);
+    });
+
+    it('returns while Redis is down, fails fast, and connects once Redis is up', async () => {
+      await fake.stop();
+      const events: RedisConnectionEvent[] = [];
+      const started = Date.now();
+      const store = await openInBackground({ onConnectionEvent: (e) => events.push(e) });
+      expect(Date.now() - started).toBeLessThan(500);
+
+      expect(store.isConnected).toBe(false);
+      expect(store.historyPaging).toBe(true);
+      await expect(store.getSession('s')).rejects.toMatchObject({ code: 'REDIS_UNAVAILABLE' });
+      await expect(store.saveSession('s', [])).rejects.toMatchObject({ code: 'REDIS_UNAVAILABLE' });
+      await waitUntil(() => events.some((e) => e.type === 'error'));
+
+      await fake.start();
+      await waitUntil(() => store.isConnected, 5000);
+      expect(store.historyPaging).toBe(true);
+      await expect(store.getSession('nothing')).resolves.toEqual([]);
+      expect(events.at(-1)).toEqual({ type: 'reconnected' });
+      expect(uncaught).not.toHaveBeenCalled();
+      expect(unhandled).not.toHaveBeenCalled();
+    });
+
+    it('stays quiet on a first connection that simply works', async () => {
+      const store = await openInBackground();
+      await waitUntil(() => store.isConnected);
+      expect(connectionLogs()).toEqual([]);
+    });
+
+    it('gets past a server that accepts the connection but never answers', async () => {
+      fake.hold = () => true;
+      const store = await openInBackground();
+      await waitUntil(() => fake.connectionCount() > 0);
+      expect(store.isConnected).toBe(false);
+      await expect(store.getSession('s')).rejects.toMatchObject({ code: 'REDIS_UNAVAILABLE' });
+
+      // The stuck connection never gets an answer, so this needs a new one.
+      const connectionsWhileSilent = fake.connectionCount();
+      fake.hold = () => false;
+      await waitUntil(
+        () => fake.connectionCount() > connectionsWhileSilent && store.isConnected,
+        5000,
+      );
+      await expect(store.getSession('nothing')).resolves.toEqual([]);
+    });
+
+    it('reports each failed attempt and keeps trying', async () => {
+      fake.hold = () => true;
+      const events: RedisConnectionEvent[] = [];
+      const store = await openInBackground({ onConnectionEvent: (e) => events.push(e) });
+      await waitUntil(() => events.filter((e) => e.type === 'error').length >= 2, 5000);
+      fake.hold = () => false;
+      await waitUntil(() => store.isConnected, 5000);
+    });
+
+    it('closes promptly while connecting, stops trying, and leaves nothing running', async () => {
+      await fake.stop();
+      const store = await openInBackground();
+      await sleep(50);
+      const started = Date.now();
+      await store.close();
+      await store.close();
+      expect(Date.now() - started).toBeLessThan(500);
+      expect(store.isConnected).toBe(false);
+
+      await fake.start();
+      const connections = fake.connectionCount();
+      await sleep(2500);
+      expect(fake.connectionCount()).toBe(connections);
+      await waitUntil(() => socketsHoldingProcess() === 0);
+    });
+
+    it('closes promptly during a handshake the server never answers', async () => {
+      fake.hold = () => true;
+      const store = await openInBackground();
+      await waitUntil(() => fake.connectionCount() > 0);
+      const started = Date.now();
+      await store.close();
+      expect(Date.now() - started).toBeLessThan(500);
+      const connections = fake.connectionCount();
+      await sleep(400);
+      expect(fake.connectionCount()).toBe(connections);
+    });
+
+    it('runs the backfill only after connecting, without holding up create()', async () => {
+      await fake.stop();
+      const store = await openInBackground({ skipMigration: false });
+      expect(fake.commands.some((c) => c[0] === 'SCARD')).toBe(false);
+      await fake.start();
+      await fake.waitForCommand((c) => c[0] === 'SCARD', 5000);
+      await waitUntil(() => store.isConnected);
+    });
+
+    it('retries a backfill that failed, on the next connection', async () => {
+      const store = await openInBackground({ skipMigration: false });
+      await fake.waitForCommand((c) => c[0] === 'SCARD');
+      const scards = () => fake.commands.filter((c) => c[0] === 'SCARD').length;
+      await waitUntil(() => store.isConnected);
+      expect(scards()).toBeGreaterThan(0);
+
+      await store.close();
+      const failing = await RedisStore.create({
+        url: fake.url,
+        ttls: { executionHistory: null },
+        waitForConnection: false,
+        responseTimeoutMs: 100,
+      });
+      stores.push(failing);
+      fake.hold = (c) => c[0] === 'SCARD' || c[0] === 'ZCARD';
+      await waitUntil(() => failing.isConnected);
+      const before = scards();
+      await fake.waitForCommand((c) => c[0] === 'SCARD');
+      fake.dropConnections();
+      fake.hold = () => false;
+      await waitUntil(() => scards() > before, 5000);
+      expect(unhandled).not.toHaveBeenCalled();
+    });
+
+    it('does not start a backfill after close()', async () => {
+      await fake.stop();
+      const store = await openInBackground({ skipMigration: false });
+      await store.close();
+      await fake.start();
+      await sleep(400);
+      expect(fake.commands.some((c) => c[0] === 'SCARD')).toBe(false);
+    });
+  });
+
   describe('the runtime during an outage', () => {
     const unavailable = { code: 'REDIS_UNAVAILABLE' };
     const provider = {

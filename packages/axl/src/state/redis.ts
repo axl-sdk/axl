@@ -233,6 +233,19 @@ export interface RedisStoreOptions {
    */
   responseTimeoutMs?: number;
   /**
+   * Set to `false` so that `create()` returns right away and the store connects
+   * in the background, retrying until Redis is available. Calls reject with
+   * `REDIS_UNAVAILABLE` until then. Defaults to `true`, where `create()` rejects
+   * if Redis is unavailable, which surfaces bad configuration at startup.
+   *
+   * Requires {@link responseTimeoutMs}, so that a server that accepts the
+   * connection but never answers can't leave it connecting forever. Nothing
+   * rejects if the configuration is wrong: failed attempts go to
+   * {@link onConnectionEvent}, and `isConnected` stays `false`. The startup
+   * backfill runs after the first connection instead of during `create()`.
+   */
+  waitForConnection?: boolean;
+  /**
    * Skip the lazy backfill of legacy execution / eval-history entries into
    * the sorted-set indexes during `RedisStore.create()`. Default `false`
    * (backfill runs on startup, one MULTI per 500-entry chunk plus two
@@ -615,8 +628,10 @@ async function connectClient(
 ): Promise<{ client: ConnectableRedisClient; stopResponseWatch?: () => void }> {
   // A failed first connection must reject `create()` rather than retry
   // forever, so hosts see bad config at startup. Only reconnect after the
-  // connection has worked once.
-  let established = false;
+  // connection has worked once, unless the host asked to connect in the background.
+  const inBackground = opts.waitForConnection === false;
+  let established = inBackground;
+  let everFailed = false;
   const responseTimeoutMs = opts.responseTimeoutMs;
   const client = createClient({
     ...(opts.url ? { url: opts.url } : {}),
@@ -636,6 +651,7 @@ async function connectClient(
   const reportConnectionEvent = connectionEventReporter(client, opts.onConnectionEvent);
   client.on('error', (error) => {
     if (!established || client.isOpen === false) return;
+    everFailed = true;
     reportConnectionEvent({
       type: 'error',
       error: error instanceof Error ? error : new Error(String(error)),
@@ -651,10 +667,18 @@ async function connectClient(
   client.on('ready', () => {
     if (!established) {
       established = true;
-    } else if (client.isOpen !== false) {
+    } else if (client.isOpen !== false && (!inBackground || everFailed)) {
       reportConnectionEvent({ type: 'reconnected' });
     }
   });
+  if (inBackground) {
+    // Retries by itself, so this settles only on success or close().
+    client.connect().catch(() => {});
+    return {
+      client,
+      stopResponseWatch: watchResponses(client, responseTimeoutMs!, reportConnectionEvent),
+    };
+  }
   if (responseTimeoutMs === undefined) {
     await client.connect();
     return { client };
@@ -794,6 +818,12 @@ export class RedisStore implements StateStore {
         `RedisStore: responseTimeoutMs must be a positive number of milliseconds, got ${responseTimeoutMs}.`,
       );
     }
+    if (opts.waitForConnection === false && responseTimeoutMs === undefined) {
+      throw new Error(
+        'RedisStore: waitForConnection: false requires responseTimeoutMs, so a server that ' +
+          'accepts the connection but never answers cannot leave it connecting forever.',
+      );
+    }
 
     let createClient: (clientOpts: RedisClientOptions) => ConnectableRedisClient;
     try {
@@ -846,6 +876,11 @@ export class RedisStore implements StateStore {
     store.stopResponseWatch = stopResponseWatch;
     warnIfRedisExecutionRetentionUnset(opts);
 
+    if (opts.waitForConnection === false) {
+      if (!opts.skipMigration) store.backfillOnceConnected(client);
+      return store;
+    }
+
     // Lazy backfill of the new sorted-set indexes for installs upgrading
     // from pre-ZSET versions. Cheap when there's nothing to do (two ZCARD
     // calls); typically a few seconds for installs with sub-10k entries.
@@ -864,6 +899,35 @@ export class RedisStore implements StateStore {
     }
 
     return store;
+  }
+
+  /**
+   * Run the startup backfill when a connection becomes ready, until it succeeds.
+   * Nothing is waiting on it, and listings work without it, so a failure is
+   * reported and the next connection tries again.
+   */
+  private backfillOnceConnected(client: ConnectableRedisClient): void {
+    let state: 'waiting' | 'running' | 'done' = 'waiting';
+    client.on('ready', () => {
+      if (state !== 'waiting') return;
+      state = 'running';
+      this.backfillExecutionIndex()
+        .then(() => this.backfillEvalIndex())
+        .then(
+          () => {
+            state = 'done';
+          },
+          (err: unknown) => {
+            state = 'waiting';
+            // A lost connection is already reported, and the next one retries.
+            if (client.isReady === false || client.isOpen === false) return;
+            console.warn(
+              '[axl] RedisStore: the startup index backfill failed ' +
+                `(${errorMessage(err)}). Listings stay correct meanwhile.`,
+            );
+          },
+        );
+    });
   }
 
   /**

@@ -135,7 +135,30 @@ Without `onConnectionEvent`, the store logs one line when an outage starts and o
 | Workflow that finishes during an outage | You still get the result. Its execution history record isn't saved, and `console.error` says so. Its checkpoints stay until `ttls.checkpoint` expires them. With `state.persist: 'streaming'`, events already in Redis are reported as an incomplete run by the next `recoverIncompleteStreams()` |
 | `store.close()` or `runtime.shutdown()` | Finishes without waiting for Redis to return |
 
-`RedisStore.create()` doesn't retry: if Redis is unreachable or rejects your credentials at startup, it rejects with that error. Retry it yourself if your app should wait for Redis.
+`RedisStore.create()` doesn't retry: if Redis is unreachable or rejects your credentials at startup, it rejects with that error. Retry it yourself if your app should wait for Redis, or let the store connect in the background.
+
+#### Starting while Redis is down
+
+To let your app start during a Redis outage, pass `waitForConnection: false`. `create()` returns right away and the store keeps trying to connect:
+
+```ts
+const store = await RedisStore.create({
+  url: process.env.REDIS_URL!,
+  waitForConnection: false,
+  responseTimeoutMs: 30_000,
+  onConnectionEvent: (event) => {
+    if (event.type === 'error') logger.warn({ err: event.error }, 'redis connection problem');
+    else logger.info('redis connected');
+  },
+});
+```
+
+Until it connects, calls reject with `REDIS_UNAVAILABLE` and `store.isConnected` is `false`, the same as during an outage. Startup work that needs the store, such as `runtime.recoverIncompleteStreams()`, rejects too, so wait for `store.isConnected` or retry it.
+
+- **`responseTimeoutMs` is required.** It stops a server that accepts the connection but never answers from leaving the store connecting forever.
+- **Wrong settings don't stop your app.** A bad password or URL host shows up as repeated `error` events, not as a failed `create()`, so watch `onConnectionEvent` or `isConnected`.
+- **`store.close()` is safe at any time**, including while connecting.
+- **The index backfill runs after the first connection**, and doesn't hold up `create()`. If it fails, the next connection tries again.
 
 #### When Redis stops answering
 

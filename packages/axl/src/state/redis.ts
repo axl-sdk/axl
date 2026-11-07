@@ -762,6 +762,8 @@ async function connectClient(
  * async `RedisStore.create()` factory, which connects before returning.
  */
 export class RedisStore implements StateStore {
+  /** Set when `close()` starts, while the connection is still open. */
+  private closing = false;
   /** Where the next save's check of listed sessions picks up. */
   private sessionSweepCursor = '0';
   /** Overlapping saves would all check the same page, so only one checks at a time. */
@@ -779,7 +781,7 @@ export class RedisStore implements StateStore {
    * reconnecting and after `close()`.
    */
   get isConnected(): boolean {
-    return this.connection.isOpen !== false && this.connection.isReady !== false;
+    return !this.closing && this.connection.isOpen !== false && this.connection.isReady !== false;
   }
 
   /**
@@ -794,6 +796,9 @@ export class RedisStore implements StateStore {
    * "The client is closed" rejection.
    */
   private get client(): RedisClient {
+    // Same rejection as after `close()` finishes. A command sent now could
+    // apply in Redis and still be rejected when the socket closes.
+    if (this.closing) throw new Error('The client is closed');
     if (this.connection.isOpen !== false && this.connection.isReady === false) {
       throw new AxlError(
         'REDIS_UNAVAILABLE',
@@ -1952,9 +1957,10 @@ export class RedisStore implements StateStore {
   }
 
   private warnPruneFailed(index: HistoryIndex, err: unknown): void {
-    // A lost connection isn't the permission problem this warning explains,
-    // and spending the one-time warning on it would hide a real one later.
-    if (this.connection.isReady === false) return;
+    // A lost connection or a closing store isn't the permission problem this
+    // warning explains, and spending the one-time warning on it would hide a
+    // real one later.
+    if (!this.isConnected) return;
     warnDiagnosticOnce(
       `redis_history_prune_failed\0${index.kind}`,
       `RedisStore: removing expired ${index.label} index entries failed ` +
@@ -2211,8 +2217,8 @@ export class RedisStore implements StateStore {
   }
 
   private warnSessionPruneFailed(err: unknown): void {
-    // A lost connection isn't the permission problem this warning explains.
-    if (this.connection.isReady === false) return;
+    // A lost connection or a closing store isn't the permission problem this warning explains.
+    if (!this.isConnected) return;
     warnDiagnosticOnce(
       'redis_session_ids_prune_failed',
       `RedisStore: removing expired session ids failed (${errorMessage(err)}), so ` +
@@ -2300,6 +2306,7 @@ export class RedisStore implements StateStore {
    * closed socket is all Redis needs to clean up, so nothing is lost.
    */
   async close(): Promise<void> {
+    this.closing = true;
     this.stopResponseWatch?.();
     if (this.connection.isOpen === false) return;
     if (this.connection.isReady !== false) {

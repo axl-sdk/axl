@@ -131,6 +131,17 @@ describe('RedisStore session id cleanup on save', () => {
     expect(mockClient.sScan).toHaveBeenCalledTimes(2);
   });
 
+  it('does not warn about permissions when the store closes during the check', async () => {
+    const { store, mockClient } = createRedisStoreWithMockClient('axl:', { session: 60 });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    mockClient.sScan.mockImplementationOnce(async () => {
+      await store.close();
+      throw new Error('The client is closed');
+    });
+    await store.saveSession('s', history);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
   it('does not fail a save when the check loses its connection', async () => {
     const { store, mockClient } = createRedisStoreWithMockClient('axl:', { session: 60 });
     mockClient.sScan.mockRejectedValueOnce(new Error('Socket closed unexpectedly'));

@@ -270,6 +270,20 @@ describe('RedisStore connection handling', () => {
       expect(store.isConnected).toBe(false);
     });
 
+    it('refuses new commands without sending them while it waits', async () => {
+      const store = await open();
+      fake.hold = (command) => command[0] === 'PING';
+      const closing = store.close();
+      await fake.waitForCommand((command) => command[0] === 'PING');
+
+      expect(store.isConnected).toBe(false);
+      await expect(store.saveSession('late', [{ role: 'user', content: 'hi' }])).rejects.toThrow(
+        'The client is closed',
+      );
+      expect(fake.commands.some((command) => command.includes('late'))).toBe(false);
+      await closing;
+    });
+
     it('rejects commands that never got an answer', async () => {
       const store = await open();
       fake.hold = () => true;

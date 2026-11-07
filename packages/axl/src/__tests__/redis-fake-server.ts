@@ -184,7 +184,6 @@ export async function startFakeRedis(options?: { auth?: 'reject' }): Promise<Fak
           }
           if (fake.hold(command)) continue;
           socket.write(respond(command, state));
-          if (command[0] === 'QUIT') socket.end();
         }
       });
     });

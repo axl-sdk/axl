@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`RedisStore` can recover when Redis stops answering.** Set `responseTimeoutMs` so that a hung server or a silently dropped connection rejects waiting calls and reconnects, instead of leaving them pending, even while your app keeps sending commands. It also limits how long `create()` waits for a server that accepts the connection but never answers. Off by default. See [When Redis stops answering](docs/integration.md#when-redis-stops-answering).
 
+### Fixed
+
+- **`RedisStore` no longer repeats its index backfill on every startup.** An id in the older history index with no record behind it kept the backfill re-reading the whole index at each start, and kept listings on their slow path. Those ids are now removed the first time.
+
 ## [0.27.1] - 2026-11-05
 
 ### Fixed

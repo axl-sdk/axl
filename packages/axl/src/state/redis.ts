@@ -873,48 +873,39 @@ export class RedisStore implements StateStore {
    * `skipMigration: true`.
    */
   async backfillExecutionIndex(): Promise<void> {
-    await this.backfillHistoryIndex(
-      this.execHistorySetKey(),
-      this.execHistoryZsetKey(),
-      (id) => this.execHistoryKey(id),
-      (raw) => {
-        const exec = JSON.parse(raw) as HistoricalExecutionInfo;
-        return typeof exec.startedAt === 'number'
-          ? { score: exec.startedAt, value: exec.executionId }
-          : null;
-      },
-      'execution-history',
-    );
+    await this.backfillHistoryIndex(this.historyIndex('execution'), (raw) => {
+      const exec = JSON.parse(raw) as HistoricalExecutionInfo;
+      return typeof exec.startedAt === 'number'
+        ? { score: exec.startedAt, value: exec.executionId }
+        : null;
+    });
   }
 
   /** Backfill the eval-history sorted-set. Symmetric to `backfillExecutionIndex`. */
   async backfillEvalIndex(): Promise<void> {
-    await this.backfillHistoryIndex(
-      this.evalHistorySetKey(),
-      this.evalHistoryZsetKey(),
-      (id) => this.evalHistoryKey(id),
-      (raw) => {
-        const entry = JSON.parse(raw) as EvalHistoryEntry;
-        return typeof entry.timestamp === 'number'
-          ? { score: entry.timestamp, value: entry.id }
-          : null;
-      },
-      'eval-history',
-    );
+    await this.backfillHistoryIndex(this.historyIndex('eval'), (raw) => {
+      const entry = JSON.parse(raw) as EvalHistoryEntry;
+      return typeof entry.timestamp === 'number'
+        ? { score: entry.timestamp, value: entry.id }
+        : null;
+    });
   }
 
   /**
    * Shared implementation for both backfill paths. Reads SET members,
    * batch-MGETs their data blobs in chunks, and ZADDs each into the new
    * sorted-set inside a single MULTI per chunk.
+   *
+   * Ids with no data blob are removed from the id set. Left there, the set stays
+   * larger than the sorted set, so every startup repeats this walk and listing
+   * stays on its slow path.
    */
   private async backfillHistoryIndex(
-    setKey: string,
-    zsetKey: string,
-    dataKey: (id: string) => string,
+    index: HistoryIndex,
     scoreOf: (raw: string) => { score: number; value: string } | null,
-    label: string,
   ): Promise<void> {
+    const setKey = index.ids;
+    const zsetKey = index.time;
     const [setSize, zsetSize] = await Promise.all([
       this.client.sCard(setKey),
       this.client.zCard(zsetKey),
@@ -930,10 +921,11 @@ export class RedisStore implements StateStore {
     const CHUNK_SIZE = 500;
     let migrated = 0;
     let skipped = 0;
+    const missing: string[] = [];
 
     for (let i = 0; i < allIds.length; i += CHUNK_SIZE) {
       const chunk = allIds.slice(i, i + CHUNK_SIZE);
-      const dataKeys = chunk.map((id) => dataKey(id));
+      const dataKeys = chunk.map((id) => index.dataKey(id));
       const raws = await this.client.mGet(dataKeys);
 
       const tx = this.client.multi();
@@ -942,9 +934,9 @@ export class RedisStore implements StateStore {
         const raw = raws[j];
         if (raw == null) {
           // SET has the ID but no data blob — partial state from a
-          // pre-MULTI/EXEC release. Skip; the reader's null-guard catches
-          // this too.
+          // pre-MULTI/EXEC release. The reader's null-guard catches this too.
           skipped++;
+          missing.push(chunk[j]);
           continue;
         }
         try {
@@ -965,9 +957,16 @@ export class RedisStore implements StateStore {
       if (queuedInChunk > 0) await tx.exec();
     }
 
+    // The script checks each blob again, so an id saved since the read stays.
+    if (missing.length > 0) {
+      await this.runPruneScript(index, missing).catch((err: unknown) =>
+        this.warnPruneFailed(index, err),
+      );
+    }
+
     if (migrated > 0 || skipped > 0) {
       console.log(
-        `[axl] RedisStore: backfilled ${migrated} ${label} entries into sorted-set index` +
+        `[axl] RedisStore: backfilled ${migrated} ${index.label} entries into sorted-set index` +
           (skipped > 0 ? ` (${skipped} skipped — missing or malformed)` : ''),
       );
     }
@@ -1768,21 +1767,25 @@ export class RedisStore implements StateStore {
     try {
       await this.pruneHistory(index);
     } catch (err) {
-      // A lost connection isn't the permission problem this warning explains,
-      // and spending the one-time warning on it would hide a real one later.
-      if (this.connection.isReady === false) return;
-      warnDiagnosticOnce(
-        `redis_history_prune_failed\0${index.kind}`,
-        `RedisStore: removing expired ${index.label} index entries failed ` +
-          `(${err instanceof Error ? err.message : String(err)}). The record was saved; ` +
-          'the next save retries the cleanup. Listings stay correct meanwhile. The cleanup ' +
-          'runs a Lua script, so the Redis user needs permission to run EVAL.',
-        undefined,
-        'docs/api-reference.md#redisstore-options',
-      );
+      this.warnPruneFailed(index, err);
     } finally {
       inFlight.delete(index.kind);
     }
+  }
+
+  private warnPruneFailed(index: HistoryIndex, err: unknown): void {
+    // A lost connection isn't the permission problem this warning explains,
+    // and spending the one-time warning on it would hide a real one later.
+    if (this.connection.isReady === false) return;
+    warnDiagnosticOnce(
+      `redis_history_prune_failed\0${index.kind}`,
+      `RedisStore: removing expired ${index.label} index entries failed ` +
+        `(${err instanceof Error ? err.message : String(err)}). The cleanup is tried ` +
+        'again later, and listings stay correct meanwhile. The cleanup runs a Lua script, ' +
+        'so the Redis user needs permission to run EVAL.',
+      undefined,
+      'docs/api-reference.md#redisstore-options',
+    );
   }
 
   private async pruneHistory(index: HistoryIndex): Promise<void> {

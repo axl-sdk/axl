@@ -154,9 +154,9 @@ Choosing a value:
 
 - **Set it above your slowest expected command.** Replies come back in order, so a `PING` waits behind everything sent before it. It applies to the whole connection, so you can't exempt one slow command. A large session save, or a server busy for longer than the value, looks like a stall.
 - **A rejected write may still have been applied.** Redis may have run it before the connection dropped, so check before retrying a write that isn't safe to repeat.
-- **A blocked Node.js event loop can cause a reconnect.** The store allows for blocks up to about twice the value. Longer ones can drop a healthy connection, which clears up after the reconnect.
+- **A blocked Node.js event loop can cause a reconnect.** The store waits one extra second when a block delays its check. A single block longer than about twice the value, or blocks in quick succession, can still drop a healthy connection, which clears up after the reconnect.
 
-It works on every supported `redis` version. Giving up on a reconnect that reached a server which never answers needs `redis` 5.1.0 or later.
+It works on every supported `redis` version. On `redis` 5.0.x with a password, a reconnect that reaches a server which never answers isn't given up on, so use 5.1.0 or later.
 
 ### Execution history: retention and paging
 

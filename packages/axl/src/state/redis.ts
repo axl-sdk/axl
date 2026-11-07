@@ -493,7 +493,11 @@ function connectionEventReporter(
 
 /** A deadline timer this much late means the event loop was blocked, not Redis. */
 const LOOP_STALL_TOLERANCE_MS = 100;
-/** Extra time a late deadline waits, so a reply held up by the blocked loop can be read. */
+/**
+ * Extra time a late deadline waits, once, so a reply held up by the blocked loop
+ * can be read. Only once: on a loop that stays busy every timer is late, and
+ * waiting again each time would never detect a stalled server.
+ */
 const LOOP_STALL_GRACE_MS = 1000;
 
 /**
@@ -534,12 +538,12 @@ function watchResponses(
       clearTimeout(timer);
       schedule(check, checkEveryMs);
     };
-    const expireAfter = (delayMs: number) => {
+    const expireAfter = (delayMs: number, mayWaitForBlockedLoop: boolean) => {
       const dueAt = Date.now() + delayMs;
       schedule(() => {
         if (settled || stopped) return;
-        if (Date.now() - dueAt > LOOP_STALL_TOLERANCE_MS) {
-          expireAfter(LOOP_STALL_GRACE_MS);
+        if (mayWaitForBlockedLoop && Date.now() - dueAt > LOOP_STALL_TOLERANCE_MS) {
+          expireAfter(LOOP_STALL_GRACE_MS, false);
           return;
         }
         reset();
@@ -563,7 +567,7 @@ function watchResponses(
       schedule(check, checkEveryMs);
     };
     client.ping().then(onReply, onReply);
-    expireAfter(timeoutMs);
+    expireAfter(timeoutMs, true);
   };
 
   schedule(check, checkEveryMs);

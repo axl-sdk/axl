@@ -452,6 +452,20 @@ describe('RedisStore connection handling', () => {
     const stallServer = () => {
       fake.hold = isApplicationCommand;
     };
+    /**
+     * Keep sending commands, more often than any idle timer allows, until one
+     * rejects. Measured with timers, so it works while `Date.now` is mocked.
+     */
+    const firstRejectionUnderTraffic = async (store: RedisStore) => {
+      let rejected = false;
+      for (let elapsed = 0; elapsed < 3000 && !rejected; elapsed += 10) {
+        store.getSession('s').catch(() => {
+          rejected = true;
+        });
+        await sleep(10);
+      }
+      return rejected ? 'rejected' : 'still pending after 3s';
+    };
     const blockEventLoop = (ms: number) => {
       const until = Date.now() + ms;
       while (Date.now() < until);
@@ -572,6 +586,32 @@ describe('RedisStore connection handling', () => {
       expect(events).toEqual([]);
       expect(fake.connectionCount()).toBe(1);
       expect(store.isConnected).toBe(true);
+    });
+
+    it('still resets a stalled connection when the event loop stays busy', async () => {
+      const store = await open({ responseTimeoutMs: 100 });
+      stallServer();
+      // Every clock read looks later than the last, so every timer seems late,
+      // as on a host whose event loop never catches up.
+      const realNow = Date.now.bind(Date);
+      let skew = 0;
+      const now = vi.spyOn(Date, 'now').mockImplementation(() => realNow() + (skew += 200));
+      try {
+        await expect(firstRejectionUnderTraffic(store)).resolves.toBe('rejected');
+      } finally {
+        now.mockRestore();
+      }
+    });
+
+    it('detects a second stall after recovering from the first', async () => {
+      const store = await open({ responseTimeoutMs: 100 });
+      for (let stall = 0; stall < 2; stall++) {
+        stallServer();
+        await expect(firstRejectionUnderTraffic(store)).resolves.toBe('rejected');
+        fake.hold = () => false;
+        await waitUntil(() => store.isConnected);
+        await expect(store.getSession('nothing')).resolves.toEqual([]);
+      }
     });
 
     it('rejects create() when the server accepts the connection but never answers', async () => {

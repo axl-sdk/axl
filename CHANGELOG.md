@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.3] - 2026-11-07
+
 ### Added
 
 - **Calls cut off by a lost connection have their own error code.** A `RedisStore` call that was waiting for Redis when the connection dropped, when `responseTimeoutMs` reset it, or when `close()` gave up, now rejects with `AxlError` code `REDIS_CONNECTION_LOST`. Before, it got the Redis client's own error. The code is separate from `REDIS_UNAVAILABLE` because the call may have reached Redis and a write may have applied. Errors on a healthy connection, from Redis or from a bad argument, come through unchanged. The client's error is in `cause`, and its message stays part of the new one. Checks with `instanceof` against node-redis error classes need to look at `cause` instead. See [Riding out a Redis outage](docs/integration.md#riding-out-a-redis-outage).
@@ -2351,7 +2353,8 @@ Initial public open-source release on npm under the `@axlsdk` scope. No new feat
 - `createServer()` factory, `ConnectionManager` for channel subscriptions, `CostAggregator` for cost tracking
 - Eight panels: Agent Playground, Workflow Runner, Trace Explorer, Cost Dashboard, Memory Browser, Session Manager, Tool Inspector, Eval Runner
 
-[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.27.2...HEAD
+[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.27.3...HEAD
+[0.27.3]: https://github.com/axl-sdk/axl/compare/v0.27.2...v0.27.3
 [0.27.2]: https://github.com/axl-sdk/axl/compare/v0.27.1...v0.27.2
 [0.27.1]: https://github.com/axl-sdk/axl/compare/v0.27.0...v0.27.1
 [0.27.0]: https://github.com/axl-sdk/axl/compare/v0.26.0...v0.27.0

@@ -4256,8 +4256,9 @@ export class WorkflowContext<TInput = unknown> {
     const agentStamp = options?.agent ? { agent: options.agent } : {};
 
     // Check for a saved checkpoint from a previous execution
-    const saved = await this.stateStore.getCheckpoint(this.executionId, name);
-    if (saved !== null) {
+    const stored = await this.stateStore.getCheckpoint(this.executionId, name);
+    if (stored !== null) {
+      const saved = readCheckpointValue(stored);
       this.emitEvent({
         type: 'checkpoint_replay',
         ...agentStamp,
@@ -4276,7 +4277,7 @@ export class WorkflowContext<TInput = unknown> {
     if (!options?.saveRequired && this.autoCheckpointCounters.saveFailed) return result;
 
     try {
-      await this.stateStore.saveCheckpoint(this.executionId, name, result);
+      await this.stateStore.saveCheckpoint(this.executionId, name, checkpointValueToSave(result));
     } catch (err) {
       if (options?.saveRequired) throw err;
       this.autoCheckpointCounters.saveFailed = true;
@@ -6394,4 +6395,29 @@ export class WorkflowContext<TInput = unknown> {
     }
     if (overflowErr) throw overflowErr;
   }
+}
+
+/**
+ * Stores report a missing checkpoint as `null`, so a result of `null` or
+ * `undefined` saved as itself would read back as "nothing saved" and run its
+ * step again on replay. JSON-backed stores can't write `undefined` at all. So
+ * these two are saved as a marker instead. Every other value is saved as it
+ * is, which keeps checkpoints readable across versions.
+ */
+const EMPTY_CHECKPOINT_KEY = '__axlEmptyCheckpoint';
+
+function checkpointValueToSave(value: unknown): unknown {
+  if (value === undefined) return { [EMPTY_CHECKPOINT_KEY]: 'undefined' };
+  if (value === null) return { [EMPTY_CHECKPOINT_KEY]: 'null' };
+  return value;
+}
+
+function readCheckpointValue(stored: unknown): unknown {
+  if (typeof stored !== 'object' || stored === null || Object.keys(stored).length !== 1) {
+    return stored;
+  }
+  const marker = (stored as Record<string, unknown>)[EMPTY_CHECKPOINT_KEY];
+  if (marker === 'undefined') return undefined;
+  if (marker === 'null') return null;
+  return stored;
 }

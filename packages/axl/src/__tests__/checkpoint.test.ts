@@ -2,8 +2,17 @@ import { describe, it, expect, vi } from 'vitest';
 import { WorkflowContext } from '../context.js';
 import type { WorkflowContextInit } from '../context.js';
 import { ProviderRegistry } from '../providers/registry.js';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { afterAll } from 'vitest';
 import { MemoryStore } from '../state/memory.js';
+import { RedisStore } from '../state/redis.js';
+import { SQLiteStore } from '../state/sqlite.js';
+import type { StateStore } from '../state/types.js';
 import { agent } from '../agent.js';
+import { createRedisStoreWithMockClient } from './redis-mock-client.js';
 
 // ── Mock Provider ────────────────────────────────────────────────────────
 
@@ -39,7 +48,7 @@ class TestProvider {
 
 function createTestContext(
   provider: TestProvider,
-  store: MemoryStore,
+  store: StateStore,
   executionId: string,
   init?: Partial<WorkflowContextInit>,
 ) {
@@ -334,5 +343,60 @@ describe('ctx.checkpoint()', () => {
     expect(
       await store.getCheckpoint('exec-cp-child', `__auto/${testAgent._name}/ask/1`),
     ).not.toBeNull();
+  });
+});
+
+describe('a checkpoint whose function returns nothing', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'axl-checkpoint-'));
+  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+  const stores: Array<[string, () => Promise<StateStore>]> = [
+    ['MemoryStore', async () => new MemoryStore()],
+    ['SQLiteStore', async () => new SQLiteStore(join(dir, `${randomUUID()}.db`))],
+    ['RedisStore', async () => createRedisStoreWithMockClient().store],
+  ];
+  if (process.env.REDIS_URL) {
+    stores.push([
+      'RedisStore on real Redis',
+      () =>
+        RedisStore.create({
+          url: process.env.REDIS_URL,
+          keyPrefix: `axl-test-${randomUUID()}:`,
+          skipMigration: true,
+          ttls: { executionHistory: null },
+        }),
+    ]);
+  }
+
+  describe.each(stores)('on %s', (_name, createStore) => {
+    it.each([
+      ['undefined', undefined],
+      ['null', null],
+    ])('saves %s and replays it without running the function again', async (_label, value) => {
+      const store = await createStore();
+      try {
+        const provider = new TestProvider([{ content: 'ok' }]);
+        let runs = 0;
+        const step = async () => {
+          runs++;
+          return value;
+        };
+
+        const first = createTestContext(provider, store, 'exec-empty');
+        expect(await first.checkpoint('charge-card', step)).toBe(value);
+        const replay = createTestContext(provider, store, 'exec-empty');
+        expect(await replay.checkpoint('charge-card', step)).toBe(value);
+
+        expect(runs).toBe(1);
+      } finally {
+        await store.close?.();
+      }
+    });
+  });
+
+  it('still replays a value saved by an earlier version', async () => {
+    const store = new MemoryStore();
+    await store.saveCheckpoint('exec-old', 'step', { total: 3 });
+    const ctx = createTestContext(new TestProvider([{ content: 'ok' }]), store, 'exec-old');
+    expect(await ctx.checkpoint('step', async () => ({ total: 0 }))).toEqual({ total: 3 });
   });
 });

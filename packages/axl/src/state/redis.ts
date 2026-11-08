@@ -186,7 +186,11 @@ interface RedisMulti {
  *   once per attempt while Redis is down.
  * - `reconnected`: the store is connected again and commands work.
  */
-export type RedisConnectionEvent = { type: 'error'; error: Error } | { type: 'reconnected' };
+export type RedisConnectionEvent =
+  | { type: 'error'; error: Error }
+  // Only with `waitForConnection: false`, once, when the store first connects.
+  | { type: 'connected' }
+  | { type: 'reconnected' };
 
 /** Options accepted by {@link RedisStore.create}. */
 export interface RedisStoreOptions {
@@ -521,6 +525,57 @@ function abandonConnection(client: RedisClient): void {
   }
 }
 
+/**
+ * Give commands cut off by a lost connection a code of their own. They were
+ * sent and may have applied, so they can't share `REDIS_UNAVAILABLE`, which
+ * promises a command was never sent.
+ *
+ * The test is the connection's state when the rejection arrives, not the
+ * error's class: node-redis rejects them with whatever ended the socket, up to
+ * the operating system's `ECONNRESET`, and it also rejects a bad argument
+ * without sending anything. Every loss leaves the connection down before the
+ * rejection is handled, because node-redis fails waiting commands as it tears
+ * the socket down. On a healthy connection, errors pass through unchanged,
+ * whether Redis sent them, like `NOPERM`, or node-redis did, like a bad
+ * argument. A call that fails for another reason at the moment the connection
+ * fails is labeled lost too, which only makes a retry more careful.
+ *
+ * A transaction is built by chaining on the object `multi()` returns, so that
+ * object is wrapped too, and the chain keeps returning the wrapper.
+ */
+function withLostConnectionErrors(client: RedisClient): RedisClient {
+  const relabel = (error: unknown): never => {
+    const connected = client.isReady !== false && client.isOpen !== false;
+    if (connected || error instanceof AxlError) throw error;
+    const lost = new AxlError(
+      'REDIS_CONNECTION_LOST',
+      `RedisStore: the connection to Redis failed before it answered (${errorMessage(error)}). ` +
+        'The command may still have been applied.',
+    );
+    lost.cause = error;
+    throw lost;
+  };
+  const wrap = <T extends object>(target: T): T => {
+    const wrapper: T = new Proxy(target, {
+      get(object, key) {
+        const value: unknown = Reflect.get(object, key, object);
+        if (typeof value !== 'function') return value;
+        return (...args: unknown[]) => {
+          const result: unknown = value.apply(object, args);
+          if (result === object) return wrapper;
+          if (result instanceof Promise) return result.catch(relabel);
+          if (result !== null && typeof result === 'object' && 'exec' in result) {
+            return wrap(result);
+          }
+          return result;
+        };
+      },
+    });
+    return wrapper;
+  };
+  return wrap(client);
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -533,6 +588,7 @@ function errorMessage(error: unknown): string {
 function connectionEventReporter(
   client: RedisClient,
   onConnectionEvent: RedisStoreOptions['onConnectionEvent'],
+  startsConnected: boolean,
 ): (event: RedisConnectionEvent) => void {
   if (onConnectionEvent) {
     const reportFailure = (error: unknown) =>
@@ -546,16 +602,24 @@ function connectionEventReporter(
     };
   }
   let outageLogged = false;
+  let everConnected = startsConnected;
   return (event) => {
-    if (event.type === 'reconnected') {
+    if (event.type === 'connected' || event.type === 'reconnected') {
+      everConnected = true;
+      // A first connection that simply worked isn't worth a line.
+      if (event.type === 'reconnected' || outageLogged) {
+        console.warn(`[axl] RedisStore: ${event.type} to Redis.`);
+      }
       outageLogged = false;
-      console.warn('[axl] RedisStore: reconnected to Redis.');
     } else if (!outageLogged) {
       // An error on a healthy connection has no matching recovery to reset the flag.
       outageLogged = client.isReady === false;
       console.warn(
-        `[axl] RedisStore: Redis connection lost (${event.error.message}). Store calls fail ` +
-          'until it reconnects, which happens automatically.',
+        everConnected
+          ? `[axl] RedisStore: Redis connection lost (${event.error.message}). Store calls ` +
+              'fail until it reconnects, which happens automatically.'
+          : `[axl] RedisStore: can't reach Redis yet (${event.error.message}). Store calls ` +
+              'fail until it connects, which it keeps trying.',
       );
     }
   };
@@ -688,7 +752,6 @@ async function connectClient(
   // connection has worked once, unless the host asked to connect in the background.
   const inBackground = opts.waitForConnection === false;
   let established = inBackground;
-  let everFailed = false;
   const responseTimeoutMs = opts.responseTimeoutMs;
   const client = createClient({
     ...(opts.url ? { url: opts.url } : {}),
@@ -705,10 +768,13 @@ async function connectClient(
   });
   // node-redis reports a closed socket as an `error` event. With no listener,
   // Node throws it as an uncaught exception and the host process exits.
-  const reportConnectionEvent = connectionEventReporter(client, opts.onConnectionEvent);
+  const reportConnectionEvent = connectionEventReporter(
+    client,
+    opts.onConnectionEvent,
+    !inBackground,
+  );
   client.on('error', (error) => {
     if (!established || client.isOpen === false) return;
-    everFailed = true;
     reportConnectionEvent({
       type: 'error',
       error: error instanceof Error ? error : new Error(String(error)),
@@ -721,11 +787,15 @@ async function connectClient(
   client.on('connect', () => {
     if (client.isOpen === false) client.unref?.();
   });
+  // `create()` resolving reports the first connection, except in the
+  // background, where nothing else would.
+  let everConnected = !inBackground;
   client.on('ready', () => {
     if (!established) {
       established = true;
-    } else if (client.isOpen !== false && (!inBackground || everFailed)) {
-      reportConnectionEvent({ type: 'reconnected' });
+    } else if (client.isOpen !== false) {
+      reportConnectionEvent({ type: everConnected ? 'reconnected' : 'connected' });
+      everConnected = true;
     }
   });
   if (inBackground) {
@@ -806,8 +876,17 @@ export class RedisStore implements StateStore {
           'The store reconnects automatically; retry once Redis is back.',
       );
     }
-    return this.connection;
+    // Keyed by the connection it wraps, so a connection swapped in later is used.
+    if (this.reportingLostConnections?.wraps !== this.connection) {
+      this.reportingLostConnections = {
+        wraps: this.connection,
+        client: withLostConnectionErrors(this.connection),
+      };
+    }
+    return this.reportingLostConnections.client;
   }
+
+  private reportingLostConnections?: { wraps: RedisClient; client: RedisClient };
 
   /**
    * History kinds with a prune running in this process. A save skips its

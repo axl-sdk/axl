@@ -846,4 +846,47 @@ describe('Session concurrency — per-session serializer', () => {
     expect(locks.size).toBe(0);
     await runtime.shutdown();
   });
+
+  // ────────────────────────────────────────────────────────────────────
+  // 17. stream.promise settles after the turn's save
+  // ────────────────────────────────────────────────────────────────────
+  // A caller ordering turns across instances with its own lock releases it
+  // when stream.promise settles. Another instance reads the store next, so
+  // the turn must already be there.
+  class SlowSaveStore extends MemoryStore {
+    failSave = false;
+    override async saveSession(id: string, history: ChatMessage[]): Promise<void> {
+      await new Promise((r) => setTimeout(r, 30));
+      if (this.failSave) throw new Error('disk full');
+      await super.saveSession(id, history);
+    }
+  }
+
+  it('stream.promise resolves only after the turn is saved', async () => {
+    const store = new SlowSaveStore();
+    const { runtime } = makeEchoRuntime(store);
+    const stream = await runtime.session('ordered').stream('chat', 'hello');
+
+    await expect(stream.promise).resolves.toBe('reply-to-hello');
+    expect(await store.getSession('ordered')).toEqual([
+      { role: 'user', content: 'hello' },
+      { role: 'assistant', content: 'reply-to-hello', agent: 'echo' },
+    ]);
+    await runtime.shutdown();
+  });
+
+  it('stream.promise still resolves with the result after a failed save is reported', async () => {
+    const store = new SlowSaveStore();
+    store.failSave = true;
+    const { runtime } = makeEchoRuntime(store);
+    const reported = vi.fn();
+    runtime.on('error', reported);
+    const stream = await runtime.session('lost').stream('chat', 'hello');
+
+    await expect(stream.promise).resolves.toBe('reply-to-hello');
+    expect(reported).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'session_history_save_failed', sessionId: 'lost' }),
+    );
+    await runtime.shutdown();
+  });
 });

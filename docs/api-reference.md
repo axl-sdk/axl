@@ -1708,7 +1708,7 @@ const result = await session.send('HandleSupport', { msg: 'Help me' });
 | Method | Description |
 |--------|-------------|
 | `session.send(workflow, input, { signal?, events? })` | Execute a workflow with session history. Returns the result. Serialized per `sessionId` (see [Concurrency](#concurrency-and-races)). Pass `signal` to cancel via `AbortSignal` — fires the same path as `runtime.abort(executionId)`. A pre-aborted signal short-circuits before acquiring the lock. `events` configures the iterator-queue cap and overflow policy on the underlying `ctx.events` bus (see [`EventStreamOptions`](#eventstreamoptions)) |
-| `session.stream(workflow, input, { signal?, events? })` | Execute a workflow with session history. Returns an `AxlStream`. Serialized per `sessionId` — the lock is held until the stream's terminal `done`/`error` event fires. `signal` aborts the stream and releases the lock. `events` configures the iterator-queue cap and overflow policy on both the returned `AxlStream` and the workflow's `ctx.events` bus |
+| `session.stream(workflow, input, { signal?, events? })` | Execute a workflow with session history. Returns an `AxlStream`. Serialized per `sessionId` — the lock is held until the stream ends and, on success, its turn is saved. `stream.promise` resolves after that save, so the next turn on any instance reads it. The `done` event comes before the save. `signal` aborts the stream and releases the lock. `events` configures the iterator-queue cap and overflow policy on both the returned `AxlStream` and the workflow's `ctx.events` bus |
 | `session.history()` | Get the last persisted message history snapshot from the store. Does **not** await in-flight `send()`/`stream()` — returns the previously committed state, which may be stale by one exchange |
 | `session.handoffs()` | Get the handoff history for this session. Same snapshot semantics as `history()` |
 | `session.end()` | Close the session and delete history from the store. Serialized: queues behind any in-flight `send`/`stream` so the delete is the final state |
@@ -1781,7 +1781,7 @@ The queue above works within one runtime. When several app instances share a sto
 - **An ended session stays ended.** A turn that was running when another instance called `end()` isn't saved, and `session_turn_discarded` fires. If the session had no messages when the turn started, the turn is saved instead, because nothing shows the session existed.
 - **Summaries are a best effort under overlap.** A summary isn't saved if the session changed while it was being generated. A write in the brief moment after that check can still replace a newer summary, and a summary can repeat content. To rule this out, run one turn at a time.
 
-To run one turn at a time per session across instances, route each session to one instance, or hold your own per-session lock around `send()` and `stream()`.
+To run one turn at a time per session across instances, route each session to one instance, or hold your own per-session lock around `send()` and `stream()`. Release the lock when `send()` returns or `stream.promise` settles. By then the turn is saved, or its failed save has been reported. Releasing it at the `done` event is too early, because the turn isn't saved yet.
 
 These stores and setups don't get the protection against overwrites, so the last save wins:
 

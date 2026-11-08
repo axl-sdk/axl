@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`stream.promise` on a session stream resolves after the turn is saved.** It used to resolve at the `done` event, before the save. A caller that ordered turns across instances with its own lock and released it there let the next turn read history without this one. `session.send()` already returned only after saving. If the save fails, the promise still resolves with the result and the failure is reported as `session_history_save_failed`, as before. See [Several app instances sharing a session](docs/api-reference.md#several-app-instances-sharing-a-session).
+
 ## [0.27.3] - 2026-11-07
 
 ### Added

@@ -235,8 +235,8 @@ export class Session {
     if (this.closed) throw new Error('Session has been ended');
     options?.signal?.throwIfAborted?.();
 
-    // The serializer holds the lock until `done`/`error` so the next caller
-    // sees a saved history. `streamReady` resolves once the AxlStream object
+    // The serializer holds the lock until the stream settles and, on success,
+    // its turn is saved, so the next caller sees the saved history. `streamReady` resolves once the AxlStream object
     // is constructed, so callers don't have to wait for the stream to finish.
     let resolveReady!: (s: AxlStream) => void;
     let rejectReady!: (e: unknown) => void;
@@ -280,56 +280,59 @@ export class Session {
     events: EventStreamOptions | undefined,
   ): Promise<void> {
     let history: ChatMessage[] | undefined;
-    let base: TurnBase;
     let axlStream: AxlStream;
     try {
       const prepared = await this.prepareHistory(input);
-      history = prepared.history;
-      base = prepared.base;
+      const turnHistory = prepared.history;
+      history = turnHistory;
       axlStream = this.runtime.stream(workflowName, input, {
         metadata: prepared.metadata,
         signal,
         events,
       });
+      // Save before `stream.promise` resolves, as `send()` does before it
+      // returns. Callers that order turns across instances release their own
+      // lock on the promise, and the next instance reads the store. Only a
+      // finished stream saves; an errored one has no result to commit.
+      axlStream._beforeResolve((result) =>
+        this.commitHistory(turnHistory, prepared.base, result).catch((err) =>
+          this.reportLostTurn(err),
+        ),
+      );
     } catch (err) {
       if (history) clearSessionInput(history);
       rejectReady(err);
       throw err;
     }
 
-    // Hand the stream to the caller now — the lock is still held by the
-    // `await completion` below, so the next session call queues behind it.
+    // Hand the stream to the caller now. The lock is held until the stream
+    // settles below, so the next session call queues behind it.
     resolveReady(axlStream);
 
-    // Hold the lock until the stream terminates. `axlStream.promise`
-    // resolves on the `done` event (with the result) and rejects on
-    // `error`; using it instead of `on('done'|'error', ...)` avoids any
-    // listener-vs-sync-emit ordering risk. Save only on success — an
-    // errored stream has no committed result.
     try {
-      const completion = axlStream.promise.then(
-        (result) =>
-          this.commitHistory(history!, base, result).catch((err) => {
-            const error = err instanceof Error ? err.message : String(err);
-            try {
-              this.runtime.emit('error', {
-                type: 'session_history_save_failed',
-                sessionId: this.sessionId,
-                error,
-              });
-            } catch {
-              // emit('error') throws with no listener. The stream's result is
-              // already delivered, so this log is all that records the lost turn.
-              console.error(
-                `[axl] Failed to save session history for sessionId=${this.sessionId}: ${error}`,
-              );
-            }
-          }),
-        () => undefined,
-      );
-      await completion;
+      // Resolves after the save; rejects on `error`, which we don't rethrow.
+      await axlStream.promise.catch(() => undefined);
     } finally {
-      clearSessionInput(history!);
+      clearSessionInput(history);
+    }
+  }
+
+  /** The stream's result is already delivered, so a failed save is reported
+   *  rather than thrown. */
+  private reportLostTurn(err: unknown): void {
+    const error = err instanceof Error ? err.message : String(err);
+    try {
+      this.runtime.emit('error', {
+        type: 'session_history_save_failed',
+        sessionId: this.sessionId,
+        error,
+      });
+    } catch {
+      // emit('error') throws with no listener, so this log is all that
+      // records the lost turn.
+      console.error(
+        `[axl] Failed to save session history for sessionId=${this.sessionId}: ${error}`,
+      );
     }
   }
 

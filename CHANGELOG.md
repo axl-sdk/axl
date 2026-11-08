@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.4] - 2026-11-08
+
+### Fixed
+
+- **`stream.promise` on a session stream resolves after the turn is saved.** It used to resolve at the `done` event, before the save. A caller that ordered turns across instances with its own lock and released it there let the next turn read history without this one. `session.send()` already returned only after saving. If the save fails, the promise still resolves with the result and the failure is reported as `session_history_save_failed`, as before. See [Several app instances sharing a session](docs/api-reference.md#several-app-instances-sharing-a-session).
+
 ## [0.27.3] - 2026-11-07
 
 ### Added
@@ -2353,7 +2359,8 @@ Initial public open-source release on npm under the `@axlsdk` scope. No new feat
 - `createServer()` factory, `ConnectionManager` for channel subscriptions, `CostAggregator` for cost tracking
 - Eight panels: Agent Playground, Workflow Runner, Trace Explorer, Cost Dashboard, Memory Browser, Session Manager, Tool Inspector, Eval Runner
 
-[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.27.3...HEAD
+[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.27.4...HEAD
+[0.27.4]: https://github.com/axl-sdk/axl/compare/v0.27.3...v0.27.4
 [0.27.3]: https://github.com/axl-sdk/axl/compare/v0.27.2...v0.27.3
 [0.27.2]: https://github.com/axl-sdk/axl/compare/v0.27.1...v0.27.2
 [0.27.1]: https://github.com/axl-sdk/axl/compare/v0.27.0...v0.27.1

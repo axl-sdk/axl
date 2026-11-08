@@ -66,6 +66,7 @@ export class AxlStream extends Readable implements AsyncIterable<AxlEvent> {
   readonly promise: Promise<unknown>;
   private resolvePromise!: (value: unknown) => void;
   private rejectPromise!: (error: Error) => void;
+  private beforeResolve?: (result: unknown) => Promise<void>;
 
   constructor(options?: EventStreamOptions) {
     super({ objectMode: true, read() {} });
@@ -278,7 +279,22 @@ export class AxlStream extends Readable implements AsyncIterable<AxlEvent> {
     this.push(doneEvent);
     this.push(null);
     this.events._finish();
-    this.resolvePromise(result);
+    const resolve = () => this.resolvePromise(result);
+    const work = this.beforeResolve;
+    if (!work) return resolve();
+    // Start `work` in a microtask so a synchronous throw can't leave `promise` pending.
+    void Promise.resolve()
+      .then(() => work(result))
+      .then(resolve, resolve);
+  }
+
+  /** Internal: run `work` after the `done` event and before `promise`
+   *  resolves. A session stream saves its turn here, so a caller awaiting
+   *  `promise` reads the saved history next. `work` reports its own
+   *  failures; `promise` still resolves with the result. Register before
+   *  the stream can finish. */
+  _beforeResolve(work: (result: unknown) => Promise<void>): void {
+    this.beforeResolve = work;
   }
 
   /** Signal an error. `executionId` is required for the same reason as
